@@ -1,0 +1,19 @@
+# Default: treat as text, force LF on checkout (prevents Windows editors
+# from sneaking CRLF back into the repo).
+* text=auto eol=lf
+
+# Windows-only scripts: keep the repository's CRLF bytes as-is so
+# PowerShell / cmd.exe handle them correctly and Git does not create
+# noisy EOL-only diffs for existing CRLF script files.
+*.ps1 -text
+*.cmd -text
+*.bat -text
+
+# Pre-built binary artifacts: never touch line endings.
+dist_beta/* binary
+*.png binary
+*.jpg binary
+*.pdf binary
+
+# Vendored third-party source: leave as-is.
+vendor/** -text
