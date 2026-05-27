@@ -1,0 +1,60 @@
+[package]
+name = "cokacmux"
+version = "0.2.12"
+edition = "2021"
+authors = ["cokac <monogatree@gmail.com>"]
+description = "TUI multiplexer for Claude Code, Codex, and OpenCode agent sessions."
+license = "MIT"
+repository = "https://github.com/kstost/cokacmux"
+autobins = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cokacmux"
+path = "src/bin/cokacmux.rs"
+required-features = ["tui"]
+
+[features]
+default = ["claude", "codex", "opencode", "cli", "discovery", "tui"]
+claude = []
+codex = []
+opencode = ["dep:rusqlite"]
+cli = ["dep:clap", "dep:anyhow", "discovery"]
+discovery = ["dep:dirs"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:anyhow", "dep:portable-pty", "dep:vt100", "discovery", "claude", "codex"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+sha2 = "0.10"
+thiserror = "1"
+
+clap = { version = "4", features = ["derive"], optional = true }
+anyhow = { version = "1", optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+dirs = { version = "5", optional = true }
+ratatui = { version = "0.28", optional = true }
+crossterm = { version = "0.28", optional = true }
+unicode-width = { version = "0.1", optional = true }
+portable-pty = { version = "0.9", optional = true }
+vt100 = { version = "0.16", optional = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[patch.crates-io]
+# Local fork of vt100 0.16.2 with bounds-check fixes for the
+# clear_wide / Screen::text() panics that trigger when a wide character is
+# stranded at the last column after a shrink resize. See vendor/vt100-cokac.
+vt100 = { path = "vendor/vt100-cokac" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
