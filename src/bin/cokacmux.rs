@@ -1206,6 +1206,7 @@ fn clone_provider_at(index: usize) -> Provider {
     CLONE_PROVIDER_OPTIONS[index % CLONE_PROVIDER_OPTIONS.len()]
 }
 
+#[cfg(test)]
 fn clone_provider_default_index(source: Provider) -> usize {
     CLONE_PROVIDER_OPTIONS
         .iter()
@@ -1252,9 +1253,38 @@ fn move_new_session_kind(kind: NewSessionKind, delta: i32) -> NewSessionKind {
     }
 }
 
-fn move_provider(provider: Provider, delta: i32) -> Provider {
-    let index = clone_provider_default_index(provider);
-    clone_provider_at(move_clone_provider_index(index, delta))
+fn move_provider_in_options(provider: Provider, delta: i32, options: &[Provider]) -> Provider {
+    if options.is_empty() {
+        return provider;
+    }
+    let Some(index) = options.iter().position(|candidate| *candidate == provider) else {
+        return options[0];
+    };
+    let next = (index as i32 + delta).rem_euclid(options.len() as i32) as usize;
+    options[next]
+}
+
+fn available_agent_provider_options(agent_programs: &AgentProgramSettings) -> Vec<Provider> {
+    CLONE_PROVIDER_OPTIONS
+        .iter()
+        .copied()
+        .filter(|provider| agent_provider_available(*provider, agent_programs))
+        .collect()
+}
+
+fn normalize_agent_provider_selection(
+    provider: Provider,
+    options: &[Provider],
+) -> Option<Provider> {
+    if options.contains(&provider) {
+        Some(provider)
+    } else {
+        options.first().copied()
+    }
+}
+
+fn agent_provider_available(provider: Provider, agent_programs: &AgentProgramSettings) -> bool {
+    resolve_agent_program_for_provider(provider, agent_programs).is_some()
 }
 
 fn move_launch_mode(launch_mode: AgentLaunchMode, delta: i32) -> AgentLaunchMode {
@@ -1346,6 +1376,7 @@ enum InputMode {
         cwd: String,
         cwd_cursor: usize,
         provider: Provider,
+        provider_options: Vec<Provider>,
         launch_mode: AgentLaunchMode,
     },
     CloneTarget {
@@ -4435,12 +4466,17 @@ impl App {
         );
         let cwd_cursor = cwd.len();
         self.status = "choose what to start.".into();
+        let provider_options =
+            available_agent_provider_options(&self.settings.cokacmux.agent_programs);
+        let provider =
+            normalize_agent_provider_selection(provider, &provider_options).unwrap_or(provider);
         self.input_mode = InputMode::NewSession {
             selected: NEW_SESSION_FIELD_KIND,
             kind: NewSessionKind::Terminal,
             cwd,
             cwd_cursor,
             provider,
+            provider_options,
             launch_mode: AgentLaunchMode::Normal,
         };
     }
@@ -4454,6 +4490,18 @@ impl App {
         cols: u16,
         rows: u16,
     ) -> bool {
+        if kind == NewSessionKind::CodingAgent
+            && !agent_provider_available(provider, &self.settings.cokacmux.agent_programs)
+        {
+            self.status = format!("{} agent is not installed.", provider.as_str());
+            debug_log(
+                "new_session_provider_unavailable",
+                serde_json::json!({
+                    "provider": provider.as_str(),
+                }),
+            );
+            return false;
+        }
         let cwd = match normalize_launch_cwd(&cwd) {
             Ok(cwd) => cwd,
             Err(message) => {
@@ -9084,7 +9132,10 @@ fn shell_display_word(value: &str) -> String {
 
 #[cfg(not(windows))]
 fn agent_command_builder(spec: &AgentLaunchSpec) -> CommandBuilder {
-    let mut command = CommandBuilder::new(&spec.program);
+    let program = resolve_unix_agent_program(&spec.program)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| spec.program.clone());
+    let mut command = CommandBuilder::new(program);
     command.args(&spec.args);
     for (key, value) in &spec.env {
         command.env(key, value);
@@ -9180,12 +9231,31 @@ fn windows_node_for_npm_shim(program: &Path) -> PathBuf {
 
 #[cfg(windows)]
 fn resolve_windows_agent_program(program: &str) -> PathBuf {
+    if let Some(provider) = provider_for_default_agent_program(program) {
+        if let Some(path) = resolve_windows_agent_program_for_provider(provider, program) {
+            if provider == Provider::OpenCode {
+                if let Some(native) = opencode_native_exe_for_windows_wrapper(&path) {
+                    return native;
+                }
+            }
+            return path;
+        }
+    }
     resolve_windows_agent_program_with_env(
         program,
         std::env::var_os("PATH"),
         std::env::var_os("PATHEXT"),
     )
     .unwrap_or_else(|| PathBuf::from(program))
+}
+
+#[cfg(windows)]
+fn provider_for_default_agent_program(program: &str) -> Option<Provider> {
+    let trimmed = program.trim();
+    CLONE_PROVIDER_OPTIONS
+        .iter()
+        .copied()
+        .find(|provider| trimmed.eq_ignore_ascii_case(default_agent_program(*provider)))
 }
 
 #[cfg(windows)]
@@ -9506,6 +9576,166 @@ fn shell_launch_spec(info: &SessionInfo) -> AgentLaunchSpec {
     }
 }
 
+fn resolve_agent_program_for_provider(
+    provider: Provider,
+    agent_programs: &AgentProgramSettings,
+) -> Option<PathBuf> {
+    let program = agent_programs.program_for(provider);
+    resolve_agent_program_candidate(provider, &program)
+}
+
+#[cfg(unix)]
+fn resolve_agent_program_candidate(_provider: Provider, program: &str) -> Option<PathBuf> {
+    resolve_unix_agent_program(program)
+}
+
+#[cfg(windows)]
+fn resolve_agent_program_candidate(provider: Provider, program: &str) -> Option<PathBuf> {
+    let resolved = resolve_windows_agent_program_for_provider(provider, program)?;
+    if provider == Provider::OpenCode {
+        opencode_native_exe_for_windows_wrapper(&resolved).or(Some(resolved))
+    } else {
+        Some(resolved)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn resolve_agent_program_candidate(_provider: Provider, program: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(program);
+    path.is_file().then_some(path)
+}
+
+#[cfg(unix)]
+fn resolve_unix_agent_program(program: &str) -> Option<PathBuf> {
+    let trimmed = program.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let expanded = expand_configured_program_path(trimmed);
+    let path = Path::new(&expanded);
+    if path.components().count() > 1 || path.is_absolute() {
+        return unix_runnable_file(path).then(|| path.to_path_buf());
+    }
+
+    resolve_unix_program_with_which(&expanded)
+        .or_else(|| resolve_unix_program_with_login_shell(&expanded))
+}
+
+#[cfg(unix)]
+fn resolve_unix_program_with_which(program: &str) -> Option<PathBuf> {
+    let output = Command::new("which").arg(program).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty())
+        .then_some(PathBuf::from(path))
+        .filter(|path| unix_runnable_file(path))
+}
+
+#[cfg(unix)]
+fn resolve_unix_program_with_login_shell(program: &str) -> Option<PathBuf> {
+    let command = format!("which {}", shell_single_quote(program));
+    let output = Command::new("bash").args(["-lc", &command]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty())
+        .then_some(PathBuf::from(path))
+        .filter(|path| unix_runnable_file(path))
+}
+
+#[cfg(unix)]
+fn unix_runnable_file(path: &Path) -> bool {
+    path.metadata()
+        .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn resolve_windows_agent_program_for_provider(
+    provider: Provider,
+    program: &str,
+) -> Option<PathBuf> {
+    let requested = Path::new(program);
+    let extensions = windows_agent_provider_extensions(provider);
+    if requested.components().count() > 1 || requested.is_absolute() {
+        return resolve_windows_agent_candidate_with_extensions(
+            requested.to_path_buf(),
+            &extensions,
+        );
+    }
+
+    std::env::var_os("PATH")
+        .as_deref()
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .find_map(|dir| {
+            resolve_windows_agent_candidate_with_extensions(dir.join(program), &extensions)
+        })
+}
+
+#[cfg(windows)]
+fn resolve_windows_agent_candidate_with_extensions(
+    base: PathBuf,
+    extensions: &[&str],
+) -> Option<PathBuf> {
+    if base.extension().is_some() {
+        return windows_agent_path_is_runnable(&base).then_some(base);
+    }
+
+    for ext in extensions {
+        let candidate = base.with_extension(ext.trim_start_matches('.'));
+        if windows_agent_path_is_runnable(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn windows_agent_provider_extensions(provider: Provider) -> &'static [&'static str] {
+    match provider {
+        Provider::Codex => &[".cmd", ".exe", ".bat", ".com"],
+        Provider::Claude => &[".exe", ".cmd", ".bat", ".com"],
+        Provider::OpenCode => &[".exe", ".cmd", ".bat", ".com"],
+    }
+}
+
+#[cfg(windows)]
+fn windows_agent_path_is_runnable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "exe" | "cmd" | "bat" | "com" | "ps1")
+}
+
+#[cfg(windows)]
+fn opencode_native_exe_for_windows_wrapper(path: &Path) -> Option<PathBuf> {
+    if !is_windows_batch_script(path) {
+        return None;
+    }
+    let native = path
+        .parent()?
+        .join("node_modules")
+        .join("opencode-ai")
+        .join("bin")
+        .join("opencode.exe");
+    native.is_file().then_some(native)
+}
+
 fn default_agent_program(provider: Provider) -> &'static str {
     match provider {
         Provider::Codex => "codex",
@@ -9670,10 +9900,18 @@ fn handle_new_session_key(
         cwd,
         cwd_cursor,
         provider,
+        provider_options,
         launch_mode,
     } = &mut app.input_mode
     {
         *selected = clamp_new_session_field(*selected, *kind);
+        if *kind == NewSessionKind::CodingAgent {
+            if let Some(normalized) =
+                normalize_agent_provider_selection(*provider, provider_options)
+            {
+                *provider = normalized;
+            }
+        }
         if keybindings.matches(KeyAction::NewSessionCancel, key) {
             app.input_mode = InputMode::Normal;
             app.status = "cancelled.".into();
@@ -9747,8 +9985,17 @@ fn handle_new_session_key(
                 NEW_SESSION_FIELD_KIND => {
                     *kind = move_new_session_kind(*kind, 1);
                     *selected = clamp_new_session_field(*selected, *kind);
+                    if *kind == NewSessionKind::CodingAgent {
+                        if let Some(normalized) =
+                            normalize_agent_provider_selection(*provider, provider_options)
+                        {
+                            *provider = normalized;
+                        }
+                    }
                 }
-                NEW_SESSION_FIELD_PROVIDER => *provider = move_provider(*provider, 1),
+                NEW_SESSION_FIELD_PROVIDER => {
+                    *provider = move_provider_in_options(*provider, 1, provider_options)
+                }
                 NEW_SESSION_FIELD_PERMISSIONS => *launch_mode = move_launch_mode(*launch_mode, 1),
                 _ => {}
             }
@@ -9766,8 +10013,17 @@ fn handle_new_session_key(
                 NEW_SESSION_FIELD_KIND => {
                     *kind = move_new_session_kind(*kind, -1);
                     *selected = clamp_new_session_field(*selected, *kind);
+                    if *kind == NewSessionKind::CodingAgent {
+                        if let Some(normalized) =
+                            normalize_agent_provider_selection(*provider, provider_options)
+                        {
+                            *provider = normalized;
+                        }
+                    }
                 }
-                NEW_SESSION_FIELD_PROVIDER => *provider = move_provider(*provider, -1),
+                NEW_SESSION_FIELD_PROVIDER => {
+                    *provider = move_provider_in_options(*provider, -1, provider_options)
+                }
                 NEW_SESSION_FIELD_PERMISSIONS => *launch_mode = move_launch_mode(*launch_mode, -1),
                 _ => {}
             }
@@ -10439,6 +10695,7 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
         cwd,
         cwd_cursor,
         provider,
+        provider_options,
         launch_mode,
     } = &app.input_mode
     {
@@ -10450,6 +10707,7 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
             cwd,
             *cwd_cursor,
             *provider,
+            provider_options,
             *launch_mode,
             &app.settings.cokacmux.agent_programs,
             &app.keybindings,
@@ -11600,6 +11858,7 @@ fn draw_new_session_modal(
     cwd: &str,
     cwd_cursor: usize,
     provider: Provider,
+    provider_options: &[Provider],
     launch_mode: AgentLaunchMode,
     agent_programs: &AgentProgramSettings,
     keybindings: &KeyBindings,
@@ -11646,10 +11905,15 @@ fn draw_new_session_modal(
     ));
 
     if kind == NewSessionKind::CodingAgent {
+        let provider_label = if provider_options.is_empty() {
+            "none installed".to_string()
+        } else {
+            provider.as_str().to_string()
+        };
         lines.push(new_session_field_line(
             selected == NEW_SESSION_FIELD_PROVIDER,
             "Agent",
-            provider.as_str().to_string(),
+            provider_label,
             label_width,
             value_width,
         ));
@@ -11666,7 +11930,14 @@ fn draw_new_session_modal(
         format!(
             "  {}",
             truncate_width(
-                &new_session_preview_command(kind, cwd, provider, launch_mode, agent_programs),
+                &new_session_preview_command(
+                    kind,
+                    cwd,
+                    provider,
+                    provider_options,
+                    launch_mode,
+                    agent_programs,
+                ),
                 inner_width.saturating_sub(2)
             )
         ),
@@ -11718,6 +11989,7 @@ fn new_session_preview_command(
     kind: NewSessionKind,
     cwd: &str,
     provider: Provider,
+    provider_options: &[Provider],
     launch_mode: AgentLaunchMode,
     agent_programs: &AgentProgramSettings,
 ) -> String {
@@ -11734,6 +12006,12 @@ fn new_session_preview_command(
             shell_launch_spec(&info).command_line()
         }
         NewSessionKind::CodingAgent => {
+            if provider_options.is_empty() {
+                return "no installed coding agents".to_string();
+            }
+            if !provider_options.contains(&provider) {
+                return format!("{} agent is not installed", provider.as_str());
+            }
             let info = SessionInfo {
                 provider,
                 session_id: "preview".into(),
@@ -13600,13 +13878,21 @@ mod tests {
                 cwd,
                 cwd_cursor,
                 provider,
+                provider_options,
                 launch_mode,
             } => {
                 assert_eq!(*selected, NEW_SESSION_FIELD_KIND);
                 assert_eq!(*kind, NewSessionKind::Terminal);
                 assert_eq!(cwd, "/repo");
                 assert_eq!(*cwd_cursor, "/repo".len());
-                assert_eq!(*provider, Provider::OpenCode);
+                let expected_provider = if provider_options.is_empty()
+                    || provider_options.contains(&Provider::OpenCode)
+                {
+                    Provider::OpenCode
+                } else {
+                    provider_options[0]
+                };
+                assert_eq!(*provider, expected_provider);
                 assert_eq!(*launch_mode, AgentLaunchMode::Normal);
             }
             other => panic!("expected new session mode, got {:?}", other),
@@ -13622,6 +13908,7 @@ mod tests {
             cwd: "/repo".into(),
             cwd_cursor: "/repo".len(),
             provider: Provider::Codex,
+            provider_options: Vec::new(),
             launch_mode: AgentLaunchMode::Normal,
         };
 
@@ -13659,6 +13946,7 @@ mod tests {
             cwd: "".into(),
             cwd_cursor: 0,
             provider: Provider::Codex,
+            provider_options: Vec::new(),
             launch_mode: AgentLaunchMode::Normal,
         };
 
@@ -13930,6 +14218,67 @@ mod tests {
                 .agent_programs
                 .program_for(Provider::Codex),
             "codex"
+        );
+    }
+
+    #[test]
+    fn agent_provider_choices_use_available_programs() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir
+            .path()
+            .join(if cfg!(windows) { "codex.cmd" } else { "codex" });
+        fs::write(
+            &codex,
+            if cfg!(windows) {
+                "@echo off\r\n"
+            } else {
+                "#!/bin/sh\n"
+            },
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&codex, perms).unwrap();
+        }
+
+        let agent_programs = AgentProgramSettings {
+            codex: Some(codex.display().to_string()),
+            claude: Some(dir.path().join("missing-claude").display().to_string()),
+            opencode: Some(dir.path().join("missing-opencode").display().to_string()),
+            extra: serde_json::Map::new(),
+        };
+
+        assert_eq!(
+            available_agent_provider_options(&agent_programs),
+            vec![Provider::Codex]
+        );
+        assert_eq!(
+            normalize_agent_provider_selection(Provider::Claude, &[Provider::Codex]),
+            Some(Provider::Codex)
+        );
+    }
+
+    #[test]
+    fn agent_provider_choice_movement_skips_unavailable_options() {
+        let options = [Provider::Codex, Provider::OpenCode];
+
+        assert_eq!(
+            move_provider_in_options(Provider::Claude, 1, &options),
+            Provider::Codex
+        );
+        assert_eq!(
+            move_provider_in_options(Provider::Codex, 1, &options),
+            Provider::OpenCode
+        );
+        assert_eq!(
+            move_provider_in_options(Provider::Codex, -1, &options),
+            Provider::OpenCode
+        );
+        assert_eq!(
+            move_provider_in_options(Provider::Codex, 1, &[]),
+            Provider::Codex
         );
     }
 
