@@ -31,6 +31,7 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+.fuse_hidden*
 
 # Logs and debug
 *.log

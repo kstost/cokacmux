@@ -1541,6 +1541,20 @@ enum PendingAction {
         info: SessionInfo,
         removed_index: Option<usize>,
     },
+    CloneSessionDataChoice {
+        info: SessionInfo,
+        target: Provider,
+    },
+    CloneSessionOnlyConfirm {
+        info: SessionInfo,
+        target: Provider,
+    },
+    RestoreClonedSessionData {
+        info: SessionInfo,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
+    },
     CreateMissingLaunchCwd {
         info: SessionInfo,
         path: PathBuf,
@@ -1670,6 +1684,71 @@ struct SearchWorkerResult {
     seq: u64,
     query: String,
     hits: std::result::Result<Vec<session::SearchHit>, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataTaskKind {
+    Clone,
+    Restore,
+}
+
+impl DataTaskKind {
+    fn label(self) -> &'static str {
+        match self {
+            DataTaskKind::Clone => "clone",
+            DataTaskKind::Restore => "restore",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DataTaskPending {
+    seq: u64,
+    kind: DataTaskKind,
+    label: String,
+    notice: Option<String>,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct CloneWorkerResult {
+    seq: u64,
+    outcome: CloneWorkerOutcome,
+}
+
+#[derive(Debug)]
+enum CloneWorkerOutcome {
+    Ok {
+        source: SessionInfo,
+        report: session::clone::CloneReport,
+        copy_folder_data: bool,
+        data_stats: Option<session::data::CopyStats>,
+        data_snapshot_error: Option<String>,
+        clone_tree_error: Option<String>,
+    },
+    Aborted {
+        source: SessionInfo,
+        target_provider: Provider,
+        target_session_id: String,
+        data_error: String,
+        deleted_file: Option<PathBuf>,
+        deleted_rows: u64,
+    },
+    Failed {
+        source: SessionInfo,
+        target: Provider,
+        error: String,
+    },
+}
+
+#[derive(Debug)]
+struct RestoreWorkerResult {
+    seq: u64,
+    info: SessionInfo,
+    cols: u16,
+    rows: u16,
+    launch_mode: AgentLaunchMode,
+    outcome: std::result::Result<session::data::SessionDataRestoreReport, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3329,6 +3408,10 @@ enum MainEvent {
     Tick,
     /// Full-session search completed in the background.
     SearchResult(SearchWorkerResult),
+    /// Clone/session-data copy completed in the background.
+    CloneResult(CloneWorkerResult),
+    /// Saved folder-data restore completed in the background.
+    RestoreResult(RestoreWorkerResult),
 }
 
 struct App {
@@ -3353,6 +3436,8 @@ struct App {
     text_filter_matches: HashSet<AgentKey>,
     search_seq: u64,
     search_pending: Option<SearchPending>,
+    data_task_seq: u64,
+    data_task: Option<DataTaskPending>,
     input_mode: InputMode,
     preview_cache: HashMap<PreviewKey, PreviewEntry>,
     preview_cache_order: VecDeque<PreviewKey>,
@@ -3416,6 +3501,8 @@ impl App {
             text_filter_matches: HashSet::new(),
             search_seq: 0,
             search_pending: None,
+            data_task_seq: 0,
+            data_task: None,
             input_mode: InputMode::Normal,
             preview_cache: HashMap::new(),
             preview_cache_order: VecDeque::new(),
@@ -3978,6 +4065,72 @@ impl App {
                 "visible": visible,
             }),
         );
+    }
+
+    fn next_data_task_seq(&mut self) -> u64 {
+        self.data_task_seq = self.data_task_seq.saturating_add(1);
+        self.data_task_seq
+    }
+
+    fn data_task_status(&self) -> Option<String> {
+        let task = self.data_task.as_ref()?;
+        let elapsed = task.started_at.elapsed();
+        let label = task.notice.as_deref().unwrap_or(&task.label);
+        Some(format!(
+            "{} {} ({}s)",
+            startup_spinner_frame(elapsed),
+            label,
+            elapsed.as_secs()
+        ))
+    }
+
+    fn display_status(&self) -> String {
+        self.data_task_status()
+            .unwrap_or_else(|| self.status.clone())
+    }
+
+    fn reject_while_data_task_running(&mut self, action: &str) -> bool {
+        let Some(task) = self.data_task.as_mut() else {
+            return false;
+        };
+        let notice = format!("{} in progress; wait before {}", task.kind.label(), action);
+        self.status = notice.clone();
+        task.notice = Some(notice);
+        debug_log(
+            "data_task_action_blocked",
+            serde_json::json!({
+                "seq": task.seq,
+                "kind": task.kind.label(),
+                "action": action,
+            }),
+        );
+        true
+    }
+
+    fn request_quit(&mut self, reason: &str, force: bool) -> bool {
+        if !force && self.reject_while_data_task_running("quitting") {
+            debug_log(
+                "quit_blocked_by_data_task",
+                serde_json::json!({
+                    "reason": reason,
+                }),
+            );
+            return false;
+        }
+        if force {
+            if let Some(task) = self.data_task.as_ref() {
+                debug_log(
+                    "quit_forced_during_data_task",
+                    serde_json::json!({
+                        "reason": reason,
+                        "seq": task.seq,
+                        "kind": task.kind.label(),
+                    }),
+                );
+            }
+        }
+        self.should_quit = true;
+        true
     }
 
     fn agent_state_for(&self, info: &SessionInfo) -> AgentListState {
@@ -4928,6 +5081,9 @@ impl App {
     }
 
     fn begin_new_session(&mut self, cwd: String, provider: Provider, origin: &str) {
+        if self.reject_while_data_task_running("opening a new session") {
+            return;
+        }
         debug_log(
             "new_session_open",
             serde_json::json!({
@@ -4962,6 +5118,9 @@ impl App {
         cols: u16,
         rows: u16,
     ) -> bool {
+        if self.reject_while_data_task_running("starting a new session") {
+            return false;
+        }
         if kind == NewSessionKind::CodingAgent
             && !agent_provider_available(provider, &self.settings.cokacmux.agent_programs)
         {
@@ -5034,6 +5193,9 @@ impl App {
     }
 
     fn begin_agent_launch(&mut self, cols: u16, rows: u16) {
+        if self.reject_while_data_task_running("launching an agent") {
+            return;
+        }
         let Some(info) = self.current().cloned() else {
             self.status = "no session selected.".into();
             return;
@@ -5249,12 +5411,215 @@ impl App {
         }
     }
 
+    fn prompt_restore_cloned_session_data(
+        &mut self,
+        info: SessionInfo,
+        snapshot: session::data::SessionDataSnapshot,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
+    ) {
+        let key = AgentKey::new(&info);
+        let yes_key = self.keybindings.help(KeyAction::ConfirmYes, "y");
+        let no_key = self.keybindings.help(KeyAction::ConfirmNo, "N");
+        self.status = format!("saved folder data found: {}", truncate_width(&info.cwd, 48));
+        self.input_mode = InputMode::Confirm {
+            prompt: restore_cloned_data_confirm_prompt(&info, &snapshot, &yes_key, &no_key),
+            action: PendingAction::RestoreClonedSessionData {
+                info,
+                cols,
+                rows,
+                launch_mode,
+            },
+        };
+        debug_log(
+            "attach_data_restore_confirm_open",
+            serde_json::json!({
+                "provider": key.provider.as_str(),
+                "session_id": &key.session_id,
+                "cwd": &snapshot.original_cwd,
+                "snapshot_path": snapshot.snapshot_path.display().to_string(),
+                "launch_mode": launch_mode.as_str(),
+            }),
+        );
+    }
+
+    fn restore_cloned_session_data_and_attach(
+        &mut self,
+        info: SessionInfo,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
+    ) {
+        if self.reject_while_data_task_running("restoring folder data") {
+            return;
+        }
+        let seq = self.next_data_task_seq();
+        let label = format!(
+            "restoring folder data for {} {}",
+            info.provider.as_str(),
+            truncate_width(&info.session_id, 14)
+        );
+        self.data_task = Some(DataTaskPending {
+            seq,
+            kind: DataTaskKind::Restore,
+            label: label.clone(),
+            notice: None,
+            started_at: Instant::now(),
+        });
+        self.status = label;
+        debug_log(
+            "attach_data_restore_worker_start",
+            serde_json::json!({
+                "seq": seq,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "launch_mode": launch_mode.as_str(),
+            }),
+        );
+
+        let Some(tx) = self.main_tx.clone() else {
+            let result = run_restore_worker(seq, info, cols, rows, launch_mode);
+            self.on_restore_worker_result(result);
+            return;
+        };
+        match thread::Builder::new()
+            .name("cokacmux-data-restore".to_string())
+            .spawn(move || {
+                let result = run_restore_worker(seq, info, cols, rows, launch_mode);
+                let _ = tx.send(MainEvent::RestoreResult(result));
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                self.data_task = None;
+                self.status = format!(
+                    "restore worker failed: {}",
+                    truncate_width(&e.to_string(), 80)
+                );
+                debug_log(
+                    "attach_data_restore_worker_spawn_failed",
+                    serde_json::json!({
+                        "seq": seq,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn on_restore_worker_result(&mut self, result: RestoreWorkerResult) {
+        let Some(task) = self.data_task.as_ref() else {
+            debug_log(
+                "attach_data_restore_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "reason": "none_pending",
+                }),
+            );
+            return;
+        };
+        if task.seq != result.seq || task.kind != DataTaskKind::Restore {
+            debug_log(
+                "attach_data_restore_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "pending_seq": task.seq,
+                    "pending_kind": task.kind.label(),
+                    "reason": "stale",
+                }),
+            );
+            return;
+        }
+        self.data_task = None;
+
+        let key = AgentKey::new(&result.info);
+        match result.outcome {
+            Ok(report) => {
+                let restore_status = match report.backup_path.as_ref() {
+                    Some(backup) => format!(
+                        "restored folder data; previous folder backed up to {}",
+                        truncate_width(&backup.display().to_string(), 48)
+                    ),
+                    None => "restored folder data".to_string(),
+                };
+                let snapshot_cleanup_status = report
+                    .snapshot_remove_error
+                    .as_ref()
+                    .map(|e| format!("saved snapshot cleanup failed: {}", truncate_width(e, 56)));
+                debug_log(
+                    "attach_data_restore_ok",
+                    serde_json::json!({
+                        "provider": key.provider.as_str(),
+                        "session_id": &key.session_id,
+                        "target_path": report.target_path.display().to_string(),
+                        "backup_path": report.backup_path.as_ref().map(|path| path.display().to_string()),
+                        "files": report.stats.files,
+                        "dirs": report.stats.dirs,
+                        "symlinks": report.stats.symlinks,
+                        "bytes": report.stats.bytes,
+                        "snapshot_removed": report.snapshot_removed,
+                        "snapshot_remove_error": report.snapshot_remove_error,
+                    }),
+                );
+                self.attach_agent_without_data_restore_prompt(
+                    result.info,
+                    result.cols,
+                    result.rows,
+                    result.launch_mode,
+                );
+                self.status = match snapshot_cleanup_status {
+                    Some(cleanup_status) => {
+                        format!("{}; {}; {}", restore_status, cleanup_status, self.status)
+                    }
+                    None => format!("{}; {}", restore_status, self.status),
+                };
+            }
+            Err(e) => {
+                self.status = format!(
+                    "restore folder data for {} failed: {}",
+                    truncate_width(&key.session_id, 14),
+                    truncate_width(&e, 72)
+                );
+                debug_log(
+                    "attach_data_restore_failed",
+                    serde_json::json!({
+                        "provider": key.provider.as_str(),
+                        "session_id": &key.session_id,
+                        "error": e,
+                    }),
+                );
+            }
+        }
+    }
+
     fn attach_agent(
         &mut self,
         info: SessionInfo,
         cols: u16,
         rows: u16,
         launch_mode: AgentLaunchMode,
+    ) {
+        self.attach_agent_with_data_restore_prompt(info, cols, rows, launch_mode, true);
+    }
+
+    fn attach_agent_without_data_restore_prompt(
+        &mut self,
+        info: SessionInfo,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
+    ) {
+        self.attach_agent_with_data_restore_prompt(info, cols, rows, launch_mode, false);
+    }
+
+    fn attach_agent_with_data_restore_prompt(
+        &mut self,
+        info: SessionInfo,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
+        prompt_for_saved_data: bool,
     ) {
         let key = AgentKey::new(&info);
         debug_log(
@@ -5266,6 +5631,31 @@ impl App {
             }),
         );
         if live_agent_meta_snapshot(&key).is_none() {
+            if prompt_for_saved_data {
+                match session::data::snapshot_for_session(&info) {
+                    Ok(Some(snapshot)) => {
+                        self.prompt_restore_cloned_session_data(
+                            info,
+                            snapshot,
+                            cols,
+                            rows,
+                            launch_mode,
+                        );
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        debug_log(
+                            "attach_data_restore_check_failed",
+                            serde_json::json!({
+                                "provider": key.provider.as_str(),
+                                "session_id": &key.session_id,
+                                "error": e.to_string(),
+                            }),
+                        );
+                    }
+                }
+            }
             match missing_session_launch_cwd(&info) {
                 Ok(Some(path)) => {
                     self.prompt_create_missing_launch_cwd(info, path, cols, rows, launch_mode);
@@ -6002,6 +6392,9 @@ impl App {
     }
 
     fn delete_session(&mut self, info: SessionInfo, removed_index: Option<usize>) {
+        if self.reject_while_data_task_running("deleting a session") {
+            return;
+        }
         debug_log(
             "delete_start",
             serde_json::json!({
@@ -6012,10 +6405,29 @@ impl App {
         );
         match session::remove::remove(&info) {
             Ok(rep) => {
+                let data_snapshot_removed = match session::data::remove_snapshot_for_session(&info)
+                {
+                    Ok(removed) => removed,
+                    Err(e) => {
+                        debug_log(
+                            "delete_data_snapshot_failed",
+                            serde_json::json!({
+                                "provider": info.provider.as_str(),
+                                "session_id": &info.session_id,
+                                "error": e.to_string(),
+                            }),
+                        );
+                        false
+                    }
+                };
                 let status = format!(
                     "deleted {} (rows={}, file={:?})",
                     info.session_id, rep.deleted_rows, rep.deleted_file
-                );
+                ) + if data_snapshot_removed {
+                    "; folder data deleted"
+                } else {
+                    ""
+                };
                 self.refresh();
                 let next_selection =
                     selection_index_after_removed_row(self.visible().len(), removed_index);
@@ -6029,6 +6441,7 @@ impl App {
                         "session_id": &info.session_id,
                         "deleted_rows": rep.deleted_rows,
                         "deleted_file": rep.deleted_file,
+                        "data_snapshot_removed": data_snapshot_removed,
                         "removed_index": removed_index,
                         "selected_index": self.list_state.selected(),
                     }),
@@ -6048,7 +6461,47 @@ impl App {
         }
     }
 
-    fn clone_session_to(&mut self, info: SessionInfo, target: Provider) {
+    fn begin_clone_session(&mut self, info: SessionInfo, target: Provider) {
+        if self.reject_while_data_task_running("cloning a session") {
+            return;
+        }
+        match session::data::snapshot_source_dir(&info) {
+            Ok(path) => {
+                let yes_key = self.keybindings.help(KeyAction::ConfirmYes, "y");
+                let no_key = self.keybindings.help(KeyAction::ConfirmNo, "N");
+                self.status = "choose whether to copy folder data.".into();
+                self.input_mode = InputMode::Confirm {
+                    prompt: clone_data_confirm_prompt(&info, &path, &yes_key, &no_key),
+                    action: PendingAction::CloneSessionDataChoice { info, target },
+                };
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                debug_log(
+                    "clone_data_unavailable",
+                    serde_json::json!({
+                        "source_provider": info.provider.as_str(),
+                        "source_session_id": &info.session_id,
+                        "cwd": &info.cwd,
+                        "target_provider": target.as_str(),
+                        "error": &reason,
+                    }),
+                );
+                let yes_key = self.keybindings.help(KeyAction::ConfirmYes, "y");
+                let no_key = self.keybindings.help(KeyAction::ConfirmNo, "N");
+                self.status = "folder data cannot be copied.".into();
+                self.input_mode = InputMode::Confirm {
+                    prompt: clone_without_data_confirm_prompt(&info, &reason, &yes_key, &no_key),
+                    action: PendingAction::CloneSessionOnlyConfirm { info, target },
+                };
+            }
+        }
+    }
+
+    fn clone_session_to(&mut self, info: SessionInfo, target: Provider, copy_folder_data: bool) {
+        if self.reject_while_data_task_running("cloning a session") {
+            return;
+        }
         debug_log(
             "clone_start",
             serde_json::json!({
@@ -6056,30 +6509,112 @@ impl App {
                 "source_session_id": &info.session_id,
                 "target_provider": target.as_str(),
                 "cwd": &info.cwd,
+                "copy_folder_data": copy_folder_data,
             }),
         );
-        match session::clone::clone_to_live(
-            &info,
-            &session::clone::CloneOpts {
-                to: Some(target),
-                ..Default::default()
-            },
-        ) {
-            Ok(rep) => {
+        let seq = self.next_data_task_seq();
+        let label = if copy_folder_data {
+            format!("cloning {} session + folder data", info.provider.as_str())
+        } else {
+            format!("cloning {} session", info.provider.as_str())
+        };
+        self.data_task = Some(DataTaskPending {
+            seq,
+            kind: DataTaskKind::Clone,
+            label: label.clone(),
+            notice: None,
+            started_at: Instant::now(),
+        });
+        self.status = label;
+        let Some(tx) = self.main_tx.clone() else {
+            let result = run_clone_worker(seq, info, target, copy_folder_data);
+            self.on_clone_worker_result(result);
+            return;
+        };
+        match thread::Builder::new()
+            .name("cokacmux-data-clone".to_string())
+            .spawn(move || {
+                let result = run_clone_worker(seq, info, target, copy_folder_data);
+                let _ = tx.send(MainEvent::CloneResult(result));
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                self.data_task = None;
+                self.status = format!(
+                    "clone worker failed: {}",
+                    truncate_width(&e.to_string(), 80)
+                );
+                debug_log(
+                    "clone_worker_spawn_failed",
+                    serde_json::json!({
+                        "seq": seq,
+                        "target_provider": target.as_str(),
+                        "copy_folder_data": copy_folder_data,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn on_clone_worker_result(&mut self, result: CloneWorkerResult) {
+        let Some(task) = self.data_task.as_ref() else {
+            debug_log(
+                "clone_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "reason": "none_pending",
+                }),
+            );
+            return;
+        };
+        if task.seq != result.seq || task.kind != DataTaskKind::Clone {
+            debug_log(
+                "clone_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "pending_seq": task.seq,
+                    "pending_kind": task.kind.label(),
+                    "reason": "stale",
+                }),
+            );
+            return;
+        }
+        self.data_task = None;
+
+        match result.outcome {
+            CloneWorkerOutcome::Ok {
+                source,
+                report,
+                copy_folder_data,
+                data_stats,
+                data_snapshot_error,
+                clone_tree_error,
+            } => {
                 let mut status = format!(
                     "cloned {} -> {}: {}",
-                    info.provider.as_str(),
-                    rep.target_provider.as_str(),
-                    rep.new_session_id,
+                    source.provider.as_str(),
+                    report.target_provider.as_str(),
+                    report.new_session_id,
                 );
-                let clone_tree_error = session::clone_tree::record_clone_report(&rep).err();
-                if let Some(e) = &clone_tree_error {
+                if let Some(stats) = data_stats.as_ref() {
+                    status.push_str(&format!(
+                        " + folder data ({} files, {} bytes)",
+                        stats.files, stats.bytes
+                    ));
+                } else if !copy_folder_data {
+                    status.push_str(" (session only)");
+                }
+                if let Some(e) = data_snapshot_error.as_ref() {
+                    status.push_str(&format!(" (folder data copy failed: {})", e));
+                }
+                if let Some(e) = clone_tree_error.as_ref() {
                     status.push_str(&format!(" (clone tree save failed: {})", e));
                 }
                 self.refresh();
                 let new_key = AgentKey {
-                    provider: rep.target_provider,
-                    session_id: rep.new_session_id.clone(),
+                    provider: report.target_provider,
+                    session_id: report.new_session_id.clone(),
                 };
                 let focused_index = self
                     .visible()
@@ -6093,34 +6628,183 @@ impl App {
                 debug_log(
                     "clone_ok",
                     serde_json::json!({
-                        "source_provider": info.provider.as_str(),
-                        "source_session_id": &info.session_id,
-                        "target_provider": rep.target_provider.as_str(),
-                        "new_session_id": &rep.new_session_id,
-                        "artifact": format!("{:?}", rep.artifact),
-                        "clone_tree_error": clone_tree_error.map(|e| e.to_string()),
+                        "source_provider": source.provider.as_str(),
+                        "source_session_id": &source.session_id,
+                        "target_provider": report.target_provider.as_str(),
+                        "new_session_id": &report.new_session_id,
+                        "artifact": format!("{:?}", report.artifact),
+                        "clone_tree_error": clone_tree_error,
+                        "copy_folder_data": copy_folder_data,
+                        "data_snapshot_error": data_snapshot_error,
                         "focused_index": focused_index,
                     }),
                 );
             }
-            Err(e) => {
+            CloneWorkerOutcome::Aborted {
+                source,
+                target_provider,
+                target_session_id,
+                data_error,
+                deleted_file,
+                deleted_rows,
+            } => {
+                self.refresh();
+                self.status = format!(
+                    "clone {} -> {} aborted: folder data copy failed; cloned session removed ({})",
+                    source.provider.as_str(),
+                    target_provider.as_str(),
+                    truncate_width(&data_error, 56)
+                );
+                debug_log(
+                    "clone_data_snapshot_failed_rolled_back",
+                    serde_json::json!({
+                        "source_provider": source.provider.as_str(),
+                        "source_session_id": &source.session_id,
+                        "target_provider": target_provider.as_str(),
+                        "target_session_id": target_session_id,
+                        "error": data_error,
+                        "deleted_file": deleted_file,
+                        "deleted_rows": deleted_rows,
+                    }),
+                );
+            }
+            CloneWorkerOutcome::Failed {
+                source,
+                target,
+                error,
+            } => {
                 self.status = format!(
                     "clone {} -> {} failed: {}",
-                    info.provider.as_str(),
+                    source.provider.as_str(),
                     target.as_str(),
-                    e
+                    error
                 );
                 debug_log(
                     "clone_failed",
                     serde_json::json!({
-                        "source_provider": info.provider.as_str(),
-                        "source_session_id": &info.session_id,
+                        "source_provider": source.provider.as_str(),
+                        "source_session_id": &source.session_id,
                         "target_provider": target.as_str(),
-                        "error": e.to_string(),
+                        "error": error,
                     }),
                 );
             }
         }
+    }
+}
+
+fn run_clone_worker(
+    seq: u64,
+    source: SessionInfo,
+    target: Provider,
+    copy_folder_data: bool,
+) -> CloneWorkerResult {
+    let outcome = match session::clone::clone_to_live(
+        &source,
+        &session::clone::CloneOpts {
+            to: Some(target),
+            ..Default::default()
+        },
+    ) {
+        Ok(report) => {
+            let mut data_stats = None;
+            let mut data_snapshot_error = None;
+            if copy_folder_data {
+                match session::data::create_snapshot_for_clone(&source, &report) {
+                    Ok(data_report) => data_stats = Some(data_report.stats),
+                    Err(e) => {
+                        let data_error = e.to_string();
+                        let cloned_info = session_info_from_clone_report(&source, &report);
+                        match session::remove::remove(&cloned_info) {
+                            Ok(remove_report) => {
+                                return CloneWorkerResult {
+                                    seq,
+                                    outcome: CloneWorkerOutcome::Aborted {
+                                        source,
+                                        target_provider: report.target_provider,
+                                        target_session_id: report.new_session_id,
+                                        data_error,
+                                        deleted_file: remove_report.deleted_file,
+                                        deleted_rows: remove_report.deleted_rows,
+                                    },
+                                };
+                            }
+                            Err(rollback_error) => {
+                                let rollback_error = rollback_error.to_string();
+                                debug_log(
+                                    "clone_data_snapshot_rollback_failed",
+                                    serde_json::json!({
+                                        "source_provider": source.provider.as_str(),
+                                        "source_session_id": &source.session_id,
+                                        "target_provider": report.target_provider.as_str(),
+                                        "target_session_id": &report.new_session_id,
+                                        "data_error": data_error,
+                                        "rollback_error": rollback_error,
+                                    }),
+                                );
+                                data_snapshot_error = Some(format!(
+                                    "{}; rollback failed: {}",
+                                    data_error, rollback_error
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            let clone_tree_error = session::clone_tree::record_clone_report(&report)
+                .err()
+                .map(|e| e.to_string());
+            CloneWorkerOutcome::Ok {
+                source,
+                report,
+                copy_folder_data,
+                data_stats,
+                data_snapshot_error,
+                clone_tree_error,
+            }
+        }
+        Err(e) => CloneWorkerOutcome::Failed {
+            source,
+            target,
+            error: e.to_string(),
+        },
+    };
+    CloneWorkerResult { seq, outcome }
+}
+
+fn run_restore_worker(
+    seq: u64,
+    info: SessionInfo,
+    cols: u16,
+    rows: u16,
+    launch_mode: AgentLaunchMode,
+) -> RestoreWorkerResult {
+    let outcome = session::data::restore_snapshot_for_session(&info).map_err(|e| e.to_string());
+    RestoreWorkerResult {
+        seq,
+        info,
+        cols,
+        rows,
+        launch_mode,
+        outcome,
+    }
+}
+
+fn session_info_from_clone_report(
+    source: &SessionInfo,
+    report: &session::clone::CloneReport,
+) -> SessionInfo {
+    let source_path = match &report.artifact {
+        session::clone::ArtifactPath::File(path) => path.clone(),
+        session::clone::ArtifactPath::OpenCodeDb { db_path, .. } => db_path.clone(),
+    };
+    SessionInfo {
+        provider: report.target_provider,
+        session_id: report.new_session_id.clone(),
+        cwd: source.cwd.clone(),
+        source: source_path,
+        updated_at_epoch_s: 0,
+        title: source.title.clone(),
     }
 }
 
@@ -6481,6 +7165,12 @@ fn run(terminal: &mut Tui) -> Result<()> {
             MainEvent::SearchResult(result) => {
                 app.on_search_result(result);
             }
+            MainEvent::CloneResult(result) => {
+                app.on_clone_worker_result(result);
+            }
+            MainEvent::RestoreResult(result) => {
+                app.on_restore_worker_result(result);
+            }
             MainEvent::Tick => {
                 app.poll_preview_results();
                 app.poll_agent_sessions();
@@ -6518,6 +7208,12 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 }
                 Ok(MainEvent::SearchResult(result)) => {
                     app.on_search_result(result);
+                }
+                Ok(MainEvent::CloneResult(result)) => {
+                    app.on_clone_worker_result(result);
+                }
+                Ok(MainEvent::RestoreResult(result)) => {
+                    app.on_restore_worker_result(result);
                 }
                 Ok(MainEvent::Tick) => {
                     app.poll_preview_results();
@@ -10817,8 +11513,11 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16) {
     app.maybe_reload_keybindings();
     let keybindings = app.keybindings.clone();
     if keybindings.matches(KeyAction::GlobalQuit, key) {
-        debug_log_agent_key(key, "quit");
-        app.should_quit = true;
+        if app.request_quit("agent_global_quit", false) {
+            debug_log_agent_key(key, "quit");
+        } else {
+            debug_log_agent_key(key, "quit_blocked");
+        }
         return;
     }
     if matches!(app.input_mode, InputMode::NewSession { .. }) {
@@ -11300,7 +11999,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         AGENT_STATUS_HEIGHT.min(area.height),
     );
 
-    let app_status = app.status.clone();
+    let app_status = app.display_status();
     let active_key = app
         .active_agent
         .as_ref()
@@ -11891,8 +12590,11 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     let keybindings = app.keybindings.clone();
     debug_log_session_key(app, key, "received");
     if keybindings.matches(KeyAction::GlobalQuit, key) {
-        app.should_quit = true;
-        debug_log_session_key(app, key, "global_quit");
+        if app.request_quit("global_quit", false) {
+            debug_log_session_key(app, key, "global_quit");
+        } else {
+            debug_log_session_key(app, key, "global_quit_blocked");
+        }
         return;
     }
 
@@ -11906,6 +12608,18 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                     info,
                     removed_index,
                 } => app.delete_session(info, removed_index),
+                PendingAction::CloneSessionDataChoice { info, target } => {
+                    app.clone_session_to(info, target, true)
+                }
+                PendingAction::CloneSessionOnlyConfirm { info, target, .. } => {
+                    app.clone_session_to(info, target, false)
+                }
+                PendingAction::RestoreClonedSessionData {
+                    info,
+                    cols,
+                    rows,
+                    launch_mode,
+                } => app.restore_cloned_session_data_and_attach(info, cols, rows, launch_mode),
                 PendingAction::CreateMissingLaunchCwd {
                     info,
                     path,
@@ -11916,8 +12630,24 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             }
         } else if keybindings.matches(KeyAction::ConfirmNo, key) {
             app.input_mode = InputMode::Normal;
-            app.status = "cancelled.".into();
             debug_log_session_key(app, key, "confirm_cancel");
+            match action {
+                PendingAction::CloneSessionDataChoice { info, target } => {
+                    app.clone_session_to(info, target, false)
+                }
+                PendingAction::CloneSessionOnlyConfirm { .. } => {
+                    app.status = "cancelled.".into();
+                }
+                PendingAction::RestoreClonedSessionData {
+                    info,
+                    cols,
+                    rows,
+                    launch_mode,
+                } => app.attach_agent_without_data_restore_prompt(info, cols, rows, launch_mode),
+                PendingAction::Delete { .. } | PendingAction::CreateMissingLaunchCwd { .. } => {
+                    app.status = "cancelled.".into();
+                }
+            }
         } else {
             debug_log_session_key(app, key, "confirm_ignored");
         }
@@ -12028,7 +12758,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             app.input_mode = mode;
         }
         if let Some((source, target)) = clone_action {
-            app.clone_session_to(source, target);
+            app.begin_clone_session(source, target);
         }
         return;
     }
@@ -12246,11 +12976,17 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         return;
     }
     if keybindings.matches(KeyAction::SessionQuit, key) {
-        app.should_quit = true;
-        debug_log_session_key(app, key, "quit");
+        if app.request_quit("quit", false) {
+            debug_log_session_key(app, key, "quit");
+        } else {
+            debug_log_session_key(app, key, "quit_blocked");
+        }
     } else if keybindings.matches(KeyAction::SessionForceQuit, key) {
-        app.should_quit = true;
-        debug_log_session_key(app, key, "ctrl_c_quit");
+        if app.request_quit("ctrl_c_quit", true) {
+            debug_log_session_key(app, key, "ctrl_c_quit");
+        } else {
+            debug_log_session_key(app, key, "ctrl_c_quit_blocked");
+        }
     } else if keybindings.matches(KeyAction::SessionNewShell, key) {
         app.begin_new_session_from_focused();
     } else if keybindings.matches(KeyAction::SessionToggleFocus, key) {
@@ -12300,6 +13036,9 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     } else if keybindings.matches(KeyAction::SessionRefresh, key) {
         app.refresh();
     } else if keybindings.matches(KeyAction::SessionDelete, key) {
+        if app.reject_while_data_task_running("deleting a session") {
+            return;
+        }
         if let Some(info) = app.current().cloned() {
             let removed_index = app.list_state.selected();
             debug_log(
@@ -12329,7 +13068,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 }),
             );
             let target = info.provider;
-            app.clone_session_to(info, target);
+            app.begin_clone_session(info, target);
         }
     } else if keybindings.matches(KeyAction::SessionEditTitle, key)
         && app.focus == FocusPane::Sessions
@@ -12430,6 +13169,62 @@ fn create_missing_cwd_confirm_prompt(
     )
 }
 
+fn clone_data_confirm_prompt(
+    info: &SessionInfo,
+    path: &Path,
+    yes_key: &str,
+    no_key: &str,
+) -> String {
+    let path = confirm_prompt_line(&path.display().to_string(), 72);
+    format!(
+        "Copy working folder data with cloned {} session?\n{}\n{} copy data + clone   {} session only",
+        info.provider.as_str(),
+        path,
+        yes_key,
+        no_key
+    )
+}
+
+fn clone_without_data_confirm_prompt(
+    info: &SessionInfo,
+    reason: &str,
+    yes_key: &str,
+    no_key: &str,
+) -> String {
+    let reason = confirm_prompt_line(reason, 72);
+    format!(
+        "Working folder data cannot be copied for this {} session.\n{}\nClone session metadata only?\n{} clone session only   {} cancel",
+        info.provider.as_str(),
+        reason,
+        yes_key,
+        no_key
+    )
+}
+
+fn restore_cloned_data_confirm_prompt(
+    info: &SessionInfo,
+    snapshot: &session::data::SessionDataSnapshot,
+    yes_key: &str,
+    no_key: &str,
+) -> String {
+    let target = confirm_prompt_line(&info.cwd, 72);
+    let snapshot_path = confirm_prompt_line(&snapshot.snapshot_path.display().to_string(), 72);
+    let existing_policy = if Path::new(&info.cwd).exists() {
+        "Existing folder will be backed up before restore."
+    } else {
+        "Target folder will be created from saved data."
+    };
+    format!(
+        "Saved folder data exists for this cloned {} session.\n{}\nRestore to working folder before launch?\n{}\n{}\n{} restore/start   {} start without restore",
+        info.provider.as_str(),
+        snapshot_path,
+        target,
+        existing_policy,
+        yes_key,
+        no_key
+    )
+}
+
 fn confirm_prompt_line(value: &str, width: usize) -> String {
     truncate_width(sanitize_for_single_line(value).trim(), width)
 }
@@ -12437,6 +13232,9 @@ fn confirm_prompt_line(value: &str, width: usize) -> String {
 fn confirm_modal_title(action: &PendingAction) -> &'static str {
     match action {
         PendingAction::Delete { .. } => "Delete session",
+        PendingAction::CloneSessionDataChoice { .. } => "Clone folder data",
+        PendingAction::CloneSessionOnlyConfirm { .. } => "Clone session",
+        PendingAction::RestoreClonedSessionData { .. } => "Restore folder data",
         PendingAction::CreateMissingLaunchCwd { .. } => "Create folder",
     }
 }
@@ -13195,7 +13993,8 @@ fn draw_status(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let mode = truncate_width(&mode, width);
     let mode_width = UnicodeWidthStr::width(mode.as_str());
     let status_width = width.saturating_sub(mode_width + 2);
-    let status = truncate_width(&app.status, status_width);
+    let status_text = app.display_status();
+    let status = truncate_width(&status_text, status_width);
     let mut status_spans = vec![Span::styled(
         mode,
         Style::default().fg(THEME_SHORTCUT).bg(THEME_STATUS_BG),
@@ -13975,6 +14774,8 @@ mod tests {
             text_filter_matches: HashSet::new(),
             search_seq: 0,
             search_pending: None,
+            data_task_seq: 0,
+            data_task: None,
             input_mode: InputMode::Normal,
             preview_cache: HashMap::new(),
             preview_cache_order: VecDeque::new(),
@@ -14291,6 +15092,95 @@ mod tests {
             }
             other => panic!("expected delete confirm, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn clone_key_prompts_for_folder_data_when_cwd_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_key_tests();
+        app.sessions.push(session_info(
+            Provider::Codex,
+            "codex-id",
+            &dir.path().display().to_string(),
+        ));
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match app.input_mode {
+            InputMode::Confirm {
+                prompt,
+                action: PendingAction::CloneSessionDataChoice { info, target },
+            } => {
+                assert!(prompt.contains("Copy working folder data"));
+                assert!(prompt.contains("session only"));
+                assert_eq!(info.session_id, "codex-id");
+                assert_eq!(target, Provider::Codex);
+            }
+            other => panic!("expected folder-data clone confirm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn clone_key_prompts_for_session_only_when_cwd_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let mut app = app_for_key_tests();
+        app.sessions.push(session_info(
+            Provider::Codex,
+            "codex-id",
+            &missing.display().to_string(),
+        ));
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match app.input_mode {
+            InputMode::Confirm {
+                prompt,
+                action: PendingAction::CloneSessionOnlyConfirm { info, target },
+            } => {
+                assert!(prompt.contains("Working folder data cannot be copied"));
+                assert!(prompt.contains("Clone session metadata only?"));
+                assert_eq!(info.session_id, "codex-id");
+                assert_eq!(target, Provider::Codex);
+            }
+            other => panic!("expected session-only clone confirm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn clone_report_builds_removable_session_info() {
+        let mut source = session_info(Provider::Claude, "source-id", "/repo");
+        source.title = Some("Source title".to_string());
+        let artifact = PathBuf::from("/tmp/cokacmux-clone.jsonl");
+        let report = session::clone::CloneReport {
+            source_provider: Provider::Claude,
+            source_session_id: "source-id".to_string(),
+            new_session_id: "clone-id".to_string(),
+            target_provider: Provider::Codex,
+            artifact: session::clone::ArtifactPath::File(artifact.clone()),
+        };
+
+        let clone_info = session_info_from_clone_report(&source, &report);
+
+        assert_eq!(clone_info.provider, Provider::Codex);
+        assert_eq!(clone_info.session_id, "clone-id");
+        assert_eq!(clone_info.cwd, "/repo");
+        assert_eq!(clone_info.source, artifact);
+        assert_eq!(clone_info.title.as_deref(), Some("Source title"));
     }
 
     #[test]
@@ -15641,6 +16531,93 @@ mod tests {
         assert_eq!(startup_spinner_frame(Duration::from_millis(360)), "-");
         assert_eq!(startup_spinner_frame(Duration::from_millis(540)), "\\");
         assert_eq!(startup_spinner_frame(Duration::from_millis(720)), "|");
+    }
+
+    #[test]
+    fn data_task_status_uses_spinner_and_label() {
+        let mut app = app_for_key_tests();
+        app.data_task = Some(DataTaskPending {
+            seq: 1,
+            kind: DataTaskKind::Clone,
+            label: "cloning session + folder data".to_string(),
+            notice: None,
+            started_at: Instant::now(),
+        });
+
+        let status = app.display_status();
+
+        assert!(status.contains("cloning session + folder data"));
+        assert!(status.starts_with('|'));
+    }
+
+    #[test]
+    fn quit_is_blocked_while_data_task_runs() {
+        let mut app = app_for_key_tests();
+        app.data_task = Some(DataTaskPending {
+            seq: 1,
+            kind: DataTaskKind::Restore,
+            label: "restoring folder data".to_string(),
+            notice: None,
+            started_at: Instant::now(),
+        });
+
+        let allowed = app.request_quit("test", false);
+
+        assert!(!allowed);
+        assert!(!app.should_quit);
+        assert!(app.status.contains("restore in progress"));
+    }
+
+    #[test]
+    fn force_quit_is_allowed_while_data_task_runs() {
+        let mut app = app_for_key_tests();
+        app.data_task = Some(DataTaskPending {
+            seq: 1,
+            kind: DataTaskKind::Clone,
+            label: "cloning folder data".to_string(),
+            notice: None,
+            started_at: Instant::now(),
+        });
+
+        let allowed = app.request_quit("test", true);
+
+        assert!(allowed);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn session_mutating_actions_are_blocked_while_data_task_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_key_tests();
+        app.sessions.push(session_info(
+            Provider::Codex,
+            "blocked-session",
+            &dir.path().display().to_string(),
+        ));
+        app.list_state.select(Some(0));
+
+        for key in [
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        ] {
+            app.input_mode = InputMode::Normal;
+            app.status.clear();
+            app.data_task = Some(DataTaskPending {
+                seq: 1,
+                kind: DataTaskKind::Restore,
+                label: "restoring folder data".to_string(),
+                notice: None,
+                started_at: Instant::now(),
+            });
+
+            handle_key(&mut app, key, 100, 80, 20);
+
+            assert!(matches!(app.input_mode, InputMode::Normal));
+            assert!(app.status.contains("restore in progress"));
+            assert!(app.data_task.is_some());
+        }
     }
 
     #[cfg(windows)]
