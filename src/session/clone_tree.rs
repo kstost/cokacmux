@@ -109,6 +109,10 @@ pub fn record_clone_report(report: &super::clone::CloneReport) -> Result<()> {
     )
 }
 
+pub fn remove_clone_child(child: SessionKey) -> Result<bool> {
+    remove_clone_child_at_path(&clone_tree_store_path()?, child)
+}
+
 pub fn visible_tree_rows<'a, F>(
     sessions: &'a [SessionInfo],
     links: &[CloneLink],
@@ -318,6 +322,44 @@ fn record_clone_at_path(
     result
 }
 
+fn remove_clone_child_at_path(path: &Path, child: SessionKey) -> Result<bool> {
+    crate::debug::log(
+        "clone_tree_remove_child_start",
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "child_provider": child.provider.as_str(),
+            "child_session_id": &child.session_id,
+        }),
+    );
+    let mut store = read_store(path)?;
+    let before = store.links.len();
+    store.links.retain(|link| link.child != child);
+    let removed = store.links.len() != before;
+    let result = if removed {
+        write_store(path, &store)
+    } else {
+        Ok(())
+    };
+    match &result {
+        Ok(()) => crate::debug::log(
+            "clone_tree_remove_child_ok",
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "removed": removed,
+                "links": store.links.len(),
+            }),
+        ),
+        Err(error) => crate::debug::log(
+            "clone_tree_remove_child_error",
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "error": error.to_string(),
+            }),
+        ),
+    }
+    result.map(|_| removed)
+}
+
 fn read_store(path: &Path) -> Result<CloneTreeStore> {
     match fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Ok(CloneTreeStore::default()),
@@ -386,6 +428,25 @@ mod tests {
         assert_eq!(store.links[0].parent, parent);
         assert_eq!(store.links[0].child, child);
         assert_eq!(store.links[0].cloned_at_epoch_s, 20);
+    }
+
+    #[test]
+    fn remove_clone_child_removes_child_link_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(APP_DIR_NAME).join(CLONE_TREE_STORE_FILE);
+        let parent = key(Provider::Codex, "parent");
+        let child = key(Provider::Claude, "child");
+        let sibling = key(Provider::OpenCode, "sibling");
+        record_clone_at_path(&path, parent.clone(), child.clone(), 10).unwrap();
+        record_clone_at_path(&path, parent.clone(), sibling.clone(), 11).unwrap();
+
+        let removed = remove_clone_child_at_path(&path, child.clone()).unwrap();
+
+        assert!(removed);
+        let store = read_store(&path).unwrap();
+        assert_eq!(store.links.len(), 1);
+        assert_eq!(store.links[0].parent, parent);
+        assert_eq!(store.links[0].child, sibling);
     }
 
     #[test]

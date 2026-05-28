@@ -28,6 +28,9 @@ pub enum ConvertError {
     #[error("missing field: {0}")]
     MissingField(&'static str),
 
+    #[error("cancelled: {0}")]
+    Cancelled(String),
+
     #[error("{0}")]
     Other(String),
 }

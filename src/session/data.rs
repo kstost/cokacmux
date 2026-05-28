@@ -1,8 +1,9 @@
 //! Per-session working-directory snapshots managed by cokacmux.
 
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use super::clone::CloneReport;
 const APP_DIR_NAME: &str = ".cokacmux";
 const DATA_DIR_NAME: &str = "data";
 const DATA_STORE_VERSION: u32 = 1;
+const COPY_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDataSnapshot {
@@ -36,6 +38,13 @@ pub struct CopyStats {
     pub dirs: u64,
     pub symlinks: u64,
     pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyProgress {
+    pub stats: CopyStats,
+    pub total: Option<CopyStats>,
+    pub current_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +82,24 @@ pub fn create_snapshot_for_clone(
     create_snapshot_for_clone_at(&data_root()?, source, report)
 }
 
+pub fn create_snapshot_for_clone_with_progress<F>(
+    source: &SessionInfo,
+    report: &CloneReport,
+    cancel: &AtomicBool,
+    mut on_progress: F,
+) -> Result<SessionDataSnapshotReport>
+where
+    F: FnMut(CopyProgress),
+{
+    create_snapshot_for_clone_at_with_progress(
+        &data_root()?,
+        source,
+        report,
+        Some(cancel),
+        &mut on_progress,
+    )
+}
+
 pub fn restore_snapshot_for_session(info: &SessionInfo) -> Result<SessionDataRestoreReport> {
     restore_snapshot_for_session_at(&data_root()?, info)
 }
@@ -86,6 +113,18 @@ pub fn create_snapshot_for_clone_at(
     source: &SessionInfo,
     report: &CloneReport,
 ) -> Result<SessionDataSnapshotReport> {
+    let mut noop = |_progress: CopyProgress| {};
+    create_snapshot_for_clone_at_with_progress(data_root, source, report, None, &mut noop)
+}
+
+fn create_snapshot_for_clone_at_with_progress(
+    data_root: &Path,
+    source: &SessionInfo,
+    report: &CloneReport,
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut dyn FnMut(CopyProgress),
+) -> Result<SessionDataSnapshotReport> {
+    check_cancelled(cancel)?;
     let source_dir = snapshot_source_dir(source)?;
     ensure_data_root(data_root)?;
 
@@ -99,8 +138,26 @@ pub fn create_snapshot_for_clone_at(
     remove_path_if_exists(&tmp_meta_path)?;
 
     let exclude_roots = vec![canonical_or_self(data_root)];
+    let mut total = CopyStats::default();
+    if let Err(error) = scan_copy_totals(&source_dir, &exclude_roots, cancel, &mut total) {
+        let _ = remove_path_if_exists(&tmp_path);
+        return Err(error);
+    }
     let mut stats = CopyStats::default();
-    if let Err(error) = copy_dir_contents(&source_dir, &tmp_path, &exclude_roots, &mut stats) {
+    if let Err(error) = copy_dir_contents_with_progress(
+        &source_dir,
+        &tmp_path,
+        &exclude_roots,
+        &mut stats,
+        Some(&total),
+        cancel,
+        on_progress,
+    ) {
+        let _ = remove_path_if_exists(&tmp_path);
+        return Err(error);
+    }
+
+    if let Err(error) = check_cancelled(cancel) {
         let _ = remove_path_if_exists(&tmp_path);
         return Err(error);
     }
@@ -109,6 +166,11 @@ pub fn create_snapshot_for_clone_at(
         .and_then(|_| fs::rename(&tmp_path, &snapshot_path).map_err(Into::into))
     {
         let _ = remove_path_if_exists(&tmp_path);
+        return Err(error);
+    }
+
+    if let Err(error) = check_cancelled(cancel) {
+        let _ = remove_path_if_exists(&snapshot_path);
         return Err(error);
     }
 
@@ -327,55 +389,180 @@ fn copy_dir_contents(
     exclude_roots: &[PathBuf],
     stats: &mut CopyStats,
 ) -> Result<()> {
+    let mut noop = |_progress: CopyProgress| {};
+    copy_dir_contents_with_progress(source, dest, exclude_roots, stats, None, None, &mut noop)
+}
+
+fn copy_dir_contents_with_progress(
+    source: &Path,
+    dest: &Path,
+    exclude_roots: &[PathBuf],
+    stats: &mut CopyStats,
+    total: Option<&CopyStats>,
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut dyn FnMut(CopyProgress),
+) -> Result<()> {
+    check_cancelled(cancel)?;
     fs::create_dir_all(dest)?;
     stats.dirs = stats.dirs.saturating_add(1);
+    emit_copy_progress(stats, total, source, on_progress);
 
     for entry in fs::read_dir(source)? {
+        check_cancelled(cancel)?;
         let entry = entry?;
         let source_path = entry.path();
         if should_skip_path(&source_path, exclude_roots) {
             continue;
         }
         let dest_path = dest.join(entry.file_name());
-        copy_path(&source_path, &dest_path, exclude_roots, stats)?;
+        copy_path_with_progress(
+            &source_path,
+            &dest_path,
+            exclude_roots,
+            stats,
+            total,
+            cancel,
+            on_progress,
+        )?;
     }
+    check_cancelled(cancel)?;
     if let Ok(metadata) = fs::metadata(source) {
         let _ = fs::set_permissions(dest, metadata.permissions());
     }
     Ok(())
 }
 
-fn copy_path(
+fn copy_path_with_progress(
     source: &Path,
     dest: &Path,
     exclude_roots: &[PathBuf],
     stats: &mut CopyStats,
+    total: Option<&CopyStats>,
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut dyn FnMut(CopyProgress),
 ) -> Result<()> {
+    check_cancelled(cancel)?;
     let metadata = fs::symlink_metadata(source)?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
         copy_symlink(source, dest)?;
+        check_cancelled(cancel)?;
         stats.symlinks = stats.symlinks.saturating_add(1);
+        emit_copy_progress(stats, total, source, on_progress);
         return Ok(());
     }
     if unsupported_reparse_point(&metadata) {
         return Err(unsupported_entry_error(source));
     }
     if file_type.is_dir() {
-        return copy_dir_contents(source, dest, exclude_roots, stats);
+        return copy_dir_contents_with_progress(
+            source,
+            dest,
+            exclude_roots,
+            stats,
+            total,
+            cancel,
+            on_progress,
+        );
     }
     if file_type.is_file() {
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let bytes = fs::copy(source, dest)?;
-        let _ = fs::set_permissions(dest, metadata.permissions());
-        stats.files = stats.files.saturating_add(1);
-        stats.bytes = stats.bytes.saturating_add(bytes);
+        copy_file_chunked_with_progress(source, dest, &metadata, stats, total, cancel, on_progress)?;
         return Ok(());
     }
 
     Err(unsupported_entry_error(source))
+}
+
+fn copy_file_chunked_with_progress(
+    source: &Path,
+    dest: &Path,
+    metadata: &fs::Metadata,
+    stats: &mut CopyStats,
+    total: Option<&CopyStats>,
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut dyn FnMut(CopyProgress),
+) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut reader = File::open(source)?;
+    let mut writer = File::create(dest)?;
+    let mut buffer = vec![0; COPY_CHUNK_SIZE];
+    loop {
+        check_cancelled(cancel)?;
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        check_cancelled(cancel)?;
+        writer.write_all(&buffer[..read])?;
+        stats.bytes = stats.bytes.saturating_add(read as u64);
+        emit_copy_progress(stats, total, source, on_progress);
+    }
+    writer.flush()?;
+    check_cancelled(cancel)?;
+    let _ = fs::set_permissions(dest, metadata.permissions());
+    stats.files = stats.files.saturating_add(1);
+    emit_copy_progress(stats, total, source, on_progress);
+    Ok(())
+}
+
+fn scan_copy_totals(
+    source: &Path,
+    exclude_roots: &[PathBuf],
+    cancel: Option<&AtomicBool>,
+    total: &mut CopyStats,
+) -> Result<()> {
+    check_cancelled(cancel)?;
+    let metadata = fs::symlink_metadata(source)?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        total.symlinks = total.symlinks.saturating_add(1);
+        return Ok(());
+    }
+    if unsupported_reparse_point(&metadata) {
+        return Err(unsupported_entry_error(source));
+    }
+    if file_type.is_dir() {
+        total.dirs = total.dirs.saturating_add(1);
+        for entry in fs::read_dir(source)? {
+            check_cancelled(cancel)?;
+            let entry = entry?;
+            let source_path = entry.path();
+            if should_skip_path(&source_path, exclude_roots) {
+                continue;
+            }
+            scan_copy_totals(&source_path, exclude_roots, cancel, total)?;
+        }
+        return Ok(());
+    }
+    if file_type.is_file() {
+        total.files = total.files.saturating_add(1);
+        total.bytes = total.bytes.saturating_add(metadata.len());
+        return Ok(());
+    }
+    Err(unsupported_entry_error(source))
+}
+
+fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<()> {
+    if cancel.is_some_and(|token| token.load(Ordering::Relaxed)) {
+        Err(ConvertError::Cancelled("operation cancelled".into()))
+    } else {
+        Ok(())
+    }
+}
+
+fn emit_copy_progress(
+    stats: &CopyStats,
+    total: Option<&CopyStats>,
+    current_path: &Path,
+    on_progress: &mut dyn FnMut(CopyProgress),
+) {
+    on_progress(CopyProgress {
+        stats: stats.clone(),
+        total: total.cloned(),
+        current_path: current_path.to_path_buf(),
+    });
 }
 
 fn unsupported_entry_error(source: &Path) -> ConvertError {
@@ -773,6 +960,86 @@ mod tests {
             .snapshot_path
             .join(".cokacmux/data")
             .exists());
+    }
+
+    #[test]
+    fn cancelled_snapshot_copy_cleans_partial_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "snapshot").unwrap();
+
+        let source = info(Provider::Codex, "source", &project);
+        let report = CloneReport {
+            source_provider: Provider::Codex,
+            source_session_id: "source".into(),
+            new_session_id: "clone-cancelled".into(),
+            target_provider: Provider::Codex,
+            artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
+        };
+        let cancel = AtomicBool::new(true);
+
+        let error = create_snapshot_for_clone_at_with_progress(
+            &data_root,
+            &source,
+            &report,
+            Some(&cancel),
+            &mut |_progress| {},
+        )
+        .expect_err("cancelled snapshot creation should fail");
+
+        assert!(matches!(error, ConvertError::Cancelled(_)));
+        assert!(!data_root.join("codex-clone-cancelled").exists());
+        assert!(!data_root.join("codex-clone-cancelled.json").exists());
+        if data_root.exists() {
+            let leftovers: Vec<_> = fs::read_dir(&data_root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert!(leftovers.is_empty(), "leftover temp entries: {leftovers:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_copy_can_cancel_during_large_file_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("large.bin"), vec![7_u8; COPY_CHUNK_SIZE + 4096]).unwrap();
+
+        let source = info(Provider::Codex, "source", &project);
+        let report = CloneReport {
+            source_provider: Provider::Codex,
+            source_session_id: "source".into(),
+            new_session_id: "clone-cancelled-chunk".into(),
+            target_provider: Provider::Codex,
+            artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
+        };
+        let cancel = AtomicBool::new(false);
+
+        let error = create_snapshot_for_clone_at_with_progress(
+            &data_root,
+            &source,
+            &report,
+            Some(&cancel),
+            &mut |progress| {
+                if progress.stats.bytes > 0 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .expect_err("chunk-level cancellation should fail snapshot creation");
+
+        assert!(matches!(error, ConvertError::Cancelled(_)));
+        assert!(!data_root.join("codex-clone-cancelled-chunk").exists());
+        assert!(!data_root.join("codex-clone-cancelled-chunk.json").exists());
+        let leftovers: Vec<_> = fs::read_dir(&data_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp entries: {leftovers:?}");
     }
 
     #[test]

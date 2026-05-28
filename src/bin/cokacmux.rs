@@ -19,6 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -71,6 +72,7 @@ use cokacmux::providers::discovery::SessionInfo;
 use cokacmux::session;
 use cokacmux::session::render::Mode;
 use cokacmux::universal::Provider;
+use cokacmux::ConvertError;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 const PREVIEW_CACHE_LIMIT: usize = 16;
@@ -126,6 +128,7 @@ const THEME_PROVIDER_OPENCODE: Color = Color::Indexed(107);
 const AGENT_DEFAULT_BG: Color = THEME_BG;
 const STARTUP_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const STARTUP_SPINNER_TICK_MS: u128 = 180;
+const DATA_TASK_PROGRESS_THROTTLE_MS: u64 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Settings {
@@ -1707,7 +1710,46 @@ struct DataTaskPending {
     kind: DataTaskKind,
     label: String,
     notice: Option<String>,
+    progress_message: Option<String>,
+    progress_path: Option<String>,
+    progress_stats: Option<session::data::CopyStats>,
+    progress_total: Option<session::data::CopyStats>,
+    cancel_token: Option<Arc<AtomicBool>>,
+    cancel_requested: bool,
     started_at: Instant,
+}
+
+impl DataTaskPending {
+    fn new(seq: u64, kind: DataTaskKind, label: String) -> Self {
+        Self {
+            seq,
+            kind,
+            label,
+            notice: None,
+            progress_message: None,
+            progress_path: None,
+            progress_stats: None,
+            progress_total: None,
+            cancel_token: None,
+            cancel_requested: false,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn with_cancel_token(mut self, cancel_token: Arc<AtomicBool>) -> Self {
+        self.cancel_token = Some(cancel_token);
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DataTaskProgressEvent {
+    seq: u64,
+    kind: DataTaskKind,
+    message: String,
+    current_path: Option<String>,
+    stats: Option<session::data::CopyStats>,
+    total: Option<session::data::CopyStats>,
 }
 
 #[derive(Debug)]
@@ -1733,6 +1775,14 @@ enum CloneWorkerOutcome {
         data_error: String,
         deleted_file: Option<PathBuf>,
         deleted_rows: u64,
+    },
+    Cancelled {
+        source: SessionInfo,
+        target: Provider,
+        target_session_id: Option<String>,
+        deleted_file: Option<PathBuf>,
+        deleted_rows: u64,
+        cleanup_error: Option<String>,
     },
     Failed {
         source: SessionInfo,
@@ -3408,6 +3458,8 @@ enum MainEvent {
     Tick,
     /// Full-session search completed in the background.
     SearchResult(SearchWorkerResult),
+    /// Data-task worker progress update.
+    DataTaskProgress(DataTaskProgressEvent),
     /// Clone/session-data copy completed in the background.
     CloneResult(CloneWorkerResult),
     /// Saved folder-data restore completed in the background.
@@ -4075,12 +4127,35 @@ impl App {
     fn data_task_status(&self) -> Option<String> {
         let task = self.data_task.as_ref()?;
         let elapsed = task.started_at.elapsed();
-        let label = task.notice.as_deref().unwrap_or(&task.label);
+        let label = task
+            .notice
+            .as_deref()
+            .or(task.progress_message.as_deref())
+            .unwrap_or(&task.label);
+        let stats = task
+            .progress_stats
+            .as_ref()
+            .map(|stats| format!(" · {}", copy_stats_summary(stats)))
+            .unwrap_or_default();
+        let percent = copy_percent_summary(
+            task.progress_stats.as_ref(),
+            task.progress_total.as_ref(),
+        )
+        .map(|percent| format!(" · {percent}"))
+        .unwrap_or_default();
+        let cancel = if task.cancel_requested {
+            " · cancelling"
+        } else {
+            ""
+        };
         Some(format!(
-            "{} {} ({}s)",
+            "{} {} ({}s){}{}{}",
             startup_spinner_frame(elapsed),
             label,
-            elapsed.as_secs()
+            elapsed.as_secs(),
+            stats,
+            percent,
+            cancel
         ))
     }
 
@@ -4104,6 +4179,99 @@ impl App {
                 "action": action,
             }),
         );
+        true
+    }
+
+    fn on_data_task_progress(&mut self, event: DataTaskProgressEvent) {
+        let Some(task) = self.data_task.as_mut() else {
+            debug_log(
+                "data_task_progress_ignored",
+                serde_json::json!({
+                    "seq": event.seq,
+                    "kind": event.kind.label(),
+                    "reason": "none_pending",
+                }),
+            );
+            return;
+        };
+        if task.seq != event.seq || task.kind != event.kind {
+            debug_log(
+                "data_task_progress_ignored",
+                serde_json::json!({
+                    "seq": event.seq,
+                    "kind": event.kind.label(),
+                    "pending_seq": task.seq,
+                    "pending_kind": task.kind.label(),
+                    "reason": "stale",
+                }),
+            );
+            return;
+        }
+        task.progress_message = Some(event.message);
+        task.progress_path = event.current_path;
+        task.progress_stats = event.stats;
+        task.progress_total = event.total;
+        if !task.cancel_requested {
+            task.notice = None;
+        }
+    }
+
+    fn handle_data_task_key(&mut self, key: KeyEvent) -> bool {
+        let Some(task) = self.data_task.as_mut() else {
+            return false;
+        };
+        if task.kind != DataTaskKind::Clone {
+            return false;
+        }
+
+        let is_plain_esc = key.code == KeyCode::Esc && key.modifiers.is_empty();
+        if is_plain_esc {
+            if !task.cancel_requested {
+                if let Some(cancel_token) = task.cancel_token.as_ref() {
+                    cancel_token.store(true, Ordering::Relaxed);
+                }
+                task.cancel_requested = true;
+                let notice = "clone cancellation requested; rolling back when safe".to_string();
+                task.notice = Some(notice.clone());
+                self.status = notice;
+                debug_log(
+                    "data_task_cancel_requested",
+                    serde_json::json!({
+                        "seq": task.seq,
+                        "kind": task.kind.label(),
+                    }),
+                );
+            } else {
+                let notice = "clone cancellation already requested; waiting for worker".to_string();
+                task.notice = Some(notice.clone());
+                self.status = notice;
+                debug_log(
+                    "data_task_cancel_repeated",
+                    serde_json::json!({
+                        "seq": task.seq,
+                        "kind": task.kind.label(),
+                    }),
+                );
+            }
+        } else {
+            let notice = if task.cancel_requested {
+                "clone is cancelling; other actions are locked"
+            } else {
+                "clone in progress; press Esc to cancel"
+            }
+            .to_string();
+            task.notice = Some(notice.clone());
+            self.status = notice;
+            debug_log(
+                "data_task_input_blocked",
+                serde_json::json!({
+                    "seq": task.seq,
+                    "kind": task.kind.label(),
+                    "key": key_code_label(key),
+                    "modifiers": format!("{:?}", key.modifiers),
+                }),
+            );
+        }
         true
     }
 
@@ -5460,13 +5628,7 @@ impl App {
             info.provider.as_str(),
             truncate_width(&info.session_id, 14)
         );
-        self.data_task = Some(DataTaskPending {
-            seq,
-            kind: DataTaskKind::Restore,
-            label: label.clone(),
-            notice: None,
-            started_at: Instant::now(),
-        });
+        self.data_task = Some(DataTaskPending::new(seq, DataTaskKind::Restore, label.clone()));
         self.status = label;
         debug_log(
             "attach_data_restore_worker_start",
@@ -6518,24 +6680,30 @@ impl App {
         } else {
             format!("cloning {} session", info.provider.as_str())
         };
-        self.data_task = Some(DataTaskPending {
-            seq,
-            kind: DataTaskKind::Clone,
-            label: label.clone(),
-            notice: None,
-            started_at: Instant::now(),
-        });
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        self.data_task = Some(
+            DataTaskPending::new(seq, DataTaskKind::Clone, label.clone())
+                .with_cancel_token(cancel_token.clone()),
+        );
         self.status = label;
         let Some(tx) = self.main_tx.clone() else {
-            let result = run_clone_worker(seq, info, target, copy_folder_data);
+            let result = run_clone_worker(seq, info, target, copy_folder_data, cancel_token, None);
             self.on_clone_worker_result(result);
             return;
         };
+        let worker_tx = tx.clone();
         match thread::Builder::new()
             .name("cokacmux-data-clone".to_string())
             .spawn(move || {
-                let result = run_clone_worker(seq, info, target, copy_folder_data);
-                let _ = tx.send(MainEvent::CloneResult(result));
+                let result = run_clone_worker(
+                    seq,
+                    info,
+                    target,
+                    copy_folder_data,
+                    cancel_token,
+                    Some(worker_tx.clone()),
+                );
+                let _ = worker_tx.send(MainEvent::CloneResult(result));
             }) {
             Ok(_) => {}
             Err(e) => {
@@ -6668,6 +6836,45 @@ impl App {
                     }),
                 );
             }
+            CloneWorkerOutcome::Cancelled {
+                source,
+                target,
+                target_session_id,
+                deleted_file,
+                deleted_rows,
+                cleanup_error,
+            } => {
+                self.refresh();
+                let mut status = match target_session_id.as_ref() {
+                    Some(session_id) => format!(
+                        "clone {} -> {} cancelled; cloned session removed: {}",
+                        source.provider.as_str(),
+                        target.as_str(),
+                        session_id
+                    ),
+                    None => format!(
+                        "clone {} -> {} cancelled before cloned session was created",
+                        source.provider.as_str(),
+                        target.as_str()
+                    ),
+                };
+                if let Some(error) = cleanup_error.as_ref() {
+                    status.push_str(&format!(" (cleanup failed: {})", truncate_width(error, 56)));
+                }
+                self.status = status;
+                debug_log(
+                    "clone_cancelled",
+                    serde_json::json!({
+                        "source_provider": source.provider.as_str(),
+                        "source_session_id": &source.session_id,
+                        "target_provider": target.as_str(),
+                        "target_session_id": target_session_id,
+                        "deleted_file": deleted_file,
+                        "deleted_rows": deleted_rows,
+                        "cleanup_error": cleanup_error,
+                    }),
+                );
+            }
             CloneWorkerOutcome::Failed {
                 source,
                 target,
@@ -6698,7 +6905,24 @@ fn run_clone_worker(
     source: SessionInfo,
     target: Provider,
     copy_folder_data: bool,
+    cancel_token: Arc<AtomicBool>,
+    progress_tx: Option<Sender<MainEvent>>,
 ) -> CloneWorkerResult {
+    let mut progress = CloneProgressReporter::new(progress_tx, seq);
+    if clone_cancelled(&cancel_token) {
+        return CloneWorkerResult {
+            seq,
+            outcome: CloneWorkerOutcome::Cancelled {
+                source,
+                target,
+                target_session_id: None,
+                deleted_file: None,
+                deleted_rows: 0,
+                cleanup_error: None,
+            },
+        };
+    }
+    progress.send_now("creating cloned session", None, None, None);
     let outcome = match session::clone::clone_to_live(
         &source,
         &session::clone::CloneOpts {
@@ -6707,12 +6931,40 @@ fn run_clone_worker(
         },
     ) {
         Ok(report) => {
+            if clone_cancelled(&cancel_token) {
+                return CloneWorkerResult {
+                    seq,
+                    outcome: cancel_clone_after_report(source, report),
+                };
+            }
             let mut data_stats = None;
             let mut data_snapshot_error = None;
             if copy_folder_data {
-                match session::data::create_snapshot_for_clone(&source, &report) {
-                    Ok(data_report) => data_stats = Some(data_report.stats),
+                progress.send_now("scanning folder data", None, None, None);
+                match session::data::create_snapshot_for_clone_with_progress(
+                    &source,
+                    &report,
+                    &cancel_token,
+                    |copy_progress| {
+                        progress.send_copy_progress("copying folder data", copy_progress);
+                    },
+                ) {
+                    Ok(data_report) => {
+                        progress.send_now(
+                            "folder data copied",
+                            None,
+                            Some(data_report.stats.clone()),
+                            progress.last_total(),
+                        );
+                        data_stats = Some(data_report.stats);
+                    }
                     Err(e) => {
+                        if is_cancelled_error(&e) {
+                            return CloneWorkerResult {
+                                seq,
+                                outcome: cancel_clone_after_report(source, report),
+                            };
+                        }
                         let data_error = e.to_string();
                         let cloned_info = session_info_from_clone_report(&source, &report);
                         match session::remove::remove(&cloned_info) {
@@ -6750,10 +7002,46 @@ fn run_clone_worker(
                         }
                     }
                 }
+                if clone_cancelled(&cancel_token) {
+                    let cloned_info = session_info_from_clone_report(&source, &report);
+                    let _ = session::data::remove_snapshot_for_session(&cloned_info);
+                    return CloneWorkerResult {
+                        seq,
+                        outcome: cancel_clone_after_report(source, report),
+                    };
+                }
+            }
+            progress.send_now(
+                "recording clone tree",
+                None,
+                data_stats.clone(),
+                progress.last_total(),
+            );
+            if clone_cancelled(&cancel_token) {
+                let cloned_info = session_info_from_clone_report(&source, &report);
+                let _ = session::data::remove_snapshot_for_session(&cloned_info);
+                return CloneWorkerResult {
+                    seq,
+                    outcome: cancel_clone_after_report(source, report),
+                };
             }
             let clone_tree_error = session::clone_tree::record_clone_report(&report)
                 .err()
                 .map(|e| e.to_string());
+            if clone_cancelled(&cancel_token) {
+                let cloned_info = session_info_from_clone_report(&source, &report);
+                let _ = session::data::remove_snapshot_for_session(&cloned_info);
+                return CloneWorkerResult {
+                    seq,
+                    outcome: cancel_clone_after_report(source, report),
+                };
+            }
+            progress.send_now(
+                "finalizing clone",
+                None,
+                data_stats.clone(),
+                progress.last_total(),
+            );
             CloneWorkerOutcome::Ok {
                 source,
                 report,
@@ -6763,13 +7051,160 @@ fn run_clone_worker(
                 clone_tree_error,
             }
         }
-        Err(e) => CloneWorkerOutcome::Failed {
-            source,
-            target,
-            error: e.to_string(),
-        },
+        Err(e) => {
+            if clone_cancelled(&cancel_token) {
+                CloneWorkerOutcome::Cancelled {
+                    source,
+                    target,
+                    target_session_id: None,
+                    deleted_file: None,
+                    deleted_rows: 0,
+                    cleanup_error: None,
+                }
+            } else {
+                CloneWorkerOutcome::Failed {
+                    source,
+                    target,
+                    error: e.to_string(),
+                }
+            }
+        }
     };
     CloneWorkerResult { seq, outcome }
+}
+
+fn clone_cancelled(cancel_token: &AtomicBool) -> bool {
+    cancel_token.load(Ordering::Relaxed)
+}
+
+fn is_cancelled_error(error: &ConvertError) -> bool {
+    matches!(error, ConvertError::Cancelled(_))
+}
+
+struct CloneProgressReporter {
+    tx: Option<Sender<MainEvent>>,
+    seq: u64,
+    last_sent_at: Option<Instant>,
+    last_total: Option<session::data::CopyStats>,
+}
+
+impl CloneProgressReporter {
+    fn new(tx: Option<Sender<MainEvent>>, seq: u64) -> Self {
+        Self {
+            tx,
+            seq,
+            last_sent_at: None,
+            last_total: None,
+        }
+    }
+
+    fn last_total(&self) -> Option<session::data::CopyStats> {
+        self.last_total.clone()
+    }
+
+    fn send_copy_progress(&mut self, message: &str, progress: session::data::CopyProgress) {
+        if let Some(total) = progress.total.as_ref() {
+            self.last_total = Some(total.clone());
+        }
+        let now = Instant::now();
+        let should_send = match self.last_sent_at {
+            Some(last) => {
+                now.duration_since(last) >= Duration::from_millis(DATA_TASK_PROGRESS_THROTTLE_MS)
+            }
+            None => true,
+        } || copy_progress_is_complete(&progress);
+        if should_send {
+            self.last_sent_at = Some(now);
+            self.send_now(
+                message,
+                Some(progress.current_path.display().to_string()),
+                Some(progress.stats),
+                progress.total,
+            );
+        }
+    }
+
+    fn send_now(
+        &mut self,
+        message: &str,
+        current_path: Option<String>,
+        stats: Option<session::data::CopyStats>,
+        total: Option<session::data::CopyStats>,
+    ) {
+        if let Some(total) = total.as_ref() {
+            self.last_total = Some(total.clone());
+        }
+        self.last_sent_at = Some(Instant::now());
+        if let Some(tx) = self.tx.as_ref() {
+            let _ = tx.send(MainEvent::DataTaskProgress(DataTaskProgressEvent {
+                seq: self.seq,
+                kind: DataTaskKind::Clone,
+                message: message.to_string(),
+                current_path,
+                stats,
+                total,
+            }));
+        }
+    }
+}
+
+fn copy_progress_is_complete(progress: &session::data::CopyProgress) -> bool {
+    let Some(total) = progress.total.as_ref() else {
+        return false;
+    };
+    progress.stats.files >= total.files
+        && progress.stats.dirs >= total.dirs
+        && progress.stats.symlinks >= total.symlinks
+        && progress.stats.bytes >= total.bytes
+}
+
+fn cancel_clone_after_report(
+    source: SessionInfo,
+    report: session::clone::CloneReport,
+) -> CloneWorkerOutcome {
+    let cloned_info = session_info_from_clone_report(&source, &report);
+    let clone_tree_cleanup_error = session::clone_tree::remove_clone_child(
+        session::clone_tree::SessionKey::new(report.target_provider, report.new_session_id.clone()),
+    )
+    .err()
+    .map(|error| error.to_string());
+    let snapshot_cleanup_error = session::data::remove_snapshot_for_session(&cloned_info)
+        .err()
+        .map(|error| error.to_string());
+    match session::remove::remove(&cloned_info) {
+        Ok(remove_report) => CloneWorkerOutcome::Cancelled {
+            source,
+            target: report.target_provider,
+            target_session_id: Some(report.new_session_id),
+            deleted_file: remove_report.deleted_file,
+            deleted_rows: remove_report.deleted_rows,
+            cleanup_error: join_cleanup_errors([clone_tree_cleanup_error, snapshot_cleanup_error]),
+        },
+        Err(remove_error) => {
+            let cleanup_error = join_cleanup_errors([
+                clone_tree_cleanup_error,
+                snapshot_cleanup_error,
+                Some(format!("clone cleanup failed: {remove_error}")),
+            ]);
+            CloneWorkerOutcome::Cancelled {
+                source,
+                target: report.target_provider,
+                target_session_id: Some(report.new_session_id),
+                deleted_file: None,
+                deleted_rows: 0,
+                cleanup_error,
+            }
+        }
+    }
+}
+
+fn join_cleanup_errors<const N: usize>(errors: [Option<String>; N]) -> Option<String> {
+    let errors: Vec<String> = errors.into_iter().flatten().collect();
+    if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
+    }
 }
 
 fn run_restore_worker(
@@ -7165,6 +7600,9 @@ fn run(terminal: &mut Tui) -> Result<()> {
             MainEvent::SearchResult(result) => {
                 app.on_search_result(result);
             }
+            MainEvent::DataTaskProgress(progress) => {
+                app.on_data_task_progress(progress);
+            }
             MainEvent::CloneResult(result) => {
                 app.on_clone_worker_result(result);
             }
@@ -7208,6 +7646,9 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 }
                 Ok(MainEvent::SearchResult(result)) => {
                     app.on_search_result(result);
+                }
+                Ok(MainEvent::DataTaskProgress(progress)) => {
+                    app.on_data_task_progress(progress);
                 }
                 Ok(MainEvent::CloneResult(result)) => {
                     app.on_clone_worker_result(result);
@@ -11511,6 +11952,9 @@ fn new_session_cwd_text_key(selected: usize, key: KeyEvent) -> bool {
 
 fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16) {
     app.maybe_reload_keybindings();
+    if app.handle_data_task_key(key) {
+        return;
+    }
     let keybindings = app.keybindings.clone();
     if keybindings.matches(KeyAction::GlobalQuit, key) {
         if app.request_quit("agent_global_quit", false) {
@@ -11949,6 +12393,34 @@ fn startup_spinner_frame(elapsed: Duration) -> &'static str {
     STARTUP_SPINNER_FRAMES[index]
 }
 
+fn copy_stats_summary(stats: &session::data::CopyStats) -> String {
+    format!(
+        "{} files, {} dirs, {} symlinks, {} bytes",
+        stats.files, stats.dirs, stats.symlinks, stats.bytes
+    )
+}
+
+fn copy_percent_summary(
+    stats: Option<&session::data::CopyStats>,
+    total: Option<&session::data::CopyStats>,
+) -> Option<String> {
+    let stats = stats?;
+    let total = total?;
+    let (done, total) = if total.bytes > 0 {
+        (stats.bytes, total.bytes)
+    } else if total.files > 0 {
+        (stats.files, total.files)
+    } else if total.symlinks > 0 {
+        (stats.symlinks, total.symlinks)
+    } else if total.dirs > 0 {
+        (stats.dirs, total.dirs)
+    } else {
+        return Some("100%".to_string());
+    };
+    let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0).min(100);
+    Some(format!("{percent}%"))
+}
+
 fn render_agent_startup_spinner(
     buf: &mut Buffer,
     area: Rect,
@@ -12134,7 +12606,9 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
-    if let InputMode::Confirm { prompt, action } = &app.input_mode {
+    if let Some(task) = app.data_task.as_ref().filter(|task| task.kind == DataTaskKind::Clone) {
+        draw_data_task_modal(f, area, task);
+    } else if let InputMode::Confirm { prompt, action } = &app.input_mode {
         draw_confirm_modal(f, area, prompt, action);
     } else if let InputMode::Filter { draft, cursor } = &app.input_mode {
         draw_filter_modal(
@@ -12190,6 +12664,89 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
         return false;
     }
     true
+}
+
+fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPending) {
+    let elapsed = task.started_at.elapsed();
+    let status = task
+        .notice
+        .as_deref()
+        .or(task.progress_message.as_deref())
+        .unwrap_or(&task.label);
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            format!(
+                "  {} {}",
+                startup_spinner_frame(elapsed),
+                truncate_width(&task.label, 58)
+            ),
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            format!("  Status: {}", truncate_width(status, 60)),
+            Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            format!("  Elapsed: {}s", elapsed.as_secs()),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ];
+
+    if let Some(stats) = task.progress_stats.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!("  Copied: {}", copy_stats_summary(stats)),
+            Style::default().fg(THEME_FG).bg(THEME_BG_ALT),
+        )));
+    }
+    if let Some(total) = task.progress_total.as_ref() {
+        let percent = copy_percent_summary(task.progress_stats.as_ref(), Some(total))
+            .unwrap_or_else(|| "0%".to_string());
+        let copied = task
+            .progress_stats
+            .as_ref()
+            .map(copy_stats_summary)
+            .unwrap_or_else(|| "0 files, 0 dirs, 0 symlinks, 0 bytes".to_string());
+        let total = copy_stats_summary(total);
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  Progress: {}",
+                truncate_width(&format!("{copied} of {total} ({percent})"), 58)
+            ),
+            Style::default().fg(THEME_FG).bg(THEME_BG_ALT),
+        )));
+    }
+    if let Some(path) = task.progress_path.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("  Current: {}", truncate_width(path, 58)),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    let help = if task.cancel_requested {
+        "  Esc pressed · cancelling and rolling back when safe"
+    } else {
+        "  Esc cancel · all other actions are locked until clone completes"
+    };
+    lines.push(Line::from(Span::styled(
+        help,
+        Style::default().fg(THEME_SHORTCUT).bg(THEME_BG_ALT),
+    )));
+
+    let height = (lines.len() as u16).saturating_add(2).clamp(7, 10);
+    let modal_area = centered_rect_fixed(74, height, area);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Clone in progress");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, modal_area);
+    f.render_widget(p, modal_area);
 }
 
 fn agent_sidebar_width(total_width: u16, configured_width: u16) -> u16 {
@@ -12587,6 +13144,9 @@ fn color_distance(r: u16, g: u16, b: u16, cr: u16, cg: u16, cb: u16) -> u32 {
 
 fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, agent_rows: u16) {
     app.maybe_reload_keybindings();
+    if app.handle_data_task_key(key) {
+        return;
+    }
     let keybindings = app.keybindings.clone();
     debug_log_session_key(app, key, "received");
     if keybindings.matches(KeyAction::GlobalQuit, key) {
@@ -16536,13 +17096,11 @@ mod tests {
     #[test]
     fn data_task_status_uses_spinner_and_label() {
         let mut app = app_for_key_tests();
-        app.data_task = Some(DataTaskPending {
-            seq: 1,
-            kind: DataTaskKind::Clone,
-            label: "cloning session + folder data".to_string(),
-            notice: None,
-            started_at: Instant::now(),
-        });
+        app.data_task = Some(DataTaskPending::new(
+            1,
+            DataTaskKind::Clone,
+            "cloning session + folder data".to_string(),
+        ));
 
         let status = app.display_status();
 
@@ -16553,13 +17111,11 @@ mod tests {
     #[test]
     fn quit_is_blocked_while_data_task_runs() {
         let mut app = app_for_key_tests();
-        app.data_task = Some(DataTaskPending {
-            seq: 1,
-            kind: DataTaskKind::Restore,
-            label: "restoring folder data".to_string(),
-            notice: None,
-            started_at: Instant::now(),
-        });
+        app.data_task = Some(DataTaskPending::new(
+            1,
+            DataTaskKind::Restore,
+            "restoring folder data".to_string(),
+        ));
 
         let allowed = app.request_quit("test", false);
 
@@ -16571,18 +17127,60 @@ mod tests {
     #[test]
     fn force_quit_is_allowed_while_data_task_runs() {
         let mut app = app_for_key_tests();
-        app.data_task = Some(DataTaskPending {
-            seq: 1,
-            kind: DataTaskKind::Clone,
-            label: "cloning folder data".to_string(),
-            notice: None,
-            started_at: Instant::now(),
-        });
+        app.data_task = Some(DataTaskPending::new(
+            1,
+            DataTaskKind::Clone,
+            "cloning folder data".to_string(),
+        ));
 
         let allowed = app.request_quit("test", true);
 
         assert!(allowed);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn clone_data_task_locks_input_except_esc_cancel() {
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        let mut app = app_for_key_tests();
+        app.sessions
+            .push(session_info(Provider::Codex, "first", "/repo/one"));
+        app.sessions
+            .push(session_info(Provider::Codex, "second", "/repo/two"));
+        app.list_state.select(Some(0));
+        app.data_task = Some(
+            DataTaskPending::new(
+                1,
+                DataTaskKind::Clone,
+                "cloning codex session + folder data".to_string(),
+            )
+            .with_cancel_token(cancel_token.clone()),
+        );
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert_eq!(app.list_state.selected(), Some(0));
+        assert!(!cancel_token.load(Ordering::Relaxed));
+        assert!(app.status.contains("press Esc to cancel"));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(cancel_token.load(Ordering::Relaxed));
+        let task = app.data_task.as_ref().expect("clone task remains pending");
+        assert!(task.cancel_requested);
+        assert!(app.status.contains("cancellation requested"));
     }
 
     #[test]
@@ -16604,13 +17202,11 @@ mod tests {
         ] {
             app.input_mode = InputMode::Normal;
             app.status.clear();
-            app.data_task = Some(DataTaskPending {
-                seq: 1,
-                kind: DataTaskKind::Restore,
-                label: "restoring folder data".to_string(),
-                notice: None,
-                started_at: Instant::now(),
-            });
+            app.data_task = Some(DataTaskPending::new(
+                1,
+                DataTaskKind::Restore,
+                "restoring folder data".to_string(),
+            ));
 
             handle_key(&mut app, key, 100, 80, 20);
 
