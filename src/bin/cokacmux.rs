@@ -93,6 +93,12 @@ const AGENT_ACTIVITY_META_WRITE_INTERVAL_MS: u64 = 750;
 const DEBUG_LOG_FILE: &str = "cokacmux.log";
 const DEBUG_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const APP_DIR_NAME: &str = ".cokacmux";
+const AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+up", "shift+alt+pageup"];
+const AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+down", "shift+alt+pagedown"];
+const PREVIOUS_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+pageup"];
+const PREVIOUS_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+pagedown"];
+const LEGACY_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+pageup", "alt+pageup"];
+const LEGACY_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+pagedown", "alt+pagedown"];
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
@@ -572,12 +578,12 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "agent.scroll_page_up",
         KeyAction::AgentScrollPageUp,
-        &["shift+pageup", "alt+pageup"],
+        AGENT_SCROLL_PAGE_UP_DEFAULTS,
     ),
     (
         "agent.scroll_page_down",
         KeyAction::AgentScrollPageDown,
-        &["shift+pagedown", "alt+pagedown"],
+        AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
     ),
     (
         "agent.scroll_top",
@@ -907,7 +913,13 @@ impl KeyBindings {
             }
         };
         match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(value) => keybindings.apply_json(&value),
+            Ok(mut value) => {
+                let migrated = migrate_legacy_keybinding_defaults(&mut value);
+                keybindings.apply_json(&value);
+                if migrated {
+                    persist_migrated_keybinding_file(path, &value);
+                }
+            }
             Err(e) => return Err(format!("parse {} failed: {}", path.display(), e)),
         }
         Ok(keybindings)
@@ -1074,6 +1086,127 @@ fn parse_keybinding_json_list(
             })
             .collect(),
         other => Err(format!("expected string, array, or null, got {}", other)),
+    }
+}
+
+fn migrate_legacy_keybinding_defaults(root: &mut serde_json::Value) -> bool {
+    let mut migrated = false;
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "agent.scroll_page_up"),
+        &[
+            LEGACY_AGENT_SCROLL_PAGE_UP_DEFAULTS,
+            PREVIOUS_AGENT_SCROLL_PAGE_UP_DEFAULTS,
+        ],
+        AGENT_SCROLL_PAGE_UP_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["agent", "scroll_page_up"]),
+        &[
+            LEGACY_AGENT_SCROLL_PAGE_UP_DEFAULTS,
+            PREVIOUS_AGENT_SCROLL_PAGE_UP_DEFAULTS,
+        ],
+        AGENT_SCROLL_PAGE_UP_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "agent.scroll_page_down"),
+        &[
+            LEGACY_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
+            PREVIOUS_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
+        ],
+        AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["agent", "scroll_page_down"]),
+        &[
+            LEGACY_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
+            PREVIOUS_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
+        ],
+        AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
+    );
+    migrated
+}
+
+fn flat_keybinding_json_value_mut<'a>(
+    root: &'a mut serde_json::Value,
+    path: &str,
+) -> Option<&'a mut serde_json::Value> {
+    root.as_object_mut()?.get_mut(path)
+}
+
+fn nested_keybinding_json_value_mut<'a>(
+    root: &'a mut serde_json::Value,
+    path: &[&str],
+) -> Option<&'a mut serde_json::Value> {
+    let mut current = root;
+    for part in path {
+        current = current.as_object_mut()?.get_mut(*part)?;
+    }
+    Some(current)
+}
+
+fn migrate_generated_keybinding_value(
+    value: Option<&mut serde_json::Value>,
+    generated_values: &[&[&str]],
+    current: &[&str],
+) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    if !generated_values
+        .iter()
+        .any(|generated| keybinding_json_list_equals(value, generated))
+    {
+        return false;
+    }
+    *value = keybinding_string_array_value(current);
+    true
+}
+
+fn keybinding_json_list_equals(value: &serde_json::Value, expected: &[&str]) -> bool {
+    match value {
+        serde_json::Value::String(binding) => expected.len() == 1 && binding == expected[0],
+        serde_json::Value::Array(bindings) => {
+            bindings.len() == expected.len()
+                && bindings
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(binding, expected)| binding.as_str() == Some(*expected))
+        }
+        _ => false,
+    }
+}
+
+fn keybinding_string_array_value(bindings: &[&str]) -> serde_json::Value {
+    serde_json::Value::Array(
+        bindings
+            .iter()
+            .map(|binding| serde_json::Value::String((*binding).to_string()))
+            .collect(),
+    )
+}
+
+fn persist_migrated_keybinding_file(path: &Path, value: &serde_json::Value) {
+    let content = match serde_json::to_string_pretty(value) {
+        Ok(content) => content + "\n",
+        Err(e) => {
+            debug_log(
+                "keybindings_migration_serialize_failed",
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "error": e.to_string(),
+                }),
+            );
+            return;
+        }
+    };
+    if let Err(e) = fs::write(path, content) {
+        debug_log(
+            "keybindings_migration_write_failed",
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "error": e.to_string(),
+            }),
+        );
     }
 }
 
@@ -1395,6 +1528,13 @@ enum PendingAction {
     Delete {
         info: SessionInfo,
         removed_index: Option<usize>,
+    },
+    CreateMissingLaunchCwd {
+        info: SessionInfo,
+        path: PathBuf,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
     },
 }
 
@@ -1722,6 +1862,7 @@ struct AgentSession {
     writer: Box<dyn Write + Send>,
     output_rx: Receiver<Vec<u8>>,
     pty_log: Option<fs::File>,
+    screen_history: ScreenHistory,
     pty_size: PtySize,
     screen_hash: u64,
     last_screen_change_epoch_ms: u64,
@@ -1730,6 +1871,87 @@ struct AgentSession {
     last_meta_activity_write_epoch_ms: u64,
     debug_drain_logs: u32,
     terminal_response_scan_tail: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ScreenHistory {
+    lines: VecDeque<String>,
+    last_snapshot: Vec<String>,
+}
+
+impl ScreenHistory {
+    fn capture(&mut self, parser: &mut vt100::Parser) {
+        let lines = parser_visible_plain_lines(parser, 0)
+            .into_iter()
+            .map(|line| line.trim_end_matches(' ').to_string())
+            .collect::<Vec<_>>();
+        if lines.is_empty() || lines.iter().all(|line| line.trim().is_empty()) {
+            return;
+        }
+        if self.last_snapshot == lines {
+            return;
+        }
+        self.last_snapshot = lines.clone();
+        for line in lines {
+            self.lines.push_back(line);
+        }
+        while self.lines.len() > AGENT_SCROLLBACK_LINES {
+            self.lines.pop_front();
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn all_lines(&self) -> Vec<String> {
+        self.lines.iter().cloned().collect()
+    }
+
+    fn lines_before_visible(&self, visible_lines: &[String]) -> Vec<String> {
+        let mut lines = self.all_lines();
+        self.trim_trailing_current_snapshot(&mut lines, visible_lines);
+        lines
+    }
+
+    fn trim_trailing_current_snapshot(&self, lines: &mut Vec<String>, visible_lines: &[String]) {
+        if self.last_snapshot.is_empty() && self.lines.is_empty() {
+            return;
+        }
+        if !self.last_snapshot.is_empty()
+            && lines.len() >= self.last_snapshot.len()
+            && lines[lines.len() - self.last_snapshot.len()..] == self.last_snapshot[..]
+        {
+            lines.truncate(lines.len() - self.last_snapshot.len());
+            return;
+        }
+        let visible_lines = visible_lines
+            .iter()
+            .map(|line| line.trim_end_matches(' ').to_string())
+            .collect::<Vec<_>>();
+        if !visible_lines.is_empty()
+            && lines.len() >= visible_lines.len()
+            && lines[lines.len() - visible_lines.len()..] == visible_lines[..]
+        {
+            lines.truncate(lines.len() - visible_lines.len());
+        }
+    }
+
+    fn max_scroll_offset(&self, visible_rows: usize) -> usize {
+        self.lines.len().saturating_sub(visible_rows.max(1))
+    }
+
+    fn visible_lines(&self, offset: usize, visible_rows: usize) -> Vec<String> {
+        let visible_rows = visible_rows.max(1);
+        let end = self.lines.len().saturating_sub(offset);
+        let start = end.saturating_sub(visible_rows);
+        self.lines
+            .iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .cloned()
+            .collect()
+    }
 }
 
 impl AgentSession {
@@ -1741,14 +1963,25 @@ impl AgentSession {
         agent_programs: &AgentProgramSettings,
     ) -> Result<Self> {
         let spec = agent_launch_spec_with_programs(&info, launch_mode, agent_programs);
+        Self::spawn_with_spec(info, spec, cols, rows, launch_mode)
+    }
+
+    fn spawn_with_spec(
+        info: SessionInfo,
+        spec: AgentLaunchSpec,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
+    ) -> Result<Self> {
+        if let Some(cwd) = &spec.cwd {
+            validate_agent_launch_cwd(cwd)?;
+        }
         let pty_size = agent_pty_size(cols, rows);
         let pty_system = NativePtySystem::default();
         let pair = pty_system.openpty(pty_size)?;
         let mut command = agent_command_builder(&spec);
         if let Some(cwd) = &spec.cwd {
-            if cwd.is_dir() {
-                command.cwd(cwd.as_os_str());
-            }
+            command.cwd(cwd.as_os_str());
         }
         let debug_argv = debug_command_argv(&command);
         debug_log(
@@ -1858,6 +2091,7 @@ impl AgentSession {
         let pty_log = pty_log_path
             .as_ref()
             .and_then(|path| open_agent_pty_log_for_new_run(path, &info));
+        let screen_history = ScreenHistory::default();
         let screen_hash = screen_activity_hash(parser.screen());
         let now_ms = current_epoch_ms();
 
@@ -1871,6 +2105,7 @@ impl AgentSession {
             writer,
             output_rx,
             pty_log,
+            screen_history,
             pty_size,
             screen_hash,
             last_screen_change_epoch_ms: 0,
@@ -1891,10 +2126,12 @@ impl AgentSession {
                     self.last_output_epoch_ms = current_epoch_ms();
                     activity_changed = true;
                     self.append_pty_log(&bytes);
-                    safe_parser_process(&mut self.parser, &bytes);
-                    let next_hash = screen_activity_hash(self.parser.screen());
-                    if next_hash != self.screen_hash {
-                        self.screen_hash = next_hash;
+                    if process_parser_output(
+                        &mut self.parser,
+                        &bytes,
+                        &mut self.screen_hash,
+                        Some(&mut self.screen_history),
+                    ) {
                         self.last_screen_change_epoch_ms = current_epoch_ms();
                         activity_changed = true;
                     }
@@ -1954,6 +2191,7 @@ impl AgentSession {
                     "chunk_count": chunks.len(),
                     "total_bytes": total_bytes,
                     "screen_changed": activity_changed,
+                    "screen_history_lines": self.screen_history.len(),
                     "visible": screen_has_visible_content(self.parser.screen()),
                     "last_screen_change_epoch_ms": self.last_screen_change_epoch_ms,
                     "last_output_epoch_ms": self.last_output_epoch_ms,
@@ -1982,6 +2220,23 @@ impl AgentSession {
     }
 
     fn rehydrate_parser_from_pty_log(&mut self) {
+        let live_scrollback = parser_max_scrollback(&mut self.parser);
+        if screen_has_visible_content(self.parser.screen())
+            || live_scrollback > 0
+            || self.screen_history.len() > 0
+        {
+            debug_log(
+                "agent_pty_log_rehydrate_skipped_live_parser",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "visible": screen_has_visible_content(self.parser.screen()),
+                    "scrollback_max": live_scrollback,
+                    "screen_history_lines": self.screen_history.len(),
+                }),
+            );
+            return;
+        }
         let Ok(path) = agent_pty_log_path(&AgentKey::new(&self.info)) else {
             return;
         };
@@ -1993,8 +2248,15 @@ impl AgentSession {
             self.pty_size.cols,
             AGENT_SCROLLBACK_LINES,
         );
-        replay_agent_pty_log(&mut parser, &path, &self.info);
+        let mut screen_history = ScreenHistory::default();
+        replay_agent_pty_log_with_history(
+            &mut parser,
+            &path,
+            &self.info,
+            Some(&mut screen_history),
+        );
         self.parser = parser;
+        self.screen_history = screen_history;
         self.screen_hash = screen_activity_hash(self.parser.screen());
     }
 
@@ -2070,18 +2332,40 @@ impl AgentSession {
     }
 
     fn screen_snapshot_bytes(&mut self, include_scrollback: bool) -> Vec<u8> {
-        parser_snapshot_bytes(&mut self.parser, include_scrollback)
+        parser_snapshot_bytes_with_history(
+            &mut self.parser,
+            include_scrollback,
+            &self.screen_history,
+        )
     }
 }
 
+#[cfg(test)]
 fn parser_snapshot_bytes(parser: &mut vt100::Parser, include_scrollback: bool) -> Vec<u8> {
+    parser_snapshot_bytes_with_history(parser, include_scrollback, &ScreenHistory::default())
+}
+
+fn parser_snapshot_bytes_with_history(
+    parser: &mut vt100::Parser,
+    include_scrollback: bool,
+    screen_history: &ScreenHistory,
+) -> Vec<u8> {
     let original_scrollback = parser.screen().scrollback();
     let mut bytes = Vec::new();
 
     if include_scrollback {
         let mut replay_lines = parser_scrollback_plain_lines(parser);
+        let visible_lines = parser_visible_plain_lines(parser, 0);
+        let using_history_fallback = replay_lines.is_empty();
+        if replay_lines.is_empty() {
+            replay_lines = screen_history.lines_before_visible(&visible_lines);
+        } else {
+            screen_history.trim_trailing_current_snapshot(&mut replay_lines, &visible_lines);
+        }
         if !replay_lines.is_empty() {
-            replay_lines.extend(parser_visible_plain_lines(parser, 0));
+            if !using_history_fallback {
+                replay_lines.extend(visible_lines);
+            }
             append_plain_terminal_lines(&mut bytes, &replay_lines);
         }
     }
@@ -2093,6 +2377,14 @@ fn parser_snapshot_bytes(parser: &mut vt100::Parser, include_scrollback: bool) -
     bytes.extend_from_slice(&screen.cursor_state_formatted());
     parser.screen_mut().set_scrollback(original_scrollback);
     bytes
+}
+
+fn parser_max_scrollback(parser: &mut vt100::Parser) -> usize {
+    let original_scrollback = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let max_scrollback = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(original_scrollback);
+    max_scrollback
 }
 
 fn parser_scrollback_plain_lines(parser: &mut vt100::Parser) -> Vec<String> {
@@ -2133,18 +2425,137 @@ fn append_plain_terminal_lines(bytes: &mut Vec<u8>, lines: &[String]) {
     }
 }
 
+fn process_parser_output(
+    parser: &mut vt100::Parser,
+    data: &[u8],
+    screen_hash: &mut u64,
+    mut screen_history: Option<&mut ScreenHistory>,
+) -> bool {
+    let mut screen_changed = false;
+    let mut segment_start = 0usize;
+    let boundaries = terminal_redraw_boundary_positions(data);
+
+    for boundary in boundaries.into_iter().filter(|boundary| *boundary > 0) {
+        if boundary > segment_start {
+            if process_parser_segment(
+                parser,
+                &data[segment_start..boundary],
+                screen_hash,
+                screen_history_option_mut(&mut screen_history),
+            ) {
+                screen_changed = true;
+            }
+            segment_start = boundary;
+        }
+    }
+
+    if segment_start < data.len()
+        && process_parser_segment(
+            parser,
+            &data[segment_start..],
+            screen_hash,
+            screen_history_option_mut(&mut screen_history),
+        )
+    {
+        screen_changed = true;
+    }
+
+    screen_changed
+}
+
+fn screen_history_option_mut<'a>(
+    screen_history: &'a mut Option<&mut ScreenHistory>,
+) -> Option<&'a mut ScreenHistory> {
+    match screen_history {
+        Some(history) => Some(&mut **history),
+        None => None,
+    }
+}
+
+fn process_parser_segment(
+    parser: &mut vt100::Parser,
+    data: &[u8],
+    screen_hash: &mut u64,
+    screen_history: Option<&mut ScreenHistory>,
+) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    safe_parser_process(parser, data);
+    let next_hash = screen_activity_hash(parser.screen());
+    if next_hash == *screen_hash {
+        return false;
+    }
+    *screen_hash = next_hash;
+    if let Some(history) = screen_history {
+        history.capture(parser);
+    }
+    true
+}
+
+fn terminal_redraw_boundary_positions(data: &[u8]) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut index = 0usize;
+    while index + 2 < data.len() {
+        if data[index] != 0x1b || data[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let sequence_start = index;
+        index += 2;
+        while index < data.len() {
+            let byte = data[index];
+            if (0x40..=0x7e).contains(&byte) {
+                let params = &data[sequence_start + 2..index];
+                if is_terminal_redraw_boundary_csi(params, byte) {
+                    positions.push(sequence_start);
+                }
+                index += 1;
+                break;
+            }
+            index += 1;
+        }
+    }
+    positions
+}
+
+fn is_terminal_redraw_boundary_csi(params: &[u8], final_byte: u8) -> bool {
+    match final_byte {
+        b'H' | b'f' => params.is_empty() || params == b"1;1" || params == b";",
+        b'J' => params.contains(&b'2') || params.contains(&b'3'),
+        b'h' | b'l' => params == b"?1049",
+        _ => false,
+    }
+}
+
+#[cfg(test)]
 fn replay_agent_pty_log(parser: &mut vt100::Parser, path: &Path, info: &SessionInfo) {
+    replay_agent_pty_log_with_history(parser, path, info, None);
+}
+
+fn replay_agent_pty_log_with_history(
+    parser: &mut vt100::Parser,
+    path: &Path,
+    info: &SessionInfo,
+    mut screen_history: Option<&mut ScreenHistory>,
+) {
     let Ok(mut file) = fs::File::open(path) else {
         return;
     };
     let mut buf = [0u8; 8192];
     let mut total_bytes = 0usize;
+    let mut screen_hash = screen_activity_hash(parser.screen());
     loop {
         match file.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 total_bytes = total_bytes.saturating_add(n);
-                safe_parser_process(parser, &buf[..n]);
+                let _ = process_parser_output(
+                    parser,
+                    &buf[..n],
+                    &mut screen_hash,
+                    screen_history_option_mut(&mut screen_history),
+                );
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -2169,6 +2580,7 @@ fn replay_agent_pty_log(parser: &mut vt100::Parser, path: &Path, info: &SessionI
             "path": path.display().to_string(),
             "bytes": total_bytes,
             "scrollback": parser.screen().scrollback(),
+            "screen_history_lines": screen_history.as_ref().map(|history| history.len()),
         }),
     );
 }
@@ -2271,6 +2683,8 @@ struct AgentClient {
     info: SessionInfo,
     command_line: String,
     parser: vt100::Parser,
+    screen_history: ScreenHistory,
+    history_scroll_offset: usize,
     stream: AgentStream,
     pty_size: PtySize,
     exited: Option<String>,
@@ -2452,6 +2866,7 @@ impl AgentClient {
                         "launch_mode": launch_mode.as_str(),
                     }),
                 );
+                validate_session_launch_cwd(&info)?;
                 start_agent_daemon(&info, launch_mode)?;
                 started = true;
                 wait_for_agent_daemon(&key)?
@@ -2564,6 +2979,8 @@ impl AgentClient {
             command_line,
             info,
             parser,
+            screen_history: ScreenHistory::default(),
+            history_scroll_offset: 0,
             stream,
             pty_size,
             exited: None,
@@ -2668,11 +3085,17 @@ impl AgentClient {
         if counts_as_activity {
             self.last_output_epoch_ms = now_ms;
         }
-        safe_parser_process(&mut self.parser, data);
-        let next_hash = screen_activity_hash(self.parser.screen());
-        let screen_changed = next_hash != self.screen_hash;
+        let screen_changed = process_parser_output(
+            &mut self.parser,
+            data,
+            &mut self.screen_hash,
+            Some(&mut self.screen_history),
+        );
         if screen_changed {
-            self.screen_hash = next_hash;
+            self.history_scroll_offset = self.history_scroll_offset.min(
+                self.screen_history
+                    .max_scroll_offset(self.pty_size.rows as usize),
+            );
             if counts_as_activity {
                 self.last_screen_change_epoch_ms = now_ms;
             }
@@ -2692,6 +3115,7 @@ impl AgentClient {
                     "counts_as_activity": counts_as_activity,
                     "visible": screen_has_visible_content(self.parser.screen()),
                     "screen_changed": screen_changed,
+                    "screen_history_lines": self.screen_history.len(),
                     "last_screen_change_epoch_ms": self.last_screen_change_epoch_ms,
                     "last_output_epoch_ms": self.last_output_epoch_ms,
                     "preview": debug_screen_preview(self.parser.screen(), 5),
@@ -2708,6 +3132,9 @@ impl AgentClient {
         self.parser.screen_mut().set_size(next.rows, next.cols);
         self.screen_hash = screen_activity_hash(self.parser.screen());
         self.pty_size = next;
+        self.history_scroll_offset = self
+            .history_scroll_offset
+            .min(self.screen_history.max_scroll_offset(next.rows as usize));
         let _ = self.send_request(&AgentDaemonRequest::Resize {
             cols: next.cols,
             rows: next.rows,
@@ -2715,25 +3142,35 @@ impl AgentClient {
     }
 
     fn scrollback_offset(&self) -> usize {
-        self.parser.screen().scrollback()
+        let parser_offset = self.parser.screen().scrollback();
+        if parser_offset > 0 {
+            parser_offset
+        } else {
+            self.history_scroll_offset
+        }
     }
 
     fn set_scrollback_offset(&mut self, rows: usize) -> usize {
+        self.history_scroll_offset = 0;
         self.parser.screen_mut().set_scrollback(rows);
         self.screen_hash = screen_activity_hash(self.parser.screen());
         self.parser.screen().scrollback()
     }
 
     fn scroll_screen(&mut self, action: AgentScrollAction, page_rows: usize) -> usize {
-        let current = self.scrollback_offset();
+        let page_rows = page_rows.max(1);
+        if parser_max_scrollback(&mut self.parser) == 0 {
+            return self.scroll_history_screen(action, page_rows);
+        }
+
+        let current = self.parser.screen().scrollback();
         let next = match action {
             AgentScrollAction::Lines(lines) => apply_scrollback_delta(current, lines),
             AgentScrollAction::Pages(pages) => {
-                let rows = page_rows.max(1);
                 if pages >= 0 {
-                    current.saturating_add(rows.saturating_mul(pages as usize))
+                    current.saturating_add(page_rows.saturating_mul(pages as usize))
                 } else {
-                    current.saturating_sub(rows.saturating_mul((-pages) as usize))
+                    current.saturating_sub(page_rows.saturating_mul((-pages) as usize))
                 }
             }
             AgentScrollAction::Top => usize::MAX,
@@ -2742,10 +3179,33 @@ impl AgentClient {
         self.set_scrollback_offset(next)
     }
 
+    fn scroll_history_screen(&mut self, action: AgentScrollAction, page_rows: usize) -> usize {
+        self.parser.screen_mut().set_scrollback(0);
+        self.screen_hash = screen_activity_hash(self.parser.screen());
+        let max_offset = self.screen_history.max_scroll_offset(page_rows);
+        let current = self.history_scroll_offset.min(max_offset);
+        let next = match action {
+            AgentScrollAction::Lines(lines) => apply_scrollback_delta(current, lines),
+            AgentScrollAction::Pages(pages) => {
+                if pages >= 0 {
+                    current.saturating_add(page_rows.saturating_mul(pages as usize))
+                } else {
+                    current.saturating_sub(page_rows.saturating_mul((-pages) as usize))
+                }
+            }
+            AgentScrollAction::Top => max_offset,
+            AgentScrollAction::Bottom => 0,
+        }
+        .min(max_offset);
+        self.history_scroll_offset = next;
+        next
+    }
+
     fn send_key(&mut self, key: KeyEvent) {
         if let Some(data) = key_event_to_bytes(key) {
             if self.scrollback_offset() > 0 {
                 self.set_scrollback_offset(0);
+                self.history_scroll_offset = 0;
             }
             self.last_input_epoch_ms = current_epoch_ms();
             let _ = self.send_request(&AgentDaemonRequest::Input { data });
@@ -4561,11 +5021,61 @@ impl App {
         true
     }
 
-    fn begin_agent_launch(&mut self) {
+    fn begin_agent_launch(&mut self, cols: u16, rows: u16) {
         let Some(info) = self.current().cloned() else {
             self.status = "no session selected.".into();
             return;
         };
+        if self.main_tx.is_some() {
+            self.refresh_agent_runtime_states();
+        }
+        let runtime_info = self.runtime_info_for_selected_agent(&info);
+        let key = AgentKey::new(&runtime_info);
+        if self
+            .active_agent
+            .as_ref()
+            .is_some_and(|agent| AgentKey::new(&agent.info) == key)
+        {
+            self.show_sessions_view = false;
+            self.status = format!(
+                "switched to active {}",
+                live_agent_status_label(&runtime_info)
+            );
+            debug_log(
+                "agent_launch_switch_active",
+                serde_json::json!({
+                    "provider": key.provider.as_str(),
+                    "session_id": &key.session_id,
+                }),
+            );
+            return;
+        }
+        match self
+            .agent_states
+            .get(&key)
+            .copied()
+            .unwrap_or(AgentListState::Idle)
+        {
+            AgentListState::Live { .. } | AgentListState::Attached { mine: true, .. } => {
+                self.attach_existing_live_agent(runtime_info, cols, rows, "agent_launch_live");
+                return;
+            }
+            AgentListState::Attached { mine: false, .. } => {
+                self.status = format!(
+                    "{} is already attached in another cokacmux process.",
+                    live_agent_status_label(&runtime_info)
+                );
+                debug_log(
+                    "agent_launch_blocked_foreign_attached",
+                    serde_json::json!({
+                        "provider": key.provider.as_str(),
+                        "session_id": &key.session_id,
+                    }),
+                );
+                return;
+            }
+            AgentListState::Idle => {}
+        }
         let key = AgentKey::new(&info);
         debug_log(
             "agent_launch_mode_open",
@@ -4580,6 +5090,151 @@ impl App {
             source: info,
             selected: 0,
         };
+    }
+
+    fn attach_existing_live_agent(
+        &mut self,
+        info: SessionInfo,
+        cols: u16,
+        rows: u16,
+        origin: &str,
+    ) {
+        let key = AgentKey::new(&info);
+        let label = live_agent_status_label(&info);
+        let should_select_visible =
+            !is_shell_session_info(&info) && !is_new_agent_session_info(&info);
+        debug_log(
+            "attach_existing_live_agent_start",
+            serde_json::json!({
+                "origin": origin,
+                "provider": key.provider.as_str(),
+                "session_id": &key.session_id,
+                "cols": cols,
+                "rows": rows,
+            }),
+        );
+        if self.main_tx.is_none() {
+            self.status = format!("cannot switch to live {}; event loop is not ready", label);
+            debug_log(
+                "attach_existing_live_agent_unavailable",
+                serde_json::json!({
+                    "origin": origin,
+                    "provider": key.provider.as_str(),
+                    "session_id": &key.session_id,
+                }),
+            );
+            return;
+        }
+        let (main_tx, reader_id) = self.agent_attach_handles();
+        match AgentClient::attach_existing(info, cols, rows, main_tx, reader_id) {
+            Ok(agent) => {
+                self.status = format!("switched to live {}", label);
+                self.show_sessions_view = false;
+                self.active_agent = Some(agent);
+                self.mark_agent_attached_locally(key.clone());
+                if should_select_visible {
+                    self.select_visible_session(&key);
+                }
+                self.refresh_agent_runtime_states();
+                debug_log(
+                    "attach_existing_live_agent_ready",
+                    serde_json::json!({
+                        "origin": origin,
+                        "provider": key.provider.as_str(),
+                        "session_id": &key.session_id,
+                    }),
+                );
+            }
+            Err(e) => {
+                self.status = format!("switch to live {} failed: {}", label, e);
+                self.refresh_agent_runtime_states();
+                debug_log(
+                    "attach_existing_live_agent_failed",
+                    serde_json::json!({
+                        "origin": origin,
+                        "provider": key.provider.as_str(),
+                        "session_id": &key.session_id,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn prompt_create_missing_launch_cwd(
+        &mut self,
+        info: SessionInfo,
+        path: PathBuf,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
+    ) {
+        let key = AgentKey::new(&info);
+        let yes_key = self.keybindings.help(KeyAction::ConfirmYes, "y");
+        let no_key = self.keybindings.help(KeyAction::ConfirmNo, "N");
+        self.status = format!(
+            "launch folder missing: {}",
+            truncate_width(&path.display().to_string(), 48)
+        );
+        self.input_mode = InputMode::Confirm {
+            prompt: create_missing_cwd_confirm_prompt(&info, &path, &yes_key, &no_key),
+            action: PendingAction::CreateMissingLaunchCwd {
+                info,
+                path: path.clone(),
+                cols,
+                rows,
+                launch_mode,
+            },
+        };
+        debug_log(
+            "attach_launch_cwd_create_confirm_open",
+            serde_json::json!({
+                "provider": key.provider.as_str(),
+                "session_id": &key.session_id,
+                "cwd": path.display().to_string(),
+                "launch_mode": launch_mode.as_str(),
+            }),
+        );
+    }
+
+    fn create_missing_launch_cwd_and_attach(
+        &mut self,
+        info: SessionInfo,
+        path: PathBuf,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
+    ) {
+        let key = AgentKey::new(&info);
+        match create_agent_launch_cwd(&path) {
+            Ok(()) => {
+                debug_log(
+                    "attach_launch_cwd_created",
+                    serde_json::json!({
+                        "provider": key.provider.as_str(),
+                        "session_id": &key.session_id,
+                        "cwd": path.display().to_string(),
+                        "launch_mode": launch_mode.as_str(),
+                    }),
+                );
+                self.attach_agent(info, cols, rows, launch_mode);
+            }
+            Err(e) => {
+                self.status = format!(
+                    "create launch folder failed: {}",
+                    truncate_width(&e.to_string(), 72)
+                );
+                debug_log(
+                    "attach_launch_cwd_create_failed",
+                    serde_json::json!({
+                        "provider": key.provider.as_str(),
+                        "session_id": &key.session_id,
+                        "cwd": path.display().to_string(),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
     }
 
     fn attach_agent(
@@ -4598,6 +5253,33 @@ impl App {
                 "launch_mode": launch_mode.as_str(),
             }),
         );
+        if live_agent_meta_snapshot(&key).is_none() {
+            match missing_session_launch_cwd(&info) {
+                Ok(Some(path)) => {
+                    self.prompt_create_missing_launch_cwd(info, path, cols, rows, launch_mode);
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.status = format!(
+                        "attach {} agent {} failed: {}",
+                        key.provider.as_str(),
+                        truncate_width(&key.session_id, 14),
+                        e
+                    );
+                    debug_log(
+                        "attach_launch_cwd_invalid",
+                        serde_json::json!({
+                            "provider": key.provider.as_str(),
+                            "session_id": &key.session_id,
+                            "cwd": &info.cwd,
+                            "error": e.to_string(),
+                        }),
+                    );
+                    return;
+                }
+            }
+        }
         if let Err(e) = prepare_agent_session(&info) {
             self.status = format!(
                 "prepare {} agent {} failed: {}",
@@ -5211,6 +5893,10 @@ impl App {
         };
         let before = agent.scrollback_offset();
         let after = agent.scroll_screen(action, page_rows);
+        let parser_scrollback = agent.parser.screen().scrollback();
+        let parser_scrollback_max = parser_max_scrollback(&mut agent.parser);
+        let history_scroll_offset = agent.history_scroll_offset;
+        let screen_history_lines = agent.screen_history.len();
         self.status = if before == 0 && after == 0 && agent_scroll_action_moves_up(action) {
             "PTY scrollback: no saved lines.".into()
         } else if after == 0 {
@@ -5228,6 +5914,10 @@ impl App {
                 "action": format!("{:?}", action),
                 "before": before,
                 "after": after,
+                "parser_scrollback": parser_scrollback,
+                "parser_scrollback_max": parser_scrollback_max,
+                "history_scroll_offset": history_scroll_offset,
+                "screen_history_lines": screen_history_lines,
             }),
         );
     }
@@ -5638,7 +6328,7 @@ fn print_help() {
          ↑↓ / j k     navigate\n  \
          Alt+↑/↓ or Ctrl+Shift+↑/↓ select from sidebar/list\n  \
          Alt+←/→ or Ctrl+Shift+←/→ resize panes (saved)\n  \
-         Agent: Shift+↑/↓ scroll PTY one line, Shift/Alt+PgUp/PgDn page, Shift/Alt+Home/End top/bottom\n  \
+         Agent: Shift+↑/↓ scroll PTY one line, Shift+Alt+↑/↓ page, Shift/Alt+Home/End top/bottom\n  \
          PgUp / PgDn   jump 10\n  \
          g/Home / G/End top / bottom\n  \
          Tab / Esc     switch focus between session list and preview\n  \
@@ -5647,7 +6337,7 @@ fn print_help() {
          t             edit selected session title\n  \
          r             refresh from disk\n  \
          c             clone/convert selected session\n  \
-         e             choose launch mode, then attach/start selected agent session\n  \
+         e             switch to live selected agent, or choose launch mode to start it\n  \
          Ctrl+] / Ctrl+[ switch between sessions and active agent\n  \
          Ctrl+K        kill selected/current agent\n  \
          Ctrl+PgUp/PgDn switch live agent from agent screen\n  \
@@ -5877,6 +6567,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     let meta_path = agent_meta_path(&key)?;
     let settings = Settings::load();
     let startup_spec = agent_launch_spec_with_settings(&info, launch_mode, &settings);
+    validate_session_launch_cwd(&info)?;
     debug_log(
         "daemon_start",
         serde_json::json!({
@@ -6277,6 +6968,7 @@ fn send_daemon_attached(
             "snapshot_len": snapshot.len(),
             "include_scrollback": include_scrollback,
             "scrollback": agent.parser.screen().scrollback(),
+            "screen_history_lines": agent.screen_history.len(),
             "visible": screen_has_visible_content(agent.parser.screen()),
             "last_screen_change_epoch_ms": agent.last_screen_change_epoch_ms,
             "last_output_epoch_ms": agent.last_output_epoch_ms,
@@ -8083,6 +8775,7 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
             meta.pid
         ));
     }
+    validate_session_launch_cwd(info)?;
     let socket_path = agent_socket_path(&key)?;
     if socket_path.exists() {
         let _ = fs::remove_file(&socket_path);
@@ -9501,6 +10194,55 @@ fn normalize_launch_cwd(raw: &str) -> std::result::Result<String, String> {
         .map_err(|e| format!("resolve folder failed: {}", e))
 }
 
+fn validate_session_launch_cwd(info: &SessionInfo) -> Result<()> {
+    match missing_session_launch_cwd(info)? {
+        Some(path) => Err(anyhow::anyhow!(
+            "launch folder does not exist: {}",
+            path.display()
+        )),
+        None => Ok(()),
+    }
+}
+
+fn validate_agent_launch_cwd(path: &Path) -> Result<()> {
+    match missing_agent_launch_cwd(path)? {
+        Some(path) => Err(anyhow::anyhow!(
+            "launch folder does not exist: {}",
+            path.display()
+        )),
+        None => Ok(()),
+    }
+}
+
+fn missing_session_launch_cwd(info: &SessionInfo) -> Result<Option<PathBuf>> {
+    if info.cwd.is_empty() {
+        return Ok(None);
+    }
+    missing_agent_launch_cwd(Path::new(&info.cwd))
+}
+
+fn missing_agent_launch_cwd(path: &Path) -> Result<Option<PathBuf>> {
+    match path.metadata() {
+        Ok(meta) if meta.is_dir() => Ok(None),
+        Ok(_) => Err(anyhow::anyhow!(
+            "launch folder is not a directory: {}",
+            path.display()
+        )),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Some(path.to_path_buf())),
+        Err(e) => Err(anyhow::anyhow!(
+            "cannot access launch folder {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
+fn create_agent_launch_cwd(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .map_err(|e| anyhow::anyhow!("create {} failed: {}", path.display(), e))?;
+    validate_agent_launch_cwd(path)
+}
+
 fn expand_home_path(raw: &str) -> PathBuf {
     if raw == "~" {
         if let Some(home) = dirs::home_dir() {
@@ -10600,7 +11342,12 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     let (agent_cursor, scrollback_offset) = {
         let startup_spinner_started_at = agent.startup_spinner_started_at();
         let screen = agent.parser.screen();
-        let scrollback_offset = screen.scrollback();
+        let history_scroll_offset = agent.history_scroll_offset;
+        let scrollback_offset = if screen.scrollback() > 0 {
+            screen.scrollback()
+        } else {
+            history_scroll_offset
+        };
         let cursor = if startup_spinner_started_at.is_some()
             || screen.hide_cursor()
             || scrollback_offset > 0
@@ -10616,7 +11363,14 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         };
         let buf = f.buffer_mut();
         fill_area(buf, agent_area, Style::default().bg(AGENT_DEFAULT_BG));
-        render_vt100_screen(buf, screen, agent_area);
+        if screen.scrollback() == 0 && history_scroll_offset > 0 {
+            let lines = agent
+                .screen_history
+                .visible_lines(history_scroll_offset, agent_area.height as usize);
+            render_plain_agent_history(buf, agent_area, &lines);
+        } else {
+            render_vt100_screen(buf, screen, agent_area);
+        }
         if let Some(started_at) = startup_spinner_started_at {
             render_agent_startup_spinner(buf, agent_area, &agent.info, started_at);
         }
@@ -11021,6 +11775,20 @@ fn render_vt100_screen(buf: &mut Buffer, screen: &vt100::Screen, area: Rect) {
     }
 }
 
+fn render_plain_agent_history(buf: &mut Buffer, area: Rect, lines: &[String]) {
+    let style = Style::default().fg(THEME_FG).bg(AGENT_DEFAULT_BG);
+    for (row, line) in lines.iter().take(area.height as usize).enumerate() {
+        let y = area.y + row as u16;
+        buf.set_stringn(
+            area.x,
+            y,
+            truncate_width(line, area.width as usize),
+            area.width as usize,
+            style,
+        );
+    }
+}
+
 fn vt100_cell_style(cell: &vt100::Cell) -> Style {
     let mut style = Style::default()
         .fg(vt100_color(cell.fgcolor()))
@@ -11126,6 +11894,13 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                     info,
                     removed_index,
                 } => app.delete_session(info, removed_index),
+                PendingAction::CreateMissingLaunchCwd {
+                    info,
+                    path,
+                    cols,
+                    rows,
+                    launch_mode,
+                } => app.create_missing_launch_cwd_and_attach(info, path, cols, rows, launch_mode),
             }
         } else if keybindings.matches(KeyAction::ConfirmNo, key) {
             app.input_mode = InputMode::Normal;
@@ -11549,7 +12324,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     {
         app.begin_title_edit();
     } else if keybindings.matches(KeyAction::SessionLaunchAgent, key) {
-        app.begin_agent_launch();
+        app.begin_agent_launch(agent_cols.max(1), agent_rows.max(1));
     } else if keybindings.matches(KeyAction::SessionRefreshPreview, key) {
         // Force a re-render of the preview (and refresh cache).
         if let Some(info) = app.current().cloned() {
@@ -11627,6 +12402,22 @@ fn delete_confirm_prompt(info: &SessionInfo, yes_key: &str, no_key: &str) -> Str
     )
 }
 
+fn create_missing_cwd_confirm_prompt(
+    info: &SessionInfo,
+    path: &Path,
+    yes_key: &str,
+    no_key: &str,
+) -> String {
+    let path = confirm_prompt_line(&path.display().to_string(), 72);
+    format!(
+        "{} launch folder does not exist.\n{}\nCreate it and continue?\n{} create/start   {} cancel",
+        info.provider.as_str(),
+        path,
+        yes_key,
+        no_key
+    )
+}
+
 fn confirm_prompt_line(value: &str, width: usize) -> String {
     truncate_width(sanitize_for_single_line(value).trim(), width)
 }
@@ -11634,6 +12425,7 @@ fn confirm_prompt_line(value: &str, width: usize) -> String {
 fn confirm_modal_title(action: &PendingAction) -> &'static str {
     match action {
         PendingAction::Delete { .. } => "Delete session",
+        PendingAction::CreateMissingLaunchCwd { .. } => "Create folder",
     }
 }
 
@@ -12547,8 +13339,8 @@ fn agent_help_text(keybindings: &KeyBindings) -> String {
         keybindings.help_pair(
             KeyAction::AgentScrollPageUp,
             KeyAction::AgentScrollPageDown,
-            "Shift+PgUp",
-            "Shift+PgDn",
+            "Shift+Alt+Up",
+            "Shift+Alt+Down",
         ),
         keybindings.help_pair(
             KeyAction::AgentSwitchPrev,
@@ -13255,8 +14047,169 @@ mod tests {
             serde_json::json!(["delete", "d"])
         );
         assert_eq!(
+            value["agent"]["scroll_page_up"],
+            serde_json::json!(["shift+alt+up", "shift+alt+pageup"])
+        );
+        assert_eq!(
             value["agent"]["scroll_page_down"],
-            serde_json::json!(["shift+pagedown", "alt+pagedown"])
+            serde_json::json!(["shift+alt+down", "shift+alt+pagedown"])
+        );
+    }
+
+    #[test]
+    fn legacy_generated_agent_scroll_page_bindings_are_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "agent": {
+    "scroll_page_up": ["shift+pageup", "alt+pageup"],
+    "scroll_page_down": ["shift+pagedown", "alt+pagedown"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        assert_eq!(
+            agent_scrollback_key(
+                &keybindings,
+                KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT | KeyModifiers::ALT)
+            ),
+            Some(AgentScrollAction::Pages(1))
+        );
+        assert_eq!(
+            agent_scrollback_key(
+                &keybindings,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT | KeyModifiers::ALT)
+            ),
+            Some(AgentScrollAction::Pages(-1))
+        );
+        assert_eq!(
+            agent_scrollback_key(
+                &keybindings,
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT | KeyModifiers::ALT)
+            ),
+            Some(AgentScrollAction::Pages(1))
+        );
+        assert_eq!(
+            agent_scrollback_key(
+                &keybindings,
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT | KeyModifiers::ALT)
+            ),
+            Some(AgentScrollAction::Pages(-1))
+        );
+        assert_eq!(
+            agent_scrollback_key(
+                &keybindings,
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)
+            ),
+            None
+        );
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            value["agent"]["scroll_page_up"],
+            serde_json::json!(["shift+alt+up", "shift+alt+pageup"])
+        );
+        assert_eq!(
+            value["agent"]["scroll_page_down"],
+            serde_json::json!(["shift+alt+down", "shift+alt+pagedown"])
+        );
+    }
+
+    #[test]
+    fn previous_generated_agent_scroll_page_bindings_are_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "agent": {
+    "scroll_page_up": ["shift+alt+pageup"],
+    "scroll_page_down": ["shift+alt+pagedown"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        assert_eq!(
+            agent_scrollback_key(
+                &keybindings,
+                KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT | KeyModifiers::ALT)
+            ),
+            Some(AgentScrollAction::Pages(1))
+        );
+        assert_eq!(
+            agent_scrollback_key(
+                &keybindings,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT | KeyModifiers::ALT)
+            ),
+            Some(AgentScrollAction::Pages(-1))
+        );
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            value["agent"]["scroll_page_up"],
+            serde_json::json!(["shift+alt+up", "shift+alt+pageup"])
+        );
+        assert_eq!(
+            value["agent"]["scroll_page_down"],
+            serde_json::json!(["shift+alt+down", "shift+alt+pagedown"])
+        );
+    }
+
+    #[test]
+    fn custom_agent_scroll_page_bindings_are_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "agent": {
+    "scroll_page_up": ["shift+pageup", "alt+k"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        assert_eq!(
+            agent_scrollback_key(
+                &keybindings,
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)
+            ),
+            Some(AgentScrollAction::Pages(1))
+        );
+        assert_eq!(
+            agent_scrollback_key(
+                &keybindings,
+                KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT | KeyModifiers::ALT)
+            ),
+            None
+        );
+        assert_eq!(
+            agent_scrollback_key(
+                &keybindings,
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT | KeyModifiers::ALT)
+            ),
+            None
+        );
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            value["agent"]["scroll_page_up"],
+            serde_json::json!(["shift+pageup", "alt+k"])
         );
     }
 
@@ -13857,6 +14810,91 @@ mod tests {
     }
 
     #[test]
+    fn e_on_live_selected_session_switches_without_launch_selector() {
+        let mut app = app_for_key_tests();
+        let info = session_info(Provider::Codex, "codex-id", "/repo");
+        app.agent_states.insert(
+            AgentKey::new(&info),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.sessions.push(info);
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.active_agent.is_none());
+        assert!(app.status.contains("cannot switch to live"));
+    }
+
+    #[test]
+    fn e_on_foreign_attached_selected_session_does_not_open_launch_selector() {
+        let mut app = app_for_key_tests();
+        let info = session_info(Provider::Claude, "claude-id", "/repo");
+        app.agent_states.insert(
+            AgentKey::new(&info),
+            AgentListState::Attached {
+                mine: false,
+                activity: AgentActivity::Busy,
+            },
+        );
+        app.sessions.push(info);
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.active_agent.is_none());
+        assert!(app.status.contains("already attached in another"));
+    }
+
+    #[test]
+    fn e_on_live_selected_missing_cwd_does_not_prompt_create_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("deleted-project");
+        let mut app = app_for_key_tests();
+        let info = session_info(
+            Provider::Codex,
+            "live-missing-cwd",
+            &missing.display().to_string(),
+        );
+        app.agent_states.insert(
+            AgentKey::new(&info),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.sessions.push(info);
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(!missing.exists());
+        assert!(app.status.contains("cannot switch to live"));
+    }
+
+    #[test]
     fn ctrl_n_opens_new_session_dialog_from_selected_session() {
         let mut app = app_for_key_tests();
         app.sessions
@@ -13987,6 +15025,131 @@ mod tests {
         assert!(normalize_launch_cwd("")
             .unwrap_err()
             .starts_with("folder path is required."));
+    }
+
+    #[test]
+    fn existing_agent_launch_cwd_validation_rejects_missing_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("deleted-project");
+        let info = session_info(
+            Provider::Claude,
+            "missing-cwd",
+            &missing.display().to_string(),
+        );
+
+        let error = validate_session_launch_cwd(&info).unwrap_err().to_string();
+
+        assert!(error.starts_with("launch folder does not exist:"));
+        assert!(error.contains("deleted-project"));
+    }
+
+    #[test]
+    fn existing_agent_launch_cwd_validation_rejects_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let info = session_info(
+            Provider::Claude,
+            "file-cwd",
+            &file.path().display().to_string(),
+        );
+
+        let error = validate_session_launch_cwd(&info).unwrap_err().to_string();
+
+        assert!(error.starts_with("launch folder is not a directory:"));
+    }
+
+    #[test]
+    fn create_agent_launch_cwd_creates_missing_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("new").join("project");
+
+        create_agent_launch_cwd(&missing).unwrap();
+
+        assert!(missing.is_dir());
+        validate_agent_launch_cwd(&missing).unwrap();
+    }
+
+    #[test]
+    fn agent_launch_confirm_prompts_to_create_missing_cwd_before_starting_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("deleted-project");
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::AgentLaunch {
+            selected: 0,
+            source: session_info(
+                Provider::Claude,
+                &format!("missing-cwd-{}", uuid::Uuid::now_v7()),
+                &missing.display().to_string(),
+            ),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::Confirm {
+                prompt,
+                action:
+                    PendingAction::CreateMissingLaunchCwd {
+                        info,
+                        path,
+                        cols,
+                        rows,
+                        launch_mode,
+                    },
+            } => {
+                assert!(prompt.contains("launch folder does not exist"));
+                assert!(prompt.contains("Create it and continue?"));
+                assert!(info.session_id.starts_with("missing-cwd-"));
+                assert_eq!(path, &missing);
+                assert_eq!(*cols, 80);
+                assert_eq!(*rows, 20);
+                assert_eq!(*launch_mode, AgentLaunchMode::Normal);
+            }
+            other => panic!("expected create-folder confirm, got {:?}", other),
+        }
+        assert!(app.active_agent.is_none());
+        assert!(app.show_sessions_view);
+        assert!(!missing.exists());
+        assert!(app.status.contains("launch folder missing:"));
+        assert!(app.status.contains("deleted-project"));
+    }
+
+    #[test]
+    fn missing_cwd_create_confirm_cancel_does_not_create_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("deleted-project");
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::Confirm {
+            prompt: "Create?".to_string(),
+            action: PendingAction::CreateMissingLaunchCwd {
+                info: session_info(
+                    Provider::Claude,
+                    "missing-cwd",
+                    &missing.display().to_string(),
+                ),
+                path: missing.clone(),
+                cols: 80,
+                rows: 20,
+                launch_mode: AgentLaunchMode::Normal,
+            },
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert_eq!(app.status, "cancelled.");
+        assert!(!missing.exists());
     }
 
     #[test]
@@ -15334,7 +16497,7 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn agent_scrollback_keys_accept_shift_or_alt_navigation() {
+    fn agent_scrollback_keys_accept_dedicated_navigation() {
         assert_eq!(
             is_agent_scrollback_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)),
             Some(AgentScrollAction::Lines(1))
@@ -15344,11 +16507,31 @@ IF EXIST "%~dp0\node.exe" (
             Some(AgentScrollAction::Lines(-1))
         );
         assert_eq!(
-            is_agent_scrollback_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)),
+            is_agent_scrollback_key(KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::SHIFT | KeyModifiers::ALT
+            )),
             Some(AgentScrollAction::Pages(1))
         );
         assert_eq!(
-            is_agent_scrollback_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT)),
+            is_agent_scrollback_key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::SHIFT | KeyModifiers::ALT
+            )),
+            Some(AgentScrollAction::Pages(-1))
+        );
+        assert_eq!(
+            is_agent_scrollback_key(KeyEvent::new(
+                KeyCode::PageUp,
+                KeyModifiers::SHIFT | KeyModifiers::ALT
+            )),
+            Some(AgentScrollAction::Pages(1))
+        );
+        assert_eq!(
+            is_agent_scrollback_key(KeyEvent::new(
+                KeyCode::PageDown,
+                KeyModifiers::SHIFT | KeyModifiers::ALT
+            )),
             Some(AgentScrollAction::Pages(-1))
         );
         assert_eq!(
@@ -15364,14 +16547,18 @@ IF EXIST "%~dp0\node.exe" (
             None
         );
         assert_eq!(
+            is_agent_scrollback_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)),
+            None
+        );
+        assert_eq!(
+            is_agent_scrollback_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT)),
+            None
+        );
+        assert_eq!(
             is_agent_scrollback_key(KeyEvent::new(
                 KeyCode::Up,
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT
             )),
-            None
-        );
-        assert_eq!(
-            is_agent_scrollback_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
             None
         );
     }
@@ -15436,6 +16623,349 @@ IF EXIST "%~dp0\node.exe" (
             "persistent PTY log should replay old lines into scrollback: {:?}",
             restored_lines
         );
+    }
+
+    #[test]
+    fn parser_snapshot_uses_screen_history_when_vt100_scrollback_is_empty() {
+        let mut source = vt100::Parser::new(5, 30, AGENT_SCROLLBACK_LINES);
+        let mut history = ScreenHistory::default();
+        for frame in 1..=8 {
+            let bytes = format!("\x1b[?1049h\x1b[H\x1b[2JFRAME{:03}\r\n", frame);
+            safe_parser_process(&mut source, bytes.as_bytes());
+            history.capture(&mut source);
+        }
+        assert_eq!(
+            parser_max_scrollback(&mut source),
+            0,
+            "alternate-screen redraws should not create vt100 scrollback"
+        );
+        assert!(
+            history.max_scroll_offset(5) > 0,
+            "screen history should preserve redraw snapshots"
+        );
+
+        let snapshot = parser_snapshot_bytes_with_history(&mut source, true, &history);
+        let mut restored = vt100::Parser::new(5, 30, AGENT_SCROLLBACK_LINES);
+        safe_parser_process(&mut restored, &snapshot);
+        let restored_text = parser_snapshot_text(&mut restored);
+        assert!(
+            restored_text.contains("FRAME001") && restored_text.contains("FRAME008"),
+            "snapshot should transfer screen history fallback: {:?}",
+            restored_text
+        );
+    }
+
+    #[test]
+    fn screen_history_captures_multiple_fullscreen_frames_in_one_chunk() {
+        let mut source = vt100::Parser::new(5, 30, AGENT_SCROLLBACK_LINES);
+        let mut history = ScreenHistory::default();
+        let mut screen_hash = screen_activity_hash(source.screen());
+        let mut bytes = Vec::new();
+        for frame in 1..=8 {
+            bytes.extend_from_slice(
+                format!("\x1b[?1049h\x1b[H\x1b[2JFRAME{frame:03}\r\n").as_bytes(),
+            );
+        }
+
+        assert!(process_parser_output(
+            &mut source,
+            &bytes,
+            &mut screen_hash,
+            Some(&mut history),
+        ));
+
+        let history_text = history.all_lines().join("\n");
+        assert!(
+            history_text.contains("FRAME001") && history_text.contains("FRAME008"),
+            "history should retain intermediate redraw frames: {:?}",
+            history_text
+        );
+        assert_eq!(
+            parser_max_scrollback(&mut source),
+            0,
+            "test setup must exercise screen-history fallback"
+        );
+    }
+
+    #[test]
+    fn parser_snapshot_history_fallback_does_not_duplicate_current_frame() {
+        let mut source = vt100::Parser::new(5, 30, AGENT_SCROLLBACK_LINES);
+        let mut history = ScreenHistory::default();
+        let mut screen_hash = screen_activity_hash(source.screen());
+        for frame in 1..=3 {
+            let bytes = format!("\x1b[?1049h\x1b[H\x1b[2JFRAME{frame:03}\r\n");
+            let _ = process_parser_output(
+                &mut source,
+                bytes.as_bytes(),
+                &mut screen_hash,
+                Some(&mut history),
+            );
+        }
+
+        let snapshot = parser_snapshot_bytes_with_history(&mut source, true, &history);
+        let snapshot_text = String::from_utf8_lossy(&snapshot);
+        assert_eq!(
+            snapshot_text.matches("FRAME003").count(),
+            1,
+            "current fullscreen frame should not be duplicated in fallback snapshot: {:?}",
+            snapshot_text
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_client_scrolls_screen_history_when_parser_scrollback_is_empty() {
+        let (stream, _peer) = AgentStream::pair().unwrap();
+        let pty_size = agent_pty_size(40, 6);
+        let parser = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
+        let mut client = AgentClient {
+            info: session_info(Provider::Claude, "history-scroll", "/repo"),
+            command_line: "test".into(),
+            parser,
+            screen_history: ScreenHistory::default(),
+            history_scroll_offset: 0,
+            stream,
+            pty_size,
+            exited: Some("test".into()),
+            screen_hash: 0,
+            last_screen_change_epoch_ms: 0,
+            last_output_epoch_ms: 0,
+            last_input_epoch_ms: 0,
+            pending_snapshot_output: false,
+            startup_spinner_started_at: None,
+            debug_output_events: 0,
+            reader_id: 0,
+            reader_thread: None,
+        };
+        client.screen_hash = screen_activity_hash(client.parser.screen());
+
+        for frame in 1..=8 {
+            let bytes = format!("\x1b[?1049h\x1b[H\x1b[2JFRAME{:03}\r\n", frame);
+            client.process_agent_output(bytes.as_bytes(), true);
+        }
+
+        assert_eq!(
+            parser_max_scrollback(&mut client.parser),
+            0,
+            "test setup must exercise the screen-history path"
+        );
+        let after = client.scroll_screen(AgentScrollAction::Pages(1), 5);
+        assert!(
+            after > 0,
+            "page-up should use screen history when vt100 scrollback is empty"
+        );
+        assert_eq!(client.scrollback_offset(), after);
+
+        let lines = client.screen_history.visible_lines(after, 5);
+        assert!(
+            lines.iter().any(|line| line.contains("FRAME")),
+            "history render source should contain captured fullscreen frames: {:?}",
+            lines
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pty_output_round_trips_through_scrollback_log_and_snapshot() {
+        let shell = PathBuf::from("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = format!("pty-e2e-{}", uuid::Uuid::now_v7());
+        let mut info = session_info(
+            Provider::Claude,
+            &session_id,
+            &dir.path().display().to_string(),
+        );
+        info.source = PathBuf::from(SHELL_SESSION_SOURCE_MARKER);
+
+        let key = AgentKey::new(&info);
+        let pty_log_path = agent_pty_log_path(&key).unwrap();
+        let _ = remove_agent_pty_log(&key);
+        let spec = AgentLaunchSpec {
+            program: shell.display().to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: Some(dir.path().to_path_buf()),
+        };
+
+        let mut agent =
+            AgentSession::spawn_with_spec(info.clone(), spec, 40, 6, AgentLaunchMode::Normal)
+                .unwrap();
+        agent.send_bytes(
+            b"i=1; while [ \"$i\" -le 40 ]; do printf 'COKPTY%03d\\n' \"$i\"; i=$((i + 1)); done\n",
+        );
+        assert!(
+            drain_agent_until(&mut agent, Duration::from_secs(5), |agent| {
+                parser_snapshot_text(&mut agent.parser).contains("COKPTY040")
+            }),
+            "PTY child output did not reach the parser"
+        );
+
+        if let Some(file) = agent.pty_log.as_mut() {
+            file.flush().unwrap();
+        }
+        let log_bytes = fs::read(&pty_log_path).unwrap();
+        let log_text = String::from_utf8_lossy(&log_bytes);
+        assert!(
+            log_text.contains("COKPTY001"),
+            "ptylog lost earliest output"
+        );
+        assert!(log_text.contains("COKPTY040"), "ptylog lost latest output");
+
+        let snapshot_text = parser_snapshot_text(&mut agent.parser);
+        assert!(
+            snapshot_text.contains("COKPTY001") && snapshot_text.contains("COKPTY040"),
+            "live parser snapshot did not preserve full scrollback: {:?}",
+            snapshot_text
+        );
+
+        agent.parser.screen_mut().set_scrollback(usize::MAX);
+        let top_offset = agent.parser.screen().scrollback();
+        assert!(top_offset > 0, "PTY output should create scrollback");
+        let top_lines = parser_visible_plain_lines(&mut agent.parser, top_offset);
+        assert!(
+            top_lines.iter().any(|line| line.contains("COKPTY001")),
+            "scrolling to top did not reveal earliest output: {:?}",
+            top_lines
+        );
+        agent.parser.screen_mut().set_scrollback(0);
+        assert_eq!(agent.parser.screen().scrollback(), 0);
+
+        agent.parser = vt100::Parser::new(
+            agent.pty_size.rows,
+            agent.pty_size.cols,
+            AGENT_SCROLLBACK_LINES,
+        );
+        agent.screen_history = ScreenHistory::default();
+        agent.screen_hash = screen_activity_hash(agent.parser.screen());
+        agent.rehydrate_parser_from_pty_log();
+        let replay_text = parser_snapshot_text(&mut agent.parser);
+        assert!(
+            replay_text.contains("COKPTY001") && replay_text.contains("COKPTY040"),
+            "ptylog replay did not restore full scrollback: {:?}",
+            replay_text
+        );
+
+        let snapshot = agent.screen_snapshot_bytes(true);
+        let mut restored = vt100::Parser::new(
+            agent.pty_size.rows,
+            agent.pty_size.cols,
+            AGENT_SCROLLBACK_LINES,
+        );
+        safe_parser_process(&mut restored, &snapshot);
+        let restored_text = parser_snapshot_text(&mut restored);
+        assert!(
+            restored_text.contains("COKPTY001") && restored_text.contains("COKPTY040"),
+            "snapshot event did not transfer full scrollback: {:?}",
+            restored_text
+        );
+
+        agent.send_bytes(b"exit\n");
+        let _ = drain_agent_until(&mut agent, Duration::from_millis(500), |_| false);
+        let _ = agent.child.kill();
+        let _ = agent.child.wait();
+        drop(agent.pty_log.take());
+        let _ = remove_agent_pty_log(&key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pty_fullscreen_redraws_scroll_through_screen_history() {
+        let shell = PathBuf::from("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = format!("pty-fullscreen-{}", uuid::Uuid::now_v7());
+        let mut info = session_info(
+            Provider::Claude,
+            &session_id,
+            &dir.path().display().to_string(),
+        );
+        info.source = PathBuf::from(SHELL_SESSION_SOURCE_MARKER);
+
+        let key = AgentKey::new(&info);
+        let _ = remove_agent_pty_log(&key);
+        let spec = AgentLaunchSpec {
+            program: shell.display().to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: Some(dir.path().to_path_buf()),
+        };
+
+        let mut agent =
+            AgentSession::spawn_with_spec(info.clone(), spec, 40, 6, AgentLaunchMode::Normal)
+                .unwrap();
+        agent.send_bytes(b"printf '\\033[?1049h'\n");
+        let _ = drain_agent_until(&mut agent, Duration::from_secs(2), |_| false);
+
+        for frame in 1..=12 {
+            let command = format!("printf '\\033[H\\033[2JFRAME{frame:03}\\nROW{frame:03}\\n'\n");
+            agent.send_bytes(command.as_bytes());
+            assert!(
+                drain_agent_until(&mut agent, Duration::from_secs(2), |agent| {
+                    parser_snapshot_text(&mut agent.parser).contains(&format!("FRAME{frame:03}"))
+                }),
+                "fullscreen frame {frame:03} did not reach the parser"
+            );
+        }
+
+        assert_eq!(
+            parser_max_scrollback(&mut agent.parser),
+            0,
+            "fullscreen redraws should leave vt100 scrollback empty"
+        );
+        assert!(
+            agent
+                .screen_history
+                .max_scroll_offset(agent.pty_size.rows as usize)
+                > 0,
+            "screen history should provide a fallback scroll range"
+        );
+
+        let snapshot = agent.screen_snapshot_bytes(true);
+        let mut restored = vt100::Parser::new(
+            agent.pty_size.rows,
+            agent.pty_size.cols,
+            AGENT_SCROLLBACK_LINES,
+        );
+        safe_parser_process(&mut restored, &snapshot);
+        let restored_text = parser_snapshot_text(&mut restored);
+        assert!(
+            restored_text.contains("FRAME001") && restored_text.contains("FRAME012"),
+            "snapshot event did not transfer fullscreen screen history: {:?}",
+            restored_text
+        );
+
+        agent.send_bytes(b"printf '\\033[?1049l'; exit\n");
+        let _ = drain_agent_until(&mut agent, Duration::from_millis(500), |_| false);
+        let _ = agent.child.kill();
+        let _ = agent.child.wait();
+        drop(agent.pty_log.take());
+        let _ = remove_agent_pty_log(&key);
+    }
+
+    #[cfg(unix)]
+    fn drain_agent_until<F>(agent: &mut AgentSession, timeout: Duration, mut predicate: F) -> bool
+    where
+        F: FnMut(&mut AgentSession) -> bool,
+    {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let _ = agent.drain_output_chunks();
+            if predicate(agent) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = agent.drain_output_chunks();
+        predicate(agent)
+    }
+
+    fn parser_snapshot_text(parser: &mut vt100::Parser) -> String {
+        String::from_utf8_lossy(&parser_snapshot_bytes(parser, true)).into_owned()
     }
 
     #[test]
