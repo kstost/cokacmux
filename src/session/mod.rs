@@ -5,6 +5,7 @@
 
 pub mod clone;
 pub mod clone_tree;
+pub mod data;
 pub mod native_validate;
 pub mod remove;
 pub mod render;
