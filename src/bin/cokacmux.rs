@@ -1,4 +1,4 @@
-//! cokacmux — TUI session browser for Claude Code / Codex / OpenCode.
+//! cokacmux — TUI session browser for local coding agents.
 //!
 //! Layout:
 //!   ┌────────────────────────────┬─────────────────────────────┐
@@ -6315,7 +6315,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     println!(
-        "cokacmux — TUI session browser for Claude Code / Codex / OpenCode\n\n\
+        "cokacmux — TUI session browser for local coding agents\n\n\
          USAGE:\n  cokacmux              launch interactive TUI\n  \
          cokacmux --debug      launch with debug logs enabled\n  \
          cokacmux --trace      launch with high-volume trace logs enabled\n  \
@@ -9472,7 +9472,7 @@ fn agent_runtime_dir() -> Result<PathBuf> {
 /// Scan `~/.cokacmux/agents/` for live daemons that are not in the provider
 /// session list: shell panes and fresh coding-agent panes. They are marked by
 /// a synthetic `source` value in the meta JSON, so the agents sidebar can list
-/// and switch to them alongside stored Claude/Codex/OpenCode sessions.
+/// and switch to them alongside stored provider sessions.
 fn discover_live_shell_infos() -> Vec<SessionInfo> {
     let Ok(dir) = agent_runtime_dir() else {
         trace_log(
