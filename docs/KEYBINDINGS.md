@@ -15,8 +15,8 @@ cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다
     "quit": ["q", "ctrl+q"]
   },
   "agent": {
-    "scroll_page_up": ["shift+up", "alt+k"],
-    "scroll_page_down": ["shift+down", "alt+j"],
+    "scroll_page_up": ["shift+alt+up", "shift+alt+pageup"],
+    "scroll_page_down": ["shift+alt+down", "shift+alt+pagedown"],
     "switch_prev": ["ctrl+,"],
     "switch_next": ["ctrl+."]
   },
@@ -38,6 +38,8 @@ cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다
 
 액션을 설정하면 기본값에 추가되는 것이 아니라 그 액션의 기본 단축키 전체를 대체합니다. 예를 들어 `"sessions.quit": ["ctrl+q"]`만 쓰면 `q` 종료는 꺼지고 `ctrl+q`만 남습니다.
 
+구버전에서 자동 생성된 `agent.scroll_page_up` / `agent.scroll_page_down` 값은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+
 점 표기(flat)도 사용할 수 있습니다.
 
 ```json
@@ -54,7 +56,7 @@ cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다
 ```text
 ctrl+q
 alt+up
-shift+pageup
+shift+alt+up
 ctrl+shift+left
 ```
 
@@ -179,8 +181,8 @@ G
 | `agent.toggle_sidebar` | `ctrl+b` | agents 사이드바 표시/숨김 |
 | `agent.scroll_line_up` | `shift+up` | PTY scrollback 한 줄 위 |
 | `agent.scroll_line_down` | `shift+down` | PTY scrollback 한 줄 아래 |
-| `agent.scroll_page_up` | `shift+pageup`, `alt+pageup` | PTY scrollback 한 페이지 위 |
-| `agent.scroll_page_down` | `shift+pagedown`, `alt+pagedown` | PTY scrollback 한 페이지 아래 |
+| `agent.scroll_page_up` | `shift+alt+up`, `shift+alt+pageup` | PTY scrollback 한 페이지 위 |
+| `agent.scroll_page_down` | `shift+alt+down`, `shift+alt+pagedown` | PTY scrollback 한 페이지 아래 |
 | `agent.scroll_top` | `shift+home`, `alt+home` | PTY scrollback 맨 위 |
 | `agent.scroll_bottom` | `shift+end`, `alt+end` | PTY scrollback 맨 아래 |
 | `agent.resize_left` | `alt+left`, `ctrl+shift+left` | agents 사이드바 좁히기 |
@@ -231,7 +233,7 @@ G
 
 ### agent_launch
 
-`sessions.launch_agent`로 열리는 launch mode 선택 모달에서 쓰는 액션입니다.
+`sessions.launch_agent`가 아직 실행 중이 아닌 세션에 대해 여는 launch mode 선택 모달에서 쓰는 액션입니다. 선택 세션의 agent가 이미 살아 있으면 이 모달을 거치지 않고 바로 switch/attach 합니다.
 
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
@@ -282,5 +284,7 @@ clone target 선택 모달에서 쓰는 액션입니다.
 | `fn+down` | `pagedown` |
 | `fn+left` | `home` |
 | `fn+right` | `end` |
+
+에이전트 page scroll 기본값은 전용 Page 키가 없어도 쓸 수 있도록 `shift+alt+up/down`을 먼저 제공합니다. 외장 키보드나 `fn+up/down`을 선호하는 환경에서는 `shift+alt+pageup/pagedown`도 같은 동작입니다.
 
 터미널이나 macOS 단축키 설정에 따라 `ctrl+fn+up/down` 같은 조합이 앱까지 전달되지 않을 수 있습니다. 그런 경우 `agent.switch_prev`, `agent.switch_next`, `agent.scroll_page_up`, `agent.scroll_page_down`을 다른 키로 지정하세요.

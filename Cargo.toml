@@ -1,6 +1,6 @@
 [package]
 name = "cokacmux"
-version = "0.2.12"
+version = "0.2.14"
 edition = "2021"
 authors = ["cokac <monogatree@gmail.com>"]
 description = "TUI multiplexer for Claude Code, Codex, and OpenCode agent sessions."
