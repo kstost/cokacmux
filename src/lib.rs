@@ -1,7 +1,7 @@
 //! cokacmux — bidirectional converter for coding-agent session data.
 //!
-//! Three providers (Claude Code, Codex, OpenCode) write their session data
-//! to disk in three very different shapes:
+//! Supported coding-agent providers write their session data to disk in
+//! very different shapes. The currently implemented adapters include:
 //!
 //! - **Claude**: JSONL per session under `~/.claude/projects/<encoded-cwd>/`
 //!   with sidecar `tool-results/` directory for overflow.
@@ -11,7 +11,7 @@
 //!   with `session`, `message`, and `part` tables.
 //!
 //! This crate defines [`UniversalSession`] — a provider-agnostic data model
-//! that can hold any of the three shapes without loss — and provides
+//! that can hold supported provider data without loss — and provides
 //! `from_X` / `to_X` adapter pairs for each provider. Any X → Y conversion
 //! is the composition `from_X → to_Y`.
 //!
