@@ -448,6 +448,8 @@ enum KeyAction {
     NewSessionPrev,
     NewSessionChoiceNext,
     NewSessionChoicePrev,
+    NewSessionMoveLeft,
+    NewSessionMoveRight,
     NewSessionBackspace,
     NewSessionDelete,
     NewSessionHome,
@@ -698,6 +700,16 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
         "new_session.choice_prev",
         KeyAction::NewSessionChoicePrev,
         &["left", "h"],
+    ),
+    (
+        "new_session.move_left",
+        KeyAction::NewSessionMoveLeft,
+        &["left"],
+    ),
+    (
+        "new_session.move_right",
+        KeyAction::NewSessionMoveRight,
+        &["right"],
     ),
     (
         "new_session.backspace",
@@ -10704,10 +10716,10 @@ fn handle_new_session_key(
             } else if keybindings.matches(KeyAction::NewSessionEnd, key) {
                 *cwd_cursor = cwd.len();
                 debug_log_key_event(key, "new_session_cwd_end");
-            } else if key.code == KeyCode::Left {
+            } else if keybindings.matches(KeyAction::NewSessionMoveLeft, key) {
                 *cwd_cursor = prev_char_boundary(cwd, *cwd_cursor);
                 debug_log_key_event(key, "new_session_cwd_left");
-            } else if key.code == KeyCode::Right {
+            } else if keybindings.matches(KeyAction::NewSessionMoveRight, key) {
                 *cwd_cursor = next_char_boundary(cwd, *cwd_cursor);
                 debug_log_key_event(key, "new_session_cwd_right");
             } else if let KeyCode::Char(c) = key.code {
@@ -12933,7 +12945,7 @@ fn agent_launch_help_text(keybindings: &KeyBindings) -> String {
 
 fn new_session_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} start · {} field · {} change · {} cancel",
+        "{} start · {} field · {} change · {} cursor · {} cancel",
         keybindings.help(KeyAction::NewSessionConfirm, "Enter"),
         keybindings.help_pair(
             KeyAction::NewSessionPrev,
@@ -12944,6 +12956,12 @@ fn new_session_help_text(keybindings: &KeyBindings) -> String {
         keybindings.help_pair(
             KeyAction::NewSessionChoicePrev,
             KeyAction::NewSessionChoiceNext,
+            "Left",
+            "Right",
+        ),
+        keybindings.help_pair(
+            KeyAction::NewSessionMoveLeft,
+            KeyAction::NewSessionMoveRight,
             "Left",
             "Right",
         ),
@@ -14971,6 +14989,62 @@ mod tests {
                 assert_eq!(cwd, "/repojkhl ");
                 assert_eq!(*cwd_cursor, "/repojkhl ".len());
             }
+            other => panic!("expected new session mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn custom_new_session_cwd_cursor_keys_are_used_by_handler() {
+        let mut app = app_for_key_tests();
+        app.keybindings.apply_json(&serde_json::json!({
+            "new_session": {
+                "move_left": ["ctrl+b"],
+                "move_right": ["ctrl+f"]
+            }
+        }));
+        app.input_mode = InputMode::NewSession {
+            selected: NEW_SESSION_FIELD_CWD,
+            kind: NewSessionKind::Terminal,
+            cwd: "/repo".into(),
+            cwd_cursor: "/repo".len(),
+            provider: Provider::Codex,
+            provider_options: Vec::new(),
+            launch_mode: AgentLaunchMode::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        match &app.input_mode {
+            InputMode::NewSession { cwd_cursor, .. } => assert_eq!(*cwd_cursor, "/repo".len()),
+            other => panic!("expected new session mode, got {:?}", other),
+        }
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+        match &app.input_mode {
+            InputMode::NewSession { cwd_cursor, .. } => assert_eq!(*cwd_cursor, "/repo".len() - 1),
+            other => panic!("expected new session mode, got {:?}", other),
+        }
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+        match &app.input_mode {
+            InputMode::NewSession { cwd_cursor, .. } => assert_eq!(*cwd_cursor, "/repo".len()),
             other => panic!("expected new session mode, got {:?}", other),
         }
     }

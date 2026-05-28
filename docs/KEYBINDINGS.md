@@ -256,12 +256,14 @@ G
 | `new_session.prev` | `up`, `k`, `backtab` | 이전 입력 항목 |
 | `new_session.choice_next` | `right`, `l`, `space` | Type / Agent / Permissions 다음 값 |
 | `new_session.choice_prev` | `left`, `h` | Type / Agent / Permissions 이전 값 |
+| `new_session.move_left` | `left` | 폴더 경로 커서 왼쪽 이동 |
+| `new_session.move_right` | `right` | 폴더 경로 커서 오른쪽 이동 |
 | `new_session.backspace` | `backspace` | 폴더 경로에서 커서 앞 글자 삭제 |
 | `new_session.delete` | `delete` | 폴더 경로에서 커서 위치 글자 삭제 |
 | `new_session.home` | `home` | 폴더 경로 커서 처음으로 |
 | `new_session.end` | `end` | 폴더 경로 커서 끝으로 |
 
-폴더 경로 입력 항목에서는 일반 문자 키가 경로 입력으로 우선 처리됩니다. 그래서 기본값에 `j`, `k`, `h`, `l`, `space`가 포함되어 있어도 경로 입력 중에는 문자로 들어갑니다. 입력 항목을 이동하려면 화살표, `tab`, `backtab`을 쓰면 됩니다.
+폴더 경로 입력 항목에서는 일반 문자 키가 경로 입력으로 우선 처리됩니다. 그래서 기본값에 `j`, `k`, `h`, `l`, `space`가 포함되어 있어도 경로 입력 중에는 문자로 들어갑니다. 입력 항목을 이동하려면 `up`, `down`, `tab`, `backtab`을 쓰면 됩니다.
 
 ### clone_target
 
