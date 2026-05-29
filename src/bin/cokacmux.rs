@@ -101,6 +101,57 @@ const PREVIOUS_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+pageup"];
 const PREVIOUS_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+pagedown"];
 const LEGACY_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+pageup", "alt+pageup"];
 const LEGACY_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+pagedown", "alt+pagedown"];
+const CODEX_TRANSCRIPT_OPEN_BINDINGS: &[&str] = &[
+    "ctrl-t",
+    "shift-up",
+    "shift-down",
+    "alt-shift-up",
+    "alt-shift-down",
+    "alt-shift-page-up",
+    "alt-shift-page-down",
+    "shift-home",
+    "shift-end",
+    "alt-home",
+    "alt-end",
+];
+const CODEX_PAGER_SCROLL_UP_BINDINGS: &[&str] = &["up", "k", "shift-up"];
+const CODEX_PAGER_SCROLL_DOWN_BINDINGS: &[&str] = &["down", "j", "shift-down"];
+const CODEX_PAGER_PAGE_UP_BINDINGS: &[&str] = &[
+    "page-up",
+    "shift-space",
+    "ctrl-b",
+    "alt-shift-up",
+    "alt-shift-page-up",
+];
+const CODEX_PAGER_PAGE_DOWN_BINDINGS: &[&str] = &[
+    "page-down",
+    "space",
+    "ctrl-f",
+    "alt-shift-down",
+    "alt-shift-page-down",
+];
+const CODEX_PAGER_JUMP_TOP_BINDINGS: &[&str] = &["home", "shift-home", "alt-home"];
+const CODEX_PAGER_JUMP_BOTTOM_BINDINGS: &[&str] = &["end", "shift-end", "alt-end"];
+const CODEX_SCROLL_KEYMAP_OVERRIDES: &[(&str, &[&str])] = &[
+    (
+        "tui.keymap.global.open_transcript",
+        CODEX_TRANSCRIPT_OPEN_BINDINGS,
+    ),
+    ("tui.keymap.pager.scroll_up", CODEX_PAGER_SCROLL_UP_BINDINGS),
+    (
+        "tui.keymap.pager.scroll_down",
+        CODEX_PAGER_SCROLL_DOWN_BINDINGS,
+    ),
+    ("tui.keymap.pager.page_up", CODEX_PAGER_PAGE_UP_BINDINGS),
+    ("tui.keymap.pager.page_down", CODEX_PAGER_PAGE_DOWN_BINDINGS),
+    ("tui.keymap.pager.jump_top", CODEX_PAGER_JUMP_TOP_BINDINGS),
+    (
+        "tui.keymap.pager.jump_bottom",
+        CODEX_PAGER_JUMP_BOTTOM_BINDINGS,
+    ),
+];
+const CLAUDE_CODE_NO_FLICKER_ENV: &str = "CLAUDE_CODE_NO_FLICKER";
+const CLAUDE_CODE_NO_FLICKER_VALUE: &str = "1";
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
@@ -2795,10 +2846,8 @@ fn trim_visible_screen_suffix_duplicates(
 ) -> usize {
     let mut removed = trim_suffix_matching_page(scrollback_lines, visible_lines);
     if removed == 0 {
-        removed = trim_suffix_matching_page(
-            scrollback_lines,
-            trim_trailing_blank_lines(visible_lines),
-        );
+        removed =
+            trim_suffix_matching_page(scrollback_lines, trim_trailing_blank_lines(visible_lines));
     }
     removed
 }
@@ -2810,7 +2859,10 @@ fn trim_suffix_matching_page(scrollback_lines: &mut Vec<String>, page: &[String]
 
     let mut removed = 0usize;
     while scrollback_lines.len() >= page.len()
-        && normalized_lines_equal(&scrollback_lines[scrollback_lines.len() - page.len()..], page)
+        && normalized_lines_equal(
+            &scrollback_lines[scrollback_lines.len() - page.len()..],
+            page,
+        )
     {
         let next_len = scrollback_lines.len() - page.len();
         scrollback_lines.truncate(next_len);
@@ -2840,10 +2892,7 @@ fn normalized_suffix_prefix_overlap(previous: &[String], next: &[String]) -> usi
     (1..=max_overlap)
         .rev()
         .find(|overlap| {
-            normalized_lines_equal(
-                &previous[previous.len() - overlap..],
-                &next[..*overlap],
-            )
+            normalized_lines_equal(&previous[previous.len() - overlap..], &next[..*overlap])
         })
         .unwrap_or(0)
 }
@@ -4084,7 +4133,11 @@ impl App {
         agent_sidebar_width(total_width, self.agent_sidebar_config_width())
     }
 
-    fn sync_active_agent_viewport(&mut self, total_width: u16, terminal_rows: u16) -> AgentViewport {
+    fn sync_active_agent_viewport(
+        &mut self,
+        total_width: u16,
+        terminal_rows: u16,
+    ) -> AgentViewport {
         let viewport = agent_viewport_for_terminal(
             total_width,
             terminal_rows,
@@ -4625,12 +4678,10 @@ impl App {
             .as_ref()
             .map(|stats| format!(" · {}", copy_stats_summary(stats)))
             .unwrap_or_default();
-        let percent = copy_percent_summary(
-            task.progress_stats.as_ref(),
-            task.progress_total.as_ref(),
-        )
-        .map(|percent| format!(" · {percent}"))
-        .unwrap_or_default();
+        let percent =
+            copy_percent_summary(task.progress_stats.as_ref(), task.progress_total.as_ref())
+                .map(|percent| format!(" · {percent}"))
+                .unwrap_or_default();
         let cancel = if task.cancel_requested {
             " · cancelling"
         } else {
@@ -6116,7 +6167,11 @@ impl App {
             info.provider.as_str(),
             truncate_width(&info.session_id, 14)
         );
-        self.data_task = Some(DataTaskPending::new(seq, DataTaskKind::Restore, label.clone()));
+        self.data_task = Some(DataTaskPending::new(
+            seq,
+            DataTaskKind::Restore,
+            label.clone(),
+        ));
         self.status = label;
         debug_log(
             "attach_data_restore_worker_start",
@@ -6963,12 +7018,17 @@ impl App {
         let overlay_before = agent.codex_transcript_overlay_assumed_open;
         let mut delegated_keys = Vec::new();
         let strategy = if provider == Provider::Codex {
-            if let Some(scroll_key) = codex_transcript_scroll_key(action) {
-                if !overlay_before {
-                    delegated_keys.push(codex_transcript_open_key());
-                }
+            if let Some(keys) = codex_child_scroll_delegated_keys(action, key, overlay_before) {
+                delegated_keys = keys;
+                "codex_keymap_transcript_overlay"
+            } else {
+                delegated_keys.push(key);
+                "forward_original"
+            }
+        } else if provider == Provider::Claude {
+            if let Some(scroll_key) = claude_child_scroll_key(action) {
                 delegated_keys.push(scroll_key);
-                "codex_transcript_overlay"
+                "claude_fullscreen_scroll"
             } else {
                 delegated_keys.push(key);
                 "forward_original"
@@ -6986,7 +7046,7 @@ impl App {
         for delegated_key in delegated_keys {
             agent.send_key(delegated_key);
         }
-        if strategy == "codex_transcript_overlay" {
+        if strategy == "codex_keymap_transcript_overlay" {
             agent.codex_transcript_overlay_assumed_open = true;
         } else {
             let overlay_after = codex_transcript_overlay_state_after_forwarded_key(agent, key);
@@ -6997,11 +7057,13 @@ impl App {
                 "Codex transcript: delegated {}.",
                 child_scroll_action_label(action)
             )
-        } else {
+        } else if provider == Provider::Claude && strategy == "claude_fullscreen_scroll" {
             format!(
-                "{} scroll key forwarded to child.",
-                provider.as_str()
+                "Claude fullscreen: delegated {}.",
+                child_scroll_action_label(action)
             )
+        } else {
+            format!("{} scroll key forwarded to child.", provider.as_str())
         };
         debug_log(
             "agent_child_scroll_delegated",
@@ -12508,6 +12570,47 @@ fn default_agent_program(provider: Provider) -> &'static str {
     }
 }
 
+fn codex_keybinding_array_toml(bindings: &[&str]) -> String {
+    let mut value = String::from("[");
+    for (idx, binding) in bindings.iter().enumerate() {
+        if idx > 0 {
+            value.push(',');
+        }
+        value.push('"');
+        for c in binding.chars() {
+            match c {
+                '\\' => value.push_str("\\\\"),
+                '"' => value.push_str("\\\""),
+                other => value.push(other),
+            }
+        }
+        value.push('"');
+    }
+    value.push(']');
+    value
+}
+
+fn append_codex_scroll_keymap_overrides(args: &mut Vec<String>) {
+    for (path, bindings) in CODEX_SCROLL_KEYMAP_OVERRIDES {
+        args.push("-c".to_string());
+        args.push(format!("{path}={}", codex_keybinding_array_toml(bindings)));
+    }
+}
+
+fn claude_fullscreen_scroll_env() -> Vec<(String, String)> {
+    vec![(
+        CLAUDE_CODE_NO_FLICKER_ENV.to_string(),
+        CLAUDE_CODE_NO_FLICKER_VALUE.to_string(),
+    )]
+}
+
+#[cfg(test)]
+fn codex_scroll_keymap_cli_args() -> Vec<String> {
+    let mut args = Vec::new();
+    append_codex_scroll_keymap_overrides(&mut args);
+    args
+}
+
 fn new_agent_launch_spec_with_programs(
     info: &SessionInfo,
     launch_mode: AgentLaunchMode,
@@ -12524,6 +12627,7 @@ fn new_agent_launch_spec_with_programs(
             if launch_mode == AgentLaunchMode::SkipPermissions {
                 args.push("--yolo".to_string());
             }
+            append_codex_scroll_keymap_overrides(&mut args);
             if let Some(path) = &cwd {
                 args.push("-C".to_string());
                 args.push(path.display().to_string());
@@ -12543,7 +12647,7 @@ fn new_agent_launch_spec_with_programs(
             AgentLaunchSpec {
                 program: agent_programs.program_for(Provider::Claude),
                 args,
-                env: Vec::new(),
+                env: claude_fullscreen_scroll_env(),
                 cwd,
             }
         }
@@ -12599,6 +12703,7 @@ fn agent_launch_spec_with_programs(
             if launch_mode == AgentLaunchMode::SkipPermissions {
                 args.push("--yolo".to_string());
             }
+            append_codex_scroll_keymap_overrides(&mut args);
             args.push("resume".to_string());
             if let Some(path) = &cwd {
                 args.push("-C".to_string());
@@ -12622,7 +12727,7 @@ fn agent_launch_spec_with_programs(
             AgentLaunchSpec {
                 program: agent_programs.program_for(Provider::Claude),
                 args,
-                env: Vec::new(),
+                env: claude_fullscreen_scroll_env(),
                 cwd,
             }
         }
@@ -12843,13 +12948,7 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
             terminal_rows,
             app.agent_sidebar_config_width(),
         );
-        handle_new_session_key(
-            app,
-            key,
-            viewport.pty_cols,
-            viewport.pty_rows,
-            &keybindings,
-        );
+        handle_new_session_key(app, key, viewport.pty_cols, viewport.pty_rows, &keybindings);
         return;
     }
     if keybindings.matches(KeyAction::AgentToggleSessions, key) {
@@ -13005,10 +13104,6 @@ fn child_scroll_action_label(action: AgentScrollAction) -> &'static str {
     }
 }
 
-fn codex_transcript_open_key() -> KeyEvent {
-    KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
-}
-
 fn codex_transcript_scroll_key(action: AgentScrollAction) -> Option<KeyEvent> {
     let code = match action {
         AgentScrollAction::Lines(delta) if delta > 0 => KeyCode::Up,
@@ -13022,10 +13117,31 @@ fn codex_transcript_scroll_key(action: AgentScrollAction) -> Option<KeyEvent> {
     Some(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
-fn codex_transcript_overlay_state_after_forwarded_key(
-    agent: &AgentClient,
-    key: KeyEvent,
-) -> bool {
+fn codex_child_scroll_delegated_keys(
+    action: AgentScrollAction,
+    original: KeyEvent,
+    overlay_assumed_open: bool,
+) -> Option<Vec<KeyEvent>> {
+    codex_transcript_scroll_key(action)?;
+    let mut keys = vec![original];
+    if !overlay_assumed_open {
+        keys.push(original);
+    }
+    Some(keys)
+}
+
+fn claude_child_scroll_key(action: AgentScrollAction) -> Option<KeyEvent> {
+    let (code, modifiers) = match action {
+        AgentScrollAction::Pages(delta) if delta > 0 => (KeyCode::PageUp, KeyModifiers::NONE),
+        AgentScrollAction::Pages(delta) if delta < 0 => (KeyCode::PageDown, KeyModifiers::NONE),
+        AgentScrollAction::Top => (KeyCode::Home, KeyModifiers::CONTROL),
+        AgentScrollAction::Bottom => (KeyCode::End, KeyModifiers::CONTROL),
+        AgentScrollAction::Lines(_) | AgentScrollAction::Pages(_) => return None,
+    };
+    Some(KeyEvent::new(code, modifiers))
+}
+
+fn codex_transcript_overlay_state_after_forwarded_key(agent: &AgentClient, key: KeyEvent) -> bool {
     codex_transcript_overlay_state_after_key(
         agent.info.provider,
         agent.codex_transcript_overlay_assumed_open,
@@ -13038,7 +13154,8 @@ fn codex_transcript_overlay_state_after_key(
     current_open: bool,
     key: KeyEvent,
 ) -> bool {
-    if provider != Provider::Codex || !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+    if provider != Provider::Codex
+        || !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
     {
         return current_open;
     }
@@ -13324,38 +13441,38 @@ fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
                 _ => return None,
             };
             bytes.push(code);
-        },
+        }
         KeyCode::Char(c) => {
             if alt {
                 bytes.push(0x1b);
             }
             let mut buf = [0; 4];
             bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        },
+        }
         KeyCode::Enter => {
             if alt {
                 bytes.push(0x1b);
             }
             bytes.push(b'\r');
-        },
+        }
         KeyCode::Tab => {
             if alt {
                 bytes.push(0x1b);
             }
             bytes.push(b'\t');
-        },
+        }
         KeyCode::Backspace => {
             if alt {
                 bytes.push(0x1b);
             }
             bytes.push(0x7f);
-        },
+        }
         KeyCode::Esc => {
             if alt {
                 bytes.push(0x1b);
             }
             bytes.push(0x1b);
-        },
+        }
         KeyCode::Up => bytes.extend_from_slice(&modified_csi_final(b'A', key.modifiers)),
         KeyCode::Down => bytes.extend_from_slice(&modified_csi_final(b'B', key.modifiers)),
         KeyCode::Right => bytes.extend_from_slice(&modified_csi_final(b'C', key.modifiers)),
@@ -13385,7 +13502,7 @@ fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
                 12 => bytes.extend_from_slice(b"\x1b[24~"),
                 _ => return None,
             }
-        },
+        }
         _ => return None,
     }
 
@@ -13471,7 +13588,11 @@ fn copy_percent_summary(
     } else {
         return Some("100%".to_string());
     };
-    let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0).min(100);
+    let percent = done
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(100);
     Some(format!("{percent}%"))
 }
 
@@ -13700,7 +13821,11 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
-    if let Some(task) = app.data_task.as_ref().filter(|task| task.kind == DataTaskKind::Clone) {
+    if let Some(task) = app
+        .data_task
+        .as_ref()
+        .filter(|task| task.kind == DataTaskKind::Clone)
+    {
         draw_data_task_modal(f, area, task);
     } else if let InputMode::Confirm { prompt, action } = &app.input_mode {
         draw_confirm_modal(f, area, prompt, action);
@@ -16431,6 +16556,19 @@ mod tests {
         agent_launch_spec_with_programs(info, launch_mode, &AgentProgramSettings::default())
     }
 
+    fn codex_args_with(trailing: &[&str]) -> Vec<String> {
+        let mut args = codex_scroll_keymap_cli_args();
+        args.extend(trailing.iter().map(|arg| (*arg).to_string()));
+        args
+    }
+
+    fn codex_skip_args_with(trailing: &[&str]) -> Vec<String> {
+        let mut args = vec!["--yolo".to_string()];
+        args.extend(codex_scroll_keymap_cli_args());
+        args.extend(trailing.iter().map(|arg| (*arg).to_string()));
+        args
+    }
+
     fn app_for_key_tests() -> App {
         let (preview_tx, _preview_request_rx) = mpsc::channel::<PreviewRequest>();
         let (_preview_result_tx, preview_rx) = mpsc::channel::<PreviewResult>();
@@ -18863,7 +19001,10 @@ mod tests {
             AgentLaunchMode::Normal,
         );
         assert_eq!(codex.program, "codex");
-        assert_eq!(codex.args, vec!["resume", "-C", "/repo", "codex-id"]);
+        assert_eq!(
+            codex.args,
+            codex_args_with(&["resume", "-C", "/repo", "codex-id"])
+        );
         assert!(codex.env.is_empty());
 
         let claude = default_agent_launch_spec(
@@ -18872,7 +19013,7 @@ mod tests {
         );
         assert_eq!(claude.program, "claude");
         assert_eq!(claude.args, vec!["--resume", "claude-id"]);
-        assert!(claude.env.is_empty());
+        assert_eq!(claude.env, claude_fullscreen_scroll_env());
         assert_eq!(claude.cwd, Some(PathBuf::from("/repo")));
 
         let opencode = default_agent_launch_spec(
@@ -18899,7 +19040,10 @@ mod tests {
             &agent_programs,
         );
         assert_eq!(codex.program, "/custom/bin/codex");
-        assert_eq!(codex.args, vec!["resume", "-C", "/repo", "codex-id"]);
+        assert_eq!(
+            codex.args,
+            codex_args_with(&["resume", "-C", "/repo", "codex-id"])
+        );
 
         let claude = agent_launch_spec_with_programs(
             &session_info(Provider::Claude, "claude-id", "/repo"),
@@ -18908,6 +19052,7 @@ mod tests {
         );
         assert_eq!(claude.program, "/custom/bin/claude");
         assert_eq!(claude.args, vec!["--resume", "claude-id"]);
+        assert_eq!(claude.env, claude_fullscreen_scroll_env());
 
         let opencode = agent_launch_spec_with_programs(
             &session_info(Provider::OpenCode, "opencode-id", "/repo"),
@@ -18923,7 +19068,7 @@ mod tests {
             &agent_programs,
         );
         assert_eq!(fresh_codex.program, "/custom/bin/codex");
-        assert_eq!(fresh_codex.args, vec!["--yolo", "-C", "/repo"]);
+        assert_eq!(fresh_codex.args, codex_skip_args_with(&["-C", "/repo"]));
     }
 
     #[test]
@@ -18971,7 +19116,7 @@ mod tests {
         );
         assert_eq!(
             codex.args,
-            vec!["--yolo", "resume", "-C", "/repo", "codex-id"]
+            codex_skip_args_with(&["resume", "-C", "/repo", "codex-id"])
         );
         assert!(codex.env.is_empty());
 
@@ -18983,7 +19128,7 @@ mod tests {
             claude.args,
             vec!["--dangerously-skip-permissions", "--resume", "claude-id"]
         );
-        assert!(claude.env.is_empty());
+        assert_eq!(claude.env, claude_fullscreen_scroll_env());
 
         let opencode = default_agent_launch_spec(
             &session_info(Provider::OpenCode, "opencode-id", "/repo"),
@@ -19003,7 +19148,7 @@ mod tests {
             AgentLaunchMode::Normal,
         );
         assert_eq!(codex.program, "codex");
-        assert_eq!(codex.args, vec!["-C", "/repo"]);
+        assert_eq!(codex.args, codex_args_with(&["-C", "/repo"]));
         assert!(codex.env.is_empty());
         assert_eq!(codex.cwd, Some(PathBuf::from("/repo")));
 
@@ -19011,7 +19156,7 @@ mod tests {
             &new_agent_info(Provider::Codex, "/repo"),
             AgentLaunchMode::SkipPermissions,
         );
-        assert_eq!(codex_skip.args, vec!["--yolo", "-C", "/repo"]);
+        assert_eq!(codex_skip.args, codex_skip_args_with(&["-C", "/repo"]));
 
         let claude = default_agent_launch_spec(
             &new_agent_info(Provider::Claude, "/repo"),
@@ -19019,6 +19164,7 @@ mod tests {
         );
         assert_eq!(claude.program, "claude");
         assert!(claude.args.is_empty());
+        assert_eq!(claude.env, claude_fullscreen_scroll_env());
         assert_eq!(claude.cwd, Some(PathBuf::from("/repo")));
 
         let claude_skip = default_agent_launch_spec(
@@ -19026,6 +19172,7 @@ mod tests {
             AgentLaunchMode::SkipPermissions,
         );
         assert_eq!(claude_skip.args, vec!["--dangerously-skip-permissions"]);
+        assert_eq!(claude_skip.env, claude_fullscreen_scroll_env());
 
         let opencode = default_agent_launch_spec(
             &new_agent_info(Provider::OpenCode, "/repo"),
@@ -19378,7 +19525,22 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn codex_child_scroll_uses_transcript_pager_keys() {
+    fn codex_child_scroll_uses_child_keymap_without_ctrl_t_toggle() {
+        let original = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT | KeyModifiers::ALT);
+
+        assert_eq!(
+            codex_child_scroll_delegated_keys(AgentScrollAction::Pages(1), original, false),
+            Some(vec![original, original])
+        );
+        assert_eq!(
+            codex_child_scroll_delegated_keys(AgentScrollAction::Pages(1), original, true),
+            Some(vec![original])
+        );
+        assert_eq!(
+            codex_child_scroll_delegated_keys(AgentScrollAction::Lines(0), original, false),
+            None
+        );
+
         assert_eq!(
             codex_transcript_scroll_key(AgentScrollAction::Lines(1)).map(|key| key.code),
             Some(KeyCode::Up)
@@ -19403,6 +19565,46 @@ IF EXIST "%~dp0\node.exe" (
             codex_transcript_scroll_key(AgentScrollAction::Bottom).map(|key| key.code),
             Some(KeyCode::End)
         );
+    }
+
+    #[test]
+    fn codex_launch_args_install_scroll_keymap_overrides() {
+        let args = codex_scroll_keymap_cli_args();
+        assert_eq!(args.len(), CODEX_SCROLL_KEYMAP_OVERRIDES.len() * 2);
+        assert!(args.chunks_exact(2).all(|chunk| chunk[0] == "-c"));
+        assert!(args.contains(&format!(
+            "tui.keymap.global.open_transcript={}",
+            codex_keybinding_array_toml(CODEX_TRANSCRIPT_OPEN_BINDINGS)
+        )));
+        assert!(args.contains(&format!(
+            "tui.keymap.pager.page_up={}",
+            codex_keybinding_array_toml(CODEX_PAGER_PAGE_UP_BINDINGS)
+        )));
+        assert!(args.contains(&format!(
+            "tui.keymap.pager.page_down={}",
+            codex_keybinding_array_toml(CODEX_PAGER_PAGE_DOWN_BINDINGS)
+        )));
+    }
+
+    #[test]
+    fn claude_child_scroll_uses_fullscreen_scroll_keys() {
+        assert_eq!(
+            claude_child_scroll_key(AgentScrollAction::Pages(1)).map(|key| key.code),
+            Some(KeyCode::PageUp)
+        );
+        assert_eq!(
+            claude_child_scroll_key(AgentScrollAction::Pages(-1)).map(|key| key.code),
+            Some(KeyCode::PageDown)
+        );
+        assert_eq!(
+            claude_child_scroll_key(AgentScrollAction::Top).map(|key| key.modifiers),
+            Some(KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            claude_child_scroll_key(AgentScrollAction::Bottom).map(|key| key.modifiers),
+            Some(KeyModifiers::CONTROL)
+        );
+        assert_eq!(claude_child_scroll_key(AgentScrollAction::Lines(1)), None);
     }
 
     #[test]
