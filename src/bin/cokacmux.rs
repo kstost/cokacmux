@@ -7033,6 +7033,14 @@ impl App {
                 delegated_keys.push(key);
                 "forward_original"
             }
+        } else if provider == Provider::OpenCode {
+            if let Some(scroll_key) = opencode_child_scroll_key(action) {
+                delegated_keys.push(scroll_key);
+                "opencode_page_scroll"
+            } else {
+                delegated_keys.push(key);
+                "forward_original"
+            }
         } else {
             delegated_keys.push(key);
             "forward_original"
@@ -7060,6 +7068,11 @@ impl App {
         } else if provider == Provider::Claude && strategy == "claude_fullscreen_scroll" {
             format!(
                 "Claude fullscreen: delegated {}.",
+                child_scroll_action_label(action)
+            )
+        } else if provider == Provider::OpenCode && strategy == "opencode_page_scroll" {
+            format!(
+                "OpenCode: delegated {}.",
                 child_scroll_action_label(action)
             )
         } else {
@@ -13141,7 +13154,22 @@ fn claude_child_scroll_key(action: AgentScrollAction) -> Option<KeyEvent> {
     Some(KeyEvent::new(code, modifiers))
 }
 
-fn codex_transcript_overlay_state_after_forwarded_key(agent: &AgentClient, key: KeyEvent) -> bool {
+fn opencode_child_scroll_key(action: AgentScrollAction) -> Option<KeyEvent> {
+    let code = match action {
+        AgentScrollAction::Pages(delta) if delta > 0 => KeyCode::PageUp,
+        AgentScrollAction::Pages(delta) if delta < 0 => KeyCode::PageDown,
+        AgentScrollAction::Lines(_)
+        | AgentScrollAction::Pages(_)
+        | AgentScrollAction::Top
+        | AgentScrollAction::Bottom => return None,
+    };
+    Some(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn codex_transcript_overlay_state_after_forwarded_key(
+    agent: &AgentClient,
+    key: KeyEvent,
+) -> bool {
     codex_transcript_overlay_state_after_key(
         agent.info.provider,
         agent.codex_transcript_overlay_assumed_open,
@@ -19605,6 +19633,21 @@ IF EXIST "%~dp0\node.exe" (
             Some(KeyModifiers::CONTROL)
         );
         assert_eq!(claude_child_scroll_key(AgentScrollAction::Lines(1)), None);
+    }
+
+    #[test]
+    fn opencode_child_scroll_uses_page_keys() {
+        assert_eq!(
+            opencode_child_scroll_key(AgentScrollAction::Pages(1)).map(|key| key.code),
+            Some(KeyCode::PageUp)
+        );
+        assert_eq!(
+            opencode_child_scroll_key(AgentScrollAction::Pages(-1)).map(|key| key.code),
+            Some(KeyCode::PageDown)
+        );
+        assert_eq!(opencode_child_scroll_key(AgentScrollAction::Lines(1)), None);
+        assert_eq!(opencode_child_scroll_key(AgentScrollAction::Top), None);
+        assert_eq!(opencode_child_scroll_key(AgentScrollAction::Bottom), None);
     }
 
     #[test]
