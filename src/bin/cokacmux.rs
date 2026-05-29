@@ -3789,7 +3789,6 @@ impl AgentClient {
         self.parser.screen().scrollback()
     }
 
-    #[cfg(test)]
     fn scroll_screen(&mut self, action: AgentScrollAction, page_rows: usize) -> usize {
         let page_rows = page_rows.max(1);
         if parser_max_scrollback(&mut self.parser) == 0 {
@@ -3812,7 +3811,6 @@ impl AgentClient {
         self.set_scrollback_offset(next)
     }
 
-    #[cfg(test)]
     fn scroll_history_screen(&mut self, action: AgentScrollAction, page_rows: usize) -> usize {
         self.parser.screen_mut().set_scrollback(0);
         self.screen_hash = screen_activity_hash(self.parser.screen());
@@ -7010,10 +7008,43 @@ impl App {
         }
     }
 
-    fn delegate_active_agent_scroll_to_child(&mut self, action: AgentScrollAction, key: KeyEvent) {
+    fn delegate_active_agent_scroll_to_child(
+        &mut self,
+        action: AgentScrollAction,
+        key: KeyEvent,
+        page_rows: usize,
+    ) {
         let Some(agent) = self.active_agent.as_mut() else {
             return;
         };
+        if is_shell_session_info(&agent.info) {
+            let before = agent.scrollback_offset();
+            let render_source_before = agent_scroll_render_source(agent);
+            let after = agent.scroll_screen(action, page_rows);
+            let render_source_after = agent_scroll_render_source(agent);
+            self.status = format!("Terminal: scrolled {}.", child_scroll_action_label(action));
+            debug_log(
+                "agent_terminal_parent_scroll",
+                serde_json::json!({
+                    "provider": agent.info.provider.as_str(),
+                    "session_id": &agent.info.session_id,
+                    "action": format!("{:?}", action),
+                    "label": child_scroll_action_label(action),
+                    "strategy": "parent_shell_scrollback",
+                    "original_key": debug_key_event_value(key),
+                    "page_rows": page_rows,
+                    "scrollback_before": before,
+                    "scrollback_after": after,
+                    "render_source_before": render_source_before,
+                    "render_source_after": render_source_after,
+                    "parser_scrollback": agent.parser.screen().scrollback(),
+                    "history_scroll_offset": agent.history_scroll_offset,
+                    "screen_history_lines": agent.screen_history.len(),
+                    "status": &self.status,
+                }),
+            );
+            return;
+        }
         let provider = agent.info.provider;
         let overlay_before = agent.codex_transcript_overlay_assumed_open;
         let mut delegated_keys = Vec::new();
@@ -13028,7 +13059,7 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
                 })),
             }),
         );
-        app.delegate_active_agent_scroll_to_child(action, key);
+        app.delegate_active_agent_scroll_to_child(action, key, page_rows);
         return;
     }
     if let Some(delta) = agent_pane_resize_key(&keybindings, key) {
@@ -13096,7 +13127,6 @@ fn agent_scroll_render_source(agent: &AgentClient) -> &'static str {
     }
 }
 
-#[cfg(test)]
 fn apply_scrollback_delta(current: usize, delta: i32) -> usize {
     if delta >= 0 {
         current.saturating_add(delta as usize)
@@ -20149,6 +20179,59 @@ IF EXIST "%~dp0\node.exe" (
             "history render source should contain captured fullscreen frames: {:?}",
             lines
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_session_scroll_uses_parent_scrollback() {
+        let (stream, _peer) = AgentStream::pair().unwrap();
+        let pty_size = agent_pty_size(40, 6);
+        let mut parser = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
+        for line in 1..=18 {
+            let bytes = format!("SHELLLINE{:03}\r\n", line);
+            safe_parser_process(&mut parser, bytes.as_bytes());
+        }
+        assert!(
+            parser_max_scrollback(&mut parser) > 0,
+            "test setup should create normal terminal scrollback"
+        );
+
+        let mut app = app_for_key_tests();
+        let mut client = AgentClient {
+            info: shell_session_info_for_cwd("/repo".into()),
+            command_line: "test-shell".into(),
+            parser,
+            screen_history: ScreenHistory::default(),
+            history_scroll_offset: 0,
+            stream,
+            pty_size,
+            exited: Some("test".into()),
+            screen_hash: 0,
+            last_screen_change_epoch_ms: 0,
+            last_output_epoch_ms: 0,
+            last_input_epoch_ms: 0,
+            pending_snapshot_output: false,
+            startup_spinner_started_at: None,
+            debug_output_events: 0,
+            codex_transcript_overlay_assumed_open: false,
+            reader_id: 0,
+            reader_thread: None,
+        };
+        client.screen_hash = screen_activity_hash(client.parser.screen());
+        app.active_agent = Some(client);
+
+        app.delegate_active_agent_scroll_to_child(
+            AgentScrollAction::Pages(1),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT | KeyModifiers::ALT),
+            5,
+        );
+
+        let agent = app.active_agent.as_ref().unwrap();
+        assert!(
+            agent.scrollback_offset() > 0,
+            "terminal scroll should move parent scrollback instead of forwarding a child key"
+        );
+        assert!(app.status.starts_with("Terminal: scrolled page up."));
     }
 
     #[cfg(unix)]
