@@ -93,7 +93,7 @@ const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
 const AGENT_BUSY_GRACE_MS: u64 = 3_000;
 const AGENT_ACTIVITY_META_WRITE_INTERVAL_MS: u64 = 750;
 const DEBUG_LOG_FILE: &str = "cokacmux.log";
-const DEBUG_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const DEBUG_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const APP_DIR_NAME: &str = ".cokacmux";
 const AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+up", "shift+alt+pageup"];
 const AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+down", "shift+alt+pagedown"];
@@ -2026,16 +2026,68 @@ impl ScreenHistory {
             .into_iter()
             .map(|line| line.trim_end_matches(' ').to_string())
             .collect::<Vec<_>>();
+        self.capture_lines(lines);
+    }
+
+    fn capture_lines(&mut self, lines: Vec<String>) {
         if lines.is_empty() || lines.iter().all(|line| line.trim().is_empty()) {
             return;
         }
         if self.last_snapshot == lines {
             return;
         }
-        self.last_snapshot = lines.clone();
-        for line in lines {
-            self.lines.push_back(line);
+        if self.last_snapshot.is_empty() {
+            self.append_lines(&lines);
+            self.last_snapshot = lines;
+            self.truncate_to_limit();
+            return;
         }
+
+        let previous = std::mem::replace(&mut self.last_snapshot, lines.clone());
+        self.remove_snapshot_suffix(&previous);
+
+        let stable_prefix_threshold = previous.len().min(lines.len()).min(3);
+        let common_prefix = normalized_common_prefix_len(&previous, &lines);
+        if stable_prefix_threshold > 0 && common_prefix >= stable_prefix_threshold {
+            self.append_lines(&lines);
+            self.truncate_to_limit();
+            return;
+        }
+
+        let overlap = normalized_suffix_prefix_overlap(&previous, &lines);
+        if overlap == 0 {
+            self.append_lines(&previous);
+        } else {
+            let scrolled_off = previous.len().saturating_sub(overlap);
+            if scrolled_off > 0 {
+                self.append_lines(&previous[..scrolled_off]);
+            }
+        }
+
+        self.append_lines(&lines);
+        self.truncate_to_limit();
+    }
+
+    fn append_lines(&mut self, lines: &[String]) {
+        for line in lines {
+            self.lines.push_back(line.clone());
+        }
+    }
+
+    fn remove_snapshot_suffix(&mut self, snapshot: &[String]) {
+        if snapshot.is_empty() || self.lines.len() < snapshot.len() {
+            return;
+        }
+        let start = self.lines.len() - snapshot.len();
+        let suffix = self.lines.iter().skip(start).cloned().collect::<Vec<_>>();
+        if normalized_lines_equal(&suffix, snapshot) {
+            for _ in 0..snapshot.len() {
+                self.lines.pop_back();
+            }
+        }
+    }
+
+    fn truncate_to_limit(&mut self) {
         while self.lines.len() > AGENT_SCROLLBACK_LINES {
             self.lines.pop_front();
         }
@@ -2320,9 +2372,17 @@ impl AgentSession {
                 Err(_) => break,
             }
         }
-        if !chunks.is_empty() && self.debug_drain_logs < 20 {
+        if DEBUG_ENABLED.load(Ordering::Relaxed) && !chunks.is_empty() && self.debug_drain_logs < 20
+        {
             let total_bytes: usize = chunks.iter().map(Vec::len).sum();
+            let chunk_summaries = chunks
+                .iter()
+                .take(8)
+                .map(|chunk| debug_terminal_data_summary(chunk, 512))
+                .collect::<Vec<_>>();
             self.debug_drain_logs = self.debug_drain_logs.saturating_add(1);
+            let visible_rows = self.pty_size.rows as usize;
+            let state = debug_agent_session_state_value(self, visible_rows, visible_rows.min(120));
             debug_log(
                 "daemon_agent_output_drained",
                 serde_json::json!({
@@ -2331,12 +2391,14 @@ impl AgentSession {
                     "event": self.debug_drain_logs,
                     "chunk_count": chunks.len(),
                     "total_bytes": total_bytes,
+                    "chunk_summaries": chunk_summaries,
                     "screen_changed": activity_changed,
                     "screen_history_lines": self.screen_history.len(),
                     "visible": screen_has_visible_content(self.parser.screen()),
                     "last_screen_change_epoch_ms": self.last_screen_change_epoch_ms,
                     "last_output_epoch_ms": self.last_output_epoch_ms,
                     "preview": debug_screen_preview(self.parser.screen(), 5),
+                    "state": state,
                 }),
             );
         }
@@ -2406,10 +2468,33 @@ impl AgentSession {
         if self.pty_size.rows == next.rows && self.pty_size.cols == next.cols {
             return;
         }
+        let old_rows = self.pty_size.rows;
+        let old_cols = self.pty_size.cols;
+        let visible_rows = next.rows as usize;
+        let should_debug = DEBUG_ENABLED.load(Ordering::Relaxed);
+        let state_before = should_debug
+            .then(|| debug_agent_session_state_value(self, visible_rows, visible_rows.min(120)));
         let _ = self.master.resize(next);
         self.parser.screen_mut().set_size(next.rows, next.cols);
         self.screen_hash = screen_activity_hash(self.parser.screen());
         self.pty_size = next;
+        if should_debug {
+            let state_after =
+                debug_agent_session_state_value(self, visible_rows, visible_rows.min(120));
+            debug_log(
+                "daemon_agent_resize",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "old_rows": old_rows,
+                    "old_cols": old_cols,
+                    "new_rows": next.rows,
+                    "new_cols": next.cols,
+                    "state_before": state_before,
+                    "state_after": state_after,
+                }),
+            );
+        }
     }
 
     fn send_bytes(&mut self, bytes: &[u8]) {
@@ -2473,11 +2558,30 @@ impl AgentSession {
     }
 
     fn screen_snapshot_bytes(&mut self, include_scrollback: bool) -> Vec<u8> {
-        parser_snapshot_bytes_with_history(
+        let visible_rows = self.pty_size.rows as usize;
+        let should_debug = DEBUG_ENABLED.load(Ordering::Relaxed);
+        let before = should_debug
+            .then(|| debug_agent_session_state_value(self, visible_rows, visible_rows.min(120)));
+        let snapshot = parser_snapshot_bytes_with_history(
             &mut self.parser,
             include_scrollback,
             &self.screen_history,
-        )
+        );
+        if should_debug {
+            let after = debug_agent_session_state_value(self, visible_rows, visible_rows.min(120));
+            debug_log(
+                "daemon_screen_snapshot_generated",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "include_scrollback": include_scrollback,
+                    "snapshot": debug_terminal_data_summary(&snapshot, 1024),
+                    "before": before,
+                    "after": after,
+                }),
+            );
+        }
+        snapshot
     }
 }
 
@@ -2493,20 +2597,31 @@ fn parser_snapshot_bytes_with_history(
 ) -> Vec<u8> {
     let original_scrollback = parser.screen().scrollback();
     let mut bytes = Vec::new();
+    let mut replay_source = "disabled";
+    let mut replay_debug: Option<serde_json::Value> = None;
+    let mut visible_debug: Option<serde_json::Value> = None;
 
     if include_scrollback {
         let mut replay_lines = parser_scrollback_plain_lines(parser);
         let visible_lines = parser_visible_plain_lines(parser, 0);
-        let using_history_fallback = replay_lines.is_empty();
         if replay_lines.is_empty() {
+            replay_source = "screen_history";
             replay_lines = screen_history.lines_before_visible(&visible_lines);
         } else {
+            replay_source = "parser_scrollback";
             screen_history.trim_trailing_current_snapshot(&mut replay_lines, &visible_lines);
         }
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            replay_debug = Some(debug_lines_value(
+                &replay_lines,
+                replay_lines.len().min(120),
+            ));
+            visible_debug = Some(debug_lines_value(
+                &visible_lines,
+                visible_lines.len().min(120),
+            ));
+        }
         if !replay_lines.is_empty() {
-            if !using_history_fallback {
-                replay_lines.extend(visible_lines);
-            }
             append_plain_terminal_lines(&mut bytes, &replay_lines);
         }
     }
@@ -2517,6 +2632,20 @@ fn parser_snapshot_bytes_with_history(
     bytes.extend_from_slice(&screen.contents_formatted());
     bytes.extend_from_slice(&screen.cursor_state_formatted());
     parser.screen_mut().set_scrollback(original_scrollback);
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        debug_log(
+            "parser_snapshot_compose",
+            serde_json::json!({
+                "include_scrollback": include_scrollback,
+                "original_scrollback": original_scrollback,
+                "replay_source": replay_source,
+                "replay": replay_debug,
+                "visible": visible_debug,
+                "screen_history_lines": screen_history.len(),
+                "snapshot": debug_terminal_data_summary(&bytes, 1024),
+            }),
+        );
+    }
     bytes
 }
 
@@ -2564,6 +2693,171 @@ fn append_plain_terminal_lines(bytes: &mut Vec<u8>, lines: &[String]) {
             bytes.extend_from_slice(b"\r\n");
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotScrollbackSanitize {
+    before_scrollback: usize,
+    after_scrollback: usize,
+    removed_lines: usize,
+    visible_rows: usize,
+}
+
+fn sanitize_snapshot_visible_screen_duplicates(
+    parser: &mut vt100::Parser,
+) -> Option<SnapshotScrollbackSanitize> {
+    let before_scrollback = parser_max_scrollback(parser);
+    if before_scrollback == 0 {
+        return None;
+    }
+
+    let visible_lines = parser_visible_plain_lines(parser, 0);
+    let original_scrollback_lines = parser_scrollback_plain_lines(parser);
+    let mut scrollback_lines = original_scrollback_lines.clone();
+    trim_visible_screen_suffix_duplicates(&mut scrollback_lines, &visible_lines);
+    let (rows, cols) = parser.screen().size();
+    if let Some(compacted) =
+        compact_frame_scrollback_lines(&scrollback_lines, &visible_lines, rows as usize)
+    {
+        scrollback_lines = compacted;
+    }
+    if normalized_lines_equal(&scrollback_lines, &original_scrollback_lines) {
+        return None;
+    }
+    let removed_lines = original_scrollback_lines
+        .len()
+        .saturating_sub(scrollback_lines.len());
+
+    let rebuild_bytes = {
+        parser.screen_mut().set_scrollback(0);
+        let screen = parser.screen();
+        let mut bytes = Vec::new();
+        if !scrollback_lines.is_empty() {
+            append_plain_terminal_lines(&mut bytes, &scrollback_lines);
+        }
+        bytes.extend_from_slice(b"\x1b[2J\x1b[H");
+        bytes.extend_from_slice(&screen.contents_formatted());
+        bytes.extend_from_slice(&screen.cursor_state_formatted());
+        bytes
+    };
+
+    *parser = vt100::Parser::new(rows, cols, AGENT_SCROLLBACK_LINES);
+    safe_parser_process(parser, &rebuild_bytes);
+    parser.screen_mut().set_scrollback(0);
+    let after_scrollback = parser_max_scrollback(parser);
+
+    Some(SnapshotScrollbackSanitize {
+        before_scrollback,
+        after_scrollback,
+        removed_lines,
+        visible_rows: visible_lines.len(),
+    })
+}
+
+fn compact_frame_scrollback_lines(
+    scrollback_lines: &[String],
+    visible_lines: &[String],
+    visible_rows: usize,
+) -> Option<Vec<String>> {
+    let visible_rows = visible_rows.max(1);
+    if scrollback_lines.len() < visible_rows.saturating_mul(2) {
+        return None;
+    }
+
+    let leading_lines = scrollback_lines.len() % visible_rows;
+    let mut history = ScreenHistory::default();
+    if leading_lines > 0 {
+        history.append_lines(&scrollback_lines[..leading_lines]);
+    }
+    for chunk in scrollback_lines[leading_lines..].chunks(visible_rows) {
+        history.capture_lines(chunk.to_vec());
+    }
+    history.capture_lines(
+        visible_lines
+            .iter()
+            .map(|line| line.trim_end_matches(' ').to_string())
+            .collect(),
+    );
+
+    let compacted = history.lines_before_visible(visible_lines);
+    if compacted.len() < scrollback_lines.len()
+        && !normalized_lines_equal(&compacted, scrollback_lines)
+    {
+        Some(compacted)
+    } else {
+        None
+    }
+}
+
+fn trim_visible_screen_suffix_duplicates(
+    scrollback_lines: &mut Vec<String>,
+    visible_lines: &[String],
+) -> usize {
+    let mut removed = trim_suffix_matching_page(scrollback_lines, visible_lines);
+    if removed == 0 {
+        removed = trim_suffix_matching_page(
+            scrollback_lines,
+            trim_trailing_blank_lines(visible_lines),
+        );
+    }
+    removed
+}
+
+fn trim_suffix_matching_page(scrollback_lines: &mut Vec<String>, page: &[String]) -> usize {
+    if page.is_empty() || page.iter().all(|line| line.trim().is_empty()) {
+        return 0;
+    }
+
+    let mut removed = 0usize;
+    while scrollback_lines.len() >= page.len()
+        && normalized_lines_equal(&scrollback_lines[scrollback_lines.len() - page.len()..], page)
+    {
+        let next_len = scrollback_lines.len() - page.len();
+        scrollback_lines.truncate(next_len);
+        removed = removed.saturating_add(page.len());
+    }
+    removed
+}
+
+fn trim_trailing_blank_lines(lines: &[String]) -> &[String] {
+    let end = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    &lines[..end]
+}
+
+fn normalized_common_prefix_len(left: &[String], right: &[String]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| normalized_line_equal(left, right))
+        .count()
+}
+
+fn normalized_suffix_prefix_overlap(previous: &[String], next: &[String]) -> usize {
+    let max_overlap = previous.len().min(next.len());
+    (1..=max_overlap)
+        .rev()
+        .find(|overlap| {
+            normalized_lines_equal(
+                &previous[previous.len() - overlap..],
+                &next[..*overlap],
+            )
+        })
+        .unwrap_or(0)
+}
+
+fn normalized_line_equal(left: &str, right: &str) -> bool {
+    left.trim_end_matches(' ') == right.trim_end_matches(' ')
+}
+
+fn normalized_lines_equal(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| normalized_line_equal(left, right))
 }
 
 fn process_parser_output(
@@ -2798,6 +3092,8 @@ enum AgentDaemonEvent {
         #[serde(default)]
         daemon_pid: u32,
         #[serde(default)]
+        child_pid: Option<u32>,
+        #[serde(default)]
         snapshot_event: bool,
         #[serde(default)]
         last_screen_change_epoch_ms: u64,
@@ -2836,6 +3132,7 @@ struct AgentClient {
     pending_snapshot_output: bool,
     startup_spinner_started_at: Option<Instant>,
     debug_output_events: u32,
+    codex_transcript_overlay_assumed_open: bool,
     /// Monotonic id identifying the reader thread that owns the read side
     /// of `stream`. Forwarded inside every `MainEvent::AgentEvent` so the
     /// main loop can ignore events that belong to a previous attach.
@@ -3132,6 +3429,7 @@ impl AgentClient {
             pending_snapshot_output: false,
             startup_spinner_started_at: None,
             debug_output_events: 0,
+            codex_transcript_overlay_assumed_open: false,
             reader_id,
             reader_thread: Some(reader_thread),
         })
@@ -3144,6 +3442,8 @@ impl AgentClient {
         match event {
             AgentDaemonEvent::Attached {
                 command,
+                daemon_pid,
+                child_pid,
                 snapshot_event,
                 last_screen_change_epoch_ms,
                 last_output_epoch_ms,
@@ -3151,16 +3451,26 @@ impl AgentClient {
                 ..
             } => {
                 self.command_line = command;
+                let visible_rows = self.pty_size.rows as usize;
+                let state_before =
+                    debug_agent_client_state_value(self, visible_rows, visible_rows.min(120));
                 debug_log(
                     "agent_client_event_attached",
                     serde_json::json!({
                         "provider": self.info.provider.as_str(),
                         "session_id": &self.info.session_id,
                         "command": &self.command_line,
+                        "daemon_pid": daemon_pid,
+                        "daemon_exe": debug_process_exe(daemon_pid),
+                        "daemon_cmdline": debug_process_cmdline(daemon_pid),
+                        "child_pid": child_pid,
+                        "child_cmdline": child_pid.and_then(debug_process_cmdline),
                         "snapshot_event": snapshot_event,
+                        "pending_snapshot_output_before": self.pending_snapshot_output,
                         "last_screen_change_epoch_ms": last_screen_change_epoch_ms,
                         "last_output_epoch_ms": last_output_epoch_ms,
                         "last_input_epoch_ms": last_input_epoch_ms,
+                        "state_before": state_before,
                     }),
                 );
                 self.pending_snapshot_output = !snapshot_event;
@@ -3169,32 +3479,67 @@ impl AgentClient {
                     .max(last_screen_change_epoch_ms);
                 self.last_output_epoch_ms = self.last_output_epoch_ms.max(last_output_epoch_ms);
                 self.last_input_epoch_ms = self.last_input_epoch_ms.max(last_input_epoch_ms);
-            }
-            AgentDaemonEvent::Output { data } => {
-                trace_log(
-                    "agent_client_event_output",
+                let visible_rows = self.pty_size.rows as usize;
+                let state_after =
+                    debug_agent_client_state_value(self, visible_rows, visible_rows.min(120));
+                debug_log(
+                    "agent_client_event_attached_state",
                     serde_json::json!({
                         "provider": self.info.provider.as_str(),
                         "session_id": &self.info.session_id,
-                        "len": data.len(),
-                        "sample": debug_bytes_sample(&data, 512),
+                        "pending_snapshot_output_after": self.pending_snapshot_output,
+                        "state_after": state_after,
                     }),
                 );
+            }
+            AgentDaemonEvent::Output { data } => {
+                if TRACE_ENABLED.load(Ordering::Relaxed) {
+                    trace_log(
+                        "agent_client_event_output",
+                        serde_json::json!({
+                            "provider": self.info.provider.as_str(),
+                            "session_id": &self.info.session_id,
+                            "pending_snapshot_output": self.pending_snapshot_output,
+                            "data": debug_terminal_data_summary(&data, 512),
+                        }),
+                    );
+                }
                 let is_snapshot = std::mem::take(&mut self.pending_snapshot_output);
-                self.process_agent_output(&data, !is_snapshot);
+                if is_snapshot {
+                    let visible_rows = self.pty_size.rows as usize;
+                    let state_before =
+                        debug_agent_client_state_value(self, visible_rows, visible_rows.min(120));
+                    debug_log(
+                        "agent_client_legacy_snapshot_output",
+                        serde_json::json!({
+                            "provider": self.info.provider.as_str(),
+                            "session_id": &self.info.session_id,
+                            "data": debug_terminal_data_summary(&data, 1024),
+                            "state_before": state_before,
+                        }),
+                    );
+                }
+                if is_snapshot {
+                    self.process_agent_snapshot(&data);
+                } else {
+                    self.process_agent_output(&data, true);
+                }
             }
             AgentDaemonEvent::Snapshot { data } => {
+                let visible_rows = self.pty_size.rows as usize;
+                let state_before =
+                    debug_agent_client_state_value(self, visible_rows, visible_rows.min(120));
                 debug_log(
                     "agent_client_event_snapshot",
                     serde_json::json!({
                         "provider": self.info.provider.as_str(),
                         "session_id": &self.info.session_id,
-                        "len": data.len(),
-                        "sample": debug_bytes_sample(&data, 512),
+                        "data": debug_terminal_data_summary(&data, 1024),
+                        "state_before": state_before,
                     }),
                 );
                 self.pending_snapshot_output = false;
-                self.process_agent_output(&data, false);
+                self.process_agent_snapshot(&data);
             }
             AgentDaemonEvent::Exited { status } => {
                 debug_log(
@@ -3223,6 +3568,11 @@ impl AgentClient {
 
     fn process_agent_output(&mut self, data: &[u8], counts_as_activity: bool) {
         let now_ms = current_epoch_ms();
+        let visible_rows = self.pty_size.rows as usize;
+        let should_debug = DEBUG_ENABLED.load(Ordering::Relaxed)
+            && (self.debug_output_events < 20 || TRACE_ENABLED.load(Ordering::Relaxed));
+        let state_before = should_debug
+            .then(|| debug_agent_client_state_value(self, visible_rows, visible_rows.min(120)));
         if counts_as_activity {
             self.last_output_epoch_ms = now_ms;
         }
@@ -3245,14 +3595,16 @@ impl AgentClient {
             self.startup_spinner_started_at = None;
         }
         self.debug_output_events = self.debug_output_events.saturating_add(1);
-        if self.debug_output_events <= 20 || TRACE_ENABLED.load(Ordering::Relaxed) {
+        if should_debug {
+            let state_after =
+                debug_agent_client_state_value(self, visible_rows, visible_rows.min(120));
             debug_log(
                 "agent_client_output_processed",
                 serde_json::json!({
                     "provider": self.info.provider.as_str(),
                     "session_id": &self.info.session_id,
                     "event": self.debug_output_events,
-                    "len": data.len(),
+                    "data": debug_terminal_data_summary(data, 1024),
                     "counts_as_activity": counts_as_activity,
                     "visible": screen_has_visible_content(self.parser.screen()),
                     "screen_changed": screen_changed,
@@ -3260,6 +3612,71 @@ impl AgentClient {
                     "last_screen_change_epoch_ms": self.last_screen_change_epoch_ms,
                     "last_output_epoch_ms": self.last_output_epoch_ms,
                     "preview": debug_screen_preview(self.parser.screen(), 5),
+                    "state_before": state_before,
+                    "state_after": state_after,
+                }),
+            );
+        }
+    }
+
+    fn process_agent_snapshot(&mut self, data: &[u8]) {
+        let visible_rows = self.pty_size.rows as usize;
+        let should_debug = DEBUG_ENABLED.load(Ordering::Relaxed);
+        let state_before = should_debug
+            .then(|| debug_agent_client_state_value(self, visible_rows, visible_rows.min(120)));
+        if should_debug {
+            debug_log(
+                "agent_client_snapshot_reset_start",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "data": debug_terminal_data_summary(data, 1024),
+                    "state_before": state_before,
+                }),
+            );
+        }
+        self.parser = vt100::Parser::new(
+            self.pty_size.rows,
+            self.pty_size.cols,
+            AGENT_SCROLLBACK_LINES,
+        );
+        self.screen_history = ScreenHistory::default();
+        self.history_scroll_offset = 0;
+        self.codex_transcript_overlay_assumed_open = false;
+        self.screen_hash = screen_activity_hash(self.parser.screen());
+        self.process_agent_output(data, false);
+        let sanitize = sanitize_snapshot_visible_screen_duplicates(&mut self.parser);
+        if let Some(sanitize) = sanitize {
+            self.history_scroll_offset = 0;
+            self.screen_hash = screen_activity_hash(self.parser.screen());
+            if should_debug {
+                debug_log(
+                    "agent_client_snapshot_sanitized",
+                    serde_json::json!({
+                        "provider": self.info.provider.as_str(),
+                        "session_id": &self.info.session_id,
+                        "before_scrollback": sanitize.before_scrollback,
+                        "after_scrollback": sanitize.after_scrollback,
+                        "removed_lines": sanitize.removed_lines,
+                        "visible_rows": sanitize.visible_rows,
+                        "state_after": debug_agent_client_state_value(
+                            self,
+                            visible_rows,
+                            visible_rows.min(120),
+                        ),
+                    }),
+                );
+            }
+        }
+        if should_debug {
+            let state_after =
+                debug_agent_client_state_value(self, visible_rows, visible_rows.min(120));
+            debug_log(
+                "agent_client_snapshot_reset_done",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "state_after": state_after,
                 }),
             );
         }
@@ -3270,16 +3687,41 @@ impl AgentClient {
         if self.pty_size.rows == next.rows && self.pty_size.cols == next.cols {
             return;
         }
+        let old_rows = self.pty_size.rows;
+        let old_cols = self.pty_size.cols;
+        let visible_rows = next.rows as usize;
+        let should_debug = DEBUG_ENABLED.load(Ordering::Relaxed);
+        let state_before = should_debug
+            .then(|| debug_agent_client_state_value(self, visible_rows, visible_rows.min(120)));
         self.parser.screen_mut().set_size(next.rows, next.cols);
         self.screen_hash = screen_activity_hash(self.parser.screen());
         self.pty_size = next;
         self.history_scroll_offset = self
             .history_scroll_offset
             .min(self.screen_history.max_scroll_offset(next.rows as usize));
-        let _ = self.send_request(&AgentDaemonRequest::Resize {
+        let send_result = self.send_request(&AgentDaemonRequest::Resize {
             cols: next.cols,
             rows: next.rows,
         });
+        if should_debug {
+            let state_after =
+                debug_agent_client_state_value(self, visible_rows, visible_rows.min(120));
+            debug_log(
+                "agent_client_resize",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "old_rows": old_rows,
+                    "old_cols": old_cols,
+                    "new_rows": next.rows,
+                    "new_cols": next.cols,
+                    "send_ok": send_result.is_ok(),
+                    "send_error": send_result.err().map(|e| e.to_string()),
+                    "state_before": state_before,
+                    "state_after": state_after,
+                }),
+            );
+        }
     }
 
     fn scrollback_offset(&self) -> usize {
@@ -3298,6 +3740,7 @@ impl AgentClient {
         self.parser.screen().scrollback()
     }
 
+    #[cfg(test)]
     fn scroll_screen(&mut self, action: AgentScrollAction, page_rows: usize) -> usize {
         let page_rows = page_rows.max(1);
         if parser_max_scrollback(&mut self.parser) == 0 {
@@ -3320,6 +3763,7 @@ impl AgentClient {
         self.set_scrollback_offset(next)
     }
 
+    #[cfg(test)]
     fn scroll_history_screen(&mut self, action: AgentScrollAction, page_rows: usize) -> usize {
         self.parser.screen_mut().set_scrollback(0);
         self.screen_hash = screen_activity_hash(self.parser.screen());
@@ -3344,12 +3788,44 @@ impl AgentClient {
 
     fn send_key(&mut self, key: KeyEvent) {
         if let Some(data) = key_event_to_bytes(key) {
+            let scrollback_before = self.scrollback_offset();
+            if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                let visible_rows = self.pty_size.rows as usize;
+                let state_before =
+                    debug_agent_client_state_value(self, visible_rows, visible_rows.min(120));
+                debug_log(
+                    "agent_client_forward_key",
+                    serde_json::json!({
+                        "provider": self.info.provider.as_str(),
+                        "session_id": &self.info.session_id,
+                        "code": key_code_label(key),
+                        "modifiers": format!("{:?}", key.modifiers),
+                        "kind": format!("{:?}", key.kind),
+                        "state": format!("{:?}", key.state),
+                        "data": debug_terminal_data_summary(&data, 128),
+                        "scrollback_before": scrollback_before,
+                        "state_before": state_before,
+                    }),
+                );
+            }
             if self.scrollback_offset() > 0 {
                 self.set_scrollback_offset(0);
                 self.history_scroll_offset = 0;
             }
             self.last_input_epoch_ms = current_epoch_ms();
-            let _ = self.send_request(&AgentDaemonRequest::Input { data });
+            let send_result = self.send_request(&AgentDaemonRequest::Input { data });
+            if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                debug_log(
+                    "agent_client_forward_key_sent",
+                    serde_json::json!({
+                        "provider": self.info.provider.as_str(),
+                        "session_id": &self.info.session_id,
+                        "send_ok": send_result.is_ok(),
+                        "send_error": send_result.err().map(|e| e.to_string()),
+                        "scrollback_after": self.scrollback_offset(),
+                    }),
+                );
+            }
         }
     }
 
@@ -3606,6 +4082,18 @@ impl App {
 
     fn agent_sidebar_width(&self, total_width: u16) -> u16 {
         agent_sidebar_width(total_width, self.agent_sidebar_config_width())
+    }
+
+    fn sync_active_agent_viewport(&mut self, total_width: u16, terminal_rows: u16) -> AgentViewport {
+        let viewport = agent_viewport_for_terminal(
+            total_width,
+            terminal_rows,
+            self.agent_sidebar_config_width(),
+        );
+        if let Some(agent) = self.active_agent.as_mut() {
+            agent.resize(viewport.pty_cols, viewport.pty_rows);
+        }
+        viewport
     }
 
     fn maybe_reload_keybindings(&mut self) {
@@ -6447,41 +6935,87 @@ impl App {
 
     fn send_key_to_active_agent(&mut self, key: KeyEvent) {
         if let Some(agent) = self.active_agent.as_mut() {
+            let overlay_before = agent.codex_transcript_overlay_assumed_open;
             agent.send_key(key);
+            let overlay_after = codex_transcript_overlay_state_after_forwarded_key(agent, key);
+            agent.codex_transcript_overlay_assumed_open = overlay_after;
+            if overlay_before != agent.codex_transcript_overlay_assumed_open {
+                debug_log(
+                    "agent_codex_transcript_overlay_assumption",
+                    serde_json::json!({
+                        "provider": agent.info.provider.as_str(),
+                        "session_id": &agent.info.session_id,
+                        "reason": "forwarded_key",
+                        "key": debug_key_event_value(key),
+                        "before": overlay_before,
+                        "after": agent.codex_transcript_overlay_assumed_open,
+                    }),
+                );
+            }
         }
     }
 
-    fn scroll_active_agent_screen(&mut self, action: AgentScrollAction, page_rows: usize) {
+    fn delegate_active_agent_scroll_to_child(&mut self, action: AgentScrollAction, key: KeyEvent) {
         let Some(agent) = self.active_agent.as_mut() else {
             return;
         };
-        let before = agent.scrollback_offset();
-        let after = agent.scroll_screen(action, page_rows);
-        let parser_scrollback = agent.parser.screen().scrollback();
-        let parser_scrollback_max = parser_max_scrollback(&mut agent.parser);
-        let history_scroll_offset = agent.history_scroll_offset;
-        let screen_history_lines = agent.screen_history.len();
-        self.status = if before == 0 && after == 0 && agent_scroll_action_moves_up(action) {
-            "PTY scrollback: no saved lines.".into()
-        } else if after == 0 {
-            "PTY scrollback: bottom.".into()
-        } else if before == after && agent_scroll_action_moves_up(action) {
-            format!("PTY scrollback: top, {} lines up.", after)
+        let provider = agent.info.provider;
+        let overlay_before = agent.codex_transcript_overlay_assumed_open;
+        let mut delegated_keys = Vec::new();
+        let strategy = if provider == Provider::Codex {
+            if let Some(scroll_key) = codex_transcript_scroll_key(action) {
+                if !overlay_before {
+                    delegated_keys.push(codex_transcript_open_key());
+                }
+                delegated_keys.push(scroll_key);
+                "codex_transcript_overlay"
+            } else {
+                delegated_keys.push(key);
+                "forward_original"
+            }
         } else {
-            format!("PTY scrollback: {} lines up.", after)
+            delegated_keys.push(key);
+            "forward_original"
+        };
+
+        let delegated_debug = delegated_keys
+            .iter()
+            .copied()
+            .map(debug_key_event_value)
+            .collect::<Vec<_>>();
+        for delegated_key in delegated_keys {
+            agent.send_key(delegated_key);
+        }
+        if strategy == "codex_transcript_overlay" {
+            agent.codex_transcript_overlay_assumed_open = true;
+        } else {
+            let overlay_after = codex_transcript_overlay_state_after_forwarded_key(agent, key);
+            agent.codex_transcript_overlay_assumed_open = overlay_after;
+        }
+        self.status = if provider == Provider::Codex {
+            format!(
+                "Codex transcript: delegated {}.",
+                child_scroll_action_label(action)
+            )
+        } else {
+            format!(
+                "{} scroll key forwarded to child.",
+                provider.as_str()
+            )
         };
         debug_log(
-            "agent_scrollback",
+            "agent_child_scroll_delegated",
             serde_json::json!({
-                "provider": agent.info.provider.as_str(),
+                "provider": provider.as_str(),
                 "session_id": &agent.info.session_id,
                 "action": format!("{:?}", action),
-                "before": before,
-                "after": after,
-                "parser_scrollback": parser_scrollback,
-                "parser_scrollback_max": parser_scrollback_max,
-                "history_scroll_offset": history_scroll_offset,
-                "screen_history_lines": screen_history_lines,
+                "label": child_scroll_action_label(action),
+                "strategy": strategy,
+                "original_key": debug_key_event_value(key),
+                "delegated_keys": delegated_debug,
+                "codex_overlay_assumed_open_before": overlay_before,
+                "codex_overlay_assumed_open_after": agent.codex_transcript_overlay_assumed_open,
+                "status": &self.status,
             }),
         );
     }
@@ -7359,6 +7893,10 @@ fn main() -> Result<()> {
         serde_json::json!({
             "args": &args,
             "pid": std::process::id(),
+            "exe": debug_process_exe(std::process::id()),
+            "cmdline": debug_process_cmdline(std::process::id()),
+            "current_exe": std::env::current_exe().ok().map(|path| path.display().to_string()),
+            "cwd": std::env::current_dir().ok().map(|path| path.display().to_string()),
             "debug_log_file": DEBUG_LOG_FILE,
             "trace": TRACE_ENABLED.load(Ordering::Relaxed),
         }),
@@ -7459,7 +7997,7 @@ fn print_help() {
          ↑↓ / j k     navigate\n  \
          Alt+↑/↓ or Ctrl+Shift+↑/↓ select from sidebar/list\n  \
          Alt+←/→ or Ctrl+Shift+←/→ resize panes (saved)\n  \
-         Agent: Shift+↑/↓ scroll PTY one line, Shift+Alt+↑/↓ page, Shift/Alt+Home/End top/bottom\n  \
+         Agent: Shift+↑/↓ child transcript line, Shift+Alt+↑/↓ page, Shift/Alt+Home/End top/bottom\n  \
          PgUp / PgDn   jump 10\n  \
          g/Home / G/End top / bottom\n  \
          Tab / Esc     switch focus between session list and preview\n  \
@@ -7574,19 +8112,20 @@ fn run(terminal: &mut Tui) -> Result<()> {
             Err(_) => break, // all senders dropped
         };
         match event {
-            MainEvent::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+            MainEvent::Input(Event::Key(key)) if is_actionable_key_event(key) => {
                 if app.is_agent_view() {
-                    let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
-                    handle_agent_key(&mut app, key, cols);
+                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                    handle_agent_key(&mut app, key, cols, rows);
                 } else {
                     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                    let agent_cols = agent_terminal_width(cols, app.agent_sidebar_config_width());
+                    let agent_viewport =
+                        agent_viewport_for_terminal(cols, rows, app.agent_sidebar_config_width());
                     handle_key(
                         &mut app,
                         key,
                         cols,
-                        agent_cols,
-                        rows.saturating_sub(AGENT_STATUS_HEIGHT),
+                        agent_viewport.pty_cols,
+                        agent_viewport.pty_rows,
                     );
                 }
             }
@@ -7620,20 +8159,23 @@ fn run(terminal: &mut Tui) -> Result<()> {
         // render twice in a row for a tight burst of agent output.
         loop {
             match main_rx.try_recv() {
-                Ok(MainEvent::Input(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                Ok(MainEvent::Input(Event::Key(key))) if is_actionable_key_event(key) => {
                     if app.is_agent_view() {
-                        let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
-                        handle_agent_key(&mut app, key, cols);
+                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                        handle_agent_key(&mut app, key, cols, rows);
                     } else {
                         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                        let agent_cols =
-                            agent_terminal_width(cols, app.agent_sidebar_config_width());
+                        let agent_viewport = agent_viewport_for_terminal(
+                            cols,
+                            rows,
+                            app.agent_sidebar_config_width(),
+                        );
                         handle_key(
                             &mut app,
                             key,
                             cols,
-                            agent_cols,
-                            rows.saturating_sub(AGENT_STATUS_HEIGHT),
+                            agent_viewport.pty_cols,
+                            agent_viewport.pty_rows,
                         );
                     }
                 }
@@ -7684,6 +8226,10 @@ fn run(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
+fn is_actionable_key_event(key: KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
 fn run_agent_daemon_args(args: &[String]) -> Result<()> {
     if !(args.len() == 4 || args.len() == 5) {
         anyhow::bail!(
@@ -7724,6 +8270,11 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             "session_id": &info.session_id,
             "launch_mode": launch_mode.as_str(),
             "command": startup_spec.command_line(),
+            "daemon_pid": std::process::id(),
+            "daemon_exe": debug_process_exe(std::process::id()),
+            "daemon_cmdline": debug_process_cmdline(std::process::id()),
+            "current_exe": std::env::current_exe().ok().map(|path| path.display().to_string()),
+            "cwd": std::env::current_dir().ok().map(|path| path.display().to_string()),
         }),
     );
     let listener = bind_agent_listener(&key, &socket_path)?;
@@ -8114,7 +8665,12 @@ fn send_daemon_attached(
         serde_json::json!({
             "provider": agent.info.provider.as_str(),
             "session_id": &agent.info.session_id,
+            "daemon_pid": std::process::id(),
+            "daemon_exe": debug_process_exe(std::process::id()),
+            "daemon_cmdline": debug_process_cmdline(std::process::id()),
+            "child_pid": agent.child.process_id(),
             "snapshot_len": snapshot.len(),
+            "snapshot": debug_terminal_data_summary(&snapshot, 1024),
             "include_scrollback": include_scrollback,
             "scrollback": agent.parser.screen().scrollback(),
             "screen_history_lines": agent.screen_history.len(),
@@ -8129,6 +8685,7 @@ fn send_daemon_attached(
         session_id: agent.info.session_id.clone(),
         command: agent.spec.command_line(),
         daemon_pid: std::process::id(),
+        child_pid: agent.child.process_id(),
         snapshot_event: true,
         last_screen_change_epoch_ms: agent.last_screen_change_epoch_ms,
         last_output_epoch_ms: agent.last_output_epoch_ms,
@@ -9290,6 +9847,14 @@ fn debug_bytes_sample(bytes: &[u8], max_bytes: usize) -> String {
     sample
 }
 
+fn debug_bytes_tail_sample(bytes: &[u8], max_bytes: usize) -> String {
+    if bytes.len() <= max_bytes {
+        return debug_bytes_sample(bytes, max_bytes);
+    }
+    let start = bytes.len().saturating_sub(max_bytes);
+    format!("...{}", debug_bytes_sample(&bytes[start..], max_bytes))
+}
+
 fn debug_screen_preview(screen: &vt100::Screen, max_rows: usize) -> Vec<String> {
     let (rows, cols) = screen.size();
     let mut lines = Vec::new();
@@ -9312,6 +9877,314 @@ fn debug_screen_preview(screen: &vt100::Screen, max_rows: usize) -> Vec<String> 
         }
     }
     lines
+}
+
+fn debug_terminal_data_summary(data: &[u8], max_bytes: usize) -> serde_json::Value {
+    let redraw_boundaries = terminal_redraw_boundary_positions(data);
+    let boundary_head = redraw_boundaries
+        .iter()
+        .copied()
+        .take(16)
+        .collect::<Vec<_>>();
+    let mut boundary_tail = redraw_boundaries
+        .iter()
+        .rev()
+        .copied()
+        .take(16)
+        .collect::<Vec<_>>();
+    boundary_tail.reverse();
+    serde_json::json!({
+        "len": data.len(),
+        "sample": debug_bytes_sample(data, max_bytes),
+        "tail_sample": debug_bytes_tail_sample(data, max_bytes),
+        "escape_count": data.iter().filter(|byte| **byte == 0x1b).count(),
+        "newline_count": data.iter().filter(|byte| **byte == b'\n').count(),
+        "carriage_return_count": data.iter().filter(|byte| **byte == b'\r').count(),
+        "redraw_boundary_count": redraw_boundaries.len(),
+        "redraw_boundary_head": boundary_head,
+        "redraw_boundary_tail": boundary_tail,
+        "clear_2j_count": count_subsequence(data, b"\x1b[2J"),
+        "clear_3j_count": count_subsequence(data, b"\x1b[3J"),
+        "home_count": count_subsequence(data, b"\x1b[H"),
+        "alt_screen_enter_count": count_subsequence(data, b"\x1b[?1049h"),
+        "alt_screen_leave_count": count_subsequence(data, b"\x1b[?1049l"),
+    })
+}
+
+fn count_subsequence(bytes: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || bytes.len() < needle.len() {
+        return 0;
+    }
+    bytes
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+fn debug_lines_value(lines: &[String], max_rows: usize) -> serde_json::Value {
+    let non_blank_count = lines.iter().filter(|line| !line.trim().is_empty()).count();
+    let first_non_blank = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::json!({
+                "index": index,
+                "text": truncate_width(line.trim_end_matches(' '), 240),
+            })
+        });
+    let last_non_blank = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::json!({
+                "index": index,
+                "text": truncate_width(line.trim_end_matches(' '), 240),
+            })
+        });
+    let rows = lines
+        .iter()
+        .enumerate()
+        .take(max_rows)
+        .map(|(index, line)| {
+            let trimmed = line.trim_end_matches(' ');
+            serde_json::json!({
+                "index": index,
+                "text": truncate_width(trimmed, 240),
+                "raw_len": line.len(),
+                "trimmed_len": trimmed.len(),
+                "display_width": UnicodeWidthStr::width(trimmed),
+                "blank": trimmed.trim().is_empty(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "total_rows": lines.len(),
+        "logged_rows": rows.len(),
+        "non_blank_rows": non_blank_count,
+        "digest": debug_lines_digest(lines),
+        "first_non_blank": first_non_blank,
+        "last_non_blank": last_non_blank,
+        "rows": rows,
+    })
+}
+
+fn debug_lines_digest(lines: &[String]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for (index, line) in lines.iter().enumerate() {
+        index.hash(&mut hasher);
+        line.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn debug_history_digest(history: &ScreenHistory) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for (index, line) in history.lines.iter().enumerate() {
+        index.hash(&mut hasher);
+        line.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn debug_visible_lines_at_scrollback(
+    parser: &mut vt100::Parser,
+    requested_scrollback: usize,
+    max_rows: usize,
+) -> serde_json::Value {
+    let original_scrollback = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(requested_scrollback);
+    let actual_scrollback = parser.screen().scrollback();
+    let (rows, cols) = parser.screen().size();
+    let lines = parser
+        .screen()
+        .rows(0, cols)
+        .take(rows as usize)
+        .collect::<Vec<_>>();
+    parser.screen_mut().set_scrollback(original_scrollback);
+    serde_json::json!({
+        "requested_scrollback": requested_scrollback,
+        "actual_scrollback": actual_scrollback,
+        "screen_rows": rows,
+        "screen_cols": cols,
+        "lines": debug_lines_value(&lines, max_rows),
+    })
+}
+
+fn debug_parser_state_value(parser: &mut vt100::Parser, max_rows: usize) -> serde_json::Value {
+    let current_scrollback = parser.screen().scrollback();
+    let max_scrollback = parser_max_scrollback(parser);
+    let (rows, cols) = parser.screen().size();
+    let (cursor_row, cursor_col) = parser.screen().cursor_position();
+    let screen_hash = screen_activity_hash(parser.screen());
+    let visible = screen_has_visible_content(parser.screen());
+    let hide_cursor = parser.screen().hide_cursor();
+    let bottom = debug_visible_lines_at_scrollback(parser, 0, max_rows);
+    let current = debug_visible_lines_at_scrollback(parser, current_scrollback, max_rows);
+    let top = debug_visible_lines_at_scrollback(parser, max_scrollback, max_rows);
+    serde_json::json!({
+        "screen_rows": rows,
+        "screen_cols": cols,
+        "current_scrollback": current_scrollback,
+        "max_scrollback": max_scrollback,
+        "screen_hash": screen_hash,
+        "visible": visible,
+        "hide_cursor": hide_cursor,
+        "cursor_row": cursor_row,
+        "cursor_col": cursor_col,
+        "bottom": bottom,
+        "current": current,
+        "top": top,
+    })
+}
+
+fn debug_history_window_value(
+    history: &ScreenHistory,
+    requested_offset: usize,
+    visible_rows: usize,
+    max_rows: usize,
+) -> serde_json::Value {
+    let max_offset = history.max_scroll_offset(visible_rows);
+    let actual_offset = requested_offset.min(max_offset);
+    let lines = history.visible_lines(actual_offset, visible_rows);
+    serde_json::json!({
+        "requested_offset": requested_offset,
+        "actual_offset": actual_offset,
+        "visible_rows": visible_rows,
+        "lines": debug_lines_value(&lines, max_rows),
+    })
+}
+
+fn debug_screen_history_value(
+    history: &ScreenHistory,
+    current_offset: usize,
+    visible_rows: usize,
+    max_rows: usize,
+) -> serde_json::Value {
+    let max_offset = history.max_scroll_offset(visible_rows);
+    serde_json::json!({
+        "line_count": history.len(),
+        "digest": debug_history_digest(history),
+        "current_offset": current_offset,
+        "max_offset": max_offset,
+        "last_snapshot": debug_lines_value(&history.last_snapshot, max_rows.min(12)),
+        "bottom": debug_history_window_value(history, 0, visible_rows, max_rows),
+        "current": debug_history_window_value(history, current_offset, visible_rows, max_rows),
+        "top": debug_history_window_value(history, max_offset, visible_rows, max_rows),
+    })
+}
+
+fn debug_agent_client_state_value(
+    agent: &mut AgentClient,
+    visible_rows: usize,
+    max_rows: usize,
+) -> serde_json::Value {
+    let provider = agent.info.provider.as_str().to_string();
+    let session_id = agent.info.session_id.clone();
+    let command_line = truncate_width(&agent.command_line, 512);
+    let pty_rows = agent.pty_size.rows;
+    let pty_cols = agent.pty_size.cols;
+    let scrollback_offset = agent.scrollback_offset();
+    let render_source = agent_scroll_render_source(agent);
+    let history_scroll_offset = agent.history_scroll_offset;
+    let pending_snapshot_output = agent.pending_snapshot_output;
+    let startup_spinner = agent.startup_spinner_started_at().is_some();
+    let exited = agent.exited.clone();
+    let reader_id = agent.reader_id;
+    let last_screen_change_epoch_ms = agent.last_screen_change_epoch_ms;
+    let last_output_epoch_ms = agent.last_output_epoch_ms;
+    let last_input_epoch_ms = agent.last_input_epoch_ms;
+    let parser = debug_parser_state_value(&mut agent.parser, max_rows);
+    let history = debug_screen_history_value(
+        &agent.screen_history,
+        history_scroll_offset,
+        visible_rows,
+        max_rows,
+    );
+    serde_json::json!({
+        "provider": provider,
+        "session_id": session_id,
+        "command_line": command_line,
+        "pty_rows": pty_rows,
+        "pty_cols": pty_cols,
+        "scrollback_offset": scrollback_offset,
+        "render_source": render_source,
+        "history_scroll_offset": history_scroll_offset,
+        "pending_snapshot_output": pending_snapshot_output,
+        "startup_spinner": startup_spinner,
+        "exited": exited,
+        "reader_id": reader_id,
+        "last_screen_change_epoch_ms": last_screen_change_epoch_ms,
+        "last_output_epoch_ms": last_output_epoch_ms,
+        "last_input_epoch_ms": last_input_epoch_ms,
+        "parser": parser,
+        "history": history,
+    })
+}
+
+fn debug_agent_session_state_value(
+    agent: &mut AgentSession,
+    visible_rows: usize,
+    max_rows: usize,
+) -> serde_json::Value {
+    let provider = agent.info.provider.as_str().to_string();
+    let session_id = agent.info.session_id.clone();
+    let command_line = agent.spec.command_line();
+    let child_pid = agent.child.process_id();
+    let pty_rows = agent.pty_size.rows;
+    let pty_cols = agent.pty_size.cols;
+    let last_screen_change_epoch_ms = agent.last_screen_change_epoch_ms;
+    let last_output_epoch_ms = agent.last_output_epoch_ms;
+    let last_input_epoch_ms = agent.last_input_epoch_ms;
+    let parser_scrollback = agent.parser.screen().scrollback();
+    let parser = debug_parser_state_value(&mut agent.parser, max_rows);
+    let history = debug_screen_history_value(&agent.screen_history, 0, visible_rows, max_rows);
+    serde_json::json!({
+        "provider": provider,
+        "session_id": session_id,
+        "command_line": command_line,
+        "child_pid": child_pid,
+        "pty_rows": pty_rows,
+        "pty_cols": pty_cols,
+        "parser_scrollback": parser_scrollback,
+        "last_screen_change_epoch_ms": last_screen_change_epoch_ms,
+        "last_output_epoch_ms": last_output_epoch_ms,
+        "last_input_epoch_ms": last_input_epoch_ms,
+        "parser": parser,
+        "history": history,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn debug_process_cmdline(pid: u32) -> Option<Vec<String>> {
+    fs::read(format!("/proc/{}/cmdline", pid))
+        .ok()
+        .map(|bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| truncate_width(&String::from_utf8_lossy(arg), 512))
+                .collect::<Vec<_>>()
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn debug_process_cmdline(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn debug_process_exe(pid: u32) -> Option<String> {
+    fs::read_link(format!("/proc/{}/exe", pid))
+        .ok()
+        .map(|path| path.display().to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn debug_process_exe(_pid: u32) -> Option<String> {
+    None
 }
 
 #[cfg(test)]
@@ -11950,7 +12823,7 @@ fn new_session_cwd_text_key(selected: usize, key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
-fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16) {
+fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_rows: u16) {
     app.maybe_reload_keybindings();
     if app.handle_data_task_key(key) {
         return;
@@ -11965,13 +12838,16 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16) {
         return;
     }
     if matches!(app.input_mode, InputMode::NewSession { .. }) {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let agent_cols = agent_terminal_width(cols, app.agent_sidebar_config_width());
+        let viewport = agent_viewport_for_terminal(
+            total_width,
+            terminal_rows,
+            app.agent_sidebar_config_width(),
+        );
         handle_new_session_key(
             app,
             key,
-            agent_cols.max(1),
-            rows.saturating_sub(AGENT_STATUS_HEIGHT).max(1),
+            viewport.pty_cols,
+            viewport.pty_rows,
             &keybindings,
         );
         return;
@@ -12004,36 +12880,67 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16) {
     if keybindings.matches(KeyAction::AgentToggleSidebar, key) {
         debug_log_agent_key(key, "toggle_agent_sidebar");
         app.toggle_agent_sidebar_visible();
+        let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
         return;
     }
     if let Some(action) = agent_scrollback_key(&keybindings, key) {
-        debug_log_agent_key(key, "scrollback");
-        let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let page_rows = rows
-            .saturating_sub(AGENT_STATUS_HEIGHT)
-            .saturating_sub(1)
-            .max(1) as usize;
-        app.scroll_active_agent_screen(action, page_rows);
+        debug_log_agent_key(key, "delegate_scroll");
+        let viewport = app.sync_active_agent_viewport(total_width, terminal_rows);
+        let page_rows = viewport.page_rows;
+        debug_log(
+            "agent_child_scroll_key_match",
+            serde_json::json!({
+                "code": key_code_label(key),
+                "modifiers": format!("{:?}", key.modifiers),
+                "kind": format!("{:?}", key.kind),
+                "state": format!("{:?}", key.state),
+                "action": format!("{:?}", action),
+                "terminal_cols": total_width,
+                "terminal_rows": terminal_rows,
+                "agent_area_cols": viewport.area_cols,
+                "agent_area_rows": viewport.area_rows,
+                "pty_cols": viewport.pty_cols,
+                "pty_rows": viewport.pty_rows,
+                "page_rows": page_rows,
+                "total_width": total_width,
+                "sidebar_width": app.agent_sidebar_config_width(),
+                "active_agent": app.active_agent.as_ref().map(|agent| serde_json::json!({
+                    "provider": agent.info.provider.as_str(),
+                    "session_id": &agent.info.session_id,
+                    "pty_rows": agent.pty_size.rows,
+                    "pty_cols": agent.pty_size.cols,
+                    "parser_scrollback": agent.parser.screen().scrollback(),
+                    "history_scroll_offset": agent.history_scroll_offset,
+                    "screen_history_lines": agent.screen_history.len(),
+                    "codex_transcript_overlay_assumed_open": agent.codex_transcript_overlay_assumed_open,
+                })),
+            }),
+        );
+        app.delegate_active_agent_scroll_to_child(action, key);
         return;
     }
     if let Some(delta) = agent_pane_resize_key(&keybindings, key) {
         debug_log_agent_key(key, "resize");
         app.adjust_agent_sidebar_width(delta, total_width);
+        let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
         return;
     }
     if let Some(delta) = agent_sidebar_select_key(&keybindings, key) {
         debug_log_agent_key(key, "select");
+        let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
         app.switch_active_agent(delta, false);
         return;
     }
     if let Some(delta) = agent_switch_key(&keybindings, key) {
         debug_log_agent_key(key, "switch");
+        let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
         app.switch_active_agent(delta, true);
         return;
     }
     if should_log_agent_key(key) {
         debug_log_agent_key(key, "forward");
     }
+    let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
     app.send_key_to_active_agent(key);
 }
 
@@ -12064,6 +12971,20 @@ fn is_global_quit_key(key: KeyEvent) -> bool {
     KeyBindings::default().matches(KeyAction::GlobalQuit, key)
 }
 
+#[cfg(test)]
+fn agent_scroll_page_rows(terminal_rows: u16) -> usize {
+    agent_viewport_for_terminal(80, terminal_rows, 0).page_rows
+}
+
+fn agent_scroll_render_source(agent: &AgentClient) -> &'static str {
+    if agent.parser.screen().scrollback() == 0 && agent.history_scroll_offset > 0 {
+        "history"
+    } else {
+        "parser"
+    }
+}
+
+#[cfg(test)]
 fn apply_scrollback_delta(current: usize, delta: i32) -> usize {
     if delta >= 0 {
         current.saturating_add(delta as usize)
@@ -12072,11 +12993,77 @@ fn apply_scrollback_delta(current: usize, delta: i32) -> usize {
     }
 }
 
-fn agent_scroll_action_moves_up(action: AgentScrollAction) -> bool {
+fn child_scroll_action_label(action: AgentScrollAction) -> &'static str {
+    match action {
+        AgentScrollAction::Lines(delta) if delta > 0 => "line up",
+        AgentScrollAction::Lines(delta) if delta < 0 => "line down",
+        AgentScrollAction::Pages(delta) if delta > 0 => "page up",
+        AgentScrollAction::Pages(delta) if delta < 0 => "page down",
+        AgentScrollAction::Top => "top",
+        AgentScrollAction::Bottom => "bottom",
+        AgentScrollAction::Lines(_) | AgentScrollAction::Pages(_) => "none",
+    }
+}
+
+fn codex_transcript_open_key() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
+}
+
+fn codex_transcript_scroll_key(action: AgentScrollAction) -> Option<KeyEvent> {
+    let code = match action {
+        AgentScrollAction::Lines(delta) if delta > 0 => KeyCode::Up,
+        AgentScrollAction::Lines(delta) if delta < 0 => KeyCode::Down,
+        AgentScrollAction::Pages(delta) if delta > 0 => KeyCode::PageUp,
+        AgentScrollAction::Pages(delta) if delta < 0 => KeyCode::PageDown,
+        AgentScrollAction::Top => KeyCode::Home,
+        AgentScrollAction::Bottom => KeyCode::End,
+        AgentScrollAction::Lines(_) | AgentScrollAction::Pages(_) => return None,
+    };
+    Some(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn codex_transcript_overlay_state_after_forwarded_key(
+    agent: &AgentClient,
+    key: KeyEvent,
+) -> bool {
+    codex_transcript_overlay_state_after_key(
+        agent.info.provider,
+        agent.codex_transcript_overlay_assumed_open,
+        key,
+    )
+}
+
+fn codex_transcript_overlay_state_after_key(
+    provider: Provider,
+    current_open: bool,
+    key: KeyEvent,
+) -> bool {
+    if provider != Provider::Codex || !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+    {
+        return current_open;
+    }
+    if is_ctrl_char_key(key, 't') {
+        return !current_open;
+    }
+    if current_open && (is_plain_char_key(key, 'q') || is_ctrl_char_key(key, 'c')) {
+        return false;
+    }
+    current_open
+}
+
+fn is_plain_char_key(key: KeyEvent, expected: char) -> bool {
     matches!(
-        action,
-        AgentScrollAction::Lines(delta) | AgentScrollAction::Pages(delta) if delta > 0
-    ) || matches!(action, AgentScrollAction::Top)
+        key.code,
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&expected)
+    ) && key.modifiers.is_empty()
+}
+
+fn is_ctrl_char_key(key: KeyEvent, expected: char) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&expected)
+    ) && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
 #[cfg(test)]
@@ -12306,16 +13293,25 @@ fn key_code_label(key: KeyEvent) -> String {
     }
 }
 
+fn debug_key_event_value(key: KeyEvent) -> serde_json::Value {
+    serde_json::json!({
+        "code": key_code_label(key),
+        "modifiers": format!("{:?}", key.modifiers),
+        "kind": format!("{:?}", key.kind),
+        "state": format!("{:?}", key.state),
+    })
+}
+
 fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let mut bytes = Vec::new();
-    if alt {
-        bytes.push(0x1b);
-    }
 
     match key.code {
         KeyCode::Char(c) if ctrl => {
+            if alt {
+                bytes.push(0x1b);
+            }
             let lower = c.to_ascii_lowercase();
             let code = match lower {
                 'a'..='z' => (lower as u8) - b'a' + 1,
@@ -12328,44 +13324,102 @@ fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
                 _ => return None,
             };
             bytes.push(code);
-        }
+        },
         KeyCode::Char(c) => {
+            if alt {
+                bytes.push(0x1b);
+            }
             let mut buf = [0; 4];
             bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        }
-        KeyCode::Enter => bytes.push(b'\r'),
-        KeyCode::Tab => bytes.push(b'\t'),
-        KeyCode::Backspace => bytes.push(0x7f),
-        KeyCode::Esc => bytes.push(0x1b),
-        KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
-        KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
-        KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
-        KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
-        KeyCode::Home => bytes.extend_from_slice(b"\x1b[H"),
-        KeyCode::End => bytes.extend_from_slice(b"\x1b[F"),
-        KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
-        KeyCode::PageDown => bytes.extend_from_slice(b"\x1b[6~"),
-        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
-        KeyCode::Insert => bytes.extend_from_slice(b"\x1b[2~"),
-        KeyCode::F(n) => match n {
-            1 => bytes.extend_from_slice(b"\x1bOP"),
-            2 => bytes.extend_from_slice(b"\x1bOQ"),
-            3 => bytes.extend_from_slice(b"\x1bOR"),
-            4 => bytes.extend_from_slice(b"\x1bOS"),
-            5 => bytes.extend_from_slice(b"\x1b[15~"),
-            6 => bytes.extend_from_slice(b"\x1b[17~"),
-            7 => bytes.extend_from_slice(b"\x1b[18~"),
-            8 => bytes.extend_from_slice(b"\x1b[19~"),
-            9 => bytes.extend_from_slice(b"\x1b[20~"),
-            10 => bytes.extend_from_slice(b"\x1b[21~"),
-            11 => bytes.extend_from_slice(b"\x1b[23~"),
-            12 => bytes.extend_from_slice(b"\x1b[24~"),
-            _ => return None,
+        },
+        KeyCode::Enter => {
+            if alt {
+                bytes.push(0x1b);
+            }
+            bytes.push(b'\r');
+        },
+        KeyCode::Tab => {
+            if alt {
+                bytes.push(0x1b);
+            }
+            bytes.push(b'\t');
+        },
+        KeyCode::Backspace => {
+            if alt {
+                bytes.push(0x1b);
+            }
+            bytes.push(0x7f);
+        },
+        KeyCode::Esc => {
+            if alt {
+                bytes.push(0x1b);
+            }
+            bytes.push(0x1b);
+        },
+        KeyCode::Up => bytes.extend_from_slice(&modified_csi_final(b'A', key.modifiers)),
+        KeyCode::Down => bytes.extend_from_slice(&modified_csi_final(b'B', key.modifiers)),
+        KeyCode::Right => bytes.extend_from_slice(&modified_csi_final(b'C', key.modifiers)),
+        KeyCode::Left => bytes.extend_from_slice(&modified_csi_final(b'D', key.modifiers)),
+        KeyCode::Home => bytes.extend_from_slice(&modified_csi_final(b'H', key.modifiers)),
+        KeyCode::End => bytes.extend_from_slice(&modified_csi_final(b'F', key.modifiers)),
+        KeyCode::PageUp => bytes.extend_from_slice(&modified_csi_tilde(5, key.modifiers)),
+        KeyCode::PageDown => bytes.extend_from_slice(&modified_csi_tilde(6, key.modifiers)),
+        KeyCode::Delete => bytes.extend_from_slice(&modified_csi_tilde(3, key.modifiers)),
+        KeyCode::Insert => bytes.extend_from_slice(&modified_csi_tilde(2, key.modifiers)),
+        KeyCode::F(n) => {
+            if alt {
+                bytes.push(0x1b);
+            }
+            match n {
+                1 => bytes.extend_from_slice(b"\x1bOP"),
+                2 => bytes.extend_from_slice(b"\x1bOQ"),
+                3 => bytes.extend_from_slice(b"\x1bOR"),
+                4 => bytes.extend_from_slice(b"\x1bOS"),
+                5 => bytes.extend_from_slice(b"\x1b[15~"),
+                6 => bytes.extend_from_slice(b"\x1b[17~"),
+                7 => bytes.extend_from_slice(b"\x1b[18~"),
+                8 => bytes.extend_from_slice(b"\x1b[19~"),
+                9 => bytes.extend_from_slice(b"\x1b[20~"),
+                10 => bytes.extend_from_slice(b"\x1b[21~"),
+                11 => bytes.extend_from_slice(b"\x1b[23~"),
+                12 => bytes.extend_from_slice(b"\x1b[24~"),
+                _ => return None,
+            }
         },
         _ => return None,
     }
 
     Some(bytes)
+}
+
+fn modified_csi_final(final_byte: u8, modifiers: KeyModifiers) -> Vec<u8> {
+    if let Some(modifier_param) = xterm_modifier_param(modifiers) {
+        format!("\x1b[1;{}{}", modifier_param, final_byte as char).into_bytes()
+    } else {
+        format!("\x1b[{}", final_byte as char).into_bytes()
+    }
+}
+
+fn modified_csi_tilde(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
+    if let Some(modifier_param) = xterm_modifier_param(modifiers) {
+        format!("\x1b[{};{}~", code, modifier_param).into_bytes()
+    } else {
+        format!("\x1b[{}~", code).into_bytes()
+    }
+}
+
+fn xterm_modifier_param(modifiers: KeyModifiers) -> Option<u8> {
+    let mut param = 1;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        param += 1;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        param += 2;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        param += 4;
+    }
+    (param > 1).then_some(param)
 }
 
 fn theme_base_style() -> Style {
@@ -12522,12 +13576,18 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             .set_size(agent_screen_rows, agent_screen_cols);
     }
 
-    let (agent_cursor, scrollback_offset) = {
+    let (agent_cursor, scrollback_offset, render_source) = {
         let startup_spinner_started_at = agent.startup_spinner_started_at();
         let screen = agent.parser.screen();
         let history_scroll_offset = agent.history_scroll_offset;
-        let scrollback_offset = if screen.scrollback() > 0 {
-            screen.scrollback()
+        let parser_scrollback = screen.scrollback();
+        let render_source = if parser_scrollback == 0 && history_scroll_offset > 0 {
+            "history"
+        } else {
+            "parser"
+        };
+        let scrollback_offset = if parser_scrollback > 0 {
+            parser_scrollback
         } else {
             history_scroll_offset
         };
@@ -12546,7 +13606,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         };
         let buf = f.buffer_mut();
         fill_area(buf, agent_area, Style::default().bg(AGENT_DEFAULT_BG));
-        if screen.scrollback() == 0 && history_scroll_offset > 0 {
+        if render_source == "history" {
             let lines = agent
                 .screen_history
                 .visible_lines(history_scroll_offset, agent_area.height as usize);
@@ -12557,8 +13617,42 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         if let Some(started_at) = startup_spinner_started_at {
             render_agent_startup_spinner(buf, agent_area, &agent.info, started_at);
         }
-        (cursor, scrollback_offset)
+        (cursor, scrollback_offset, render_source)
     };
+
+    if DEBUG_ENABLED.load(Ordering::Relaxed)
+        && (scrollback_offset > 0 || TRACE_ENABLED.load(Ordering::Relaxed))
+    {
+        let visible_rows = agent_area.height as usize;
+        let max_rows = visible_rows.max(1).min(120);
+        let rendered_window = if render_source == "history" {
+            debug_history_window_value(
+                &agent.screen_history,
+                agent.history_scroll_offset,
+                visible_rows.max(1),
+                max_rows,
+            )
+        } else {
+            let parser_scrollback = agent.parser.screen().scrollback();
+            debug_visible_lines_at_scrollback(&mut agent.parser, parser_scrollback, max_rows)
+        };
+        let state = debug_agent_client_state_value(agent, visible_rows.max(1), max_rows);
+        debug_log(
+            "agent_render",
+            serde_json::json!({
+                "provider": agent.info.provider.as_str(),
+                "session_id": &agent.info.session_id,
+                "area_x": agent_area.x,
+                "area_y": agent_area.y,
+                "area_width": agent_area.width,
+                "area_height": agent_area.height,
+                "render_source": render_source,
+                "scrollback_offset": scrollback_offset,
+                "rendered_window": rendered_window,
+                "state": state,
+            }),
+        );
+    }
 
     let buf = f.buffer_mut();
     fill_area(buf, status_area, theme_status_style());
@@ -12755,6 +13849,32 @@ fn agent_sidebar_width(total_width: u16, configured_width: u16) -> u16 {
 
 fn agent_terminal_width(total_width: u16, configured_width: u16) -> u16 {
     total_width.saturating_sub(agent_sidebar_width(total_width, configured_width))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentViewport {
+    area_cols: u16,
+    area_rows: u16,
+    pty_cols: u16,
+    pty_rows: u16,
+    page_rows: usize,
+}
+
+fn agent_viewport_for_terminal(
+    total_width: u16,
+    terminal_rows: u16,
+    configured_sidebar_width: u16,
+) -> AgentViewport {
+    let area_rows = terminal_rows.saturating_sub(AGENT_STATUS_HEIGHT);
+    let area_cols = agent_terminal_width(total_width, configured_sidebar_width);
+    let (pty_rows, pty_cols) = agent_screen_size_for_area(Rect::new(0, 0, area_cols, area_rows));
+    AgentViewport {
+        area_cols,
+        area_rows,
+        pty_cols,
+        pty_rows,
+        page_rows: area_rows.max(1) as usize,
+    }
 }
 
 fn agent_pty_size(cols: u16, rows: u16) -> PtySize {
@@ -17309,6 +18429,23 @@ mod tests {
     }
 
     #[test]
+    fn agent_viewport_uses_rendered_agent_area_for_pty_and_page_rows() {
+        let viewport = agent_viewport_for_terminal(120, 31, 40);
+        assert_eq!(viewport.area_cols, 80);
+        assert_eq!(viewport.area_rows, 30);
+        assert_eq!(viewport.pty_cols, 80);
+        assert_eq!(viewport.pty_rows, 30);
+        assert_eq!(viewport.page_rows, 30);
+
+        let tiny = agent_viewport_for_terminal(10, 1, u16::MAX);
+        assert_eq!(tiny.area_cols, 0);
+        assert_eq!(tiny.area_rows, 0);
+        assert_eq!(tiny.pty_cols, AGENT_MIN_PTY_COLS);
+        assert_eq!(tiny.pty_rows, AGENT_MIN_PTY_ROWS);
+        assert_eq!(tiny.page_rows, 1);
+    }
+
+    #[test]
     fn sessions_pane_width_uses_saved_columns_or_fallback_percent() {
         assert_eq!(
             sessions_pane_width(100, None, DEFAULT_SESSIONS_PANE_PERCENT),
@@ -18139,8 +19276,38 @@ IF EXIST "%~dp0\node.exe" (
             &mut app,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
             80,
+            24,
         );
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn repeat_key_events_are_actionable_for_held_navigation_shortcuts() {
+        let scroll_repeat = KeyEvent::new_with_kind(
+            KeyCode::Up,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+            KeyEventKind::Repeat,
+        );
+        assert!(is_actionable_key_event(scroll_repeat));
+        assert_eq!(
+            is_agent_scrollback_key(scroll_repeat),
+            Some(AgentScrollAction::Pages(1))
+        );
+
+        let scroll_release = KeyEvent::new_with_kind(
+            KeyCode::Up,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+            KeyEventKind::Release,
+        );
+        assert!(!is_actionable_key_event(scroll_release));
+    }
+
+    #[test]
+    fn agent_scroll_page_rows_match_visible_agent_area() {
+        assert_eq!(agent_scroll_page_rows(24), 23);
+        assert_eq!(agent_scroll_page_rows(2), 1);
+        assert_eq!(agent_scroll_page_rows(1), 1);
+        assert_eq!(agent_scroll_page_rows(0), 1);
     }
 
     #[test]
@@ -18211,6 +19378,92 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
+    fn codex_child_scroll_uses_transcript_pager_keys() {
+        assert_eq!(
+            codex_transcript_scroll_key(AgentScrollAction::Lines(1)).map(|key| key.code),
+            Some(KeyCode::Up)
+        );
+        assert_eq!(
+            codex_transcript_scroll_key(AgentScrollAction::Lines(-1)).map(|key| key.code),
+            Some(KeyCode::Down)
+        );
+        assert_eq!(
+            codex_transcript_scroll_key(AgentScrollAction::Pages(1)).map(|key| key.code),
+            Some(KeyCode::PageUp)
+        );
+        assert_eq!(
+            codex_transcript_scroll_key(AgentScrollAction::Pages(-1)).map(|key| key.code),
+            Some(KeyCode::PageDown)
+        );
+        assert_eq!(
+            codex_transcript_scroll_key(AgentScrollAction::Top).map(|key| key.code),
+            Some(KeyCode::Home)
+        );
+        assert_eq!(
+            codex_transcript_scroll_key(AgentScrollAction::Bottom).map(|key| key.code),
+            Some(KeyCode::End)
+        );
+    }
+
+    #[test]
+    fn codex_transcript_overlay_assumption_tracks_open_and_close_keys() {
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let page_up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+
+        assert!(codex_transcript_overlay_state_after_key(
+            Provider::Codex,
+            false,
+            ctrl_t
+        ));
+        assert!(!codex_transcript_overlay_state_after_key(
+            Provider::Codex,
+            true,
+            ctrl_t
+        ));
+        assert!(!codex_transcript_overlay_state_after_key(
+            Provider::Codex,
+            true,
+            q
+        ));
+        assert!(!codex_transcript_overlay_state_after_key(
+            Provider::Codex,
+            true,
+            ctrl_c
+        ));
+        assert!(codex_transcript_overlay_state_after_key(
+            Provider::Codex,
+            true,
+            page_up
+        ));
+        assert!(!codex_transcript_overlay_state_after_key(
+            Provider::Claude,
+            false,
+            ctrl_t
+        ));
+    }
+
+    #[test]
+    fn modified_navigation_keys_encode_xterm_modifier_sequences() {
+        assert_eq!(
+            key_event_to_bytes(KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::SHIFT | KeyModifiers::ALT
+            )),
+            Some(b"\x1b[1;4A".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)),
+            Some(b"\x1b[5;2~".to_vec())
+        );
+        assert_eq!(
+            key_event_to_bytes(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
+            Some(b"\x1bx".to_vec())
+        );
+    }
+
+    #[test]
     fn parser_snapshot_rehydrates_scrollback_lines() {
         let mut source = vt100::Parser::new(5, 20, AGENT_SCROLLBACK_LINES);
         for line in 1..=12 {
@@ -18242,6 +19495,167 @@ IF EXIST "%~dp0\node.exe" (
                 .any(|line| line.contains("COKSCROLL001")),
             "oldest scrollback line should be visible after restoring snapshot: {:?}",
             restored_lines
+        );
+    }
+
+    #[test]
+    fn parser_snapshot_does_not_duplicate_visible_screen_into_scrollback() {
+        let mut source = vt100::Parser::new(5, 20, AGENT_SCROLLBACK_LINES);
+        for line in 1..=20 {
+            let bytes = format!("COKPAGE{:03}\r\n", line);
+            safe_parser_process(&mut source, bytes.as_bytes());
+        }
+
+        let snapshot = parser_snapshot_bytes(&mut source, true);
+        let mut restored = vt100::Parser::new(5, 20, AGENT_SCROLLBACK_LINES);
+        safe_parser_process(&mut restored, &snapshot);
+
+        let current_text = parser_visible_plain_lines(&mut restored, 0).join("\n");
+        assert!(
+            current_text.contains("COKPAGE020"),
+            "current screen should still be restored: {:?}",
+            current_text
+        );
+
+        let first_page_up = parser_visible_plain_lines(&mut restored, 5).join("\n");
+        assert!(
+            !first_page_up.contains("COKPAGE020"),
+            "first scrollback page should not duplicate the current screen: {:?}",
+            first_page_up
+        );
+    }
+
+    #[test]
+    fn snapshot_visible_suffix_trimmer_removes_current_page_duplicates() {
+        let mut scrollback = vec![
+            "OLD001".to_string(),
+            "OLD002".to_string(),
+            "CURRENT001".to_string(),
+            "CURRENT002  ".to_string(),
+            "CURRENT003".to_string(),
+        ];
+        let visible = vec![
+            "CURRENT001".to_string(),
+            "CURRENT002".to_string(),
+            "CURRENT003".to_string(),
+            String::new(),
+        ];
+
+        let removed = trim_visible_screen_suffix_duplicates(&mut scrollback, &visible);
+        assert_eq!(removed, 3);
+        assert_eq!(scrollback, vec!["OLD001".to_string(), "OLD002".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_frame_scrollback_compaction_collapses_same_anchor_frames() {
+        let frame_old = vec![
+            "HEADER".to_string(),
+            "STABLE1".to_string(),
+            "STABLE2".to_string(),
+            "WORK old".to_string(),
+        ];
+        let frame_new = vec![
+            "HEADER".to_string(),
+            "STABLE1".to_string(),
+            "STABLE2".to_string(),
+            "WORK new".to_string(),
+        ];
+        let mut scrollback = Vec::new();
+        scrollback.extend(frame_old);
+        scrollback.extend(frame_new.clone());
+
+        let compacted = compact_frame_scrollback_lines(&scrollback, &frame_new, 4).unwrap();
+        assert!(
+            compacted.is_empty(),
+            "same-anchor frame history before the current screen should collapse away: {:?}",
+            compacted
+        );
+    }
+
+    #[test]
+    fn snapshot_frame_scrollback_compaction_preserves_moving_viewport_lines() {
+        let frame1 = vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+        ];
+        let frame2 = vec![
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+            "E".to_string(),
+        ];
+        let visible = vec![
+            "C".to_string(),
+            "D".to_string(),
+            "E".to_string(),
+            "F".to_string(),
+        ];
+        let mut scrollback = Vec::new();
+        scrollback.extend(frame1);
+        scrollback.extend(frame2);
+
+        let compacted = compact_frame_scrollback_lines(&scrollback, &visible, 4).unwrap();
+        assert_eq!(compacted, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_snapshot_replaces_existing_parser_state() {
+        let pty_size = agent_pty_size(30, 5);
+        let mut first = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
+        safe_parser_process(&mut first, b"FIRSTSNAP\r\n");
+        let first_snapshot = parser_snapshot_bytes(&mut first, false);
+
+        let mut second = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
+        for line in 1..=12 {
+            let bytes = format!("SECONDSNAP{:03}\r\n", line);
+            safe_parser_process(&mut second, bytes.as_bytes());
+        }
+        let second_snapshot = parser_snapshot_bytes(&mut second, true);
+
+        let (stream, _peer) = AgentStream::pair().unwrap();
+        let mut client = AgentClient {
+            info: session_info(Provider::Claude, "snapshot-replace", "/repo"),
+            command_line: "test".into(),
+            parser: vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES),
+            screen_history: ScreenHistory::default(),
+            history_scroll_offset: 0,
+            stream,
+            pty_size,
+            exited: Some("test".into()),
+            screen_hash: 0,
+            last_screen_change_epoch_ms: 0,
+            last_output_epoch_ms: 0,
+            last_input_epoch_ms: 0,
+            pending_snapshot_output: false,
+            startup_spinner_started_at: None,
+            debug_output_events: 0,
+            codex_transcript_overlay_assumed_open: false,
+            reader_id: 0,
+            reader_thread: None,
+        };
+        client.screen_hash = screen_activity_hash(client.parser.screen());
+
+        client.process_agent_snapshot(&first_snapshot);
+        assert!(parser_visible_plain_lines(&mut client.parser, 0)
+            .join("\n")
+            .contains("FIRSTSNAP"));
+
+        client.process_agent_snapshot(&second_snapshot);
+        client.parser.screen_mut().set_scrollback(usize::MAX);
+        let top_offset = client.parser.screen().scrollback();
+        let top_text = parser_visible_plain_lines(&mut client.parser, top_offset).join("\n");
+        assert!(
+            top_text.contains("SECONDSNAP001"),
+            "replacement snapshot should restore its own oldest scrollback: {:?}",
+            top_text
+        );
+        assert!(
+            !top_text.contains("FIRSTSNAP"),
+            "replacement snapshot must not keep previous parser contents in scrollback: {:?}",
+            top_text
         );
     }
 
@@ -18335,6 +19749,86 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
+    fn screen_history_page_scroll_uses_full_frame_height() {
+        let visible_rows = 4;
+        let mut source = vt100::Parser::new(visible_rows, 30, AGENT_SCROLLBACK_LINES);
+        let mut history = ScreenHistory::default();
+        for frame in 1..=4 {
+            let bytes = format!(
+                "\x1b[?1049h\x1b[H\x1b[2JFRAME{frame:03}\r\nROW{frame:03}A\r\nROW{frame:03}B\r\nROW{frame:03}C"
+            );
+            safe_parser_process(&mut source, bytes.as_bytes());
+            history.capture(&mut source);
+        }
+
+        let lines = history.visible_lines(visible_rows as usize, visible_rows as usize);
+        assert_eq!(lines.len(), visible_rows as usize);
+        assert!(
+            lines.iter().all(|line| line.contains("003")),
+            "one page up should land on the previous full frame, not a mixed frame: {:?}",
+            lines
+        );
+    }
+
+    #[test]
+    fn screen_history_replaces_in_place_viewport_updates() {
+        let mut source = vt100::Parser::new(5, 40, AGENT_SCROLLBACK_LINES);
+        let mut history = ScreenHistory::default();
+
+        safe_parser_process(
+            &mut source,
+            b"\x1b[?1049h\x1b[H\x1b[2JHEADER\r\nSTABLE1\r\nSTABLE2\r\nWORK old\r\nSTATUS old",
+        );
+        history.capture(&mut source);
+        safe_parser_process(
+            &mut source,
+            b"\x1b[H\x1b[2JHEADER\r\nSTABLE1\r\nSTABLE2\r\nWORK new\r\nSTATUS new",
+        );
+        history.capture(&mut source);
+
+        let lines = history.all_lines();
+        assert_eq!(
+            lines.len(),
+            5,
+            "same anchored viewport updates should replace the current snapshot, not append another full frame: {:?}",
+            lines
+        );
+        assert!(lines.iter().any(|line| line == "WORK new"));
+        assert!(!lines.iter().any(|line| line == "WORK old"));
+    }
+
+    #[test]
+    fn screen_history_records_only_scrolled_off_lines_for_moving_viewport() {
+        let mut source = vt100::Parser::new(4, 40, AGENT_SCROLLBACK_LINES);
+        let mut history = ScreenHistory::default();
+
+        safe_parser_process(&mut source, b"\x1b[?1049h\x1b[H\x1b[2JA\r\nB\r\nC\r\nD");
+        history.capture(&mut source);
+        safe_parser_process(&mut source, b"\x1b[H\x1b[2JB\r\nC\r\nD\r\nE");
+        history.capture(&mut source);
+
+        assert_eq!(
+            history.all_lines(),
+            vec![
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+                "E".to_string(),
+            ]
+        );
+        assert_eq!(
+            history.visible_lines(1, 4),
+            vec![
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn parser_snapshot_history_fallback_does_not_duplicate_current_frame() {
         let mut source = vt100::Parser::new(5, 30, AGENT_SCROLLBACK_LINES);
         let mut history = ScreenHistory::default();
@@ -18381,6 +19875,7 @@ IF EXIST "%~dp0\node.exe" (
             pending_snapshot_output: false,
             startup_spinner_started_at: None,
             debug_output_events: 0,
+            codex_transcript_overlay_assumed_open: false,
             reader_id: 0,
             reader_thread: None,
         };
