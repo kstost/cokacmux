@@ -176,6 +176,13 @@ const THEME_BORDER_ACTIVE: Color = Color::Indexed(110);
 const THEME_PROVIDER_CLAUDE: Color = Color::Indexed(139);
 const THEME_PROVIDER_CODEX: Color = Color::Indexed(110);
 const THEME_PROVIDER_OPENCODE: Color = Color::Indexed(107);
+const THEME_PREVIEW_USER: Color = Color::Indexed(117);
+const THEME_PREVIEW_ASSISTANT: Color = Color::Indexed(114);
+const THEME_PREVIEW_TOOL: Color = Color::Indexed(215);
+const THEME_PREVIEW_THINKING: Color = Color::Indexed(183);
+const THEME_PREVIEW_ERROR: Color = Color::Indexed(203);
+const THEME_PREVIEW_IMAGE: Color = Color::Indexed(180);
+const THEME_PREVIEW_PATCH_REMOVE: Color = Color::Indexed(174);
 const AGENT_DEFAULT_BG: Color = THEME_BG;
 const STARTUP_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const STARTUP_SPINNER_TICK_MS: u128 = 180;
@@ -15664,7 +15671,7 @@ fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             let session_label = if app.session_view == SessionViewMode::Tree {
                 tree_session_label(row.depth, &s.session_id)
             } else {
-                s.session_id.clone()
+                session_id_display_label(&s.session_id)
             };
             let mut spans = vec![
                 Span::raw(marker),
@@ -15674,24 +15681,19 @@ fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 ),
                 Span::raw(" "),
                 prov,
-                Span::raw(" "),
-                Span::styled(
-                    fit_width(&session_label, cols.id, Align::Left),
-                    Style::default().fg(THEME_FG_DIM),
-                ),
             ];
-            if cols.age > 0 {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    fit_width(&age, cols.age, Align::Right),
-                    Style::default().fg(THEME_FG_DIM),
-                ));
-            }
             if cols.title > 0 {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(
                     fit_width(title, cols.title, Align::Left),
                     Style::default().fg(THEME_FG_STRONG),
+                ));
+            }
+            if cols.age > 0 {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    fit_width(&age, cols.age, Align::Right),
+                    Style::default().fg(THEME_FG_DIM),
                 ));
             }
             if cols.cwd > 0 {
@@ -15701,6 +15703,13 @@ fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Style::default().fg(THEME_FG_DIM),
                 ));
             }
+            spans.extend([
+                Span::raw(" "),
+                Span::styled(
+                    fit_width(&session_label, cols.id, Align::Left),
+                    Style::default().fg(THEME_FG_DIM),
+                ),
+            ]);
             let line = Line::from(spans);
             ListItem::new(line)
         })
@@ -15811,15 +15820,160 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let buf = f.buffer_mut();
     fill_area(buf, inner, theme_base_style());
-    for (row, line) in lines.iter().take(inner.height as usize).enumerate() {
-        buf.set_stringn(
-            inner.x,
-            inner.y + row as u16,
-            line,
-            inner.width as usize,
-            theme_base_style(),
-        );
+    let styled_lines: Vec<Line> = lines
+        .iter()
+        .take(inner.height as usize)
+        .map(|line| preview_line(line, app.preview_mode))
+        .collect();
+    f.render_widget(Paragraph::new(styled_lines).style(theme_base_style()), inner);
+}
+
+fn preview_line(line: &str, mode: Mode) -> Line<'static> {
+    if mode == Mode::Summary {
+        preview_summary_line(line)
+    } else {
+        Line::from(Span::styled(line.to_string(), theme_base_style()))
     }
+}
+
+fn preview_summary_line(line: &str) -> Line<'static> {
+    if line.is_empty() {
+        return Line::from(Span::raw(""));
+    }
+    if matches!(line, "Session" | "Messages") {
+        return Line::from(Span::styled(
+            line.to_string(),
+            preview_style(THEME_ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    for (prefix, color) in [
+        ("USER #", THEME_PREVIEW_USER),
+        ("ASSISTANT #", THEME_PREVIEW_ASSISTANT),
+        ("TOOL #", THEME_PREVIEW_TOOL),
+        ("SYSTEM #", THEME_FG_DIM),
+        ("DEVELOPER #", THEME_SHORTCUT),
+    ] {
+        if line.starts_with(prefix) {
+            return preview_summary_role_line(line, prefix, color);
+        }
+    }
+    for (prefix, color) in [
+        ("  thinking", THEME_PREVIEW_THINKING),
+        ("  tool use:", THEME_PREVIEW_TOOL),
+        ("  image:", THEME_PREVIEW_IMAGE),
+        ("  attachment", THEME_ACCENT),
+        ("  patch:", THEME_SHORTCUT),
+        ("  other:", THEME_FG_DIM),
+        ("  input text:", THEME_PREVIEW_USER),
+        ("  output text:", THEME_PREVIEW_ASSISTANT),
+    ] {
+        if line.starts_with(prefix) {
+            return preview_summary_prefix_line(line, prefix, color);
+        }
+    }
+    if line.starts_with("  tool result") {
+        let color = if line.contains("· error") {
+            THEME_PREVIEW_ERROR
+        } else {
+            THEME_POSITIVE
+        };
+        return preview_summary_prefix_line(line, "  tool result", color);
+    }
+    if line.starts_with("  ") && line.contains(':') && !line.starts_with("    ") {
+        return preview_summary_field_line(line);
+    }
+    preview_summary_body_line(line)
+}
+
+fn preview_summary_role_line(line: &str, prefix: &str, color: Color) -> Line<'static> {
+    let role_end = line
+        .find(" · ")
+        .unwrap_or_else(|| line.len())
+        .max(prefix.len());
+    let (head, tail) = line.split_at(role_end);
+    Line::from(vec![
+        Span::styled(
+            head.to_string(),
+            preview_style(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(tail.to_string(), preview_style(THEME_FG_DIM)),
+    ])
+}
+
+fn preview_summary_prefix_line(line: &str, prefix: &str, color: Color) -> Line<'static> {
+    let split = line
+        .find(':')
+        .map(|idx| idx + 1)
+        .unwrap_or_else(|| prefix.len().min(line.len()));
+    let (head, tail) = line.split_at(split);
+    Line::from(vec![
+        Span::styled(
+            head.to_string(),
+            preview_style(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(tail.to_string(), preview_style(THEME_FG)),
+    ])
+}
+
+fn preview_summary_field_line(line: &str) -> Line<'static> {
+    let Some(split) = line.find(':').map(|idx| idx + 1) else {
+        return Line::from(Span::styled(line.to_string(), preview_style(THEME_FG)));
+    };
+    let (label, value) = line.split_at(split);
+    let value_style = if label.contains("provider") {
+        provider_color_from_summary_line(value)
+            .map(preview_style)
+            .unwrap_or_else(|| preview_style(THEME_FG_STRONG))
+    } else if label.contains("tokens") {
+        preview_style(THEME_POSITIVE)
+    } else {
+        preview_style(THEME_FG_STRONG)
+    };
+    Line::from(vec![
+        Span::styled(label.to_string(), preview_style(THEME_FG_DIM)),
+        Span::styled(value.to_string(), value_style),
+    ])
+}
+
+fn preview_summary_body_line(line: &str) -> Line<'static> {
+    let trimmed = line.trim_start();
+    let color = if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+        THEME_POSITIVE
+    } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+        THEME_PREVIEW_PATCH_REMOVE
+    } else if trimmed.starts_with("@@") {
+        THEME_SHORTCUT
+    } else if trimmed.starts_with("... +") || trimmed.starts_with("(no ") || trimmed == "(empty)" {
+        THEME_FG_DIM
+    } else if line.starts_with("    ") && line.contains(':') {
+        THEME_ACCENT
+    } else {
+        THEME_FG
+    };
+
+    if line.starts_with("    ") {
+        if let Some(split) = line.find(':').filter(|idx| *idx > 4) {
+            let (label, value) = line.split_at(split + 1);
+            return Line::from(vec![
+                Span::styled(label.to_string(), preview_style(color)),
+                Span::styled(value.to_string(), preview_style(THEME_FG)),
+            ]);
+        }
+    }
+    Line::from(Span::styled(line.to_string(), preview_style(color)))
+}
+
+fn provider_color_from_summary_line(value: &str) -> Option<Color> {
+    match value.trim() {
+        "claude" => Some(THEME_PROVIDER_CLAUDE),
+        "codex" => Some(THEME_PROVIDER_CODEX),
+        "opencode" => Some(THEME_PROVIDER_OPENCODE),
+        _ => None,
+    }
+}
+
+fn preview_style(color: Color) -> Style {
+    Style::default().fg(color).bg(THEME_BG)
 }
 
 fn pane_inner(area: Rect) -> Rect {
@@ -16086,11 +16240,23 @@ fn age_label(epoch_s: u64) -> String {
 }
 
 fn tree_session_label(depth: usize, session_id: &str) -> String {
+    let session_id = session_id_display_label(session_id);
     if depth == 0 {
-        session_id.to_string()
+        session_id
     } else {
         format!("{}└ {}", "  ".repeat(depth.saturating_sub(1)), session_id)
     }
+}
+
+fn session_id_display_label(session_id: &str) -> String {
+    truncate_width(session_id_display_part(session_id), SESSION_DISPLAY_WIDTH)
+}
+
+fn session_id_display_part(session_id: &str) -> &str {
+    session_id
+        .rsplit('-')
+        .find(|part| !part.is_empty())
+        .unwrap_or(session_id)
 }
 
 fn title_edit_display(draft: &str, cursor: usize, width: usize) -> String {
@@ -16235,6 +16401,9 @@ const LIST_MARKER_WIDTH: usize = 2;
 const STATE_COLUMN_WIDTH: usize = 8;
 const PROVIDER_COLUMN_WIDTH: usize = 8;
 const AGE_COLUMN_WIDTH: usize = 4;
+const SESSION_DISPLAY_WIDTH: usize = 10;
+const TITLE_MIN_COLUMN_WIDTH: usize = 10;
+const CWD_MIN_COLUMN_WIDTH: usize = 12;
 
 fn list_columns(row_width: u16) -> ListColumns {
     let content = (row_width as usize).saturating_sub(LIST_MARKER_WIDTH);
@@ -16250,7 +16419,7 @@ fn list_columns(row_width: u16) -> ListColumns {
         };
     }
 
-    if rest < 13 {
+    if rest <= SESSION_DISPLAY_WIDTH + 1 {
         return ListColumns {
             state: STATE_COLUMN_WIDTH,
             id: rest,
@@ -16260,31 +16429,32 @@ fn list_columns(row_width: u16) -> ListColumns {
         };
     }
 
-    let rest_without_age = rest.saturating_sub(1 + AGE_COLUMN_WIDTH);
-    if rest_without_age < 19 {
+    let id = SESSION_DISPLAY_WIDTH;
+    let front_width = rest.saturating_sub(1 + id);
+    if front_width < TITLE_MIN_COLUMN_WIDTH + 1 + CWD_MIN_COLUMN_WIDTH {
         return ListColumns {
             state: STATE_COLUMN_WIDTH,
-            id: rest_without_age,
-            age: AGE_COLUMN_WIDTH,
-            title: 0,
+            id,
+            age: 0,
+            title: front_width,
             cwd: 0,
         };
     }
 
-    let rest_without_title = rest_without_age.saturating_sub(1);
-    if rest_without_title < 31 {
-        let (id, title, cwd) = allocate_fluid_columns(rest_without_title, false);
+    let all_value_min = TITLE_MIN_COLUMN_WIDTH + 1 + AGE_COLUMN_WIDTH + 1 + CWD_MIN_COLUMN_WIDTH;
+    if front_width < all_value_min {
+        let (title, cwd) = allocate_title_cwd_columns(front_width.saturating_sub(1));
         return ListColumns {
             state: STATE_COLUMN_WIDTH,
             id,
-            age: AGE_COLUMN_WIDTH,
+            age: 0,
             title,
             cwd,
         };
     }
 
-    let rest_without_cwd = rest_without_title.saturating_sub(1);
-    let (id, title, cwd) = allocate_fluid_columns(rest_without_cwd, true);
+    let (title, cwd) =
+        allocate_title_cwd_columns(front_width.saturating_sub(1 + AGE_COLUMN_WIDTH + 1));
     ListColumns {
         state: STATE_COLUMN_WIDTH,
         id,
@@ -16294,31 +16464,22 @@ fn list_columns(row_width: u16) -> ListColumns {
     }
 }
 
-fn allocate_fluid_columns(total: usize, include_cwd: bool) -> (usize, usize, usize) {
-    let id_min = 8;
-    let title_min = 10;
-    let cwd_min = if include_cwd { 12 } else { 0 };
-    let min_total = id_min + title_min + cwd_min;
-    let mut id = id_min;
-    let mut title = title_min;
-    let mut cwd = cwd_min;
-    let mut slack = total.saturating_sub(min_total);
-
-    let id_extra = slack.min(28);
-    id += id_extra;
-    slack -= id_extra;
-
-    let title_extra = slack.min(if include_cwd { 38 } else { usize::MAX });
-    title += title_extra;
-    slack -= title_extra;
-
-    if include_cwd {
-        cwd += slack;
-    } else {
-        title += slack;
+fn allocate_title_cwd_columns(total: usize) -> (usize, usize) {
+    let min_total = TITLE_MIN_COLUMN_WIDTH + CWD_MIN_COLUMN_WIDTH;
+    if total <= min_total {
+        let title = total.min(TITLE_MIN_COLUMN_WIDTH);
+        return (title, total.saturating_sub(title));
     }
 
-    (id, title, cwd)
+    let slack = total - min_total;
+    let title_extra = slack * 3 / 5;
+    let cwd_extra = slack - title_extra;
+    let mut title = TITLE_MIN_COLUMN_WIDTH;
+    let mut cwd = CWD_MIN_COLUMN_WIDTH;
+    title += title_extra;
+    cwd += cwd_extra;
+
+    (title, cwd)
 }
 
 fn list_header(cols: &ListColumns) -> String {
@@ -16327,19 +16488,19 @@ fn list_header(cols: &ListColumns) -> String {
     out.push(' ');
     out.push_str(&fit_width("provider", PROVIDER_COLUMN_WIDTH, Align::Left));
     out.push(' ');
-    out.push_str(&fit_width("session", cols.id, Align::Left));
-    if cols.age > 0 {
-        out.push(' ');
-        out.push_str(&fit_width("age", cols.age, Align::Right));
-    }
     if cols.title > 0 {
-        out.push(' ');
         out.push_str(&fit_width("title", cols.title, Align::Left));
+        out.push(' ');
+    }
+    if cols.age > 0 {
+        out.push_str(&fit_width("age", cols.age, Align::Right));
+        out.push(' ');
     }
     if cols.cwd > 0 {
-        out.push(' ');
         out.push_str(&fit_width("cwd", cols.cwd, Align::Left));
+        out.push(' ');
     }
+    out.push_str(&fit_width("session", cols.id, Align::Left));
     out
 }
 
@@ -18329,6 +18490,13 @@ mod tests {
             THEME_PROVIDER_CLAUDE,
             THEME_PROVIDER_CODEX,
             THEME_PROVIDER_OPENCODE,
+            THEME_PREVIEW_USER,
+            THEME_PREVIEW_ASSISTANT,
+            THEME_PREVIEW_TOOL,
+            THEME_PREVIEW_THINKING,
+            THEME_PREVIEW_ERROR,
+            THEME_PREVIEW_IMAGE,
+            THEME_PREVIEW_PATCH_REMOVE,
             AGENT_DEFAULT_BG,
         ];
         assert!(colors
@@ -18708,6 +18876,11 @@ mod tests {
         assert!(header.contains("state"));
         assert!(header.contains("provider"));
         assert!(header.contains("session"));
+        assert!(header.contains("title"));
+        assert!(header.find("provider").unwrap() < header.find("title").unwrap());
+        assert!(header.find("title").unwrap() < header.find("age").unwrap());
+        assert!(header.find("age").unwrap() < header.find("cwd").unwrap());
+        assert!(header.find("cwd").unwrap() < header.find("session").unwrap());
     }
 
     #[test]
@@ -18725,10 +18898,57 @@ mod tests {
 
         assert!(compact.title > 0);
         assert!(compact.cwd > 0);
-        assert!(wide.id >= compact.id);
+        assert_eq!(compact.id, SESSION_DISPLAY_WIDTH);
+        assert_eq!(wide.id, SESSION_DISPLAY_WIDTH);
         assert!(wide.title >= compact.title);
         assert!(wide.cwd >= compact.cwd);
         assert_eq!(wide.row_width(), 140);
+    }
+
+    #[test]
+    fn list_columns_cap_session_and_spend_extra_width_on_title_and_cwd() {
+        let cols = list_columns(160);
+
+        assert_eq!(cols.id, SESSION_DISPLAY_WIDTH);
+        assert!(cols.title > cols.cwd / 2);
+        assert!(cols.cwd >= CWD_MIN_COLUMN_WIDTH);
+        assert_eq!(cols.row_width(), 160);
+    }
+
+    #[test]
+    fn list_columns_show_title_before_age_at_medium_width() {
+        let cols = list_columns(39);
+
+        assert!(cols.title > 0);
+        assert_eq!(cols.age, 0);
+        assert_eq!(cols.row_width(), 39);
+    }
+
+    #[test]
+    fn session_id_display_part_uses_last_dash_segment() {
+        assert_eq!(
+            session_id_display_part("123e4567-e89b-12d3-a456-426614174000"),
+            "426614174000"
+        );
+        assert_eq!(session_id_display_part("plain-session-id"), "id");
+        assert_eq!(session_id_display_part("plain"), "plain");
+    }
+
+    #[test]
+    fn session_id_display_label_limits_visible_width() {
+        assert_eq!(
+            session_id_display_label("123e4567-e89b-12d3-a456-426614174000"),
+            "426614174…"
+        );
+        assert_eq!(session_id_display_label("plain-session-id"), "id");
+    }
+
+    #[test]
+    fn tree_session_label_shortens_only_session_id() {
+        assert_eq!(
+            tree_session_label(2, "123e4567-e89b-12d3-a456-426614174000"),
+            "  └ 426614174…"
+        );
     }
 
     #[test]
