@@ -59,11 +59,11 @@ fn render_summary_includes_messages_and_meta() {
     assert!(out.contains("sid-1"));
     assert!(out.contains("Test Session"));
     assert!(out.contains("/tmp/x"));
-    assert!(out.contains("[user"));
+    assert!(out.contains("USER #0"));
     assert!(out.contains("hello there"));
-    assert!(out.contains("[assistant"));
+    assert!(out.contains("ASSISTANT #1"));
     assert!(out.contains("howdy"));
-    assert!(out.contains("tool_use"));
+    assert!(out.contains("tool use"));
     assert!(out.contains("Read"));
 }
 

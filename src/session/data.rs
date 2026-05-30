@@ -466,7 +466,15 @@ fn copy_path_with_progress(
         );
     }
     if file_type.is_file() {
-        copy_file_chunked_with_progress(source, dest, &metadata, stats, total, cancel, on_progress)?;
+        copy_file_chunked_with_progress(
+            source,
+            dest,
+            &metadata,
+            stats,
+            total,
+            cancel,
+            on_progress,
+        )?;
         return Ok(());
     }
 
@@ -1007,7 +1015,11 @@ mod tests {
         let data_root = dir.path().join("data");
         let project = dir.path().join("project");
         fs::create_dir_all(&project).unwrap();
-        fs::write(project.join("large.bin"), vec![7_u8; COPY_CHUNK_SIZE + 4096]).unwrap();
+        fs::write(
+            project.join("large.bin"),
+            vec![7_u8; COPY_CHUNK_SIZE + 4096],
+        )
+        .unwrap();
 
         let source = info(Provider::Codex, "source", &project);
         let report = CloneReport {

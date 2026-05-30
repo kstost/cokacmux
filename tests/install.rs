@@ -296,6 +296,7 @@ fn opencode_install_into_tempdir() {
         &session,
         &opencode::install::InstallOpts {
             db_path: Some(db.clone()),
+            overwrite: false,
         },
     )
     .unwrap();
@@ -309,10 +310,29 @@ fn opencode_install_into_tempdir() {
         Provider::OpenCode,
         &session.session_id,
         &ArtifactPath::OpenCodeDb {
-            db_path: db,
+            db_path: db.clone(),
             session_id: session.session_id.clone(),
         },
     )
     .unwrap();
     assert!(validation.ok, "{:?}", validation);
+
+    let err = opencode::install::install_to_default_db(
+        &session,
+        &opencode::install::InstallOpts {
+            db_path: Some(db.clone()),
+            overwrite: false,
+        },
+    )
+    .expect_err("re-install without overwrite should fail");
+    assert!(err.to_string().contains("already exists"), "{err}");
+
+    opencode::install::install_to_default_db(
+        &session,
+        &opencode::install::InstallOpts {
+            db_path: Some(db.clone()),
+            overwrite: true,
+        },
+    )
+    .unwrap();
 }

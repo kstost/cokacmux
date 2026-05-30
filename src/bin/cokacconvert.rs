@@ -108,7 +108,7 @@ enum SessionCmd {
     Clone {
         /// Source session id (or unique prefix).
         id: String,
-        /// Target provider (default: same as source).
+        /// Target provider. Must match the source; use convert for cross-provider output.
         #[arg(long, value_enum)]
         to: Option<ProviderArg>,
         /// Override cwd on the new session.

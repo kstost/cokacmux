@@ -66,7 +66,6 @@ use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use cokacmux::providers;
 use cokacmux::providers::discovery::SessionInfo;
 use cokacmux::session;
 use cokacmux::session::render::Mode;
@@ -480,6 +479,12 @@ enum KeyAction {
     AgentSwitchNext,
     ConfirmYes,
     ConfirmNo,
+    DeleteConfirmCancel,
+    DeleteConfirmConfirm,
+    DeleteConfirmNext,
+    DeleteConfirmPrev,
+    DeleteConfirmDelete,
+    DeleteConfirmCancelChoice,
     FilterCancel,
     FilterApply,
     FilterMoveLeft,
@@ -502,6 +507,13 @@ enum KeyAction {
     AgentLaunchPrev,
     AgentLaunchNormal,
     AgentLaunchSkipPermissions,
+    CloneOptionsCancel,
+    CloneOptionsConfirm,
+    CloneOptionsNext,
+    CloneOptionsPrev,
+    CloneOptionsSessionOnly,
+    CloneOptionsFolderData,
+    CloneOptionsCancelChoice,
     NewSessionCancel,
     NewSessionConfirm,
     NewSessionNext,
@@ -514,10 +526,6 @@ enum KeyAction {
     NewSessionDelete,
     NewSessionHome,
     NewSessionEnd,
-    CloneTargetCancel,
-    CloneTargetConfirm,
-    CloneTargetNext,
-    CloneTargetPrev,
 }
 
 const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
@@ -689,6 +697,71 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     ),
     ("confirm.yes", KeyAction::ConfirmYes, &["y", "Y"]),
     ("confirm.no", KeyAction::ConfirmNo, &["esc", "n", "N"]),
+    (
+        "delete_confirm.cancel",
+        KeyAction::DeleteConfirmCancel,
+        &["esc", "n", "N"],
+    ),
+    (
+        "delete_confirm.confirm",
+        KeyAction::DeleteConfirmConfirm,
+        &["enter"],
+    ),
+    (
+        "delete_confirm.next",
+        KeyAction::DeleteConfirmNext,
+        &["right", "down", "l", "j", "tab"],
+    ),
+    (
+        "delete_confirm.prev",
+        KeyAction::DeleteConfirmPrev,
+        &["left", "up", "h", "k", "backtab"],
+    ),
+    (
+        "delete_confirm.delete",
+        KeyAction::DeleteConfirmDelete,
+        &["1", "y", "Y"],
+    ),
+    (
+        "delete_confirm.cancel_choice",
+        KeyAction::DeleteConfirmCancelChoice,
+        &["2"],
+    ),
+    (
+        "clone_options.cancel",
+        KeyAction::CloneOptionsCancel,
+        &["esc"],
+    ),
+    (
+        "clone_options.confirm",
+        KeyAction::CloneOptionsConfirm,
+        &["enter"],
+    ),
+    (
+        "clone_options.next",
+        KeyAction::CloneOptionsNext,
+        &["right", "down", "l", "j", "tab"],
+    ),
+    (
+        "clone_options.prev",
+        KeyAction::CloneOptionsPrev,
+        &["left", "up", "h", "k", "backtab"],
+    ),
+    (
+        "clone_options.session_only",
+        KeyAction::CloneOptionsSessionOnly,
+        &["1"],
+    ),
+    (
+        "clone_options.folder_data",
+        KeyAction::CloneOptionsFolderData,
+        &["2"],
+    ),
+    (
+        "clone_options.cancel_choice",
+        KeyAction::CloneOptionsCancelChoice,
+        &["3"],
+    ),
     ("filter.cancel", KeyAction::FilterCancel, &["esc"]),
     ("filter.apply", KeyAction::FilterApply, &["enter"]),
     ("filter.move_left", KeyAction::FilterMoveLeft, &["left"]),
@@ -783,26 +856,6 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     ),
     ("new_session.home", KeyAction::NewSessionHome, &["home"]),
     ("new_session.end", KeyAction::NewSessionEnd, &["end"]),
-    (
-        "clone_target.cancel",
-        KeyAction::CloneTargetCancel,
-        &["esc"],
-    ),
-    (
-        "clone_target.confirm",
-        KeyAction::CloneTargetConfirm,
-        &["enter"],
-    ),
-    (
-        "clone_target.next",
-        KeyAction::CloneTargetNext,
-        &["down", "j"],
-    ),
-    (
-        "clone_target.prev",
-        KeyAction::CloneTargetPrev,
-        &["up", "k"],
-    ),
 ];
 
 #[derive(Debug, Clone)]
@@ -1404,24 +1457,7 @@ impl ProviderFilter {
     }
 }
 
-const CLONE_PROVIDER_OPTIONS: [Provider; 3] =
-    [Provider::Claude, Provider::Codex, Provider::OpenCode];
-
-fn clone_provider_at(index: usize) -> Provider {
-    CLONE_PROVIDER_OPTIONS[index % CLONE_PROVIDER_OPTIONS.len()]
-}
-
-#[cfg(test)]
-fn clone_provider_default_index(source: Provider) -> usize {
-    CLONE_PROVIDER_OPTIONS
-        .iter()
-        .position(|provider| *provider == source)
-        .unwrap_or(0)
-}
-
-fn move_clone_provider_index(index: usize, delta: i32) -> usize {
-    (index as i32 + delta).rem_euclid(CLONE_PROVIDER_OPTIONS.len() as i32) as usize
-}
+const PROVIDER_OPTIONS: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::OpenCode];
 
 fn agent_launch_mode_at(index: usize) -> AgentLaunchMode {
     AGENT_LAUNCH_MODE_OPTIONS[index % AGENT_LAUNCH_MODE_OPTIONS.len()]
@@ -1470,7 +1506,7 @@ fn move_provider_in_options(provider: Provider, delta: i32, options: &[Provider]
 }
 
 fn available_agent_provider_options(agent_programs: &AgentProgramSettings) -> Vec<Provider> {
-    CLONE_PROVIDER_OPTIONS
+    PROVIDER_OPTIONS
         .iter()
         .copied()
         .filter(|provider| agent_provider_available(*provider, agent_programs))
@@ -1571,9 +1607,20 @@ enum InputMode {
         prompt: String,
         action: PendingAction,
     },
+    DeleteConfirm {
+        info: SessionInfo,
+        removed_index: Option<usize>,
+        selected: usize,
+    },
     AgentLaunch {
         source: SessionInfo,
         selected: usize,
+    },
+    CloneOptions {
+        source: SessionInfo,
+        target: Provider,
+        selected: usize,
+        folder_data: CloneFolderDataAvailability,
     },
     NewSession {
         selected: usize,
@@ -1584,10 +1631,6 @@ enum InputMode {
         provider_options: Vec<Provider>,
         launch_mode: AgentLaunchMode,
     },
-    CloneTarget {
-        source: SessionInfo,
-        selected: usize,
-    },
     TitleEdit {
         source: SessionInfo,
         draft: String,
@@ -1597,18 +1640,6 @@ enum InputMode {
 
 #[derive(Debug, Clone)]
 enum PendingAction {
-    Delete {
-        info: SessionInfo,
-        removed_index: Option<usize>,
-    },
-    CloneSessionDataChoice {
-        info: SessionInfo,
-        target: Provider,
-    },
-    CloneSessionOnlyConfirm {
-        info: SessionInfo,
-        target: Provider,
-    },
     RestoreClonedSessionData {
         info: SessionInfo,
         cols: u16,
@@ -1622,6 +1653,66 @@ enum PendingAction {
         rows: u16,
         launch_mode: AgentLaunchMode,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteOption {
+    Delete,
+    Cancel,
+}
+
+const DELETE_OPTION_DELETE: usize = 0;
+const DELETE_OPTION_CANCEL: usize = 1;
+const DELETE_OPTION_COUNT: usize = 2;
+
+fn delete_option_at(index: usize) -> DeleteOption {
+    match index % DELETE_OPTION_COUNT {
+        DELETE_OPTION_DELETE => DeleteOption::Delete,
+        _ => DeleteOption::Cancel,
+    }
+}
+
+fn move_delete_option_index(index: usize, delta: i32) -> usize {
+    (index as i32 + delta).rem_euclid(DELETE_OPTION_COUNT as i32) as usize
+}
+
+#[derive(Debug, Clone)]
+enum CloneFolderDataAvailability {
+    Available(PathBuf),
+    Unavailable(String),
+}
+
+impl CloneFolderDataAvailability {
+    fn unavailable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Available(_) => None,
+            Self::Unavailable(reason) => Some(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloneOption {
+    SessionOnly,
+    FolderData,
+    Cancel,
+}
+
+const CLONE_OPTION_SESSION_ONLY: usize = 0;
+const CLONE_OPTION_FOLDER_DATA: usize = 1;
+const CLONE_OPTION_CANCEL: usize = 2;
+const CLONE_OPTION_COUNT: usize = 3;
+
+fn clone_option_at(index: usize) -> CloneOption {
+    match index % CLONE_OPTION_COUNT {
+        CLONE_OPTION_SESSION_ONLY => CloneOption::SessionOnly,
+        CLONE_OPTION_FOLDER_DATA => CloneOption::FolderData,
+        _ => CloneOption::Cancel,
+    }
+}
+
+fn move_clone_option_index(index: usize, delta: i32) -> usize {
+    (index as i32 + delta).rem_euclid(CLONE_OPTION_COUNT as i32) as usize
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7108,10 +7199,7 @@ impl App {
                 child_scroll_action_label(action)
             )
         } else if provider == Provider::OpenCode && strategy == "opencode_page_scroll" {
-            format!(
-                "OpenCode: delegated {}.",
-                child_scroll_action_label(action)
-            )
+            format!("OpenCode: delegated {}.", child_scroll_action_label(action))
         } else {
             format!("{} scroll key forwarded to child.", provider.as_str())
         };
@@ -7273,15 +7361,18 @@ impl App {
         if self.reject_while_data_task_running("cloning a session") {
             return;
         }
-        match session::data::snapshot_source_dir(&info) {
+        let folder_data = match session::data::snapshot_source_dir(&info) {
             Ok(path) => {
-                let yes_key = self.keybindings.help(KeyAction::ConfirmYes, "y");
-                let no_key = self.keybindings.help(KeyAction::ConfirmNo, "N");
-                self.status = "choose whether to copy folder data.".into();
-                self.input_mode = InputMode::Confirm {
-                    prompt: clone_data_confirm_prompt(&info, &path, &yes_key, &no_key),
-                    action: PendingAction::CloneSessionDataChoice { info, target },
-                };
+                debug_log(
+                    "clone_options_folder_data_available",
+                    serde_json::json!({
+                        "source_provider": info.provider.as_str(),
+                        "source_session_id": &info.session_id,
+                        "cwd": path.display().to_string(),
+                        "target_provider": target.as_str(),
+                    }),
+                );
+                CloneFolderDataAvailability::Available(path)
             }
             Err(e) => {
                 let reason = e.to_string();
@@ -7295,15 +7386,16 @@ impl App {
                         "error": &reason,
                     }),
                 );
-                let yes_key = self.keybindings.help(KeyAction::ConfirmYes, "y");
-                let no_key = self.keybindings.help(KeyAction::ConfirmNo, "N");
-                self.status = "folder data cannot be copied.".into();
-                self.input_mode = InputMode::Confirm {
-                    prompt: clone_without_data_confirm_prompt(&info, &reason, &yes_key, &no_key),
-                    action: PendingAction::CloneSessionOnlyConfirm { info, target },
-                };
+                CloneFolderDataAvailability::Unavailable(reason)
             }
-        }
+        };
+        self.status = "choose clone option.".into();
+        self.input_mode = InputMode::CloneOptions {
+            source: info,
+            target,
+            selected: CLONE_OPTION_SESSION_ONLY,
+            folder_data,
+        };
     }
 
     fn clone_session_to(&mut self, info: SessionInfo, target: Provider, copy_folder_data: bool) {
@@ -11815,149 +11907,8 @@ fn agent_file_stem(key: &AgentKey) -> String {
 }
 
 fn prepare_agent_session(info: &SessionInfo) -> Result<()> {
-    if is_shell_session_info(info) || is_new_agent_session_info(info) {
-        return Ok(());
-    }
-    if info.provider == Provider::Codex {
-        repair_cokacmux_codex_rollout(info)?;
-    }
+    let _ = info;
     Ok(())
-}
-
-fn repair_cokacmux_codex_rollout(info: &SessionInfo) -> Result<()> {
-    let key = AgentKey::new(info);
-    let live_meta = live_agent_meta_snapshot(&key);
-    repair_cokacmux_codex_rollout_guarded(info, live_meta.as_ref())
-}
-
-fn repair_cokacmux_codex_rollout_guarded(
-    info: &SessionInfo,
-    live_meta: Option<&AgentMetaSnapshot>,
-) -> Result<()> {
-    if !codex_rollout_needs_repair(&info.source)? {
-        return Ok(());
-    }
-    if let Some(meta) = live_meta {
-        debug_log(
-            "codex_repair_skipped_live_daemon",
-            serde_json::json!({
-                "provider": info.provider.as_str(),
-                "session_id": &info.session_id,
-                "daemon_pid": meta.pid,
-            }),
-        );
-        return Ok(());
-    }
-    let session = session::load(info)?;
-    let content = providers::codex::to_jsonl_string(
-        &session,
-        &providers::codex::CodexWriteOpts { replay_raw: false },
-    )?;
-    fs::write(&info.source, content)?;
-    Ok(())
-}
-
-fn codex_rollout_needs_repair(path: &Path) -> Result<bool> {
-    let content = fs::read_to_string(path)?;
-    let mut converter_owned = false;
-    let mut incompatible = false;
-    let mut has_user_response_text = false;
-    let mut has_agent_response_text = false;
-    let mut has_user_display_event = false;
-    let mut has_agent_display_event = false;
-
-    for line in content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let record_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if value
-            .get("timestamp")
-            .is_some_and(|timestamp| timestamp.is_null())
-        {
-            incompatible = true;
-        }
-
-        let payload = value.get("payload").and_then(|payload| payload.as_object());
-        if record_type == "session_meta" {
-            if let Some(payload) = payload {
-                for key in [
-                    "timestamp",
-                    "source",
-                    "thread_source",
-                    "model_provider",
-                    "base_instructions",
-                ] {
-                    if !payload.contains_key(key) {
-                        incompatible = true;
-                    }
-                }
-            }
-            if payload
-                .and_then(|payload| payload.get("originator"))
-                .and_then(|originator| originator.as_str())
-                .is_some_and(is_cokacmux_owned_originator)
-            {
-                converter_owned = true;
-            }
-        } else if record_type == "response_item" {
-            if let Some(payload) = payload {
-                if payload.get("type").and_then(|value| value.as_str()) == Some("message") {
-                    let has_text = payload
-                        .get("content")
-                        .and_then(|value| value.as_array())
-                        .is_some_and(|items| {
-                            items.iter().any(|item| {
-                                item.get("text")
-                                    .and_then(|value| value.as_str())
-                                    .is_some_and(|text| !text.is_empty())
-                            })
-                        });
-                    if has_text {
-                        match payload.get("role").and_then(|value| value.as_str()) {
-                            Some("user") => has_user_response_text = true,
-                            Some("assistant") => has_agent_response_text = true,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            if payload.and_then(|payload| payload.get("id")).is_some() {
-                incompatible = true;
-            }
-        } else if record_type == "event_msg" {
-            if let Some(payload_type) = payload
-                .and_then(|payload| payload.get("type"))
-                .and_then(|payload_type| payload_type.as_str())
-            {
-                if payload_type.starts_with("synthesized.") {
-                    incompatible = true;
-                }
-                if payload_type == "user_message" {
-                    has_user_display_event = true;
-                } else if payload_type == "agent_message" {
-                    has_agent_display_event = true;
-                }
-            }
-        }
-    }
-
-    if has_user_response_text && !has_user_display_event {
-        incompatible = true;
-    }
-    if has_agent_response_text && !has_agent_display_event {
-        incompatible = true;
-    }
-
-    Ok(converter_owned && incompatible)
-}
-
-fn is_cokacmux_owned_originator(originator: &str) -> bool {
-    originator == "cokacmux"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12113,7 +12064,7 @@ fn resolve_windows_agent_program(program: &str) -> PathBuf {
 #[cfg(windows)]
 fn provider_for_default_agent_program(program: &str) -> Option<Provider> {
     let trimmed = program.trim();
-    CLONE_PROVIDER_OPTIONS
+    PROVIDER_OPTIONS
         .iter()
         .copied()
         .find(|provider| trimmed.eq_ignore_ascii_case(default_agent_program(*provider)))
@@ -13236,10 +13187,7 @@ fn opencode_child_scroll_key(action: AgentScrollAction) -> Option<KeyEvent> {
     Some(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
-fn codex_transcript_overlay_state_after_forwarded_key(
-    agent: &AgentClient,
-    key: KeyEvent,
-) -> bool {
+fn codex_transcript_overlay_state_after_forwarded_key(agent: &AgentClient, key: KeyEvent) -> bool {
     codex_transcript_overlay_state_after_key(
         agent.info.provider,
         agent.codex_transcript_overlay_assumed_open,
@@ -13466,9 +13414,10 @@ fn input_mode_label(mode: &InputMode) -> &'static str {
         InputMode::Normal => "normal",
         InputMode::Filter { .. } => "filter",
         InputMode::Confirm { .. } => "confirm",
+        InputMode::DeleteConfirm { .. } => "delete_confirm",
         InputMode::AgentLaunch { .. } => "agent_launch",
+        InputMode::CloneOptions { .. } => "clone_options",
         InputMode::NewSession { .. } => "new_session",
-        InputMode::CloneTarget { .. } => "clone_target",
         InputMode::TitleEdit { .. } => "title_edit",
     }
 }
@@ -13927,6 +13876,13 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
         draw_data_task_modal(f, area, task);
     } else if let InputMode::Confirm { prompt, action } = &app.input_mode {
         draw_confirm_modal(f, area, prompt, action);
+    } else if let InputMode::DeleteConfirm {
+        info,
+        removed_index: _,
+        selected,
+    } = &app.input_mode
+    {
+        draw_delete_confirm_modal(f, area, info, *selected, &app.keybindings);
     } else if let InputMode::Filter { draft, cursor } = &app.input_mode {
         draw_filter_modal(
             f,
@@ -13943,6 +13899,22 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
             source,
             *selected,
             &app.settings.cokacmux.agent_programs,
+            &app.keybindings,
+        );
+    } else if let InputMode::CloneOptions {
+        source,
+        target,
+        selected,
+        folder_data,
+    } = &app.input_mode
+    {
+        draw_clone_options_modal(
+            f,
+            area,
+            source,
+            *target,
+            *selected,
+            folder_data,
             &app.keybindings,
         );
     } else if let InputMode::NewSession {
@@ -13968,8 +13940,6 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
             &app.settings.cokacmux.agent_programs,
             &app.keybindings,
         );
-    } else if let InputMode::CloneTarget { source, selected } = &app.input_mode {
-        draw_clone_target_modal(f, area, source, *selected, &app.keybindings);
     } else if let InputMode::TitleEdit {
         source,
         draft,
@@ -14050,8 +14020,7 @@ fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPendi
         Style::default().fg(THEME_SHORTCUT).bg(THEME_BG_ALT),
     )));
 
-    let height = (lines.len() as u16).saturating_add(2).clamp(7, 10);
-    let modal_area = centered_rect_fixed(74, height, area);
+    let modal_area = modal_area_for_wrapped_lines(area, "Clone in progress", &lines, 44, 86, 7, 12);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -14507,16 +14476,6 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             app.input_mode = InputMode::Normal;
             debug_log_session_key(app, key, "confirm_yes");
             match action {
-                PendingAction::Delete {
-                    info,
-                    removed_index,
-                } => app.delete_session(info, removed_index),
-                PendingAction::CloneSessionDataChoice { info, target } => {
-                    app.clone_session_to(info, target, true)
-                }
-                PendingAction::CloneSessionOnlyConfirm { info, target, .. } => {
-                    app.clone_session_to(info, target, false)
-                }
                 PendingAction::RestoreClonedSessionData {
                     info,
                     cols,
@@ -14535,24 +14494,243 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             app.input_mode = InputMode::Normal;
             debug_log_session_key(app, key, "confirm_cancel");
             match action {
-                PendingAction::CloneSessionDataChoice { info, target } => {
-                    app.clone_session_to(info, target, false)
-                }
-                PendingAction::CloneSessionOnlyConfirm { .. } => {
-                    app.status = "cancelled.".into();
-                }
                 PendingAction::RestoreClonedSessionData {
                     info,
                     cols,
                     rows,
                     launch_mode,
                 } => app.attach_agent_without_data_restore_prompt(info, cols, rows, launch_mode),
-                PendingAction::Delete { .. } | PendingAction::CreateMissingLaunchCwd { .. } => {
-                    app.status = "cancelled.".into();
-                }
+                PendingAction::CreateMissingLaunchCwd { .. } => app.status = "cancelled.".into(),
             }
         } else {
             debug_log_session_key(app, key, "confirm_ignored");
+        }
+        return;
+    }
+    // Delete confirmation dialog
+    if let InputMode::DeleteConfirm {
+        info,
+        removed_index,
+        selected,
+    } = &mut app.input_mode
+    {
+        let mut next_mode: Option<InputMode> = None;
+        let mut delete_action: Option<(SessionInfo, Option<usize>)> = None;
+        let choose_option = |option: DeleteOption,
+                             info: &SessionInfo,
+                             removed_index: Option<usize>,
+                             delete_action: &mut Option<(SessionInfo, Option<usize>)>,
+                             next_mode: &mut Option<InputMode>| {
+            match option {
+                DeleteOption::Delete => {
+                    *delete_action = Some((info.clone(), removed_index));
+                    *next_mode = Some(InputMode::Normal);
+                }
+                DeleteOption::Cancel => {
+                    *next_mode = Some(InputMode::Normal);
+                }
+            }
+        };
+
+        if keybindings.matches(KeyAction::DeleteConfirmCancel, key)
+            || keybindings.matches(KeyAction::DeleteConfirmCancelChoice, key)
+        {
+            next_mode = Some(InputMode::Normal);
+            app.status = "cancelled.".into();
+            debug_log_key_event(key, "delete_confirm_cancel");
+        } else if keybindings.matches(KeyAction::DeleteConfirmConfirm, key) {
+            let option = delete_option_at(*selected);
+            if option == DeleteOption::Cancel {
+                app.status = "cancelled.".into();
+            }
+            choose_option(
+                option,
+                info,
+                *removed_index,
+                &mut delete_action,
+                &mut next_mode,
+            );
+            debug_log(
+                "delete_confirm_confirm",
+                serde_json::json!({
+                    "provider": info.provider.as_str(),
+                    "session_id": &info.session_id,
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::DeleteConfirmNext, key) {
+            *selected = move_delete_option_index(*selected, 1);
+            debug_log(
+                "delete_confirm_move",
+                serde_json::json!({
+                    "provider": info.provider.as_str(),
+                    "session_id": &info.session_id,
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::DeleteConfirmPrev, key) {
+            *selected = move_delete_option_index(*selected, -1);
+            debug_log(
+                "delete_confirm_move",
+                serde_json::json!({
+                    "provider": info.provider.as_str(),
+                    "session_id": &info.session_id,
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::DeleteConfirmDelete, key) {
+            *selected = DELETE_OPTION_DELETE;
+            choose_option(
+                DeleteOption::Delete,
+                info,
+                *removed_index,
+                &mut delete_action,
+                &mut next_mode,
+            );
+        } else {
+            debug_log_key_event(key, "delete_confirm_ignored");
+        }
+
+        if let Some(mode) = next_mode {
+            app.input_mode = mode;
+        }
+        if let Some((info, removed_index)) = delete_action {
+            app.delete_session(info, removed_index);
+        }
+        return;
+    }
+    // Clone option dialog
+    if let InputMode::CloneOptions {
+        source,
+        target,
+        selected,
+        folder_data,
+    } = &mut app.input_mode
+    {
+        let mut next_mode: Option<InputMode> = None;
+        let mut clone_action: Option<(SessionInfo, Provider, bool)> = None;
+        let mut unavailable_reason: Option<String> = None;
+        let choose_option = |option: CloneOption,
+                             source: &SessionInfo,
+                             target: Provider,
+                             folder_data: &CloneFolderDataAvailability,
+                             clone_action: &mut Option<(SessionInfo, Provider, bool)>,
+                             unavailable_reason: &mut Option<String>,
+                             next_mode: &mut Option<InputMode>| {
+            match option {
+                CloneOption::SessionOnly => {
+                    *clone_action = Some((source.clone(), target, false));
+                    *next_mode = Some(InputMode::Normal);
+                }
+                CloneOption::FolderData => {
+                    if let Some(reason) = folder_data.unavailable_reason() {
+                        *unavailable_reason = Some(reason.to_string());
+                    } else {
+                        *clone_action = Some((source.clone(), target, true));
+                        *next_mode = Some(InputMode::Normal);
+                    }
+                }
+                CloneOption::Cancel => {
+                    *next_mode = Some(InputMode::Normal);
+                }
+            }
+        };
+
+        if keybindings.matches(KeyAction::CloneOptionsCancel, key)
+            || keybindings.matches(KeyAction::CloneOptionsCancelChoice, key)
+        {
+            next_mode = Some(InputMode::Normal);
+            app.status = "cancelled.".into();
+            debug_log_key_event(key, "clone_options_cancel");
+        } else if keybindings.matches(KeyAction::CloneOptionsConfirm, key) {
+            let option = clone_option_at(*selected);
+            if option == CloneOption::Cancel {
+                app.status = "cancelled.".into();
+            }
+            choose_option(
+                option,
+                source,
+                *target,
+                folder_data,
+                &mut clone_action,
+                &mut unavailable_reason,
+                &mut next_mode,
+            );
+            debug_log(
+                "clone_options_confirm",
+                serde_json::json!({
+                    "source_provider": source.provider.as_str(),
+                    "source_session_id": &source.session_id,
+                    "target_provider": target.as_str(),
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::CloneOptionsNext, key) {
+            *selected = move_clone_option_index(*selected, 1);
+            debug_log(
+                "clone_options_move",
+                serde_json::json!({
+                    "source_provider": source.provider.as_str(),
+                    "source_session_id": &source.session_id,
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::CloneOptionsPrev, key) {
+            *selected = move_clone_option_index(*selected, -1);
+            debug_log(
+                "clone_options_move",
+                serde_json::json!({
+                    "source_provider": source.provider.as_str(),
+                    "source_session_id": &source.session_id,
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::CloneOptionsSessionOnly, key) {
+            *selected = CLONE_OPTION_SESSION_ONLY;
+            choose_option(
+                CloneOption::SessionOnly,
+                source,
+                *target,
+                folder_data,
+                &mut clone_action,
+                &mut unavailable_reason,
+                &mut next_mode,
+            );
+        } else if keybindings.matches(KeyAction::CloneOptionsFolderData, key) {
+            *selected = CLONE_OPTION_FOLDER_DATA;
+            choose_option(
+                CloneOption::FolderData,
+                source,
+                *target,
+                folder_data,
+                &mut clone_action,
+                &mut unavailable_reason,
+                &mut next_mode,
+            );
+        } else {
+            debug_log_key_event(key, "clone_options_ignored");
+        }
+
+        if let Some(reason) = unavailable_reason {
+            app.status = format!(
+                "folder data cannot be copied: {}",
+                truncate_width(&reason, 72)
+            );
+            debug_log(
+                "clone_options_folder_data_blocked",
+                serde_json::json!({
+                    "source_provider": source.provider.as_str(),
+                    "source_session_id": &source.session_id,
+                    "target_provider": target.as_str(),
+                    "error": reason,
+                }),
+            );
+        }
+        if let Some(mode) = next_mode {
+            app.input_mode = mode;
+        }
+        if let Some((source, target, copy_folder_data)) = clone_action {
+            app.clone_session_to(source, target, copy_folder_data);
         }
         return;
     }
@@ -14613,55 +14791,6 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         }
         if let Some((source, launch_mode)) = attach_action {
             app.attach_agent(source, agent_cols.max(1), agent_rows.max(1), launch_mode);
-        }
-        return;
-    }
-    // Clone target selection mode
-    if let InputMode::CloneTarget { source, selected } = &mut app.input_mode {
-        let mut next_mode: Option<InputMode> = None;
-        let mut clone_action: Option<(SessionInfo, Provider)> = None;
-        if keybindings.matches(KeyAction::CloneTargetCancel, key) {
-            next_mode = Some(InputMode::Normal);
-            app.status = "cancelled.".into();
-            debug_log_session_key(app, key, "clone_target_cancel");
-        } else if keybindings.matches(KeyAction::CloneTargetConfirm, key) {
-            let target = clone_provider_at(*selected);
-            next_mode = Some(InputMode::Normal);
-            clone_action = Some((source.clone(), target));
-            debug_log(
-                "clone_target_confirm",
-                serde_json::json!({
-                    "source_provider": source.provider.as_str(),
-                    "source_session_id": &source.session_id,
-                    "target_provider": target.as_str(),
-                }),
-            );
-        } else if keybindings.matches(KeyAction::CloneTargetNext, key) {
-            *selected = move_clone_provider_index(*selected, 1);
-            debug_log(
-                "clone_target_move",
-                serde_json::json!({
-                    "selected": *selected,
-                    "provider": clone_provider_at(*selected).as_str(),
-                }),
-            );
-        } else if keybindings.matches(KeyAction::CloneTargetPrev, key) {
-            *selected = move_clone_provider_index(*selected, -1);
-            debug_log(
-                "clone_target_move",
-                serde_json::json!({
-                    "selected": *selected,
-                    "provider": clone_provider_at(*selected).as_str(),
-                }),
-            );
-        } else {
-            debug_log_key_event(key, "clone_target_ignored");
-        }
-        if let Some(mode) = next_mode {
-            app.input_mode = mode;
-        }
-        if let Some((source, target)) = clone_action {
-            app.begin_clone_session(source, target);
         }
         return;
     }
@@ -14951,20 +15080,19 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                     "session_id": &info.session_id,
                 }),
             );
-            let yes_key = keybindings.help(KeyAction::ConfirmYes, "y");
-            let no_key = keybindings.help(KeyAction::ConfirmNo, "N");
-            app.input_mode = InputMode::Confirm {
-                prompt: delete_confirm_prompt(&info, &yes_key, &no_key),
-                action: PendingAction::Delete {
-                    info,
-                    removed_index,
-                },
+            app.input_mode = InputMode::DeleteConfirm {
+                info,
+                removed_index,
+                selected: DELETE_OPTION_CANCEL,
             };
         }
     } else if keybindings.matches(KeyAction::SessionClone, key) {
+        if app.reject_while_data_task_running("cloning a session") {
+            return;
+        }
         if let Some(info) = app.current().cloned() {
             debug_log(
-                "clone_direct_start",
+                "clone_prompt_open",
                 serde_json::json!({
                     "provider": info.provider.as_str(),
                     "session_id": &info.session_id,
@@ -15045,15 +15173,73 @@ fn draw_confirm_modal(f: &mut ratatui::Frame, area: Rect, prompt: &str, action: 
     f.render_widget(p, modal_area);
 }
 
-fn delete_confirm_prompt(info: &SessionInfo, yes_key: &str, no_key: &str) -> String {
-    let session_id = confirm_prompt_line(&info.session_id, 64);
-    format!(
-        "Delete {} session?\n{}\nThis removes stored history.\n{} delete   {} cancel",
-        info.provider.as_str(),
-        session_id,
-        yes_key,
-        no_key
-    )
+fn draw_delete_confirm_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    info: &SessionInfo,
+    selected: usize,
+    keybindings: &KeyBindings,
+) {
+    let lines = delete_confirm_lines(info, selected, keybindings);
+    let modal_area = modal_area_for_wrapped_lines(area, "Delete session", &lines, 48, 86, 7, 12);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Delete session");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    f.render_widget(p, modal_area);
+}
+
+fn delete_confirm_lines(
+    info: &SessionInfo,
+    selected: usize,
+    keybindings: &KeyBindings,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            format!("Delete {} session?", info.provider.as_str()),
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            format!("Session: {}", confirm_prompt_line(&info.session_id, 64)),
+            Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            "This removes stored history.",
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+        Line::from(""),
+        delete_confirm_button_line(selected),
+        Line::from(Span::styled(
+            delete_confirm_help_text(keybindings),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ]
+}
+
+fn delete_confirm_button_line(selected: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        delete_confirm_button_span("1 Delete session", selected == DELETE_OPTION_DELETE),
+        Span::raw("  "),
+        delete_confirm_button_span("2 Cancel", selected == DELETE_OPTION_CANCEL),
+    ])
+}
+
+fn delete_confirm_button_span(label: &str, selected: bool) -> Span<'static> {
+    let text = format!(" {} ", label);
+    let style = if selected {
+        theme_selected_style()
+    } else {
+        Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT)
+    };
+    Span::styled(text, style)
 }
 
 fn create_missing_cwd_confirm_prompt(
@@ -15067,38 +15253,6 @@ fn create_missing_cwd_confirm_prompt(
         "{} launch folder does not exist.\n{}\nCreate it and continue?\n{} create/start   {} cancel",
         info.provider.as_str(),
         path,
-        yes_key,
-        no_key
-    )
-}
-
-fn clone_data_confirm_prompt(
-    info: &SessionInfo,
-    path: &Path,
-    yes_key: &str,
-    no_key: &str,
-) -> String {
-    let path = confirm_prompt_line(&path.display().to_string(), 72);
-    format!(
-        "Copy working folder data with cloned {} session?\n{}\n{} copy data + clone   {} session only",
-        info.provider.as_str(),
-        path,
-        yes_key,
-        no_key
-    )
-}
-
-fn clone_without_data_confirm_prompt(
-    info: &SessionInfo,
-    reason: &str,
-    yes_key: &str,
-    no_key: &str,
-) -> String {
-    let reason = confirm_prompt_line(reason, 72);
-    format!(
-        "Working folder data cannot be copied for this {} session.\n{}\nClone session metadata only?\n{} clone session only   {} cancel",
-        info.provider.as_str(),
-        reason,
         yes_key,
         no_key
     )
@@ -15134,9 +15288,6 @@ fn confirm_prompt_line(value: &str, width: usize) -> String {
 
 fn confirm_modal_title(action: &PendingAction) -> &'static str {
     match action {
-        PendingAction::Delete { .. } => "Delete session",
-        PendingAction::CloneSessionDataChoice { .. } => "Clone folder data",
-        PendingAction::CloneSessionOnlyConfirm { .. } => "Clone session",
         PendingAction::RestoreClonedSessionData { .. } => "Restore folder data",
         PendingAction::CreateMissingLaunchCwd { .. } => "Create folder",
     }
@@ -15159,24 +15310,8 @@ fn confirm_modal_lines(prompt: &str) -> Vec<Line<'static>> {
 }
 
 fn confirm_modal_area(prompt: &str, area: Rect) -> Rect {
-    let prompt_lines: Vec<&str> = prompt.lines().collect();
-    let widest_line = prompt_lines
-        .iter()
-        .map(|line| UnicodeWidthStr::width(*line))
-        .max()
-        .unwrap_or(0);
-    let target_width = widest_line.saturating_add(4).clamp(38, 72) as u16;
-    let width = target_width.min(area.width);
-    let inner_width = width.saturating_sub(2).max(1) as usize;
-    let prompt_line_count: usize = prompt_lines
-        .iter()
-        .map(|line| UnicodeWidthStr::width(*line).div_ceil(inner_width).max(1))
-        .sum();
-    let height = (prompt_line_count as u16)
-        .saturating_add(2)
-        .clamp(4, 8)
-        .min(area.height);
-    centered_rect_fixed(width, height, area)
+    let lines = confirm_modal_lines(prompt);
+    modal_area_for_wrapped_lines(area, "Confirm", &lines, 38, 84, 4, 14)
 }
 
 fn draw_filter_modal(
@@ -15187,15 +15322,6 @@ fn draw_filter_modal(
     pending: Option<&SearchPending>,
     keybindings: &KeyBindings,
 ) {
-    let modal_area = centered_rect_fixed(72, 7, area);
-    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
-        .style(theme_alt_style())
-        .title("Search sessions");
-    let input_width = modal_area.width.saturating_sub(4) as usize;
-    let input = title_edit_display(draft, cursor, input_width);
     let search_button = if let Some(pending) = pending {
         format!(
             " {} Searching ",
@@ -15219,6 +15345,18 @@ fn draw_filter_modal(
     } else {
         filter_help_text(keybindings)
     };
+    let button_width = UnicodeWidthStr::width(search_button.as_str())
+        .saturating_add(UnicodeWidthStr::width(cancel_button.as_str()))
+        .saturating_add(4);
+    let desired_width = UnicodeWidthStr::width(draft)
+        .saturating_add(1)
+        .max(UnicodeWidthStr::width("Query"))
+        .max(button_width)
+        .max(UnicodeWidthStr::width(help.as_str()));
+    let provisional_area =
+        modal_area_from_content_rows(area, "Search sessions", desired_width, 4, 44, 84, 6, 12);
+    let input_width = provisional_area.width.saturating_sub(4) as usize;
+    let input = title_edit_display(draft, cursor, input_width);
     let lines = vec![
         Line::from(Span::styled(
             "Query",
@@ -15242,6 +15380,13 @@ fn draw_filter_modal(
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
         )),
     ];
+    let modal_area = modal_area_for_wrapped_lines(area, "Search sessions", &lines, 44, 84, 6, 12);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Search sessions");
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
@@ -15258,21 +15403,21 @@ fn draw_title_edit_modal(
     cursor: usize,
     keybindings: &KeyBindings,
 ) {
-    let modal_area = centered_rect_fixed(72, 5, area);
-    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
-        .style(theme_alt_style())
-        .title("Edit title");
-    let input_width = modal_area.width.saturating_sub(4) as usize;
+    let session_line = format!(
+        "{} session {}",
+        source.provider.as_str(),
+        truncate_width(&source.session_id, 24)
+    );
+    let help = title_edit_help_text(keybindings);
+    let desired_width = UnicodeWidthStr::width(session_line.as_str())
+        .max(UnicodeWidthStr::width(draft).saturating_add(1))
+        .max(UnicodeWidthStr::width(help.as_str()));
+    let provisional_area =
+        modal_area_from_content_rows(area, "Edit title", desired_width, 3, 44, 84, 5, 10);
+    let input_width = provisional_area.width.saturating_sub(4) as usize;
     let input = title_edit_display(draft, cursor, input_width);
     let lines = vec![
-        Line::from(format!(
-            "{} session {}",
-            source.provider.as_str(),
-            truncate_width(&source.session_id, 24)
-        )),
+        Line::from(session_line),
         Line::from(Span::styled(
             input,
             Style::default()
@@ -15280,10 +15425,17 @@ fn draw_title_edit_modal(
                 .bg(THEME_SELECTED_BG),
         )),
         Line::from(Span::styled(
-            title_edit_help_text(keybindings),
+            help,
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
         )),
     ];
+    let modal_area = modal_area_for_wrapped_lines(area, "Edit title", &lines, 44, 84, 5, 10);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Edit title");
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
@@ -15300,24 +15452,42 @@ fn draw_agent_launch_modal(
     agent_programs: &AgentProgramSettings,
     keybindings: &KeyBindings,
 ) {
-    let modal_area = centered_rect_fixed(78, 8, area);
-    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
-        .style(theme_alt_style())
-        .title("Agent launch");
-    let inner_width = modal_area.width.saturating_sub(2) as usize;
+    let intro = format!(
+        "Start/attach {} session {}",
+        source.provider.as_str(),
+        truncate_width(&source.session_id, 24)
+    );
+    let help = agent_launch_help_text(keybindings);
+    let option_width = AGENT_LAUNCH_MODE_OPTIONS
+        .iter()
+        .copied()
+        .map(|launch_mode| {
+            let label = launch_mode.label();
+            let command =
+                agent_launch_spec_with_programs(source, launch_mode, agent_programs).command_line();
+            UnicodeWidthStr::width(label)
+                .saturating_add(UnicodeWidthStr::width(command.as_str()).min(42))
+                .saturating_add(8)
+        })
+        .max()
+        .unwrap_or(0);
+    let desired_width = UnicodeWidthStr::width(intro.as_str())
+        .max(UnicodeWidthStr::width(help.as_str()))
+        .max(option_width);
+    let provisional_area = modal_area_from_content_rows(
+        area,
+        "Agent launch",
+        desired_width,
+        AGENT_LAUNCH_MODE_OPTIONS.len().saturating_add(4),
+        54,
+        96,
+        8,
+        12,
+    );
+    let inner_width = provisional_area.width.saturating_sub(2) as usize;
     let label_width = 25.min(inner_width.saturating_sub(12));
     let command_width = inner_width.saturating_sub(7 + label_width);
-    let mut lines = vec![
-        Line::from(format!(
-            "Start/attach {} session {}",
-            source.provider.as_str(),
-            truncate_width(&source.session_id, 24)
-        )),
-        Line::from(""),
-    ];
+    let mut lines = vec![Line::from(intro), Line::from("")];
 
     for (idx, launch_mode) in AGENT_LAUNCH_MODE_OPTIONS.iter().copied().enumerate() {
         let is_selected = idx == selected;
@@ -15343,16 +15513,138 @@ fn draw_agent_launch_modal(
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        agent_launch_help_text(keybindings),
+        help,
         Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
     )));
 
+    let modal_area = modal_area_for_wrapped_lines(area, "Agent launch", &lines, 54, 96, 8, 12);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Agent launch");
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
         .wrap(Wrap { trim: false });
     f.render_widget(ratatui::widgets::Clear, modal_area);
     f.render_widget(p, modal_area);
+}
+
+fn draw_clone_options_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    source: &SessionInfo,
+    target: Provider,
+    selected: usize,
+    folder_data: &CloneFolderDataAvailability,
+    keybindings: &KeyBindings,
+) {
+    let intro = format!(
+        "Clone {} session {}",
+        source.provider.as_str(),
+        truncate_width(&source.session_id, 24)
+    );
+    let target_line = format!("Target: {}", target.as_str());
+    let data_line = clone_options_data_line(folder_data);
+    let help = clone_options_help_text(keybindings);
+    let lines = vec![
+        Line::from(Span::styled(
+            intro,
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            target_line,
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+        clone_options_data_status_line(folder_data, data_line),
+        Line::from(""),
+        clone_options_button_line(selected, folder_data),
+        Line::from(Span::styled(
+            help,
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ];
+    let modal_area = modal_area_for_wrapped_lines(area, "Clone session", &lines, 58, 94, 8, 12);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Clone session");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    f.render_widget(p, modal_area);
+}
+
+fn clone_options_data_line(folder_data: &CloneFolderDataAvailability) -> String {
+    match folder_data {
+        CloneFolderDataAvailability::Available(path) => {
+            format!(
+                "Folder data: {}",
+                truncate_width(&path.display().to_string(), 72)
+            )
+        }
+        CloneFolderDataAvailability::Unavailable(reason) => {
+            format!("Folder data unavailable: {}", truncate_width(reason, 62))
+        }
+    }
+}
+
+fn clone_options_data_status_line(
+    folder_data: &CloneFolderDataAvailability,
+    data_line: String,
+) -> Line<'static> {
+    let style = match folder_data {
+        CloneFolderDataAvailability::Available(_) => {
+            Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT)
+        }
+        CloneFolderDataAvailability::Unavailable(_) => {
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT)
+        }
+    };
+    Line::from(Span::styled(data_line, style))
+}
+
+fn clone_options_button_line(
+    selected: usize,
+    folder_data: &CloneFolderDataAvailability,
+) -> Line<'static> {
+    let folder_data_enabled = matches!(folder_data, CloneFolderDataAvailability::Available(_));
+    Line::from(vec![
+        Span::raw("  "),
+        clone_options_button_span(
+            "1 Session only",
+            selected == CLONE_OPTION_SESSION_ONLY,
+            true,
+        ),
+        Span::raw("  "),
+        clone_options_button_span(
+            "2 Folder data too",
+            selected == CLONE_OPTION_FOLDER_DATA,
+            folder_data_enabled,
+        ),
+        Span::raw("  "),
+        clone_options_button_span("3 Cancel", selected == CLONE_OPTION_CANCEL, true),
+    ])
+}
+
+fn clone_options_button_span(label: &str, selected: bool, enabled: bool) -> Span<'static> {
+    let text = format!(" {} ", label);
+    let style = if selected && enabled {
+        theme_selected_style()
+    } else if selected {
+        theme_selected_style().fg(THEME_FG_DIM)
+    } else if enabled {
+        Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT)
+    } else {
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT)
+    };
+    Span::styled(text, style)
 }
 
 fn draw_new_session_modal(
@@ -15368,22 +15660,41 @@ fn draw_new_session_modal(
     agent_programs: &AgentProgramSettings,
     keybindings: &KeyBindings,
 ) {
-    let height = if kind == NewSessionKind::CodingAgent {
-        10
-    } else {
+    let selected = clamp_new_session_field(selected, kind);
+    let help = new_session_help_text(keybindings);
+    let preview_command = new_session_preview_command(
+        kind,
+        cwd,
+        provider,
+        provider_options,
+        launch_mode,
+        agent_programs,
+    );
+    let desired_width = UnicodeWidthStr::width("Choose what to start")
+        .max(UnicodeWidthStr::width(cwd).saturating_add(20))
+        .max(UnicodeWidthStr::width(kind.label()).saturating_add(20))
+        .max(UnicodeWidthStr::width(launch_mode.label()).saturating_add(20))
+        .max(UnicodeWidthStr::width(help.as_str()))
+        .max(UnicodeWidthStr::width(preview_command.as_str()).min(76));
+    let content_rows: usize = if kind == NewSessionKind::CodingAgent {
         8
+    } else {
+        6
     };
-    let modal_area = centered_rect_fixed(84, height, area);
-    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
-        .style(theme_alt_style())
-        .title("New session");
-    let inner_width = modal_area.width.saturating_sub(2) as usize;
+    let min_height = content_rows.saturating_add(2) as u16;
+    let provisional_area = modal_area_from_content_rows(
+        area,
+        "New session",
+        desired_width,
+        content_rows,
+        56,
+        98,
+        min_height,
+        14,
+    );
+    let inner_width = provisional_area.width.saturating_sub(2) as usize;
     let label_width = 12usize.min(inner_width.saturating_sub(8));
     let value_width = inner_width.saturating_sub(label_width + 5);
-    let selected = clamp_new_session_field(selected, kind);
     let mut lines = vec![Line::from(Span::styled(
         "Choose what to start",
         Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
@@ -15434,26 +15745,24 @@ fn draw_new_session_modal(
     lines.push(Line::from(Span::styled(
         format!(
             "  {}",
-            truncate_width(
-                &new_session_preview_command(
-                    kind,
-                    cwd,
-                    provider,
-                    provider_options,
-                    launch_mode,
-                    agent_programs,
-                ),
-                inner_width.saturating_sub(2)
-            )
+            truncate_width(&preview_command, inner_width.saturating_sub(2))
         ),
         Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        new_session_help_text(keybindings),
+        help,
         Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
     )));
 
+    let modal_area =
+        modal_area_for_wrapped_lines(area, "New session", &lines, 56, 98, min_height, 14);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("New session");
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
@@ -15530,62 +15839,6 @@ fn new_session_preview_command(
     }
 }
 
-fn draw_clone_target_modal(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    source: &SessionInfo,
-    selected: usize,
-    keybindings: &KeyBindings,
-) {
-    let modal_area = centered_rect(62, 30, area);
-    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
-        .style(theme_alt_style())
-        .title("Clone target");
-    let mut lines = vec![
-        Line::from(format!(
-            "Clone {} session {}",
-            source.provider.as_str(),
-            truncate_width(&source.session_id, 24)
-        )),
-        Line::from(""),
-    ];
-
-    for (idx, provider) in CLONE_PROVIDER_OPTIONS.iter().copied().enumerate() {
-        let is_selected = idx == selected;
-        let is_same = provider == source.provider;
-        let style = if is_selected {
-            theme_selected_style()
-        } else {
-            theme_alt_style()
-        };
-        let label = if is_same {
-            format!("{} (same provider)", provider.as_str())
-        } else {
-            provider.as_str().to_string()
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{} {}", if is_selected { "▶" } else { " " }, label),
-            style,
-        )));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        clone_target_help_text(keybindings),
-        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-    )));
-
-    let p = Paragraph::new(lines)
-        .block(block)
-        .style(theme_alt_style())
-        .wrap(Wrap { trim: false });
-    f.render_widget(ratatui::widgets::Clear, modal_area);
-    f.render_widget(p, modal_area);
-}
-
 fn title_edit_help_text(keybindings: &KeyBindings) -> String {
     format!(
         "{} move · {} · {} · {} save · {} cancel",
@@ -15644,6 +15897,39 @@ fn agent_launch_help_text(keybindings: &KeyBindings) -> String {
     )
 }
 
+fn delete_confirm_help_text(keybindings: &KeyBindings) -> String {
+    format!(
+        "{} choose · {} select · {} delete · {}/{} cancel",
+        keybindings.help(KeyAction::DeleteConfirmConfirm, "Enter"),
+        keybindings.help_pair(
+            KeyAction::DeleteConfirmPrev,
+            KeyAction::DeleteConfirmNext,
+            "Left",
+            "Right",
+        ),
+        keybindings.help(KeyAction::DeleteConfirmDelete, "1"),
+        keybindings.help(KeyAction::DeleteConfirmCancelChoice, "2"),
+        keybindings.help(KeyAction::DeleteConfirmCancel, "Esc"),
+    )
+}
+
+fn clone_options_help_text(keybindings: &KeyBindings) -> String {
+    format!(
+        "{} choose · {} select · {}/{}/{} direct · {} cancel",
+        keybindings.help(KeyAction::CloneOptionsConfirm, "Enter"),
+        keybindings.help_pair(
+            KeyAction::CloneOptionsPrev,
+            KeyAction::CloneOptionsNext,
+            "Left",
+            "Right",
+        ),
+        keybindings.help(KeyAction::CloneOptionsSessionOnly, "1"),
+        keybindings.help(KeyAction::CloneOptionsFolderData, "2"),
+        keybindings.help(KeyAction::CloneOptionsCancelChoice, "3"),
+        keybindings.help(KeyAction::CloneOptionsCancel, "Esc"),
+    )
+}
+
 fn new_session_help_text(keybindings: &KeyBindings) -> String {
     format!(
         "{} start · {} field · {} change · {} cursor · {} cancel",
@@ -15667,20 +15953,6 @@ fn new_session_help_text(keybindings: &KeyBindings) -> String {
             "Right",
         ),
         keybindings.help(KeyAction::NewSessionCancel, "Esc"),
-    )
-}
-
-fn clone_target_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} clone · {} choose · {} cancel",
-        keybindings.help(KeyAction::CloneTargetConfirm, "Enter"),
-        keybindings.help_pair(
-            KeyAction::CloneTargetPrev,
-            KeyAction::CloneTargetNext,
-            "Up",
-            "Down",
-        ),
-        keybindings.help(KeyAction::CloneTargetCancel, "Esc"),
     )
 }
 
@@ -15858,7 +16130,10 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .take(inner.height as usize)
         .map(|line| preview_line(line, app.preview_mode))
         .collect();
-    f.render_widget(Paragraph::new(styled_lines).style(theme_base_style()), inner);
+    f.render_widget(
+        Paragraph::new(styled_lines).style(theme_base_style()),
+        inner,
+    );
 }
 
 fn preview_line(line: &str, mode: Mode) -> Line<'static> {
@@ -16673,23 +16948,92 @@ fn truncate_width(s: &str, width: usize) -> String {
     out
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(v[1])[1]
+const MODAL_MARGIN_X: u16 = 2;
+const MODAL_MARGIN_Y: u16 = 1;
+
+fn modal_area_for_wrapped_lines(
+    area: Rect,
+    title: &str,
+    lines: &[Line<'_>],
+    min_width: u16,
+    max_width: u16,
+    min_height: u16,
+    max_height: u16,
+) -> Rect {
+    let desired_content_width = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .max(modal_title_content_width(title));
+    let width = modal_width(area, desired_content_width, min_width, max_width);
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    let content_rows = lines
+        .iter()
+        .map(|line| wrapped_modal_rows(line.width(), content_width))
+        .sum();
+    let height = modal_height(area, content_rows, min_height, max_height);
+    centered_rect_fixed(width, height, area)
+}
+
+fn modal_area_from_content_rows(
+    area: Rect,
+    title: &str,
+    desired_content_width: usize,
+    content_rows: usize,
+    min_width: u16,
+    max_width: u16,
+    min_height: u16,
+    max_height: u16,
+) -> Rect {
+    let desired_content_width = desired_content_width.max(modal_title_content_width(title));
+    let width = modal_width(area, desired_content_width, min_width, max_width);
+    let height = modal_height(area, content_rows, min_height, max_height);
+    centered_rect_fixed(width, height, area)
+}
+
+fn modal_title_content_width(title: &str) -> usize {
+    UnicodeWidthStr::width(title).saturating_add(2)
+}
+
+fn modal_width(area: Rect, desired_content_width: usize, min_width: u16, max_width: u16) -> u16 {
+    let max_width = modal_available_width(area).min(max_width.max(1)).max(1);
+    let min_width = min_width.max(1).min(max_width);
+    usize_to_u16_saturating(desired_content_width.saturating_add(2))
+        .max(min_width)
+        .min(max_width)
+}
+
+fn modal_height(area: Rect, content_rows: usize, min_height: u16, max_height: u16) -> u16 {
+    let max_height = modal_available_height(area).min(max_height.max(1)).max(1);
+    let min_height = min_height.max(1).min(max_height);
+    usize_to_u16_saturating(content_rows.saturating_add(2))
+        .max(min_height)
+        .min(max_height)
+}
+
+fn modal_available_width(area: Rect) -> u16 {
+    if area.width > MODAL_MARGIN_X.saturating_mul(2).saturating_add(4) {
+        area.width.saturating_sub(MODAL_MARGIN_X.saturating_mul(2))
+    } else {
+        area.width
+    }
+}
+
+fn modal_available_height(area: Rect) -> u16 {
+    if area.height > MODAL_MARGIN_Y.saturating_mul(2).saturating_add(3) {
+        area.height.saturating_sub(MODAL_MARGIN_Y.saturating_mul(2))
+    } else {
+        area.height
+    }
+}
+
+fn wrapped_modal_rows(line_width: usize, content_width: usize) -> usize {
+    line_width.div_ceil(content_width.max(1)).max(1)
+}
+
+fn usize_to_u16_saturating(value: usize) -> u16 {
+    value.min(u16::MAX as usize) as u16
 }
 
 fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {
@@ -17149,16 +17493,14 @@ mod tests {
         );
 
         match app.input_mode {
-            InputMode::Confirm {
-                action:
-                    PendingAction::Delete {
-                        info,
-                        removed_index,
-                    },
-                ..
+            InputMode::DeleteConfirm {
+                info,
+                removed_index,
+                selected,
             } => {
                 assert_eq!(info.session_id, "codex-id");
                 assert_eq!(removed_index, Some(0));
+                assert_eq!(selected, DELETE_OPTION_CANCEL);
             }
             other => panic!("expected delete confirm, got {:?}", other),
         }
@@ -17184,16 +17526,18 @@ mod tests {
         );
 
         match app.input_mode {
-            InputMode::Confirm {
-                prompt,
-                action: PendingAction::CloneSessionDataChoice { info, target },
+            InputMode::CloneOptions {
+                source,
+                target,
+                selected,
+                folder_data: CloneFolderDataAvailability::Available(path),
             } => {
-                assert!(prompt.contains("Copy working folder data"));
-                assert!(prompt.contains("session only"));
-                assert_eq!(info.session_id, "codex-id");
+                assert_eq!(source.session_id, "codex-id");
                 assert_eq!(target, Provider::Codex);
+                assert_eq!(selected, CLONE_OPTION_SESSION_ONLY);
+                assert_eq!(path, dir.path());
             }
-            other => panic!("expected folder-data clone confirm, got {:?}", other),
+            other => panic!("expected clone options with folder data, got {:?}", other),
         }
     }
 
@@ -17218,17 +17562,71 @@ mod tests {
         );
 
         match app.input_mode {
-            InputMode::Confirm {
-                prompt,
-                action: PendingAction::CloneSessionOnlyConfirm { info, target },
+            InputMode::CloneOptions {
+                source,
+                target,
+                selected,
+                folder_data: CloneFolderDataAvailability::Unavailable(reason),
             } => {
-                assert!(prompt.contains("Working folder data cannot be copied"));
-                assert!(prompt.contains("Clone session metadata only?"));
-                assert_eq!(info.session_id, "codex-id");
+                assert_eq!(source.session_id, "codex-id");
                 assert_eq!(target, Provider::Codex);
+                assert_eq!(selected, CLONE_OPTION_SESSION_ONLY);
+                assert!(reason.contains("No such file") || reason.contains("not found"));
             }
-            other => panic!("expected session-only clone confirm, got {:?}", other),
+            other => panic!(
+                "expected clone options without folder data, got {:?}",
+                other
+            ),
         }
+    }
+
+    #[test]
+    fn clone_options_disabled_folder_data_stays_open() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::CloneOptions {
+            source: session_info(Provider::Codex, "codex-id", "/missing"),
+            target: Provider::Codex,
+            selected: CLONE_OPTION_SESSION_ONLY,
+            folder_data: CloneFolderDataAvailability::Unavailable("missing cwd".into()),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match app.input_mode {
+            InputMode::CloneOptions { selected, .. } => {
+                assert_eq!(selected, CLONE_OPTION_FOLDER_DATA);
+            }
+            other => panic!("expected clone options to remain open, got {:?}", other),
+        }
+        assert!(app.status.contains("folder data cannot be copied"));
+    }
+
+    #[test]
+    fn clone_options_cancel_choice_closes_dialog() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::CloneOptions {
+            source: session_info(Provider::Codex, "codex-id", "/repo"),
+            target: Provider::Codex,
+            selected: CLONE_OPTION_SESSION_ONLY,
+            folder_data: CloneFolderDataAvailability::Available(PathBuf::from("/repo")),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert_eq!(app.status, "cancelled.");
     }
 
     #[test]
@@ -17254,7 +17652,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_delete_uses_stored_target_even_if_selection_changes() {
+    fn delete_confirm_uses_stored_target_even_if_selection_changes() {
         let dir = tempfile::tempdir().unwrap();
         let victim_path = dir.path().join("victim.jsonl");
         let other_path = dir.path().join("other.jsonl");
@@ -17269,17 +17667,15 @@ mod tests {
         let mut app = app_for_key_tests();
         app.sessions.push(other);
         app.list_state.select(Some(0));
-        app.input_mode = InputMode::Confirm {
-            prompt: "Delete?".to_string(),
-            action: PendingAction::Delete {
-                info: victim,
-                removed_index: Some(0),
-            },
+        app.input_mode = InputMode::DeleteConfirm {
+            info: victim,
+            removed_index: Some(0),
+            selected: DELETE_OPTION_CANCEL,
         };
 
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
             100,
             80,
             20,
@@ -17290,28 +17686,53 @@ mod tests {
     }
 
     #[test]
+    fn delete_confirm_default_enter_cancels_without_removing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim_path = dir.path().join("victim.jsonl");
+        fs::write(&victim_path, "{}\n").unwrap();
+
+        let mut victim = session_info(Provider::Claude, "victim", "/repo");
+        victim.source = victim_path.clone();
+
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::DeleteConfirm {
+            info: victim,
+            removed_index: Some(0),
+            selected: DELETE_OPTION_CANCEL,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(victim_path.exists());
+        assert_eq!(app.status, "cancelled.");
+    }
+
+    #[test]
     fn delete_confirm_prompt_sanitizes_session_id_controls() {
         let info = session_info(
             Provider::Claude,
             "sid\x1b]0;owned\x07next\nrow\tend",
             "/repo",
         );
-        let prompt = delete_confirm_prompt(&info, "y/Y", "Esc/n");
-        let lines: Vec<&str> = prompt.lines().collect();
+        let lines = delete_confirm_lines(&info, DELETE_OPTION_CANCEL, &KeyBindings::default());
+        let session_line = lines[1].spans[0].content.as_ref();
 
-        assert_eq!(lines.len(), 4);
-        assert!(!prompt.contains('\x1b'));
-        assert_eq!(lines[1], "sidnext row end");
+        assert_eq!(lines.len(), 6);
+        assert!(!session_line.contains('\x1b'));
+        assert!(session_line.contains("sidnext row end"));
     }
 
     #[test]
     fn confirm_modal_uses_compact_prompt_sized_area() {
         let area = Rect::new(0, 0, 120, 40);
-        let prompt = delete_confirm_prompt(
-            &session_info(Provider::Codex, "codex-id", "/repo"),
-            "y/Y",
-            "Esc/n",
-        );
+        let prompt =
+            "Delete codex session?\ncodex-id\nThis removes stored history.\ny/Y delete   Esc/n cancel";
         let modal = confirm_modal_area(&prompt, area);
 
         assert_eq!(prompt.lines().count(), 4);
@@ -17324,19 +17745,151 @@ mod tests {
     #[test]
     fn confirm_modal_wraps_without_using_screen_percent_height() {
         let area = Rect::new(0, 0, 50, 20);
-        let prompt = delete_confirm_prompt(
-            &session_info(
-                Provider::OpenCode,
-                "019e61ef-ec81-7bc0-a8a0-9e64619fa037-extra-long-id",
-                "/repo",
-            ),
-            "y/Y",
-            "Esc/n",
+        let prompt = format!(
+            "Delete opencode session?\n{}\nThis removes stored history.\ny/Y delete   Esc/n cancel",
+            "019e61ef-ec81-7bc0-a8a0-9e64619fa037-extra-long-id"
         );
         let modal = confirm_modal_area(&prompt, area);
 
-        assert_eq!(modal.width, 50);
-        assert!(modal.height <= 8);
+        assert!(modal.width <= area.width.saturating_sub(4));
+        assert!(modal.x >= 2);
+        assert!(modal.height >= 6);
+        assert!(modal.height <= 14);
+    }
+
+    #[test]
+    fn modal_area_wraps_lines_and_keeps_margin_when_space_allows() {
+        let area = Rect::new(0, 0, 32, 12);
+        let lines = vec![Line::from("  abcdefghijklmnopqrstuvwxyz0123456789")];
+        let modal = modal_area_for_wrapped_lines(area, "Long prompt", &lines, 10, 80, 3, 12);
+
+        assert!(modal.width <= area.width.saturating_sub(4));
+        assert!(modal.x >= 2);
+        assert!(modal.height >= 4);
+    }
+
+    #[test]
+    fn modal_area_clamps_to_tiny_viewport() {
+        let area = Rect::new(0, 0, 8, 3);
+        let lines = vec![Line::from("  content that cannot fit")];
+        let modal = modal_area_for_wrapped_lines(area, "Tiny", &lines, 10, 80, 3, 12);
+
+        assert_eq!(modal, area);
+    }
+
+    #[test]
+    fn input_modals_render_on_narrow_viewports() {
+        let keybindings = KeyBindings::default();
+        let agent_programs = AgentProgramSettings::default();
+        let source = session_info(
+            Provider::Codex,
+            "codex-id-with-a-long-display-tail",
+            "/repo/with/a/very/long/path/that/needs/truncation",
+        );
+        let confirm_action = PendingAction::CreateMissingLaunchCwd {
+            info: source.clone(),
+            path: PathBuf::from("/tmp/missing-launch-folder"),
+            cols: 80,
+            rows: 20,
+            launch_mode: AgentLaunchMode::Normal,
+        };
+        let confirm_prompt =
+            "Create missing launch folder?\n/tmp/missing-launch-folder\nCreate it and continue?\ny/Y create/start   Esc/n cancel";
+        let mut data_task = DataTaskPending::new(
+            1,
+            DataTaskKind::Clone,
+            "Cloning session data into a new native session artifact".to_string(),
+        );
+        data_task.progress_message =
+            Some("Copying files with a status line that should wrap cleanly".to_string());
+        data_task.progress_path =
+            Some("/repo/with/a/very/long/path/that/should/not_break_the_modal".to_string());
+
+        for (cols, rows) in [(32, 10), (20, 6)] {
+            let backend = ratatui::backend::TestBackend::new(cols, rows);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+            terminal
+                .draw(|f| draw_data_task_modal(f, f.area(), &data_task))
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_confirm_modal(f, f.area(), &confirm_prompt, &confirm_action);
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_delete_confirm_modal(
+                        f,
+                        f.area(),
+                        &source,
+                        DELETE_OPTION_CANCEL,
+                        &keybindings,
+                    );
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_filter_modal(
+                        f,
+                        f.area(),
+                        "long search query that should stay inside the dialog",
+                        18,
+                        None,
+                        &keybindings,
+                    );
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_title_edit_modal(
+                        f,
+                        f.area(),
+                        &source,
+                        "a title long enough to exercise input clipping",
+                        12,
+                        &keybindings,
+                    );
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_agent_launch_modal(f, f.area(), &source, 1, &agent_programs, &keybindings);
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_clone_options_modal(
+                        f,
+                        f.area(),
+                        &source,
+                        Provider::Codex,
+                        CLONE_OPTION_FOLDER_DATA,
+                        &CloneFolderDataAvailability::Unavailable(
+                            "folder path is not available".to_string(),
+                        ),
+                        &keybindings,
+                    );
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_new_session_modal(
+                        f,
+                        f.area(),
+                        NEW_SESSION_FIELD_CWD,
+                        NewSessionKind::CodingAgent,
+                        &source.cwd,
+                        source.cwd.len(),
+                        Provider::Codex,
+                        &[Provider::Codex],
+                        AgentLaunchMode::SkipPermissions,
+                        &agent_programs,
+                        &keybindings,
+                    );
+                })
+                .unwrap();
+        }
     }
 
     #[test]
@@ -18477,31 +19030,6 @@ mod tests {
             move_provider_in_options(Provider::Codex, 1, &[]),
             Provider::Codex
         );
-    }
-
-    #[test]
-    fn clone_provider_default_is_source_provider() {
-        assert_eq!(
-            clone_provider_at(clone_provider_default_index(Provider::Claude)),
-            Provider::Claude
-        );
-        assert_eq!(
-            clone_provider_at(clone_provider_default_index(Provider::Codex)),
-            Provider::Codex
-        );
-        assert_eq!(
-            clone_provider_at(clone_provider_default_index(Provider::OpenCode)),
-            Provider::OpenCode
-        );
-    }
-
-    #[test]
-    fn clone_provider_selection_wraps() {
-        let first = 0;
-        let last = CLONE_PROVIDER_OPTIONS.len() - 1;
-
-        assert_eq!(move_clone_provider_index(first, -1), last);
-        assert_eq!(move_clone_provider_index(last, 1), first);
     }
 
     #[test]
@@ -19692,11 +20220,23 @@ IF EXIST "%~dp0\node.exe" (
 
         let mut app = app_for_key_tests();
         app.input_mode = InputMode::Confirm {
-            prompt: "Delete?".to_string(),
-            action: PendingAction::Delete {
+            prompt: "Create?".to_string(),
+            action: PendingAction::CreateMissingLaunchCwd {
                 info: session_info(Provider::Codex, "codex-id", "/repo"),
-                removed_index: Some(0),
+                path: PathBuf::from("/repo"),
+                cols: 80,
+                rows: 20,
+                launch_mode: AgentLaunchMode::Normal,
             },
+        };
+        handle_key(&mut app, ctrl_q, 80, 50, 20);
+        assert!(app.should_quit);
+
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::DeleteConfirm {
+            info: session_info(Provider::Codex, "codex-id", "/repo"),
+            removed_index: Some(0),
+            selected: DELETE_OPTION_CANCEL,
         };
         handle_key(&mut app, ctrl_q, 80, 50, 20);
         assert!(app.should_quit);
@@ -19710,9 +20250,11 @@ IF EXIST "%~dp0\node.exe" (
         assert!(app.should_quit);
 
         let mut app = app_for_key_tests();
-        app.input_mode = InputMode::CloneTarget {
-            selected: 0,
+        app.input_mode = InputMode::CloneOptions {
             source: session_info(Provider::Codex, "codex-id", "/repo"),
+            target: Provider::Codex,
+            selected: CLONE_OPTION_SESSION_ONLY,
+            folder_data: CloneFolderDataAvailability::Available(PathBuf::from("/repo")),
         };
         handle_key(&mut app, ctrl_q, 80, 50, 20);
         assert!(app.should_quit);
@@ -21126,69 +21668,7 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn codex_repair_detection_is_limited_to_cokacmux_owned_rollouts() {
-        use std::io::Write;
-
-        let mut mux_owned = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            mux_owned,
-            r#"{{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{{"id":"019e4660-0000-7000-8000-000000000006","cwd":"/tmp","originator":"cokacmux"}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            mux_owned,
-            r#"{{"timestamp":"2026-05-20T01:00:00.100Z","type":"response_item","payload":{{"type":"message","role":"user","content":[],"id":"u1"}}}}"#
-        )
-        .unwrap();
-        assert!(codex_rollout_needs_repair(mux_owned.path()).unwrap());
-
-        let mut missing_modern_meta = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            missing_modern_meta,
-            r#"{{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{{"id":"019e4660-0000-7000-8000-000000000004","cwd":"/tmp","originator":"cokacmux","cli_version":"0.1.9"}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            missing_modern_meta,
-            r#"{{"timestamp":"2026-05-20T01:00:00.100Z","type":"response_item","payload":{{"type":"message","role":"user","content":[]}}}}"#
-        )
-        .unwrap();
-        assert!(codex_rollout_needs_repair(missing_modern_meta.path()).unwrap());
-
-        let mut missing_display_events = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            missing_display_events,
-            r#"{{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{{"id":"019e4660-0000-7000-8000-000000000005","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp","originator":"cokacmux","source":"cli","thread_source":"user","model_provider":"openai","base_instructions":{{"text":"You are Codex."}}}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            missing_display_events,
-            r#"{{"timestamp":"2026-05-20T01:00:00.100Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hello"}}]}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            missing_display_events,
-            r#"{{"timestamp":"2026-05-20T01:00:01.100Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"hi back"}}]}}}}"#
-        )
-        .unwrap();
-        assert!(codex_rollout_needs_repair(missing_display_events.path()).unwrap());
-
-        let mut native = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            native,
-            r#"{{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{{"id":"019e4660-0000-7000-8000-000000000002","cwd":"/tmp","originator":"codex-tui"}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            native,
-            r#"{{"timestamp":"2026-05-20T01:00:00.100Z","type":"response_item","payload":{{"type":"message","role":"user","content":[],"id":"u1"}}}}"#
-        )
-        .unwrap();
-        assert!(!codex_rollout_needs_repair(native.path()).unwrap());
-    }
-
-    #[test]
-    fn codex_repair_rewrites_cokacmux_owned_rollout_for_resume() {
+    fn prepare_agent_session_does_not_modify_existing_codex_rollout() {
         use std::io::Write;
 
         let session_id = "019e4660-0000-7000-8000-000000000003";
@@ -21218,60 +21698,11 @@ IF EXIST "%~dp0\node.exe" (
             updated_at_epoch_s: 0,
             title: None,
         };
+        let before = fs::read_to_string(file.path()).unwrap();
 
-        repair_cokacmux_codex_rollout(&info).unwrap();
+        prepare_agent_session(&info).unwrap();
 
-        let repaired = fs::read_to_string(file.path()).unwrap();
-        assert!(!repaired.contains("\"timestamp\":null"));
-        assert!(!repaired.contains("synthesized."));
-        assert!(!repaired.contains("\"id\":\"u1\""));
-        assert!(repaired.contains("\"text\":\"hello\""));
-        assert!(repaired.contains("\"type\":\"user_message\""));
-    }
-
-    #[test]
-    fn codex_repair_does_not_rewrite_while_live_daemon_exists() {
-        use std::io::Write;
-
-        let session_id = "019e4660-0000-7000-8000-000000000007";
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"{{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{{"id":"{}","cwd":"/tmp","originator":"cokacmux"}}}}"#,
-            session_id
-        )
-        .unwrap();
-        writeln!(
-            file,
-            r#"{{"timestamp":null,"type":"event_msg","payload":{{"type":"synthesized.claude:system","raw":{{}}}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            file,
-            r#"{{"timestamp":"2026-05-20T01:00:00.100Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hello"}}],"id":"u1"}}}}"#
-        )
-        .unwrap();
-
-        let info = SessionInfo {
-            provider: Provider::Codex,
-            session_id: session_id.to_string(),
-            cwd: "/tmp".to_string(),
-            source: file.path().to_path_buf(),
-            updated_at_epoch_s: 0,
-            title: None,
-        };
-        let live_meta = AgentMetaSnapshot {
-            pid: std::process::id(),
-            provider: Some("codex".into()),
-            session_id: Some(session_id.into()),
-            ..Default::default()
-        };
-
-        repair_cokacmux_codex_rollout_guarded(&info, Some(&live_meta)).unwrap();
-
-        let content = fs::read_to_string(file.path()).unwrap();
-        assert!(content.contains("\"timestamp\":null"));
-        assert!(content.contains("synthesized."));
-        assert!(content.contains("\"id\":\"u1\""));
+        let after = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(after, before);
     }
 }

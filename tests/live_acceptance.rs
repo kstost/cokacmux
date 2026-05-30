@@ -243,6 +243,7 @@ fn live_opencode_install_and_list() {
         &session,
         &opencode::install::InstallOpts {
             db_path: Some(db.clone()),
+            overwrite: false,
         },
     ) {
         Ok(r) => r,

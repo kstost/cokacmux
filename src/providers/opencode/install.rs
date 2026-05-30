@@ -15,6 +15,8 @@ use crate::universal::UniversalSession;
 pub struct InstallOpts {
     /// Override the default DB path (for tests).
     pub db_path: Option<PathBuf>,
+    /// If false and target session id already exists, error out.
+    pub overwrite: bool,
 }
 
 #[derive(Debug)]
@@ -33,6 +35,7 @@ pub fn install_to_default_db(
             "session_id": &session.session_id,
             "messages": session.messages.len(),
             "db_override": opts.db_path.as_ref().map(|p| p.display().to_string()),
+            "overwrite": opts.overwrite,
         }),
     );
     let db = opts
@@ -67,7 +70,13 @@ pub fn install_to_default_db(
             )));
         }
     }
-    super::write::to_db_path(session, &db)?;
+    super::write::to_db_path_with_opts(
+        session,
+        &db,
+        &super::write::WriteOpts {
+            overwrite: opts.overwrite,
+        },
+    )?;
     crate::debug::log(
         "provider_opencode_install_ok",
         serde_json::json!({
