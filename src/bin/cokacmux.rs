@@ -48,9 +48,8 @@ unsafe extern "system" {
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -8132,7 +8131,7 @@ fn setup_terminal() -> Result<Tui> {
     debug_log("terminal_setup_start", serde_json::json!({}));
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -11152,6 +11151,7 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             continue;
         }
 
+        let terminated_child_pid = terminate_agent_child_process(meta.child_pid, meta.pid, &key);
         terminate_process_group(meta.pid);
         if process_is_alive(meta.pid) {
             report.errors = report.errors.saturating_add(1);
@@ -11175,6 +11175,7 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
                 "daemon_pid": meta.pid,
                 "provider": meta.provider.as_deref(),
                 "session_id": meta.session_id.as_deref(),
+                "child_pid": terminated_child_pid,
             }),
         );
     }
@@ -11204,7 +11205,17 @@ fn terminate_agent_daemon(key: &AgentKey) -> Result<AgentTermination> {
     if let Some(meta) = meta.as_ref() {
         if process_is_alive(meta.pid) && verify_agent_daemon_identity(key, meta.pid) {
             let pid = meta.pid;
+            let terminated_child_pid = terminate_agent_child_process(meta.child_pid, pid, key);
             terminate_process_group(pid);
+            debug_log(
+                "kill_agent_processes",
+                serde_json::json!({
+                    "provider": key.provider.as_str(),
+                    "session_id": &key.session_id,
+                    "daemon_pid": pid,
+                    "child_pid": terminated_child_pid,
+                }),
+            );
             terminated_pid = Some(pid);
         } else if meta.pid > 0 {
             debug_log(
@@ -11224,6 +11235,28 @@ fn terminate_agent_daemon(key: &AgentKey) -> Result<AgentTermination> {
         pid: terminated_pid,
         pty_log_deleted,
     })
+}
+
+fn terminate_agent_child_process(
+    child_pid: Option<u32>,
+    daemon_pid: u32,
+    key: &AgentKey,
+) -> Option<u32> {
+    let child_pid = child_pid?;
+    if child_pid == 0 || child_pid == daemon_pid || !process_is_alive(child_pid) {
+        return None;
+    }
+    debug_log(
+        "kill_agent_child_process",
+        serde_json::json!({
+            "provider": key.provider.as_str(),
+            "session_id": &key.session_id,
+            "daemon_pid": daemon_pid,
+            "child_pid": child_pid,
+        }),
+    );
+    terminate_process_group(child_pid);
+    Some(child_pid)
 }
 
 fn verify_agent_daemon_identity(key: &AgentKey, expected_pid: u32) -> bool {
@@ -20703,6 +20736,56 @@ IF EXIST "%~dp0\node.exe" (
         assert!(remove_agent_pty_log_file(&key, &path));
         assert!(!path.exists());
         assert!(!remove_agent_pty_log_file(&key, &path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_agent_child_process_kills_separate_process_group() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+
+        let mut command = Command::new(shell);
+        command
+            .args(["-c", "trap '' HUP TERM; while :; do sleep 1; done"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let child_pid = child.id();
+        let info = session_info(Provider::Claude, "kill-child", "/repo");
+        let key = AgentKey::new(&info);
+
+        assert_eq!(
+            terminate_agent_child_process(Some(child_pid), 1, &key),
+            Some(child_pid)
+        );
+
+        let start = Instant::now();
+        let mut exited = false;
+        while start.elapsed() < Duration::from_secs(2) {
+            if child.try_wait().unwrap().is_some() {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !exited {
+            terminate_process_group(child_pid);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(exited, "PTY child process group survived termination");
     }
 
     #[test]
