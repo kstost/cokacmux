@@ -9,13 +9,33 @@ use crate::universal::{ImageSource, Role, UMessage, UniversalSession};
 
 use super::db;
 
+#[derive(Debug, Clone, Copy)]
+pub struct WriteOpts {
+    pub overwrite: bool,
+}
+
+impl Default for WriteOpts {
+    fn default() -> Self {
+        Self { overwrite: true }
+    }
+}
+
 pub fn to_db_path(session: &UniversalSession, db_path: &Path) -> Result<()> {
+    to_db_path_with_opts(session, db_path, &WriteOpts::default())
+}
+
+pub fn to_db_path_with_opts(
+    session: &UniversalSession,
+    db_path: &Path,
+    opts: &WriteOpts,
+) -> Result<()> {
     debug::log(
         "provider_opencode_write_db_start",
         serde_json::json!({
             "db_path": db_path.display().to_string(),
             "session_id": &session.session_id,
             "messages": session.messages.len(),
+            "overwrite": opts.overwrite,
         }),
     );
     let mut conn = match db::open_readwrite(db_path) {
@@ -44,7 +64,7 @@ pub fn to_db_path(session: &UniversalSession, db_path: &Path) -> Result<()> {
         );
         return Err(error);
     }
-    let result = to_db_connection(&mut conn, session);
+    let result = to_db_connection_with_opts(&mut conn, session, opts);
     match &result {
         Ok(()) => debug::log(
             "provider_opencode_write_db_ok",
@@ -66,15 +86,37 @@ pub fn to_db_path(session: &UniversalSession, db_path: &Path) -> Result<()> {
 }
 
 pub fn to_db_connection(conn: &mut rusqlite::Connection, session: &UniversalSession) -> Result<()> {
+    to_db_connection_with_opts(conn, session, &WriteOpts::default())
+}
+
+pub fn to_db_connection_with_opts(
+    conn: &mut rusqlite::Connection,
+    session: &UniversalSession,
+    opts: &WriteOpts,
+) -> Result<()> {
     debug::log(
         "provider_opencode_write_connection_start",
         serde_json::json!({
             "session_id": &session.session_id,
             "messages": session.messages.len(),
+            "overwrite": opts.overwrite,
         }),
     );
     let tx = conn.transaction()?;
     let now_ms = chrono::Utc::now().timestamp_millis();
+    if !opts.overwrite {
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM session WHERE id = ?1",
+            rusqlite::params![session.session_id],
+            |row| row.get(0),
+        )?;
+        if existing > 0 {
+            return Err(crate::error::ConvertError::Other(format!(
+                "opencode session already exists: {} (set overwrite=true to replace)",
+                session.session_id
+            )));
+        }
+    }
 
     // OpenCode puts CLI-driven sessions under the special `global` project.
     // (Verified against a live opencode.db v1.15.5: every session listed by

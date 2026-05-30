@@ -150,7 +150,11 @@ fn render_summary(session: &UniversalSession) -> String {
         return out;
     }
 
-    for message in session.messages.iter().filter(|m| summary_message_visible(m)) {
+    for message in session
+        .messages
+        .iter()
+        .filter(|m| summary_message_visible(m))
+    {
         render_summary_message(&mut out, message);
     }
     out
@@ -287,11 +291,7 @@ fn render_summary_block(out: &mut String, block: &ContentBlock) {
         ContentBlock::Patch { unified_diff, .. } => {
             let (added, removed) = diff_stats(unified_diff);
             let _ = writeln!(out, "  patch: +{} -{}", added, removed);
-            push_indented_text(
-                out,
-                "    ",
-                &truncate_for_mode(unified_diff, Mode::Summary),
-            );
+            push_indented_text(out, "    ", &truncate_for_mode(unified_diff, Mode::Summary));
         }
         ContentBlock::Other { type_tag, payload } => {
             let _ = writeln!(out, "  other: {}", other_summary_label(type_tag));
@@ -813,7 +813,8 @@ mod tests {
 
     #[test]
     fn summary_formats_common_content_blocks() {
-        let mut s = UniversalSession::new("summary-sid", crate::universal::Provider::Codex, "/repo");
+        let mut s =
+            UniversalSession::new("summary-sid", crate::universal::Provider::Codex, "/repo");
         s.messages.push(UMessage {
             id: "m1".into(),
             parent_id: None,
@@ -848,7 +849,10 @@ mod tests {
                     unified_diff: "--- a\n+++ b\n-old\n+new\n".into(),
                     extras: Default::default(),
                 },
-                ContentBlock::other("opencode_user_references", serde_json::json!([{"path": "src"}])),
+                ContentBlock::other(
+                    "opencode_user_references",
+                    serde_json::json!([{"path": "src"}]),
+                ),
             ],
             flags: MessageFlags::default(),
             provenance: Provenance {
