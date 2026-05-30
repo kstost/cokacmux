@@ -1,7 +1,6 @@
 """
 Build executor for Rust projects with cross-compilation support.
 """
-import hashlib
 import os
 import shutil
 import stat
@@ -251,9 +250,6 @@ exec {clang_path} "${{args[@]}}"
             try:
                 shutil.copy2(result.binary_path, dest_path)
                 dest_path.chmod(0o755)
-                checksum_path = dest_path.with_name(f"{dest_path.name}.sha256")
-                digest = hashlib.sha256(dest_path.read_bytes()).hexdigest()
-                checksum_path.write_text(f"{digest}  {dest_path.name}\n", encoding="utf-8")
 
                 # Get file size
                 size = dest_path.stat().st_size
