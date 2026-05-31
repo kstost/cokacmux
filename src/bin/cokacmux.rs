@@ -19,7 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -3355,6 +3355,8 @@ enum AgentDaemonRequest {
         cols: u16,
         rows: u16,
         client_pid: u32,
+        #[serde(default)]
+        client_instance_id: Option<String>,
     },
     Resize {
         cols: u16,
@@ -3424,6 +3426,17 @@ struct AgentClient {
     /// Handle to the agent-socket reader thread. Joined on drop after the
     /// stream is shut down to wake the thread out of its blocking read.
     reader_thread: Option<JoinHandle<()>>,
+}
+
+fn agent_client_instance_id() -> &'static str {
+    static AGENT_CLIENT_INSTANCE_ID: OnceLock<String> = OnceLock::new();
+    AGENT_CLIENT_INSTANCE_ID.get_or_init(|| {
+        let now_ns = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        format!("{}-{}", std::process::id(), now_ns)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3631,6 +3644,7 @@ impl AgentClient {
                 "cols": client.pty_size.cols,
                 "rows": client.pty_size.rows,
                 "client_pid": std::process::id(),
+                "client_instance_id": agent_client_instance_id(),
                 "reader_id": reader_id,
             }),
         );
@@ -3638,6 +3652,7 @@ impl AgentClient {
             cols: client.pty_size.cols,
             rows: client.pty_size.rows,
             client_pid: std::process::id(),
+            client_instance_id: Some(agent_client_instance_id().to_string()),
         })?;
         Ok(client)
     }
@@ -8647,6 +8662,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
         launch_mode,
         false,
         None,
+        None,
         "starting",
         startup_epoch_ms,
         startup_epoch_ms,
@@ -8673,7 +8689,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 return Err(e);
             }
         };
-    if let Err(e) = write_agent_meta(&meta_path, &mut agent, false, None) {
+    if let Err(e) = write_agent_meta(&meta_path, &mut agent, false, None, None) {
         debug_log(
             "daemon_meta_write_failed",
             serde_json::json!({
@@ -8696,6 +8712,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     );
     let mut client: Option<DaemonConnection> = None;
     let mut attached_client_pid: Option<u32> = None;
+    let mut attached_client_instance_id: Option<String> = None;
     let daemon_started_at = Instant::now();
     let mut last_no_output_log_at = Instant::now();
     #[cfg(windows)]
@@ -8764,6 +8781,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 &mut agent,
                 attached_client_pid.is_some(),
                 attached_client_pid,
+                attached_client_instance_id.as_deref(),
             );
         }
         for bytes in output_chunks {
@@ -8774,7 +8792,8 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 {
                     client = None;
                     attached_client_pid = None;
-                    let _ = write_agent_meta(&meta_path, &mut agent, false, None);
+                    attached_client_instance_id = None;
+                    let _ = write_agent_meta(&meta_path, &mut agent, false, None, None);
                     debug_log(
                         "daemon_client_output_failed",
                         serde_json::json!({
@@ -8810,15 +8829,19 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                                 cols,
                                 rows,
                                 client_pid,
+                                client_instance_id,
                             } => {
                                 agent.resize(cols, rows);
                                 agent.rehydrate_parser_from_pty_log();
+                                let client_instance_id_for_log = client_instance_id.clone();
                                 attached_client_pid = Some(client_pid);
+                                attached_client_instance_id = client_instance_id;
                                 let _ = write_agent_meta(
                                     &meta_path,
                                     &mut agent,
                                     true,
                                     Some(client_pid),
+                                    attached_client_instance_id.as_deref(),
                                 );
                                 debug_log(
                                     "daemon_attach_request",
@@ -8826,6 +8849,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                                         "provider": agent.info.provider.as_str(),
                                         "session_id": &agent.info.session_id,
                                         "client_pid": client_pid,
+                                        "client_instance_id": client_instance_id_for_log.as_deref(),
                                         "cols": cols,
                                         "rows": rows,
                                     }),
@@ -8863,19 +8887,23 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                                     &mut agent,
                                     true,
                                     attached_client_pid,
+                                    attached_client_instance_id.as_deref(),
                                 );
                             }
                             AgentDaemonRequest::Detach => {
                                 let detached_client_pid = attached_client_pid;
                                 attached_client_pid = None;
+                                let detached_client_instance_id =
+                                    attached_client_instance_id.take();
                                 let meta_write =
-                                    write_agent_meta(&meta_path, &mut agent, false, None);
+                                    write_agent_meta(&meta_path, &mut agent, false, None, None);
                                 debug_log(
                                     "daemon_detach_request",
                                     serde_json::json!({
                                         "provider": agent.info.provider.as_str(),
                                         "session_id": &agent.info.session_id,
                                         "detached_client_pid": detached_client_pid,
+                                        "detached_client_instance_id": detached_client_instance_id.as_deref(),
                                         "child_pid": agent.child.process_id(),
                                         "meta_write_ok": meta_write.is_ok(),
                                         "meta_write_error": meta_write.err().map(|e| e.to_string()),
@@ -8891,13 +8919,15 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 Err(e) => {
                     let disconnected_client_pid = attached_client_pid;
                     attached_client_pid = None;
-                    let _ = write_agent_meta(&meta_path, &mut agent, false, None);
+                    let disconnected_client_instance_id = attached_client_instance_id.take();
+                    let _ = write_agent_meta(&meta_path, &mut agent, false, None, None);
                     debug_log(
                         "daemon_client_disconnected",
                         serde_json::json!({
                             "provider": agent.info.provider.as_str(),
                             "session_id": &agent.info.session_id,
                             "attached_client_pid": disconnected_client_pid,
+                            "attached_client_instance_id": disconnected_client_instance_id.as_deref(),
                             "child_pid": agent.child.process_id(),
                             "error_kind": format!("{:?}", e.kind()),
                             "error": e.to_string(),
@@ -9051,6 +9081,7 @@ fn write_agent_meta(
     agent: &mut AgentSession,
     attached: bool,
     attached_client_pid: Option<u32>,
+    attached_client_instance_id: Option<&str>,
 ) -> io::Result<()> {
     let now_ms = current_epoch_ms();
     write_agent_meta_parts(
@@ -9060,6 +9091,7 @@ fn write_agent_meta(
         agent.launch_mode,
         attached,
         attached_client_pid,
+        attached_client_instance_id,
         if attached { "attached" } else { "live" },
         agent.last_screen_change_epoch_ms,
         agent.last_output_epoch_ms,
@@ -9081,6 +9113,7 @@ fn write_agent_meta_parts(
     launch_mode: AgentLaunchMode,
     attached: bool,
     attached_client_pid: Option<u32>,
+    attached_client_instance_id: Option<&str>,
     phase: &str,
     last_screen_change_epoch_ms: u64,
     last_output_epoch_ms: u64,
@@ -9116,6 +9149,7 @@ fn write_agent_meta_parts(
         "activity": activity.label(),
         "attached": attached,
         "attached_client_pid": attached_client_pid,
+        "attached_client_instance_id": attached_client_instance_id,
         "last_screen_change_epoch_ms": last_screen_change_epoch_ms,
         "last_output_epoch_ms": last_output_epoch_ms,
         "last_input_epoch_ms": last_input_epoch_ms,
@@ -9167,6 +9201,7 @@ fn write_agent_meta_parts(
             "activity": activity.label(),
             "attached": attached,
             "attached_client_pid": attached_client_pid,
+            "attached_client_instance_id": attached_client_instance_id,
             "last_screen_change_epoch_ms": last_screen_change_epoch_ms,
             "last_output_epoch_ms": last_output_epoch_ms,
             "last_input_epoch_ms": last_input_epoch_ms,
@@ -9191,6 +9226,8 @@ struct AgentMetaSnapshot {
     attached: bool,
     attached_client_pid: Option<u32>,
     #[serde(default)]
+    attached_client_instance_id: Option<String>,
+    #[serde(default)]
     last_screen_change_epoch_ms: u64,
     #[serde(default)]
     last_output_epoch_ms: u64,
@@ -9210,7 +9247,12 @@ fn read_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
 }
 
 fn live_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
-    read_agent_meta_snapshot(key).filter(|meta| meta.pid > 0 && process_is_alive(meta.pid))
+    read_agent_meta_snapshot(key).filter(|meta| {
+        meta.pid > 0
+            && process_is_alive(meta.pid)
+            && agent_key_from_meta(meta).as_ref() == Some(key)
+            && agent_daemon_process_identity(meta.pid, key) != AgentDaemonProcessIdentity::Other
+    })
 }
 
 fn new_agent_backing_session_for_key(key: &AgentKey) -> Option<NewAgentBackingSession> {
@@ -9240,6 +9282,15 @@ fn new_agent_backing_session_from_meta(meta: &AgentMetaSnapshot) -> Option<NewAg
 
 impl AgentMetaSnapshot {
     fn list_state(&self, current_pid: u32, now_epoch_ms: u64) -> AgentListState {
+        self.list_state_with_client_identity(current_pid, None, now_epoch_ms)
+    }
+
+    fn list_state_with_client_identity(
+        &self,
+        current_pid: u32,
+        current_client_instance_id: Option<&str>,
+        now_epoch_ms: u64,
+    ) -> AgentListState {
         let activity = agent_activity_from_timestamps(
             now_epoch_ms,
             self.last_screen_change_epoch_ms,
@@ -9250,11 +9301,30 @@ impl AgentMetaSnapshot {
             let Some(attached_client_pid) = self.attached_client_pid else {
                 return AgentListState::Live { activity };
             };
-            if attached_client_pid != current_pid && !process_is_alive(attached_client_pid) {
+            if attached_client_pid == current_pid {
+                if let Some(current_client_instance_id) = current_client_instance_id {
+                    if self.attached_client_instance_id.as_deref()
+                        != Some(current_client_instance_id)
+                    {
+                        return AgentListState::Live { activity };
+                    }
+                }
+                return AgentListState::Attached {
+                    mine: true,
+                    activity,
+                };
+            }
+            if !process_is_alive(attached_client_pid) {
+                return AgentListState::Live { activity };
+            }
+            if current_client_instance_id.is_some()
+                && agent_client_process_identity(attached_client_pid)
+                    == AgentClientProcessIdentity::Other
+            {
                 return AgentListState::Live { activity };
             }
             AgentListState::Attached {
-                mine: attached_client_pid == current_pid,
+                mine: false,
                 activity,
             }
         } else {
@@ -9303,7 +9373,8 @@ fn read_agent_runtime_state(key: &AgentKey, current_pid: u32) -> AgentListState 
             return AgentListState::Idle;
         }
     };
-    let state = read_agent_runtime_state_at(&meta_path, &socket_path, current_pid);
+    let state =
+        read_agent_runtime_state_at_for_key(Some(key), &meta_path, &socket_path, current_pid);
     trace_log(
         "agent_runtime_state_read",
         serde_json::json!({
@@ -9319,7 +9390,17 @@ fn read_agent_runtime_state(key: &AgentKey, current_pid: u32) -> AgentListState 
     state
 }
 
+#[cfg(test)]
 fn read_agent_runtime_state_at(
+    meta_path: &Path,
+    socket_path: &Path,
+    current_pid: u32,
+) -> AgentListState {
+    read_agent_runtime_state_at_for_key(None, meta_path, socket_path, current_pid)
+}
+
+fn read_agent_runtime_state_at_for_key(
+    expected_key: Option<&AgentKey>,
     meta_path: &Path,
     socket_path: &Path,
     current_pid: u32,
@@ -9405,7 +9486,48 @@ fn read_agent_runtime_state_at(
         }
         return AgentListState::Idle;
     }
-    let state = meta.list_state(current_pid, current_epoch_ms());
+    if let Some(expected_key) = expected_key {
+        let meta_key = agent_key_from_meta(&meta);
+        let daemon_identity = agent_daemon_process_identity(meta.pid, expected_key);
+        let identity_mismatch = meta_key.as_ref() != Some(expected_key)
+            || daemon_identity == AgentDaemonProcessIdentity::Other;
+        if identity_mismatch {
+            let meta_removed = fs::remove_file(meta_path).is_ok();
+            let socket_removed = fs::remove_file(socket_path).is_ok();
+            if debug_enabled {
+                debug_log(
+                    "agent_meta_identity_mismatch_removed",
+                    serde_json::json!({
+                        "expected": agent_key_debug_value(expected_key),
+                        "meta_key": meta_key.as_ref().map(agent_key_debug_value),
+                        "daemon_identity": format!("{:?}", daemon_identity),
+                        "daemon_pid": meta.pid,
+                        "current_pid": current_pid,
+                        "meta_path": meta_path.display().to_string(),
+                        "socket_path": socket_path.display().to_string(),
+                        "meta_removed": meta_removed,
+                        "socket_removed": socket_removed,
+                        "meta_child_pid": meta.child_pid,
+                        "meta_child_alive": meta.child_pid.map(process_is_alive),
+                        "meta_attached": meta.attached,
+                        "meta_attached_client_pid": meta.attached_client_pid,
+                        "meta_attached_client_alive": meta.attached_client_pid.map(process_is_alive),
+                    }),
+                );
+            }
+            return AgentListState::Idle;
+        }
+    }
+    let now_epoch_ms = current_epoch_ms();
+    let state = if expected_key.is_some() {
+        meta.list_state_with_client_identity(
+            current_pid,
+            Some(agent_client_instance_id()),
+            now_epoch_ms,
+        )
+    } else {
+        meta.list_state(current_pid, now_epoch_ms)
+    };
     trace_log(
         "agent_runtime_state_meta_ok",
         serde_json::json!({
@@ -10859,11 +10981,13 @@ fn agent_daemon_request_debug_value(request: &AgentDaemonRequest) -> serde_json:
             cols,
             rows,
             client_pid,
+            client_instance_id,
         } => serde_json::json!({
             "type": "attach",
             "cols": cols,
             "rows": rows,
             "client_pid": client_pid,
+            "client_instance_id": client_instance_id.as_deref(),
         }),
         AgentDaemonRequest::Resize { cols, rows } => serde_json::json!({
             "type": "resize",
@@ -11150,6 +11274,10 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
         ));
     }
     validate_session_launch_cwd(info)?;
+    let meta_path = agent_meta_path(&key)?;
+    if meta_path.exists() {
+        let _ = fs::remove_file(&meta_path);
+    }
     let socket_path = agent_socket_path(&key)?;
     if socket_path.exists() {
         let _ = fs::remove_file(&socket_path);
@@ -11503,7 +11631,8 @@ fn verify_agent_daemon_identity(key: &AgentKey, expected_pid: u32) -> bool {
     if expected_pid == 0 || !process_is_alive(expected_pid) {
         return false;
     }
-    let verified = process_cmdline_matches_agent_daemon(expected_pid, key);
+    let identity = agent_daemon_process_identity(expected_pid, key);
+    let verified = identity == AgentDaemonProcessIdentity::CokacmuxDaemon;
     if !verified {
         debug_log(
             "agent_daemon_identity_cmdline_failed",
@@ -11511,29 +11640,42 @@ fn verify_agent_daemon_identity(key: &AgentKey, expected_pid: u32) -> bool {
                 "provider": key.provider.as_str(),
                 "session_id": &key.session_id,
                 "daemon_pid": expected_pid,
+                "identity": format!("{:?}", identity),
             }),
         );
     }
     verified
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentDaemonProcessIdentity {
+    CokacmuxDaemon,
+    Other,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentClientProcessIdentity {
+    CokacmuxClient,
+    Other,
+    Unknown,
+}
+
 #[cfg(target_os = "linux")]
-fn process_cmdline_matches_agent_daemon(pid: u32, key: &AgentKey) -> bool {
-    fs::read(format!("/proc/{}/cmdline", pid))
-        .ok()
-        .map(|bytes| {
-            let args = bytes
-                .split(|byte| *byte == 0)
-                .filter(|arg| !arg.is_empty())
-                .map(|arg| String::from_utf8_lossy(arg).into_owned())
-                .collect::<Vec<_>>();
-            agent_daemon_args_match(&args, key)
-        })
-        .unwrap_or(false)
+fn agent_client_process_identity(pid: u32) -> AgentClientProcessIdentity {
+    let Ok(bytes) = fs::read(format!("/proc/{}/cmdline", pid)) else {
+        return AgentClientProcessIdentity::Unknown;
+    };
+    let args = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect::<Vec<_>>();
+    agent_client_args_identity(&args)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn process_cmdline_matches_agent_daemon(pid: u32, key: &AgentKey) -> bool {
+fn agent_client_process_identity(pid: u32) -> AgentClientProcessIdentity {
     Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .stdin(Stdio::null())
@@ -11541,16 +11683,65 @@ fn process_cmdline_matches_agent_daemon(pid: u32, key: &AgentKey) -> bool {
         .ok()
         .filter(|output| output.status.success())
         .map(|output| {
-            process_command_string_matches_agent_daemon(
+            process_command_string_agent_client_identity(
+                String::from_utf8_lossy(&output.stdout).trim(),
+            )
+        })
+        .unwrap_or(AgentClientProcessIdentity::Unknown)
+}
+
+#[cfg(windows)]
+fn agent_client_process_identity(pid: u32) -> AgentClientProcessIdentity {
+    let command = format!(
+        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {}\"; if ($p) {{ $p.CommandLine }}",
+        pid
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-Command", &command])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            process_command_string_agent_client_identity(
+                String::from_utf8_lossy(&output.stdout).trim(),
+            )
+        })
+        .unwrap_or(AgentClientProcessIdentity::Unknown)
+}
+
+#[cfg(target_os = "linux")]
+fn agent_daemon_process_identity(pid: u32, key: &AgentKey) -> AgentDaemonProcessIdentity {
+    let Ok(bytes) = fs::read(format!("/proc/{}/cmdline", pid)) else {
+        return AgentDaemonProcessIdentity::Unknown;
+    };
+    let args = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect::<Vec<_>>();
+    agent_daemon_args_identity(&args, key)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn agent_daemon_process_identity(pid: u32, key: &AgentKey) -> AgentDaemonProcessIdentity {
+    Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            process_command_string_agent_daemon_identity(
                 String::from_utf8_lossy(&output.stdout).trim(),
                 key,
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(AgentDaemonProcessIdentity::Unknown)
 }
 
 #[cfg(windows)]
-fn process_cmdline_matches_agent_daemon(pid: u32, key: &AgentKey) -> bool {
+fn agent_daemon_process_identity(pid: u32, key: &AgentKey) -> AgentDaemonProcessIdentity {
     let command = format!(
         "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {}\"; if ($p) {{ $p.CommandLine }}",
         pid
@@ -11570,13 +11761,16 @@ fn process_cmdline_matches_agent_daemon(pid: u32, key: &AgentKey) -> bool {
                     "error": e.to_string(),
                 }),
             );
-            return false;
+            return AgentDaemonProcessIdentity::Unknown;
         }
     };
     let command_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let matched =
-        output.status.success() && process_command_string_matches_agent_daemon(&command_line, key);
+    let identity = if output.status.success() {
+        process_command_string_agent_daemon_identity(&command_line, key)
+    } else {
+        AgentDaemonProcessIdentity::Unknown
+    };
     debug_log(
         "agent_daemon_identity_cmdline_probe",
         serde_json::json!({
@@ -11586,29 +11780,62 @@ fn process_cmdline_matches_agent_daemon(pid: u32, key: &AgentKey) -> bool {
             "stdout_len": output.stdout.len(),
             "stderr": truncate_width(&stderr, 512),
             "command_line": truncate_width(&command_line, 512),
-            "matched": matched,
+            "identity": format!("{:?}", identity),
         }),
     );
-    matched
+    identity
 }
 
+#[cfg(test)]
 fn agent_daemon_args_match(args: &[String], key: &AgentKey) -> bool {
+    agent_daemon_args_identity(args, key) == AgentDaemonProcessIdentity::CokacmuxDaemon
+}
+
+fn agent_daemon_args_identity(args: &[String], key: &AgentKey) -> AgentDaemonProcessIdentity {
     let Some(program) = args.first() else {
-        return false;
+        return AgentDaemonProcessIdentity::Unknown;
     };
     if !program_looks_like_current_app(program) {
-        return false;
+        return AgentDaemonProcessIdentity::Other;
     }
     let Some(pos) = args.iter().position(|arg| arg == AGENT_DAEMON_ARG) else {
-        return false;
+        return AgentDaemonProcessIdentity::Other;
     };
-    args.get(pos + 1).map(String::as_str) == Some(key.provider.as_str())
+    if args.get(pos + 1).map(String::as_str) == Some(key.provider.as_str())
         && args.get(pos + 2).map(String::as_str) == Some(key.session_id.as_str())
+    {
+        AgentDaemonProcessIdentity::CokacmuxDaemon
+    } else {
+        AgentDaemonProcessIdentity::Other
+    }
+}
+
+fn agent_client_args_identity(args: &[String]) -> AgentClientProcessIdentity {
+    let Some(program) = args.first() else {
+        return AgentClientProcessIdentity::Unknown;
+    };
+    if program_looks_like_current_app(program) && !args.iter().any(|arg| arg == AGENT_DAEMON_ARG) {
+        AgentClientProcessIdentity::CokacmuxClient
+    } else {
+        AgentClientProcessIdentity::Other
+    }
 }
 
 #[cfg(windows)]
-fn process_command_string_matches_agent_daemon(command: &str, key: &AgentKey) -> bool {
-    windows_command_line_to_args(command).is_some_and(|args| agent_daemon_args_match(&args, key))
+fn process_command_string_agent_daemon_identity(
+    command: &str,
+    key: &AgentKey,
+) -> AgentDaemonProcessIdentity {
+    windows_command_line_to_args(command)
+        .map(|args| agent_daemon_args_identity(&args, key))
+        .unwrap_or(AgentDaemonProcessIdentity::Unknown)
+}
+
+#[cfg(windows)]
+fn process_command_string_agent_client_identity(command: &str) -> AgentClientProcessIdentity {
+    windows_command_line_to_args(command)
+        .map(|args| agent_client_args_identity(&args))
+        .unwrap_or(AgentClientProcessIdentity::Unknown)
 }
 
 #[cfg(windows)]
@@ -11655,8 +11882,20 @@ fn windows_command_line_to_args(command: &str) -> Option<Vec<String>> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn process_command_string_matches_agent_daemon(command: &str, key: &AgentKey) -> bool {
-    command_string_to_args(command).is_some_and(|args| agent_daemon_args_match(&args, key))
+fn process_command_string_agent_daemon_identity(
+    command: &str,
+    key: &AgentKey,
+) -> AgentDaemonProcessIdentity {
+    command_string_to_args(command)
+        .map(|args| agent_daemon_args_identity(&args, key))
+        .unwrap_or(AgentDaemonProcessIdentity::Unknown)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_command_string_agent_client_identity(command: &str) -> AgentClientProcessIdentity {
+    command_string_to_args(command)
+        .map(|args| agent_client_args_identity(&args))
+        .unwrap_or(AgentClientProcessIdentity::Unknown)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -20593,6 +20832,7 @@ mod tests {
             source: None,
             attached: true,
             attached_client_pid: Some(u32::MAX),
+            attached_client_instance_id: None,
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
@@ -20600,6 +20840,93 @@ mod tests {
 
         assert_eq!(
             meta.list_state(current_pid, current_epoch_ms()),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet
+            }
+        );
+    }
+
+    #[test]
+    fn attached_client_mine_requires_current_instance_id_when_checked() {
+        let current_pid = std::process::id();
+        let mut meta = AgentMetaSnapshot {
+            pid: current_pid,
+            child_pid: None,
+            provider: Some("claude".into()),
+            session_id: Some("s1".into()),
+            cwd: Some("/repo".into()),
+            source: None,
+            attached: true,
+            attached_client_pid: Some(current_pid),
+            attached_client_instance_id: Some("previous-client".into()),
+            last_screen_change_epoch_ms: 0,
+            last_output_epoch_ms: 0,
+            last_input_epoch_ms: 0,
+        };
+
+        assert_eq!(
+            meta.list_state_with_client_identity(
+                current_pid,
+                Some("current-client"),
+                current_epoch_ms()
+            ),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet
+            }
+        );
+
+        meta.attached_client_instance_id = Some("current-client".into());
+        assert_eq!(
+            meta.list_state_with_client_identity(
+                current_pid,
+                Some("current-client"),
+                current_epoch_ms()
+            ),
+            AgentListState::Attached {
+                mine: true,
+                activity: AgentActivity::Quiet
+            }
+        );
+    }
+
+    #[test]
+    fn attached_client_pid_must_be_cokacmux_client_when_checked() {
+        let current_pid = std::process::id();
+        #[cfg(unix)]
+        let mut foreign_client = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let mut foreign_client = Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .spawn()
+            .unwrap();
+        let meta = AgentMetaSnapshot {
+            pid: current_pid,
+            child_pid: None,
+            provider: Some("claude".into()),
+            session_id: Some("s1".into()),
+            cwd: Some("/repo".into()),
+            source: None,
+            attached: true,
+            attached_client_pid: Some(foreign_client.id()),
+            attached_client_instance_id: Some("foreign-client".into()),
+            last_screen_change_epoch_ms: 0,
+            last_output_epoch_ms: 0,
+            last_input_epoch_ms: 0,
+        };
+
+        let state = meta.list_state_with_client_identity(
+            current_pid,
+            Some("current-client"),
+            current_epoch_ms(),
+        );
+        let _ = foreign_client.kill();
+        let _ = foreign_client.wait();
+        assert_eq!(
+            state,
             AgentListState::Live {
                 activity: AgentActivity::Quiet
             }
@@ -20817,6 +21144,35 @@ mod tests {
 
         assert_eq!(
             read_agent_runtime_state_at(&meta, &socket, std::process::id()),
+            AgentListState::Idle
+        );
+        assert!(!meta.exists());
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn reused_pid_agent_meta_is_cleaned_and_treated_as_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("agent.json");
+        let socket = dir.path().join("agent.sock");
+        let key = AgentKey {
+            provider: Provider::Codex,
+            session_id: "reused-pid-session".into(),
+        };
+
+        fs::write(
+            &meta,
+            format!(
+                r#"{{"pid":{},"provider":"codex","session_id":"{}"}}"#,
+                std::process::id(),
+                &key.session_id
+            ),
+        )
+        .unwrap();
+        fs::write(&socket, "").unwrap();
+
+        assert_eq!(
+            read_agent_runtime_state_at_for_key(Some(&key), &meta, &socket, std::process::id()),
             AgentListState::Idle
         );
         assert!(!meta.exists());
