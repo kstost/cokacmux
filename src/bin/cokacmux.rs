@@ -93,6 +93,9 @@ const AGENT_ACTIVITY_META_WRITE_INTERVAL_MS: u64 = 750;
 const DEBUG_LOG_FILE: &str = "cokacmux.log";
 const DEBUG_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const APP_DIR_NAME: &str = ".cokacmux";
+const SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e", "enter"];
+const PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e"];
+const PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS: &[&str] = &["enter"];
 const AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+up", "shift+alt+pageup"];
 const AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+down", "shift+alt+pagedown"];
 const PREVIOUS_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+pageup"];
@@ -579,7 +582,7 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "sessions.toggle_preview",
         KeyAction::SessionTogglePreview,
-        &["enter"],
+        &[],
     ),
     (
         "sessions.move_next",
@@ -616,7 +619,7 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "sessions.launch_agent",
         KeyAction::SessionLaunchAgent,
-        &["e"],
+        SESSION_LAUNCH_AGENT_DEFAULTS,
     ),
     (
         "sessions.refresh_preview",
@@ -1294,6 +1297,26 @@ fn parse_keybinding_json_list(
 
 fn migrate_legacy_keybinding_defaults(root: &mut serde_json::Value) -> bool {
     let mut migrated = false;
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "sessions.launch_agent"),
+        &[PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS],
+        SESSION_LAUNCH_AGENT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["sessions", "launch_agent"]),
+        &[PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS],
+        SESSION_LAUNCH_AGENT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "sessions.toggle_preview"),
+        &[PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS],
+        &[],
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["sessions", "toggle_preview"]),
+        &[PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS],
+        &[],
+    );
     migrated |= migrate_generated_keybinding_value(
         flat_keybinding_json_value_mut(root, "agent.scroll_page_up"),
         &[
@@ -5552,17 +5575,16 @@ impl App {
         );
     }
 
-    fn toggle_preview_mode(&mut self) {
+    fn show_summary_preview(&mut self) {
         let before = self.preview_mode;
-        self.preview_mode = match self.preview_mode {
-            Mode::Summary => Mode::Full,
-            Mode::Full => Mode::Summary,
-        };
-        self.preview_scroll = 0;
+        self.preview_mode = Mode::Summary;
+        if before != self.preview_mode {
+            self.preview_scroll = 0;
+        }
         self.focus = FocusPane::Preview;
-        self.status = format!("preview mode: {}", preview_mode_label(self.preview_mode));
+        self.status = "preview: summary".to_string();
         debug_log(
-            "preview_mode_toggle",
+            "preview_summary_show",
             serde_json::json!({
                 "before": preview_mode_label(before),
                 "after": preview_mode_label(self.preview_mode),
@@ -6727,12 +6749,14 @@ impl App {
 
     fn restore_live_agent(&mut self, cols: u16, rows: u16) {
         if self.main_tx.is_none() {
-            self.status = "no active agent to switch to; press e to start selected agent".into();
+            self.status =
+                "no active agent to switch to; press e/Enter to start selected agent".into();
             return;
         }
         self.refresh_agent_runtime_states();
         let Some(info) = self.live_agent_restore_candidate() else {
-            self.status = "no active agent to switch to; press e to start selected agent".into();
+            self.status =
+                "no active agent to switch to; press e/Enter to start selected agent".into();
             return;
         };
         let key = AgentKey::new(&info);
@@ -8334,12 +8358,12 @@ fn print_help() {
          t             edit selected session title\n  \
          r             refresh from disk\n  \
          c             clone/convert selected session\n  \
-         e             switch to live selected agent, or choose launch mode to start it\n  \
+         e / Enter     switch to live selected agent, or choose launch mode to start it\n  \
          Ctrl+] / Ctrl+[ switch between sessions and active agent\n  \
          Ctrl+K        kill selected/current agent\n  \
          Ctrl+PgUp/PgDn switch live agent from agent screen\n  \
          Delete / d    delete selected session (confirm)\n  \
-         Enter         toggle preview summary/full"
+         Space         refresh preview"
     );
 }
 
@@ -15343,8 +15367,10 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         app.begin_new_session_from_focused();
     } else if keybindings.matches(KeyAction::SessionToggleFocus, key) {
         app.toggle_focus();
+    } else if keybindings.matches(KeyAction::SessionLaunchAgent, key) {
+        app.begin_agent_launch(agent_cols.max(1), agent_rows.max(1));
     } else if keybindings.matches(KeyAction::SessionTogglePreview, key) {
-        app.toggle_preview_mode();
+        app.show_summary_preview();
     } else if keybindings.matches(KeyAction::SessionMoveNext, key) {
         if app.focus == FocusPane::Preview {
             app.scroll_preview(1);
@@ -15425,8 +15451,6 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         && app.focus == FocusPane::Sessions
     {
         app.begin_title_edit();
-    } else if keybindings.matches(KeyAction::SessionLaunchAgent, key) {
-        app.begin_agent_launch(agent_cols.max(1), agent_rows.max(1));
     } else if keybindings.matches(KeyAction::SessionRefreshPreview, key) {
         // Force a re-render of the preview (and refresh cache).
         if let Some(info) = app.current().cloned() {
@@ -16562,10 +16586,9 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .map(|(requested_key, _)| requested_key == &key)
             .unwrap_or(false);
         format!(
-            " preview {} {} {} {}/{}{} ",
+            " preview {} {} {}/{}{} ",
             info.provider.as_str(),
             truncate_width(&info.session_id, 14),
-            preview_mode_short(app.preview_mode),
             app.preview_scroll,
             max_scroll,
             if loading { " *" } else { "" }
@@ -17053,7 +17076,7 @@ fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Strin
             keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
         ),
         FocusPane::Preview if width >= 92 => format!(
-            "{} sessions · {} scroll · {} select · {} resize · {} page · {} top/bottom · {} summary/full · {}/{} quit",
+            "{} sessions · {} scroll · {} select · {} resize · {} page · {} top/bottom · {}/{} quit",
             keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
             keybindings.help_pair(
                 KeyAction::SessionMovePrev,
@@ -17085,7 +17108,6 @@ fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Strin
                 "Home",
                 "End",
             ),
-            keybindings.help(KeyAction::SessionTogglePreview, "Enter"),
             keybindings.help(KeyAction::SessionQuit, "q"),
             keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
         ),
@@ -17487,13 +17509,6 @@ fn preview_mode_label(mode: Mode) -> &'static str {
     match mode {
         Mode::Summary => "summary",
         Mode::Full => "full",
-    }
-}
-
-fn preview_mode_short(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Summary => "S",
-        Mode::Full => "F",
     }
 }
 
@@ -17946,6 +17961,10 @@ mod tests {
             KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)
         ));
         assert!(keybindings.matches(
+            KeyAction::SessionLaunchAgent,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ));
+        assert!(keybindings.matches(
             KeyAction::SessionDelete,
             KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)
         ));
@@ -17955,11 +17974,19 @@ mod tests {
         ));
         let content = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(value["sessions"]["launch_agent"], serde_json::json!(["e"]));
+        assert_eq!(
+            value["sessions"]["launch_agent"],
+            serde_json::json!(["e", "enter"])
+        );
         assert_eq!(
             value["sessions"]["delete"],
             serde_json::json!(["delete", "d"])
         );
+        assert_eq!(value["sessions"]["toggle_preview"], serde_json::json!([]));
+        assert!(!keybindings.matches(
+            KeyAction::SessionTogglePreview,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ));
         assert_eq!(
             value["agent"]["scroll_page_up"],
             serde_json::json!(["shift+alt+up", "shift+alt+pageup"])
@@ -18034,6 +18061,46 @@ mod tests {
             value["agent"]["scroll_page_down"],
             serde_json::json!(["shift+alt+down", "shift+alt+pagedown"])
         );
+    }
+
+    #[test]
+    fn legacy_generated_session_preview_binding_is_migrated_to_enter_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "sessions": {
+    "launch_agent": ["e"],
+    "toggle_preview": ["enter"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        assert!(keybindings.matches(
+            KeyAction::SessionLaunchAgent,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)
+        ));
+        assert!(keybindings.matches(
+            KeyAction::SessionLaunchAgent,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::SessionTogglePreview,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            value["sessions"]["launch_agent"],
+            serde_json::json!(["e", "enter"])
+        );
+        assert_eq!(value["sessions"]["toggle_preview"], serde_json::json!([]));
     }
 
     #[test]
@@ -18938,7 +19005,7 @@ mod tests {
     }
 
     #[test]
-    fn f_no_longer_cycles_provider_filter_and_enter_toggles_preview() {
+    fn f_no_longer_cycles_provider_filter_and_enter_launches_agent() {
         // `f` was the provider-filter cycle key; that feature is disabled.
         // Pressing it should not change the filter or the selection.
         let mut app = app_for_key_tests();
@@ -18958,6 +19025,14 @@ mod tests {
         assert!(matches!(app.provider_filter, ProviderFilter::All));
         assert_eq!(app.list_state.selected(), Some(1));
         assert_eq!(app.preview_mode, Mode::Summary);
+        assert!(app.keybindings.matches(
+            KeyAction::SessionLaunchAgent,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ));
+        assert!(!app.keybindings.matches(
+            KeyAction::SessionTogglePreview,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ));
 
         handle_key(
             &mut app,
@@ -18966,7 +19041,34 @@ mod tests {
             80,
             20,
         );
-        assert_eq!(app.preview_mode, Mode::Full);
+        assert_eq!(app.preview_mode, Mode::Summary);
+        assert!(matches!(app.input_mode, InputMode::AgentLaunch { .. }));
+    }
+
+    #[test]
+    fn legacy_preview_toggle_binding_does_not_block_enter_launch() {
+        let mut app = app_for_key_tests();
+        app.keybindings.apply_json(&serde_json::json!({
+            "sessions": {
+                "toggle_preview": ["enter"]
+            }
+        }));
+        app.sessions
+            .push(session_info(Provider::Codex, "codex-id", "/repo"));
+        app.list_state.select(Some(0));
+        app.preview_mode = Mode::Summary;
+        app.focus = FocusPane::Sessions;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert_eq!(app.preview_mode, Mode::Summary);
+        assert!(matches!(app.input_mode, InputMode::AgentLaunch { .. }));
     }
 
     #[test]
@@ -18988,7 +19090,7 @@ mod tests {
         assert!(app.show_sessions_view);
         assert_eq!(
             app.status,
-            "no active agent to switch to; press e to start selected agent"
+            "no active agent to switch to; press e/Enter to start selected agent"
         );
     }
 

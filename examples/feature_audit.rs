@@ -10,7 +10,7 @@
 //! Safety:
 //!  - settings.json is backed up before the run and restored after.
 //!  - destructive / process-spawning confirmations are NOT accepted.
-//!  - 'e' and Ctrl+N are opened then canceled when exercised.
+//!  - 'e', Enter, and Ctrl+N are opened then canceled when exercised.
 //!  - 'c' (clone), 't' (edit title), 'd' (delete), Ctrl+K (kill), and Ctrl+]
 //!    (detach) are not exercised.
 //!
@@ -657,19 +657,19 @@ fn main() {
             cli_args: &[],
             expects_self_exit: false,
         },
-        // --- preview summary toggle (Enter) ---------------------------
+        // --- Enter mirrors the agent launch shortcut --------------------
         TestCase {
-            name: "preview_enter_toggle",
+            name: "agent_launch_enter_open_cancel",
             cols: 120,
             rows: 30,
             boot_ms: 1500,
             steps: &[
                 Step::Send(&[ENTER]),
                 Step::Wait(400),
-                Step::Send(&[ENTER]),
-                Step::Wait(300),
+                Step::Send(&[ESC]),
+                Step::Wait(200),
             ],
-            expect_present: &["sessions"],
+            expect_present: &["Agent launch", "Start/attach", "Normal", "Skip permissions"],
             expect_absent: &[],
             cli_args: &[],
             expects_self_exit: false,
@@ -854,7 +854,7 @@ fn main() {
                 Step::Wait(150),
                 Step::Send(&[ENTER]),
                 Step::Wait(200),
-                Step::Send(&[ENTER]),
+                Step::Send(&[ESC]),
                 Step::Wait(200),
             ],
             expect_present: &["sessions"],
