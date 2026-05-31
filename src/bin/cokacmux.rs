@@ -191,8 +191,6 @@ const THEME_PREVIEW_TIME: Color = Color::Indexed(152);
 const THEME_PREVIEW_ATTACHMENT: Color = Color::Indexed(181);
 const THEME_PREVIEW_OTHER: Color = Color::Indexed(246);
 const THEME_PREVIEW_PATCH_HEADER: Color = Color::Indexed(111);
-const THEME_PREVIEW_NUMBER: Color = Color::Indexed(179);
-const THEME_PREVIEW_BOOL: Color = Color::Indexed(147);
 const AGENT_DEFAULT_BG: Color = THEME_BG;
 const STARTUP_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const STARTUP_SPINNER_TICK_MS: u128 = 180;
@@ -5820,6 +5818,20 @@ impl App {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn preview_summary_style_state_before(
+        &self,
+        key: &PreviewKey,
+        start: usize,
+    ) -> PreviewSummaryStyleState {
+        let mut state = PreviewSummaryStyleState::default();
+        if let Some(entry) = self.preview_cache.get(key) {
+            for line in entry.lines.iter().take(start) {
+                preview_summary_update_style_state_after_line(&mut state, line);
+            }
+        }
+        state
     }
 
     /// Reap the active agent if its reader thread (or daemon) signaled
@@ -16520,6 +16532,7 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let current = app.current().cloned();
     let mut lines = Vec::new();
+    let mut summary_style_state = PreviewSummaryStyleState::default();
     let mut max_scroll = 0u16;
     let title = if let Some(info) = current {
         let key = PreviewKey::new(&info, app.preview_mode);
@@ -16531,6 +16544,8 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             if app.preview_scroll > max_scroll {
                 app.preview_scroll = max_scroll;
             }
+            summary_style_state =
+                app.preview_summary_style_state_before(&key, app.preview_scroll as usize);
             lines =
                 app.preview_visible_lines(&key, app.preview_scroll as usize, inner.height as usize);
         } else {
@@ -16571,7 +16586,9 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let styled_lines: Vec<Line> = lines
         .iter()
         .take(inner.height as usize)
-        .map(|line| preview_line(line, app.preview_mode))
+        .scan(summary_style_state, |state, line| {
+            Some(preview_line_with_state(line, app.preview_mode, state))
+        })
         .collect();
     f.render_widget(
         Paragraph::new(styled_lines).style(theme_base_style()),
@@ -16579,15 +16596,42 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn preview_line(line: &str, mode: Mode) -> Line<'static> {
-    if mode == Mode::Summary {
-        preview_summary_line(line)
-    } else {
-        Line::from(Span::styled(line.to_string(), theme_base_style()))
-    }
+#[derive(Debug, Default, Clone, Copy)]
+struct PreviewSummaryStyleState {
+    body_context: PreviewSummaryBodyContext,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum PreviewSummaryBodyContext {
+    #[default]
+    Plain,
+    ToolUseArgs,
+    ToolResult,
+    Patch,
+}
+
+fn preview_line_with_state(
+    line: &str,
+    mode: Mode,
+    state: &mut PreviewSummaryStyleState,
+) -> Line<'static> {
+    if mode != Mode::Summary {
+        return Line::from(Span::styled(line.to_string(), theme_base_style()));
+    }
+    let styled = preview_summary_line_with_context(line, state.body_context);
+    preview_summary_update_style_state_after_line(state, line);
+    styled
+}
+
+#[cfg(test)]
 fn preview_summary_line(line: &str) -> Line<'static> {
+    preview_summary_line_with_context(line, PreviewSummaryBodyContext::Plain)
+}
+
+fn preview_summary_line_with_context(
+    line: &str,
+    body_context: PreviewSummaryBodyContext,
+) -> Line<'static> {
     if line.is_empty() {
         return Line::from(Span::raw(""));
     }
@@ -16620,17 +16664,46 @@ fn preview_summary_line(line: &str) -> Line<'static> {
         }
     }
     if preview_summary_label_matches(line, "  tool result") {
-        let color = if line.contains("· error") {
-            THEME_PREVIEW_ERROR
-        } else {
-            THEME_POSITIVE
-        };
-        return preview_summary_prefix_line(line, "  tool result", color);
+        return preview_summary_tool_result_line(line);
     }
-    if line.starts_with("  ") && line.contains(':') && !line.starts_with("    ") {
+    if preview_summary_field_split(line).is_some() {
         return preview_summary_field_line(line);
     }
-    preview_summary_body_line(line)
+    preview_summary_body_line(line, body_context)
+}
+
+fn preview_summary_update_style_state_after_line(state: &mut PreviewSummaryStyleState, line: &str) {
+    if preview_summary_label_matches(line, "  patch") {
+        state.body_context = PreviewSummaryBodyContext::Patch;
+    } else if preview_summary_label_matches(line, "  tool use") {
+        state.body_context = PreviewSummaryBodyContext::ToolUseArgs;
+    } else if preview_summary_label_matches(line, "  tool result") {
+        state.body_context = PreviewSummaryBodyContext::ToolResult;
+    } else if preview_summary_line_starts_new_block(line)
+        || (line.is_empty() && state.body_context != PreviewSummaryBodyContext::ToolResult)
+    {
+        state.body_context = PreviewSummaryBodyContext::Plain;
+    }
+}
+
+fn preview_summary_line_starts_new_block(line: &str) -> bool {
+    matches!(line, "Session" | "Messages")
+        || ["USER #", "ASSISTANT #", "TOOL #", "SYSTEM #", "DEVELOPER #"]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        || [
+            "  thinking",
+            "  tool use",
+            "  image",
+            "  attachment",
+            "  other",
+            "  input text",
+            "  output text",
+            "  tool result",
+        ]
+        .iter()
+        .any(|label| preview_summary_label_matches(line, label))
+        || preview_summary_field_split(line).is_some()
 }
 
 fn preview_summary_label_matches(line: &str, label: &str) -> bool {
@@ -16638,6 +16711,36 @@ fn preview_summary_label_matches(line: &str, label: &str) -> bool {
         return false;
     };
     rest.is_empty() || rest.starts_with(':') || rest.starts_with(" · ") || rest.starts_with(" [")
+}
+
+fn preview_summary_tool_result_is_error(line: &str) -> bool {
+    line.rsplit(" · ")
+        .next()
+        .is_some_and(|status| status == "error")
+}
+
+fn preview_summary_field_split(line: &str) -> Option<usize> {
+    const SUMMARY_FIELD_LABEL_WIDTH: usize = 8;
+    let split = 2 + SUMMARY_FIELD_LABEL_WIDTH;
+    let bytes = line.as_bytes();
+    if !line.starts_with("  ") || line.starts_with("    ") || bytes.get(split) != Some(&b':') {
+        return None;
+    }
+    let label = line.get(2..split)?.trim();
+    matches!(
+        label,
+        "provider"
+            | "id"
+            | "title"
+            | "cwd"
+            | "model"
+            | "git"
+            | "tokens"
+            | "created"
+            | "updated"
+            | "messages"
+    )
+    .then_some(split + 1)
 }
 
 fn preview_summary_role_line(line: &str, prefix: &str, color: Color) -> Line<'static> {
@@ -16671,8 +16774,30 @@ fn preview_summary_prefix_line(line: &str, prefix: &str, color: Color) -> Line<'
     Line::from(spans)
 }
 
+fn preview_summary_tool_result_line(line: &str) -> Line<'static> {
+    let status_color = if preview_summary_tool_result_is_error(line) {
+        THEME_PREVIEW_ERROR
+    } else {
+        THEME_POSITIVE
+    };
+    let split = line
+        .find(':')
+        .map(|idx| idx + 1)
+        .unwrap_or_else(|| "  tool result".len().min(line.len()));
+    let (head, tail) = line.split_at(split);
+    let mut spans = vec![preview_bold_span(head, status_color)];
+    if let Some((details, status)) = tail.rsplit_once(" · ") {
+        spans.extend(preview_value_spans(details, THEME_FG_STRONG));
+        spans.push(preview_span(" · ", THEME_FG_DIM));
+        spans.push(preview_span(status, status_color));
+    } else {
+        spans.extend(preview_value_spans(tail, THEME_FG_STRONG));
+    }
+    Line::from(spans)
+}
+
 fn preview_summary_field_line(line: &str) -> Line<'static> {
-    let Some(split) = line.find(':').map(|idx| idx + 1) else {
+    let Some(split) = preview_summary_field_split(line) else {
         return Line::from(preview_span(line, THEME_FG));
     };
     let (label, value) = line.split_at(split);
@@ -16684,58 +16809,65 @@ fn preview_summary_field_line(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-fn preview_summary_body_line(line: &str) -> Line<'static> {
+fn preview_summary_body_line(line: &str, body_context: PreviewSummaryBodyContext) -> Line<'static> {
     let trimmed = line.trim_start();
-    if line.starts_with("    ") && trimmed.starts_with("- ") {
-        return preview_summary_bullet_line(line);
+    if body_context == PreviewSummaryBodyContext::ToolResult {
+        return Line::from(preview_span(line, THEME_FG));
     }
 
-    let (color, structural_color) = if trimmed.starts_with("+++") || trimmed.starts_with("---") {
-        (THEME_PREVIEW_PATCH_HEADER, true)
-    } else if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
-        (THEME_POSITIVE, true)
-    } else if trimmed.starts_with('-') && !trimmed.starts_with("---") && !trimmed.starts_with("- ")
-    {
-        (THEME_PREVIEW_PATCH_REMOVE, true)
-    } else if trimmed.starts_with("@@") {
-        (THEME_PREVIEW_PATCH_HEADER, true)
-    } else if trimmed.starts_with("... +") || trimmed.starts_with("(no ") || trimmed == "(empty)" {
-        (THEME_FG_DIM, false)
-    } else {
-        (THEME_FG, false)
-    };
+    if body_context == PreviewSummaryBodyContext::Patch {
+        let color = if trimmed.starts_with("+++") || trimmed.starts_with("---") {
+            THEME_PREVIEW_PATCH_HEADER
+        } else if trimmed.starts_with('+') {
+            THEME_POSITIVE
+        } else if trimmed.starts_with('-') {
+            THEME_PREVIEW_PATCH_REMOVE
+        } else if trimmed.starts_with("@@") {
+            THEME_PREVIEW_PATCH_HEADER
+        } else if trimmed.starts_with("... +")
+            || trimmed.starts_with("(no ")
+            || trimmed == "(empty)"
+        {
+            THEME_FG_DIM
+        } else {
+            THEME_FG
+        };
+        return Line::from(preview_span(line, color));
+    }
 
-    if line.starts_with("    ") {
-        if let Some(split) = line.find(':').filter(|idx| *idx > 4) {
-            let label_color = if structural_color {
-                color
-            } else {
-                THEME_PREVIEW_KEY
-            };
-            return preview_summary_key_value_line(line, split, label_color);
+    if body_context == PreviewSummaryBodyContext::ToolUseArgs {
+        if preview_summary_indent_width(line) == 4 {
+            if let Some(split) = line.find(':').filter(|idx| *idx > 4) {
+                return preview_summary_key_value_line_plain_value(line, split, THEME_PREVIEW_KEY);
+            }
         }
+        return Line::from(preview_span(line, THEME_FG));
     }
+
+    let color =
+        if trimmed.starts_with("... +") || trimmed.starts_with("(no ") || trimmed == "(empty)" {
+            THEME_FG_DIM
+        } else {
+            THEME_FG
+        };
 
     Line::from(preview_span(line, color))
 }
 
-fn preview_summary_bullet_line(line: &str) -> Line<'static> {
-    let indent_width = line.len().saturating_sub(line.trim_start().len());
-    let (indent, tail) = line.split_at(indent_width);
-    let (bullet, value) = tail.split_at(2.min(tail.len()));
-    let mut spans = vec![
-        preview_span(indent, THEME_FG_DIM),
-        preview_span(bullet, THEME_PREVIEW_FIELD),
-    ];
-    spans.extend(preview_value_spans(value, THEME_FG));
-    Line::from(spans)
+fn preview_summary_indent_width(line: &str) -> usize {
+    line.bytes().take_while(|byte| *byte == b' ').count()
 }
 
-fn preview_summary_key_value_line(line: &str, split: usize, label_color: Color) -> Line<'static> {
+fn preview_summary_key_value_line_plain_value(
+    line: &str,
+    split: usize,
+    label_color: Color,
+) -> Line<'static> {
     let (label, value) = line.split_at(split + 1);
-    let mut spans = vec![preview_span(label, label_color)];
-    spans.extend(preview_value_spans(value, THEME_FG));
-    Line::from(spans)
+    Line::from(vec![
+        preview_span(label, label_color),
+        preview_span(value, THEME_FG),
+    ])
 }
 
 fn preview_summary_field_value_color(label: &str, value: &str) -> Color {
@@ -16788,53 +16920,7 @@ fn push_preview_plain_span(spans: &mut Vec<Span<'static>>, text: &str, default_c
     if text.is_empty() {
         return;
     }
-    spans.push(preview_span(
-        text,
-        preview_value_color(text.trim(), default_color),
-    ));
-}
-
-fn preview_value_color(value: &str, default_color: Color) -> Color {
-    if value.is_empty() {
-        return default_color;
-    }
-    let lower = value.to_ascii_lowercase();
-    if preview_value_is_path_like(value) {
-        THEME_PREVIEW_PATH
-    } else if preview_value_is_error_status(&lower) {
-        THEME_PREVIEW_ERROR
-    } else if matches!(
-        lower.as_str(),
-        "ok" | "success" | "succeeded" | "complete" | "completed"
-    ) {
-        THEME_POSITIVE
-    } else if matches!(lower.as_str(), "true" | "false") {
-        THEME_PREVIEW_BOOL
-    } else if matches!(lower.as_str(), "null" | "(none)" | "(empty)")
-        || lower.starts_with("(no ")
-        || lower.starts_with("... +")
-    {
-        THEME_FG_DIM
-    } else if value.parse::<f64>().is_ok() {
-        THEME_PREVIEW_NUMBER
-    } else {
-        default_color
-    }
-}
-
-fn preview_value_is_error_status(value: &str) -> bool {
-    matches!(
-        value,
-        "error" | "failed" | "failure" | "denied" | "cancel" | "canceled" | "cancelled"
-    )
-}
-
-fn preview_value_is_path_like(value: &str) -> bool {
-    value.starts_with('/')
-        || value.starts_with("~/")
-        || value.starts_with("./")
-        || value.starts_with("../")
-        || value.contains(":\\")
+    spans.push(preview_span(text, default_color));
 }
 
 fn provider_color_from_summary_line(value: &str) -> Option<Color> {
@@ -19519,6 +19605,12 @@ mod tests {
 
         let title = preview_summary_line("  title   : error handling cleanup");
         assert_eq!(title.spans[1].style.fg, Some(THEME_FG_STRONG));
+
+        let title_error_word = preview_summary_line("  title   : error");
+        assert_eq!(title_error_word.spans[1].style.fg, Some(THEME_FG_STRONG));
+
+        let title_path_like = preview_summary_line("  title   : /tmp/error.rs");
+        assert_eq!(title_path_like.spans[1].style.fg, Some(THEME_FG_STRONG));
     }
 
     #[test]
@@ -19559,10 +19651,85 @@ mod tests {
     }
 
     #[test]
+    fn preview_summary_does_not_treat_body_urls_as_session_fields() {
+        let url = preview_summary_line("  http://cokacmux.cokac.com/dist_beta/");
+        assert_eq!(url.spans.len(), 1);
+        assert_eq!(url.spans[0].style.fg, Some(THEME_FG));
+
+        let colon_text = preview_summary_line("  현재 `manage.sh`: BASE_URL 확인");
+        assert_eq!(colon_text.spans.len(), 1);
+        assert_eq!(colon_text.spans[0].style.fg, Some(THEME_FG));
+
+        let field = preview_summary_line("  cwd     : /tmp/project");
+        assert_eq!(field.spans[0].style.fg, Some(THEME_PREVIEW_FIELD));
+    }
+
+    #[test]
     fn preview_summary_keeps_structured_bullets_neutral() {
         let line = preview_summary_line("    - item 1");
-        assert_eq!(line.spans[1].content.as_ref(), "- ");
-        assert_ne!(line.spans[1].style.fg, Some(THEME_PREVIEW_PATCH_REMOVE));
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].style.fg, Some(THEME_FG));
+    }
+
+    #[test]
+    fn preview_summary_does_not_treat_file_modes_as_patch_without_patch_context() {
+        let line = preview_summary_line("    -rw-rw-rw- 1 501 dialout 14347 May 21 Cargo.lock");
+        assert_eq!(line.spans[0].style.fg, Some(THEME_FG));
+    }
+
+    #[test]
+    fn preview_summary_styles_patch_lines_only_in_patch_context() {
+        let mut state = PreviewSummaryStyleState::default();
+        let tool_use =
+            preview_line_with_state("  tool use: Bash [abc123]", Mode::Summary, &mut state);
+        assert_eq!(tool_use.spans[0].style.fg, Some(THEME_PREVIEW_TOOL));
+        let command = preview_line_with_state("    cmd: ls -la", Mode::Summary, &mut state);
+        assert_eq!(command.spans[0].style.fg, Some(THEME_PREVIEW_KEY));
+        assert_eq!(command.spans[1].style.fg, Some(THEME_FG));
+        let path_arg =
+            preview_line_with_state("    path: /tmp/error.rs", Mode::Summary, &mut state);
+        assert_eq!(path_arg.spans[0].style.fg, Some(THEME_PREVIEW_KEY));
+        assert_eq!(path_arg.spans[1].style.fg, Some(THEME_FG));
+        let nested_value =
+            preview_line_with_state("      path: /tmp/error.rs", Mode::Summary, &mut state);
+        assert_eq!(nested_value.spans[0].style.fg, Some(THEME_FG));
+
+        let tool =
+            preview_line_with_state("  tool result [abc123] · ok", Mode::Summary, &mut state);
+        assert_eq!(tool.spans[0].style.fg, Some(THEME_POSITIVE));
+        let chunk = preview_line_with_state("    Chunk ID: 5fea74", Mode::Summary, &mut state);
+        assert_eq!(chunk.spans[0].style.fg, Some(THEME_FG));
+        let bullet = preview_line_with_state("    - item 1", Mode::Summary, &mut state);
+        assert_eq!(bullet.spans.len(), 1);
+        assert_eq!(bullet.spans[0].style.fg, Some(THEME_FG));
+        let rust_path = preview_line_with_state(
+            "    use ratatui::buffer::Buffer;",
+            Mode::Summary,
+            &mut state,
+        );
+        assert_eq!(rust_path.spans[0].style.fg, Some(THEME_FG));
+        let listing = preview_line_with_state(
+            "    -rw-rw-rw- 1 501 dialout 14347 May 21 Cargo.lock",
+            Mode::Summary,
+            &mut state,
+        );
+        assert_eq!(listing.spans[0].style.fg, Some(THEME_FG));
+
+        let patch = preview_line_with_state("  patch: +1 -1", Mode::Summary, &mut state);
+        assert_eq!(patch.spans[0].style.fg, Some(THEME_PREVIEW_PATCH_HEADER));
+        let removed = preview_line_with_state("    -old line", Mode::Summary, &mut state);
+        assert_eq!(removed.spans[0].style.fg, Some(THEME_PREVIEW_PATCH_REMOVE));
+        let added = preview_line_with_state("    +new line", Mode::Summary, &mut state);
+        assert_eq!(added.spans[0].style.fg, Some(THEME_POSITIVE));
+    }
+
+    #[test]
+    fn preview_summary_tool_result_error_status_must_be_terminal_detail() {
+        let ok_with_error_name = preview_summary_line("  tool result: error checker [abc123] · ok");
+        assert_eq!(ok_with_error_name.spans[0].style.fg, Some(THEME_POSITIVE));
+
+        let error_status = preview_summary_line("  tool result: Bash [abc123] · error");
+        assert_eq!(error_status.spans[0].style.fg, Some(THEME_PREVIEW_ERROR));
     }
 
     #[test]
@@ -19779,8 +19946,6 @@ mod tests {
             THEME_PREVIEW_ATTACHMENT,
             THEME_PREVIEW_OTHER,
             THEME_PREVIEW_PATCH_HEADER,
-            THEME_PREVIEW_NUMBER,
-            THEME_PREVIEW_BOOL,
             AGENT_DEFAULT_BG,
         ];
         assert!(colors

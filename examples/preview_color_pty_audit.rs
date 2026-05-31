@@ -36,12 +36,7 @@ fn main() -> AuditResult<()> {
         audit.wait_for_screen("tool result [toolu_color] · error", Duration::from_secs(8))?;
 
     assert_cell_color(&screen, "provider:", "claude", vt100::Color::Idx(139))?;
-    assert_cell_color(
-        &screen,
-        "title   :",
-        "error handling cleanup",
-        vt100::Color::Idx(255),
-    )?;
+    assert_cell_color(&screen, "title   :", "error", vt100::Color::Idx(255))?;
     assert_cell_color(
         &screen,
         "cwd     :",
@@ -49,11 +44,29 @@ fn main() -> AuditResult<()> {
         vt100::Color::Idx(116),
     )?;
     assert_cell_color(&screen, "USER #", "USER", vt100::Color::Idx(117))?;
+    assert_cell_color(
+        &screen,
+        "http://cokacmux.cokac.com/dist_beta/",
+        "http",
+        vt100::Color::Idx(252),
+    )?;
     assert_cell_color(&screen, "ASSISTANT #", "ASSISTANT", vt100::Color::Idx(114))?;
     assert_cell_color(&screen, "thinking", "thinking", vt100::Color::Idx(183))?;
     assert_cell_color(&screen, "tool use:", "tool use", vt100::Color::Idx(215))?;
     assert_cell_color(&screen, "path:", "path:", vt100::Color::Idx(180))?;
-    assert_cell_color(&screen, "path:", "/tmp/error.rs", vt100::Color::Idx(116))?;
+    assert_cell_color(&screen, "path:", "/tmp/error.rs", vt100::Color::Idx(252))?;
+    assert_cell_color(
+        &screen,
+        "      nested_path:",
+        "nested_path:",
+        vt100::Color::Idx(252),
+    )?;
+    assert_cell_color(
+        &screen,
+        "      nested_path:",
+        "/tmp/error.rs",
+        vt100::Color::Idx(252),
+    )?;
     assert_cell_color(&screen, "image:", "image:", vt100::Color::Idx(180))?;
     assert_cell_color(
         &screen,
@@ -62,6 +75,24 @@ fn main() -> AuditResult<()> {
         vt100::Color::Idx(181),
     )?;
     assert_cell_color(&screen, "TOOL #", "TOOL", vt100::Color::Idx(215))?;
+    assert_cell_color(
+        &screen,
+        "-rw-rw-rw- 1 501",
+        "-rw-rw-rw-",
+        vt100::Color::Idx(252),
+    )?;
+    assert_cell_color(
+        &screen,
+        "Chunk ID: 5fea74",
+        "Chunk ID:",
+        vt100::Color::Idx(252),
+    )?;
+    assert_cell_color(
+        &screen,
+        "use ratatui::buffer::Buffer;",
+        "ratatui",
+        vt100::Color::Idx(252),
+    )?;
     assert_cell_color(
         &screen,
         "tool result [toolu_color] · error",
@@ -338,20 +369,24 @@ fn write_claude_color_session(home: &Path) -> AuditResult<()> {
 
     let sid = serde_json::to_string(session_id)?;
     let cwd_json = serde_json::to_string(cwd)?;
-    let user_text = serde_json::to_string("input text should remain body text")?;
-    let title = serde_json::to_string("error handling cleanup")?;
+    let user_text = serde_json::to_string("http://cokacmux.cokac.com/dist_beta/")?;
+    let title = serde_json::to_string("error")?;
     let tool_path = serde_json::to_string("/tmp/error.rs")?;
+    let listing_output = serde_json::to_string(
+        "Chunk ID: 5fea74\n-rw-rw-rw- 1 501 dialout 14347 May 21 Cargo.lock\nuse ratatui::buffer::Buffer;",
+    )?;
     let content = format!(
         "{{\"type\":\"ai-title\",\"sessionId\":{sid},\"cwd\":{cwd_json},\"timestamp\":\"2026-05-29T00:00:00.000Z\",\"aiTitle\":{title}}}\n\
          {{\"type\":\"user\",\"sessionId\":{sid},\"cwd\":{cwd_json},\"timestamp\":\"2026-05-29T00:00:01.000Z\",\"uuid\":\"u1\",\"parentUuid\":null,\"message\":{{\"role\":\"user\",\"content\":{user_text}}}}}\n\
          {{\"type\":\"assistant\",\"sessionId\":{sid},\"cwd\":{cwd_json},\"timestamp\":\"2026-05-29T00:00:02.000Z\",\"uuid\":\"a1\",\"parentUuid\":\"u1\",\"message\":{{\"role\":\"assistant\",\"id\":\"msg_preview_color\",\"model\":\"claude-opus-4-7\",\"content\":[\
          {{\"type\":\"thinking\",\"thinking\":\"reasoning sample\"}},\
          {{\"type\":\"text\",\"text\":\"assistant color sample\"}},\
-         {{\"type\":\"tool_use\",\"id\":\"toolu_color\",\"name\":\"Read\",\"input\":{{\"path\":{tool_path},\"items\":[{{\"path\":{tool_path}}}],\"ok\":true}}}},\
+         {{\"type\":\"tool_use\",\"id\":\"toolu_listing\",\"name\":\"Bash\",\"input\":{{\"command\":\"ls -la\",\"description\":\"List repo root\"}}}},\
+         {{\"type\":\"tool_use\",\"id\":\"toolu_color\",\"name\":\"Read\",\"input\":{{\"path\":{tool_path},\"config\":{{\"nested_path\":{tool_path},\"mode\":\"read\",\"limit\":1,\"flag\":true}},\"items\":[{{\"path\":{tool_path}}}],\"ok\":true}}}},\
          {{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"data\":\"aGVsbG8=\"}},\"mime\":\"image/png\"}},\
          {{\"type\":\"attachment\",\"name\":\"preview.txt\",\"path\":{tool_path},\"mime\":\"text/plain\"}}\
          ],\"stop_reason\":\"tool_use\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":5}}}}}}\n\
-         {{\"type\":\"user\",\"sessionId\":{sid},\"cwd\":{cwd_json},\"timestamp\":\"2026-05-29T00:00:03.000Z\",\"uuid\":\"t1\",\"parentUuid\":\"a1\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_color\",\"is_error\":true,\"content\":\"permission denied\"}}]}}}}\n"
+         {{\"type\":\"user\",\"sessionId\":{sid},\"cwd\":{cwd_json},\"timestamp\":\"2026-05-29T00:00:03.000Z\",\"uuid\":\"t1\",\"parentUuid\":\"a1\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_listing\",\"is_error\":false,\"content\":{listing_output}}},{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_color\",\"is_error\":true,\"content\":\"permission denied\"}}]}}}}\n"
     );
     fs::write(session_dir.join(format!("{session_id}.jsonl")), content)?;
     Ok(())
