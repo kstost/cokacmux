@@ -943,6 +943,54 @@ mod tests {
         assert!(!data_root.join("codex-clone-1.json").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn failed_restore_rolls_back_existing_target_directory() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let snapshot_dir = data_root.join("claude-clone-restore-fail");
+        let target = dir.path().join("target");
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("current.txt"), "current data").unwrap();
+
+        let unsupported_socket = snapshot_dir.join("unsupported-socket");
+        let _listener = UnixListener::bind(&unsupported_socket).unwrap();
+
+        let snapshot = SessionDataSnapshot {
+            version: DATA_STORE_VERSION,
+            provider: Provider::Claude,
+            session_id: "clone-restore-fail".into(),
+            source_provider: Provider::Claude,
+            source_session_id: "source".into(),
+            original_cwd: "/source".into(),
+            snapshot_path: snapshot_dir.clone(),
+            created_at_epoch_s: 0,
+        };
+        fs::create_dir_all(&data_root).unwrap();
+        fs::write(
+            data_root.join("claude-clone-restore-fail.json"),
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let clone = info(Provider::Claude, "clone-restore-fail", &target);
+        let error = restore_snapshot_for_session_at(&data_root, &clone)
+            .expect_err("unsupported snapshot entry should fail restore");
+
+        assert!(error
+            .to_string()
+            .contains("unsupported filesystem entry in session data"));
+        assert_eq!(
+            fs::read_to_string(target.join("current.txt")).unwrap(),
+            "current data"
+        );
+        assert!(snapshot_dir.exists());
+        assert!(data_root.join("claude-clone-restore-fail.json").exists());
+    }
+
     #[test]
     fn snapshot_copy_skips_data_root_when_source_contains_it() {
         let dir = tempfile::tempdir().unwrap();

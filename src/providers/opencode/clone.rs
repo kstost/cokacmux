@@ -585,6 +585,8 @@ mod tests {
             new_version,
             new_summary_add,
             new_revert,
+            new_time_created,
+            new_time_updated,
         ): (
             String,
             String,
@@ -597,10 +599,13 @@ mod tests {
             String,
             Option<i64>,
             Option<String>,
+            i64,
+            i64,
         ) = conn
             .query_row(
                 "SELECT title, slug, share_url, permission, workspace_id, parent_id,
-                        directory, path, version, summary_additions, revert
+                        directory, path, version, summary_additions, revert,
+                        time_created, time_updated
                  FROM session WHERE id = ?1",
                 rusqlite::params![&new_sid],
                 |r| {
@@ -616,6 +621,8 @@ mod tests {
                         r.get(8)?,
                         r.get(9)?,
                         r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
                     ))
                 },
             )
@@ -635,6 +642,8 @@ mod tests {
         assert_eq!(new_version, "1.15.7");
         assert_eq!(new_summary_add, Some(5));
         assert_eq!(new_revert.as_deref(), Some("soft"));
+        assert_eq!(new_time_created, 1000);
+        assert_eq!(new_time_updated, 2000);
 
         // Message row: parentID got remapped, internal unknown field kept.
         let asst_data: String = conn

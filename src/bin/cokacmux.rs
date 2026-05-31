@@ -477,14 +477,24 @@ enum KeyAction {
     AgentSidebarNext,
     AgentSwitchPrev,
     AgentSwitchNext,
-    ConfirmYes,
-    ConfirmNo,
     DeleteConfirmCancel,
     DeleteConfirmConfirm,
     DeleteConfirmNext,
     DeleteConfirmPrev,
     DeleteConfirmDelete,
     DeleteConfirmCancelChoice,
+    CreateFolderCancel,
+    CreateFolderConfirm,
+    CreateFolderNext,
+    CreateFolderPrev,
+    CreateFolderCreate,
+    CreateFolderCancelChoice,
+    RestoreDataSkip,
+    RestoreDataConfirm,
+    RestoreDataNext,
+    RestoreDataPrev,
+    RestoreDataRestore,
+    RestoreDataSkipChoice,
     FilterCancel,
     FilterApply,
     FilterMoveLeft,
@@ -695,8 +705,6 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
         KeyAction::AgentSwitchNext,
         &["ctrl+pagedown"],
     ),
-    ("confirm.yes", KeyAction::ConfirmYes, &["y", "Y"]),
-    ("confirm.no", KeyAction::ConfirmNo, &["esc", "n", "N"]),
     (
         "delete_confirm.cancel",
         KeyAction::DeleteConfirmCancel,
@@ -725,6 +733,66 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "delete_confirm.cancel_choice",
         KeyAction::DeleteConfirmCancelChoice,
+        &["2"],
+    ),
+    (
+        "create_folder.cancel",
+        KeyAction::CreateFolderCancel,
+        &["esc", "n", "N"],
+    ),
+    (
+        "create_folder.confirm",
+        KeyAction::CreateFolderConfirm,
+        &["enter"],
+    ),
+    (
+        "create_folder.next",
+        KeyAction::CreateFolderNext,
+        &["right", "down", "l", "j", "tab"],
+    ),
+    (
+        "create_folder.prev",
+        KeyAction::CreateFolderPrev,
+        &["left", "up", "h", "k", "backtab"],
+    ),
+    (
+        "create_folder.create",
+        KeyAction::CreateFolderCreate,
+        &["1", "y", "Y"],
+    ),
+    (
+        "create_folder.cancel_choice",
+        KeyAction::CreateFolderCancelChoice,
+        &["2"],
+    ),
+    (
+        "restore_data.skip",
+        KeyAction::RestoreDataSkip,
+        &["esc", "n", "N"],
+    ),
+    (
+        "restore_data.confirm",
+        KeyAction::RestoreDataConfirm,
+        &["enter"],
+    ),
+    (
+        "restore_data.next",
+        KeyAction::RestoreDataNext,
+        &["right", "down", "l", "j", "tab"],
+    ),
+    (
+        "restore_data.prev",
+        KeyAction::RestoreDataPrev,
+        &["left", "up", "h", "k", "backtab"],
+    ),
+    (
+        "restore_data.restore",
+        KeyAction::RestoreDataRestore,
+        &["1", "y", "Y"],
+    ),
+    (
+        "restore_data.skip_choice",
+        KeyAction::RestoreDataSkipChoice,
         &["2"],
     ),
     (
@@ -1603,13 +1671,25 @@ enum InputMode {
         draft: String,
         cursor: usize,
     },
-    Confirm {
-        prompt: String,
-        action: PendingAction,
-    },
     DeleteConfirm {
         info: SessionInfo,
         removed_index: Option<usize>,
+        selected: usize,
+    },
+    CreateFolderConfirm {
+        info: SessionInfo,
+        path: PathBuf,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
+        selected: usize,
+    },
+    RestoreDataConfirm {
+        info: SessionInfo,
+        snapshot: session::data::SessionDataSnapshot,
+        cols: u16,
+        rows: u16,
+        launch_mode: AgentLaunchMode,
         selected: usize,
     },
     AgentLaunch {
@@ -1638,23 +1718,6 @@ enum InputMode {
     },
 }
 
-#[derive(Debug, Clone)]
-enum PendingAction {
-    RestoreClonedSessionData {
-        info: SessionInfo,
-        cols: u16,
-        rows: u16,
-        launch_mode: AgentLaunchMode,
-    },
-    CreateMissingLaunchCwd {
-        info: SessionInfo,
-        path: PathBuf,
-        cols: u16,
-        rows: u16,
-        launch_mode: AgentLaunchMode,
-    },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeleteOption {
     Delete,
@@ -1674,6 +1737,48 @@ fn delete_option_at(index: usize) -> DeleteOption {
 
 fn move_delete_option_index(index: usize, delta: i32) -> usize {
     (index as i32 + delta).rem_euclid(DELETE_OPTION_COUNT as i32) as usize
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateFolderOption {
+    Create,
+    Cancel,
+}
+
+const CREATE_FOLDER_OPTION_CREATE: usize = 0;
+const CREATE_FOLDER_OPTION_CANCEL: usize = 1;
+const CREATE_FOLDER_OPTION_COUNT: usize = 2;
+
+fn create_folder_option_at(index: usize) -> CreateFolderOption {
+    match index % CREATE_FOLDER_OPTION_COUNT {
+        CREATE_FOLDER_OPTION_CREATE => CreateFolderOption::Create,
+        _ => CreateFolderOption::Cancel,
+    }
+}
+
+fn move_create_folder_option_index(index: usize, delta: i32) -> usize {
+    (index as i32 + delta).rem_euclid(CREATE_FOLDER_OPTION_COUNT as i32) as usize
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreDataOption {
+    Restore,
+    StartWithoutRestore,
+}
+
+const RESTORE_DATA_OPTION_RESTORE: usize = 0;
+const RESTORE_DATA_OPTION_SKIP: usize = 1;
+const RESTORE_DATA_OPTION_COUNT: usize = 2;
+
+fn restore_data_option_at(index: usize) -> RestoreDataOption {
+    match index % RESTORE_DATA_OPTION_COUNT {
+        RESTORE_DATA_OPTION_RESTORE => RestoreDataOption::Restore,
+        _ => RestoreDataOption::StartWithoutRestore,
+    }
+}
+
+fn move_restore_data_option_index(index: usize, delta: i32) -> usize {
+    (index as i32 + delta).rem_euclid(RESTORE_DATA_OPTION_COUNT as i32) as usize
 }
 
 #[derive(Debug, Clone)]
@@ -6146,21 +6251,17 @@ impl App {
         launch_mode: AgentLaunchMode,
     ) {
         let key = AgentKey::new(&info);
-        let yes_key = self.keybindings.help(KeyAction::ConfirmYes, "y");
-        let no_key = self.keybindings.help(KeyAction::ConfirmNo, "N");
         self.status = format!(
             "launch folder missing: {}",
             truncate_width(&path.display().to_string(), 48)
         );
-        self.input_mode = InputMode::Confirm {
-            prompt: create_missing_cwd_confirm_prompt(&info, &path, &yes_key, &no_key),
-            action: PendingAction::CreateMissingLaunchCwd {
-                info,
-                path: path.clone(),
-                cols,
-                rows,
-                launch_mode,
-            },
+        self.input_mode = InputMode::CreateFolderConfirm {
+            info,
+            path: path.clone(),
+            cols,
+            rows,
+            launch_mode,
+            selected: CREATE_FOLDER_OPTION_CANCEL,
         };
         debug_log(
             "attach_launch_cwd_create_confirm_open",
@@ -6222,25 +6323,24 @@ impl App {
         launch_mode: AgentLaunchMode,
     ) {
         let key = AgentKey::new(&info);
-        let yes_key = self.keybindings.help(KeyAction::ConfirmYes, "y");
-        let no_key = self.keybindings.help(KeyAction::ConfirmNo, "N");
+        let original_cwd = snapshot.original_cwd.clone();
+        let snapshot_path = snapshot.snapshot_path.display().to_string();
         self.status = format!("saved folder data found: {}", truncate_width(&info.cwd, 48));
-        self.input_mode = InputMode::Confirm {
-            prompt: restore_cloned_data_confirm_prompt(&info, &snapshot, &yes_key, &no_key),
-            action: PendingAction::RestoreClonedSessionData {
-                info,
-                cols,
-                rows,
-                launch_mode,
-            },
+        self.input_mode = InputMode::RestoreDataConfirm {
+            info,
+            snapshot,
+            cols,
+            rows,
+            launch_mode,
+            selected: RESTORE_DATA_OPTION_SKIP,
         };
         debug_log(
             "attach_data_restore_confirm_open",
             serde_json::json!({
                 "provider": key.provider.as_str(),
                 "session_id": &key.session_id,
-                "cwd": &snapshot.original_cwd,
-                "snapshot_path": snapshot.snapshot_path.display().to_string(),
+                "cwd": original_cwd,
+                "snapshot_path": snapshot_path,
                 "launch_mode": launch_mode.as_str(),
             }),
         );
@@ -13413,8 +13513,9 @@ fn input_mode_label(mode: &InputMode) -> &'static str {
     match mode {
         InputMode::Normal => "normal",
         InputMode::Filter { .. } => "filter",
-        InputMode::Confirm { .. } => "confirm",
         InputMode::DeleteConfirm { .. } => "delete_confirm",
+        InputMode::CreateFolderConfirm { .. } => "create_folder_confirm",
+        InputMode::RestoreDataConfirm { .. } => "restore_data_confirm",
         InputMode::AgentLaunch { .. } => "agent_launch",
         InputMode::CloneOptions { .. } => "clone_options",
         InputMode::NewSession { .. } => "new_session",
@@ -13874,8 +13975,6 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
         .filter(|task| task.kind == DataTaskKind::Clone)
     {
         draw_data_task_modal(f, area, task);
-    } else if let InputMode::Confirm { prompt, action } = &app.input_mode {
-        draw_confirm_modal(f, area, prompt, action);
     } else if let InputMode::DeleteConfirm {
         info,
         removed_index: _,
@@ -13883,6 +13982,26 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
     } = &app.input_mode
     {
         draw_delete_confirm_modal(f, area, info, *selected, &app.keybindings);
+    } else if let InputMode::CreateFolderConfirm {
+        info,
+        path,
+        cols: _,
+        rows: _,
+        launch_mode: _,
+        selected,
+    } = &app.input_mode
+    {
+        draw_create_folder_confirm_modal(f, area, info, path, *selected, &app.keybindings);
+    } else if let InputMode::RestoreDataConfirm {
+        info,
+        snapshot,
+        cols: _,
+        rows: _,
+        launch_mode: _,
+        selected,
+    } = &app.input_mode
+    {
+        draw_restore_data_confirm_modal(f, area, info, snapshot, *selected, &app.keybindings);
     } else if let InputMode::Filter { draft, cursor } = &app.input_mode {
         draw_filter_modal(
             f,
@@ -14470,43 +14589,6 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         return;
     }
 
-    // Confirm modal
-    if let InputMode::Confirm { action, .. } = app.input_mode.clone() {
-        if keybindings.matches(KeyAction::ConfirmYes, key) {
-            app.input_mode = InputMode::Normal;
-            debug_log_session_key(app, key, "confirm_yes");
-            match action {
-                PendingAction::RestoreClonedSessionData {
-                    info,
-                    cols,
-                    rows,
-                    launch_mode,
-                } => app.restore_cloned_session_data_and_attach(info, cols, rows, launch_mode),
-                PendingAction::CreateMissingLaunchCwd {
-                    info,
-                    path,
-                    cols,
-                    rows,
-                    launch_mode,
-                } => app.create_missing_launch_cwd_and_attach(info, path, cols, rows, launch_mode),
-            }
-        } else if keybindings.matches(KeyAction::ConfirmNo, key) {
-            app.input_mode = InputMode::Normal;
-            debug_log_session_key(app, key, "confirm_cancel");
-            match action {
-                PendingAction::RestoreClonedSessionData {
-                    info,
-                    cols,
-                    rows,
-                    launch_mode,
-                } => app.attach_agent_without_data_restore_prompt(info, cols, rows, launch_mode),
-                PendingAction::CreateMissingLaunchCwd { .. } => app.status = "cancelled.".into(),
-            }
-        } else {
-            debug_log_session_key(app, key, "confirm_ignored");
-        }
-        return;
-    }
     // Delete confirmation dialog
     if let InputMode::DeleteConfirm {
         info,
@@ -14596,6 +14678,220 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         }
         if let Some((info, removed_index)) = delete_action {
             app.delete_session(info, removed_index);
+        }
+        return;
+    }
+    // Create missing launch folder dialog
+    if let InputMode::CreateFolderConfirm {
+        info,
+        path,
+        cols,
+        rows,
+        launch_mode,
+        selected,
+    } = &mut app.input_mode
+    {
+        let mut next_mode: Option<InputMode> = None;
+        let mut create_action: Option<(SessionInfo, PathBuf, u16, u16, AgentLaunchMode)> = None;
+        let choose_option =
+            |option: CreateFolderOption,
+             info: &SessionInfo,
+             path: &Path,
+             cols: u16,
+             rows: u16,
+             launch_mode: AgentLaunchMode,
+             create_action: &mut Option<(SessionInfo, PathBuf, u16, u16, AgentLaunchMode)>,
+             next_mode: &mut Option<InputMode>| {
+                match option {
+                    CreateFolderOption::Create => {
+                        *create_action =
+                            Some((info.clone(), path.to_path_buf(), cols, rows, launch_mode));
+                        *next_mode = Some(InputMode::Normal);
+                    }
+                    CreateFolderOption::Cancel => {
+                        *next_mode = Some(InputMode::Normal);
+                    }
+                }
+            };
+
+        if keybindings.matches(KeyAction::CreateFolderCancel, key)
+            || keybindings.matches(KeyAction::CreateFolderCancelChoice, key)
+        {
+            next_mode = Some(InputMode::Normal);
+            app.status = "cancelled.".into();
+            debug_log_key_event(key, "create_folder_cancel");
+        } else if keybindings.matches(KeyAction::CreateFolderConfirm, key) {
+            let option = create_folder_option_at(*selected);
+            if option == CreateFolderOption::Cancel {
+                app.status = "cancelled.".into();
+            }
+            choose_option(
+                option,
+                info,
+                path,
+                *cols,
+                *rows,
+                *launch_mode,
+                &mut create_action,
+                &mut next_mode,
+            );
+            debug_log(
+                "create_folder_confirm",
+                serde_json::json!({
+                    "provider": info.provider.as_str(),
+                    "session_id": &info.session_id,
+                    "cwd": path.display().to_string(),
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::CreateFolderNext, key) {
+            *selected = move_create_folder_option_index(*selected, 1);
+            debug_log(
+                "create_folder_move",
+                serde_json::json!({
+                    "provider": info.provider.as_str(),
+                    "session_id": &info.session_id,
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::CreateFolderPrev, key) {
+            *selected = move_create_folder_option_index(*selected, -1);
+            debug_log(
+                "create_folder_move",
+                serde_json::json!({
+                    "provider": info.provider.as_str(),
+                    "session_id": &info.session_id,
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::CreateFolderCreate, key) {
+            *selected = CREATE_FOLDER_OPTION_CREATE;
+            choose_option(
+                CreateFolderOption::Create,
+                info,
+                path,
+                *cols,
+                *rows,
+                *launch_mode,
+                &mut create_action,
+                &mut next_mode,
+            );
+        } else {
+            debug_log_key_event(key, "create_folder_ignored");
+        }
+
+        if let Some(mode) = next_mode {
+            app.input_mode = mode;
+        }
+        if let Some((info, path, cols, rows, launch_mode)) = create_action {
+            app.create_missing_launch_cwd_and_attach(info, path, cols, rows, launch_mode);
+        }
+        return;
+    }
+    // Restore cloned folder data dialog
+    if let InputMode::RestoreDataConfirm {
+        info,
+        snapshot,
+        cols,
+        rows,
+        launch_mode,
+        selected,
+    } = &mut app.input_mode
+    {
+        let mut next_mode: Option<InputMode> = None;
+        let mut restore_action: Option<(SessionInfo, u16, u16, AgentLaunchMode)> = None;
+        let mut skip_action: Option<(SessionInfo, u16, u16, AgentLaunchMode)> = None;
+        let choose_option =
+            |option: RestoreDataOption,
+             info: &SessionInfo,
+             cols: u16,
+             rows: u16,
+             launch_mode: AgentLaunchMode,
+             restore_action: &mut Option<(SessionInfo, u16, u16, AgentLaunchMode)>,
+             skip_action: &mut Option<(SessionInfo, u16, u16, AgentLaunchMode)>,
+             next_mode: &mut Option<InputMode>| {
+                match option {
+                    RestoreDataOption::Restore => {
+                        *restore_action = Some((info.clone(), cols, rows, launch_mode));
+                        *next_mode = Some(InputMode::Normal);
+                    }
+                    RestoreDataOption::StartWithoutRestore => {
+                        *skip_action = Some((info.clone(), cols, rows, launch_mode));
+                        *next_mode = Some(InputMode::Normal);
+                    }
+                }
+            };
+
+        if keybindings.matches(KeyAction::RestoreDataSkip, key)
+            || keybindings.matches(KeyAction::RestoreDataSkipChoice, key)
+        {
+            next_mode = Some(InputMode::Normal);
+            skip_action = Some((info.clone(), *cols, *rows, *launch_mode));
+            debug_log_key_event(key, "restore_data_skip");
+        } else if keybindings.matches(KeyAction::RestoreDataConfirm, key) {
+            let option = restore_data_option_at(*selected);
+            choose_option(
+                option,
+                info,
+                *cols,
+                *rows,
+                *launch_mode,
+                &mut restore_action,
+                &mut skip_action,
+                &mut next_mode,
+            );
+            debug_log(
+                "restore_data_confirm",
+                serde_json::json!({
+                    "provider": info.provider.as_str(),
+                    "session_id": &info.session_id,
+                    "snapshot_path": snapshot.snapshot_path.display().to_string(),
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::RestoreDataNext, key) {
+            *selected = move_restore_data_option_index(*selected, 1);
+            debug_log(
+                "restore_data_move",
+                serde_json::json!({
+                    "provider": info.provider.as_str(),
+                    "session_id": &info.session_id,
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::RestoreDataPrev, key) {
+            *selected = move_restore_data_option_index(*selected, -1);
+            debug_log(
+                "restore_data_move",
+                serde_json::json!({
+                    "provider": info.provider.as_str(),
+                    "session_id": &info.session_id,
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::RestoreDataRestore, key) {
+            *selected = RESTORE_DATA_OPTION_RESTORE;
+            choose_option(
+                RestoreDataOption::Restore,
+                info,
+                *cols,
+                *rows,
+                *launch_mode,
+                &mut restore_action,
+                &mut skip_action,
+                &mut next_mode,
+            );
+        } else {
+            debug_log_key_event(key, "restore_data_ignored");
+        }
+
+        if let Some(mode) = next_mode {
+            app.input_mode = mode;
+        }
+        if let Some((info, cols, rows, launch_mode)) = restore_action {
+            app.restore_cloned_session_data_and_attach(info, cols, rows, launch_mode);
+        } else if let Some((info, cols, rows, launch_mode)) = skip_action {
+            app.attach_agent_without_data_restore_prompt(info, cols, rows, launch_mode);
         }
         return;
     }
@@ -15157,22 +15453,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     draw_input_modal(f, area, app);
 }
 
-fn draw_confirm_modal(f: &mut ratatui::Frame, area: Rect, prompt: &str, action: &PendingAction) {
-    let modal_area = confirm_modal_area(prompt, area);
-    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
-        .style(theme_alt_style())
-        .title(confirm_modal_title(action));
-    let p = Paragraph::new(confirm_modal_lines(prompt))
-        .block(block)
-        .style(theme_alt_style())
-        .wrap(Wrap { trim: false });
-    f.render_widget(ratatui::widgets::Clear, modal_area);
-    f.render_widget(p, modal_area);
-}
-
 fn draw_delete_confirm_modal(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -15242,57 +15522,178 @@ fn delete_confirm_button_span(label: &str, selected: bool) -> Span<'static> {
     Span::styled(text, style)
 }
 
-fn create_missing_cwd_confirm_prompt(
+fn draw_create_folder_confirm_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
     info: &SessionInfo,
     path: &Path,
-    yes_key: &str,
-    no_key: &str,
-) -> String {
-    let path = confirm_prompt_line(&path.display().to_string(), 72);
-    format!(
-        "{} launch folder does not exist.\n{}\nCreate it and continue?\n{} create/start   {} cancel",
-        info.provider.as_str(),
-        path,
-        yes_key,
-        no_key
-    )
+    selected: usize,
+    keybindings: &KeyBindings,
+) {
+    let lines = create_folder_confirm_lines(info, path, selected, keybindings);
+    let modal_area = modal_area_for_wrapped_lines(area, "Create folder", &lines, 52, 92, 8, 12);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Create folder");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    f.render_widget(p, modal_area);
 }
 
-fn restore_cloned_data_confirm_prompt(
+fn create_folder_confirm_lines(
+    info: &SessionInfo,
+    path: &Path,
+    selected: usize,
+    keybindings: &KeyBindings,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            format!("{} launch folder does not exist.", info.provider.as_str()),
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Folder: {}",
+                confirm_prompt_line(&path.display().to_string(), 72)
+            ),
+            Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            "Create it and continue?",
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+        Line::from(""),
+        create_folder_button_line(selected),
+        Line::from(Span::styled(
+            create_folder_help_text(keybindings),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ]
+}
+
+fn create_folder_button_line(selected: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        modal_button_span(
+            "1 Create/start",
+            selected == CREATE_FOLDER_OPTION_CREATE,
+            true,
+        ),
+        Span::raw("  "),
+        modal_button_span("2 Cancel", selected == CREATE_FOLDER_OPTION_CANCEL, true),
+    ])
+}
+
+fn draw_restore_data_confirm_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
     info: &SessionInfo,
     snapshot: &session::data::SessionDataSnapshot,
-    yes_key: &str,
-    no_key: &str,
-) -> String {
-    let target = confirm_prompt_line(&info.cwd, 72);
-    let snapshot_path = confirm_prompt_line(&snapshot.snapshot_path.display().to_string(), 72);
+    selected: usize,
+    keybindings: &KeyBindings,
+) {
+    let lines = restore_data_confirm_lines(info, snapshot, selected, keybindings);
+    let modal_area =
+        modal_area_for_wrapped_lines(area, "Restore folder data", &lines, 58, 98, 9, 14);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Restore folder data");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    f.render_widget(p, modal_area);
+}
+
+fn restore_data_confirm_lines(
+    info: &SessionInfo,
+    snapshot: &session::data::SessionDataSnapshot,
+    selected: usize,
+    keybindings: &KeyBindings,
+) -> Vec<Line<'static>> {
     let existing_policy = if Path::new(&info.cwd).exists() {
         "Existing folder will be backed up before restore."
     } else {
         "Target folder will be created from saved data."
     };
-    format!(
-        "Saved folder data exists for this cloned {} session.\n{}\nRestore to working folder before launch?\n{}\n{}\n{} restore/start   {} start without restore",
-        info.provider.as_str(),
-        snapshot_path,
-        target,
-        existing_policy,
-        yes_key,
-        no_key
-    )
+    vec![
+        Line::from(Span::styled(
+            format!(
+                "Saved folder data exists for this {} session.",
+                info.provider.as_str()
+            ),
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Snapshot: {}",
+                confirm_prompt_line(&snapshot.snapshot_path.display().to_string(), 72)
+            ),
+            Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            format!("Target: {}", confirm_prompt_line(&info.cwd, 72)),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            existing_policy,
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+        Line::from(""),
+        restore_data_button_line(selected),
+        Line::from(Span::styled(
+            restore_data_help_text(keybindings),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ]
+}
+
+fn restore_data_button_line(selected: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        modal_button_span(
+            "1 Restore/start",
+            selected == RESTORE_DATA_OPTION_RESTORE,
+            true,
+        ),
+        Span::raw("  "),
+        modal_button_span(
+            "2 Start without restore",
+            selected == RESTORE_DATA_OPTION_SKIP,
+            true,
+        ),
+    ])
+}
+
+fn modal_button_span(label: &str, selected: bool, enabled: bool) -> Span<'static> {
+    let text = format!(" {} ", label);
+    let style = if selected && enabled {
+        theme_selected_style()
+    } else if selected {
+        theme_selected_style().fg(THEME_FG_DIM)
+    } else if enabled {
+        Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT)
+    } else {
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT)
+    };
+    Span::styled(text, style)
 }
 
 fn confirm_prompt_line(value: &str, width: usize) -> String {
     truncate_width(sanitize_for_single_line(value).trim(), width)
 }
 
-fn confirm_modal_title(action: &PendingAction) -> &'static str {
-    match action {
-        PendingAction::RestoreClonedSessionData { .. } => "Restore folder data",
-        PendingAction::CreateMissingLaunchCwd { .. } => "Create folder",
-    }
-}
-
+#[cfg(test)]
 fn confirm_modal_lines(prompt: &str) -> Vec<Line<'static>> {
     prompt
         .lines()
@@ -15309,6 +15710,7 @@ fn confirm_modal_lines(prompt: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
+#[cfg(test)]
 fn confirm_modal_area(prompt: &str, area: Rect) -> Rect {
     let lines = confirm_modal_lines(prompt);
     modal_area_for_wrapped_lines(area, "Confirm", &lines, 38, 84, 4, 14)
@@ -15322,19 +15724,19 @@ fn draw_filter_modal(
     pending: Option<&SearchPending>,
     keybindings: &KeyBindings,
 ) {
-    let search_button = if let Some(pending) = pending {
+    let search_label = if let Some(pending) = pending {
         format!(
-            " {} Searching ",
+            "{} Searching",
             startup_spinner_frame(pending.started_at.elapsed())
         )
     } else {
         format!(
-            " {} Search ",
+            "{} Search",
             keybindings.help(KeyAction::FilterApply, "Enter")
         )
     };
-    let cancel_button = format!(
-        " {} Cancel ",
+    let cancel_label = format!(
+        "{} Cancel",
         keybindings.help(KeyAction::FilterCancel, "Esc")
     );
     let help = if pending.is_some() {
@@ -15345,9 +15747,9 @@ fn draw_filter_modal(
     } else {
         filter_help_text(keybindings)
     };
-    let button_width = UnicodeWidthStr::width(search_button.as_str())
-        .saturating_add(UnicodeWidthStr::width(cancel_button.as_str()))
-        .saturating_add(4);
+    let button_width = UnicodeWidthStr::width(search_label.as_str())
+        .saturating_add(UnicodeWidthStr::width(cancel_label.as_str()))
+        .saturating_add(8);
     let desired_width = UnicodeWidthStr::width(draft)
         .saturating_add(1)
         .max(UnicodeWidthStr::width("Query"))
@@ -15368,12 +15770,9 @@ fn draw_filter_modal(
         )),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(search_button, theme_selected_style()),
+            modal_button_span(&search_label, true, pending.is_none()),
             Span::raw("  "),
-            Span::styled(
-                cancel_button,
-                Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-            ),
+            modal_button_span(&cancel_label, false, true),
         ]),
         Line::from(Span::styled(
             help,
@@ -15910,6 +16309,38 @@ fn delete_confirm_help_text(keybindings: &KeyBindings) -> String {
         keybindings.help(KeyAction::DeleteConfirmDelete, "1"),
         keybindings.help(KeyAction::DeleteConfirmCancelChoice, "2"),
         keybindings.help(KeyAction::DeleteConfirmCancel, "Esc"),
+    )
+}
+
+fn create_folder_help_text(keybindings: &KeyBindings) -> String {
+    format!(
+        "{} choose · {} select · {} create · {}/{} cancel",
+        keybindings.help(KeyAction::CreateFolderConfirm, "Enter"),
+        keybindings.help_pair(
+            KeyAction::CreateFolderPrev,
+            KeyAction::CreateFolderNext,
+            "Left",
+            "Right",
+        ),
+        keybindings.help(KeyAction::CreateFolderCreate, "1"),
+        keybindings.help(KeyAction::CreateFolderCancelChoice, "2"),
+        keybindings.help(KeyAction::CreateFolderCancel, "Esc"),
+    )
+}
+
+fn restore_data_help_text(keybindings: &KeyBindings) -> String {
+    format!(
+        "{} choose · {} select · {} restore · {}/{} skip",
+        keybindings.help(KeyAction::RestoreDataConfirm, "Enter"),
+        keybindings.help_pair(
+            KeyAction::RestoreDataPrev,
+            KeyAction::RestoreDataNext,
+            "Left",
+            "Right",
+        ),
+        keybindings.help(KeyAction::RestoreDataRestore, "1"),
+        keybindings.help(KeyAction::RestoreDataSkipChoice, "2"),
+        keybindings.help(KeyAction::RestoreDataSkip, "Esc"),
     )
 }
 
@@ -17138,6 +17569,24 @@ mod tests {
         }
     }
 
+    fn session_data_snapshot(
+        provider: Provider,
+        session_id: &str,
+        original_cwd: &str,
+        snapshot_path: PathBuf,
+    ) -> session::data::SessionDataSnapshot {
+        session::data::SessionDataSnapshot {
+            version: 1,
+            provider,
+            session_id: session_id.to_string(),
+            source_provider: provider,
+            source_session_id: format!("source-{session_id}"),
+            original_cwd: original_cwd.to_string(),
+            snapshot_path,
+            created_at_epoch_s: 0,
+        }
+    }
+
     fn new_agent_info(provider: Provider, cwd: &str) -> SessionInfo {
         let mut info = session_info(provider, "new-agent", cwd);
         info.source = PathBuf::from(NEW_AGENT_SESSION_SOURCE_MARKER);
@@ -17786,15 +18235,13 @@ mod tests {
             "codex-id-with-a-long-display-tail",
             "/repo/with/a/very/long/path/that/needs/truncation",
         );
-        let confirm_action = PendingAction::CreateMissingLaunchCwd {
-            info: source.clone(),
-            path: PathBuf::from("/tmp/missing-launch-folder"),
-            cols: 80,
-            rows: 20,
-            launch_mode: AgentLaunchMode::Normal,
-        };
-        let confirm_prompt =
-            "Create missing launch folder?\n/tmp/missing-launch-folder\nCreate it and continue?\ny/Y create/start   Esc/n cancel";
+        let missing_launch_folder = PathBuf::from("/tmp/missing-launch-folder");
+        let snapshot = session_data_snapshot(
+            Provider::Codex,
+            "codex-id-with-a-long-display-tail",
+            &source.cwd,
+            PathBuf::from("/tmp/cokacmux-snapshot-with-a-long-display-tail"),
+        );
         let mut data_task = DataTaskPending::new(
             1,
             DataTaskKind::Clone,
@@ -17814,7 +18261,26 @@ mod tests {
                 .unwrap();
             terminal
                 .draw(|f| {
-                    draw_confirm_modal(f, f.area(), &confirm_prompt, &confirm_action);
+                    draw_create_folder_confirm_modal(
+                        f,
+                        f.area(),
+                        &source,
+                        &missing_launch_folder,
+                        CREATE_FOLDER_OPTION_CANCEL,
+                        &keybindings,
+                    );
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_restore_data_confirm_modal(
+                        f,
+                        f.area(),
+                        &source,
+                        &snapshot,
+                        RESTORE_DATA_OPTION_SKIP,
+                        &keybindings,
+                    );
                 })
                 .unwrap();
             terminal
@@ -18678,24 +19144,20 @@ mod tests {
         );
 
         match &app.input_mode {
-            InputMode::Confirm {
-                prompt,
-                action:
-                    PendingAction::CreateMissingLaunchCwd {
-                        info,
-                        path,
-                        cols,
-                        rows,
-                        launch_mode,
-                    },
+            InputMode::CreateFolderConfirm {
+                info,
+                path,
+                cols,
+                rows,
+                launch_mode,
+                selected,
             } => {
-                assert!(prompt.contains("launch folder does not exist"));
-                assert!(prompt.contains("Create it and continue?"));
                 assert!(info.session_id.starts_with("missing-cwd-"));
                 assert_eq!(path, &missing);
                 assert_eq!(*cols, 80);
                 assert_eq!(*rows, 20);
                 assert_eq!(*launch_mode, AgentLaunchMode::Normal);
+                assert_eq!(*selected, CREATE_FOLDER_OPTION_CANCEL);
             }
             other => panic!("expected create-folder confirm, got {:?}", other),
         }
@@ -18711,24 +19173,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("deleted-project");
         let mut app = app_for_key_tests();
-        app.input_mode = InputMode::Confirm {
-            prompt: "Create?".to_string(),
-            action: PendingAction::CreateMissingLaunchCwd {
-                info: session_info(
-                    Provider::Claude,
-                    "missing-cwd",
-                    &missing.display().to_string(),
-                ),
-                path: missing.clone(),
-                cols: 80,
-                rows: 20,
-                launch_mode: AgentLaunchMode::Normal,
-            },
+        app.input_mode = InputMode::CreateFolderConfirm {
+            info: session_info(
+                Provider::Claude,
+                "missing-cwd",
+                &missing.display().to_string(),
+            ),
+            path: missing.clone(),
+            cols: 80,
+            rows: 20,
+            launch_mode: AgentLaunchMode::Normal,
+            selected: CREATE_FOLDER_OPTION_CANCEL,
         };
 
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             100,
             80,
             20,
@@ -18737,6 +19197,45 @@ mod tests {
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert_eq!(app.status, "cancelled.");
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn restore_data_confirm_default_enter_skips_restore_without_creating_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("clone-target");
+        let snapshot_path = dir.path().join("snapshot-data");
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::RestoreDataConfirm {
+            info: session_info(Provider::Codex, "clone-id", &target.display().to_string()),
+            snapshot: session_data_snapshot(
+                Provider::Codex,
+                "clone-id",
+                "/source-project",
+                snapshot_path.clone(),
+            ),
+            cols: 80,
+            rows: 20,
+            launch_mode: AgentLaunchMode::Normal,
+            selected: RESTORE_DATA_OPTION_SKIP,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::CreateFolderConfirm { path, selected, .. } => {
+                assert_eq!(path, &target);
+                assert_eq!(*selected, CREATE_FOLDER_OPTION_CANCEL);
+            }
+            other => panic!("expected create-folder confirm after restore skip, got {other:?}"),
+        }
+        assert!(!target.exists());
+        assert!(!snapshot_path.exists());
     }
 
     #[test]
@@ -20219,15 +20718,30 @@ IF EXIST "%~dp0\node.exe" (
         assert!(app.should_quit);
 
         let mut app = app_for_key_tests();
-        app.input_mode = InputMode::Confirm {
-            prompt: "Create?".to_string(),
-            action: PendingAction::CreateMissingLaunchCwd {
-                info: session_info(Provider::Codex, "codex-id", "/repo"),
-                path: PathBuf::from("/repo"),
-                cols: 80,
-                rows: 20,
-                launch_mode: AgentLaunchMode::Normal,
-            },
+        app.input_mode = InputMode::CreateFolderConfirm {
+            info: session_info(Provider::Codex, "codex-id", "/repo"),
+            path: PathBuf::from("/repo"),
+            cols: 80,
+            rows: 20,
+            launch_mode: AgentLaunchMode::Normal,
+            selected: CREATE_FOLDER_OPTION_CANCEL,
+        };
+        handle_key(&mut app, ctrl_q, 80, 50, 20);
+        assert!(app.should_quit);
+
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::RestoreDataConfirm {
+            info: session_info(Provider::Codex, "codex-id", "/repo"),
+            snapshot: session_data_snapshot(
+                Provider::Codex,
+                "codex-id",
+                "/repo",
+                PathBuf::from("/tmp/cokacmux-snapshot"),
+            ),
+            cols: 80,
+            rows: 20,
+            launch_mode: AgentLaunchMode::Normal,
+            selected: RESTORE_DATA_OPTION_SKIP,
         };
         handle_key(&mut app, ctrl_q, 80, 50, 20);
         assert!(app.should_quit);

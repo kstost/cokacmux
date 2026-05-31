@@ -1198,6 +1198,7 @@ mod tests {
             "source-sidecar",
         )
         .unwrap();
+        let source_mtime_before = fs::metadata(&source_path).unwrap().modified().unwrap();
         let src = session_info(
             Provider::Claude,
             "old-session",
@@ -1225,6 +1226,11 @@ mod tests {
             .join("a.txt")
             .is_file());
         assert_eq!(fs::read_to_string(&source_path).unwrap(), source_content);
+        assert_eq!(
+            fs::metadata(&source_path).unwrap().modified().unwrap(),
+            source_mtime_before,
+            "cloning must not change the source Claude JSONL mtime"
+        );
 
         let clone_info = session_info(
             Provider::Claude,
@@ -1238,6 +1244,11 @@ mod tests {
         assert!(!clone_path.exists());
         assert!(!clone_path.with_extension("").exists());
         assert_eq!(fs::read_to_string(&source_path).unwrap(), source_content);
+        assert_eq!(
+            fs::metadata(&source_path).unwrap().modified().unwrap(),
+            source_mtime_before,
+            "removing the clone must not change the source Claude JSONL mtime"
+        );
         assert_eq!(
             fs::read_to_string(source_sidecar.join("tool-results").join("a.txt")).unwrap(),
             "source-sidecar"
@@ -1405,6 +1416,7 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+        let source_mtime_before = fs::metadata(&source_path).unwrap().modified().unwrap();
         let src = session_info(
             Provider::Codex,
             "11111111-1111-7111-8111-111111111111",
@@ -1437,6 +1449,11 @@ mod tests {
         assert_eq!(remove_report.provider, Provider::Codex);
         assert!(!clone_path.exists());
         assert_eq!(fs::read_to_string(&source_path).unwrap(), source_content);
+        assert_eq!(
+            fs::metadata(&source_path).unwrap().modified().unwrap(),
+            source_mtime_before,
+            "cloning and removing a clone must not change the source Codex rollout mtime"
+        );
         let conn = rusqlite::Connection::open(&state_5).unwrap();
         let clone_rows: i64 = conn
             .query_row(

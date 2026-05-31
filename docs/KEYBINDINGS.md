@@ -192,14 +192,44 @@ G
 | `agent.switch_prev` | `ctrl+pageup` | 이전 live agent로 전환 |
 | `agent.switch_next` | `ctrl+pagedown` | 다음 live agent로 전환 |
 
-### confirm
+### delete_confirm
 
-확인 모달에서 쓰는 액션입니다.
+세션 삭제 확인 모달에서 쓰는 액션입니다.
 
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
-| `confirm.yes` | `y`, `Y` | 확인 |
-| `confirm.no` | `esc`, `n`, `N` | 취소 |
+| `delete_confirm.cancel` | `esc`, `n`, `N` | 삭제 취소 |
+| `delete_confirm.confirm` | `enter` | 선택한 버튼 실행 |
+| `delete_confirm.next` | `right`, `down`, `l`, `j`, `tab` | 다음 버튼 선택 |
+| `delete_confirm.prev` | `left`, `up`, `h`, `k`, `backtab` | 이전 버튼 선택 |
+| `delete_confirm.delete` | `1`, `y`, `Y` | Delete session 버튼 실행 |
+| `delete_confirm.cancel_choice` | `2` | Cancel 버튼 실행 |
+
+### create_folder
+
+세션 실행 폴더가 없을 때 표시되는 생성 확인 모달에서 쓰는 액션입니다. 기본 선택은 `Cancel`입니다.
+
+| 액션 | 기본 키 | 설명 |
+|---|---|---|
+| `create_folder.cancel` | `esc`, `n`, `N` | 생성하지 않고 취소 |
+| `create_folder.confirm` | `enter` | 선택한 버튼 실행 |
+| `create_folder.next` | `right`, `down`, `l`, `j`, `tab` | 다음 버튼 선택 |
+| `create_folder.prev` | `left`, `up`, `h`, `k`, `backtab` | 이전 버튼 선택 |
+| `create_folder.create` | `1`, `y`, `Y` | Create/start 버튼 실행 |
+| `create_folder.cancel_choice` | `2` | Cancel 버튼 실행 |
+
+### restore_data
+
+clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 모달에서 쓰는 액션입니다. 기본 선택은 `Start without restore`입니다.
+
+| 액션 | 기본 키 | 설명 |
+|---|---|---|
+| `restore_data.skip` | `esc`, `n`, `N` | 복원 없이 시작 |
+| `restore_data.confirm` | `enter` | 선택한 버튼 실행 |
+| `restore_data.next` | `right`, `down`, `l`, `j`, `tab` | 다음 버튼 선택 |
+| `restore_data.prev` | `left`, `up`, `h`, `k`, `backtab` | 이전 버튼 선택 |
+| `restore_data.restore` | `1`, `y`, `Y` | Restore/start 버튼 실행 |
+| `restore_data.skip_choice` | `2` | Start without restore 버튼 실행 |
 
 ### filter
 
@@ -265,16 +295,19 @@ G
 
 폴더 경로 입력 항목에서는 일반 문자 키가 경로 입력으로 우선 처리됩니다. 그래서 기본값에 `j`, `k`, `h`, `l`, `space`가 포함되어 있어도 경로 입력 중에는 문자로 들어갑니다. 입력 항목을 이동하려면 `up`, `down`, `tab`, `backtab`을 쓰면 됩니다.
 
-### clone_target
+### clone_options
 
-clone target 선택 모달에서 쓰는 액션입니다.
+clone 실행 전에 세션만 복제할지, 저장 가능한 폴더 데이터도 함께 복제할지 고르는 버튼 모달에서 쓰는 액션입니다.
 
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
-| `clone_target.cancel` | `esc` | 취소 |
-| `clone_target.confirm` | `enter` | 선택한 target으로 clone |
-| `clone_target.next` | `down`, `j` | 다음 target |
-| `clone_target.prev` | `up`, `k` | 이전 target |
+| `clone_options.cancel` | `esc` | clone 취소 |
+| `clone_options.confirm` | `enter` | 선택한 버튼 실행 |
+| `clone_options.next` | `right`, `down`, `l`, `j`, `tab` | 다음 버튼 선택 |
+| `clone_options.prev` | `left`, `up`, `h`, `k`, `backtab` | 이전 버튼 선택 |
+| `clone_options.session_only` | `1` | Session only 버튼 실행 |
+| `clone_options.folder_data` | `2` | Folder data too 버튼 실행 |
+| `clone_options.cancel_choice` | `3` | Cancel 버튼 실행 |
 
 ## macOS 참고
 
