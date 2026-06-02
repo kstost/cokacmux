@@ -93,6 +93,8 @@ const AGENT_ACTIVITY_META_WRITE_INTERVAL_MS: u64 = 750;
 const DEBUG_LOG_FILE: &str = "cokacmux.log";
 const DEBUG_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const APP_DIR_NAME: &str = ".cokacmux";
+const COKACDIR_PROGRAM_NAME: &str = "cokacdir";
+const COKACDIR_DIST_BASE_URL: &str = "https://raw.githubusercontent.com/kstost/cokacdir/main/dist";
 const SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e", "enter"];
 const PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e"];
 const PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS: &[&str] = &["enter"];
@@ -244,6 +246,7 @@ impl Settings {
     fn normalized(mut self) -> Self {
         self.cokacmux.sessions_pane_percent = self.cokacmux.sessions_pane_percent.min(100);
         self.cokacmux.agent_programs.normalize_placeholders();
+        normalize_program_placeholder(&mut self.cokacmux.cokacdir_program);
         self
     }
 
@@ -285,6 +288,8 @@ struct CokacmuxSettings {
     session_view: SessionViewMode,
     #[serde(default)]
     agent_programs: AgentProgramSettings,
+    #[serde(default)]
+    cokacdir_program: Option<String>,
     #[serde(default, rename = "debug", skip_serializing)]
     _debug: bool,
     #[serde(flatten)]
@@ -300,6 +305,7 @@ impl Default for CokacmuxSettings {
             agent_sidebar_visible: default_agent_sidebar_visible(),
             session_view: default_session_view(),
             agent_programs: AgentProgramSettings::default(),
+            cokacdir_program: Some(String::new()),
             _debug: false,
             extra: serde_json::Map::new(),
         }
@@ -1571,6 +1577,7 @@ fn move_agent_launch_mode_index(index: usize, delta: i32) -> usize {
 fn new_session_field_count(kind: NewSessionKind) -> usize {
     match kind {
         NewSessionKind::Terminal => NEW_SESSION_FIELD_PROVIDER,
+        NewSessionKind::CokacDir => NEW_SESSION_FIELD_PROVIDER,
         NewSessionKind::CodingAgent => NEW_SESSION_FIELD_COUNT,
     }
 }
@@ -1585,14 +1592,12 @@ fn move_new_session_field(index: usize, kind: NewSessionKind, delta: i32) -> usi
 }
 
 fn move_new_session_kind(kind: NewSessionKind, delta: i32) -> NewSessionKind {
-    let index = match kind {
-        NewSessionKind::Terminal => 0,
-        NewSessionKind::CodingAgent => 1,
-    };
-    match (index + delta).rem_euclid(2) {
-        0 => NewSessionKind::Terminal,
-        _ => NewSessionKind::CodingAgent,
-    }
+    let index = NEW_SESSION_KIND_OPTIONS
+        .iter()
+        .position(|candidate| *candidate == kind)
+        .unwrap_or(0);
+    let next = (index as i32 + delta).rem_euclid(NEW_SESSION_KIND_OPTIONS.len() as i32) as usize;
+    NEW_SESSION_KIND_OPTIONS[next]
 }
 
 fn move_provider_in_options(provider: Provider, delta: i32, options: &[Provider]) -> Provider {
@@ -1749,6 +1754,10 @@ enum InputMode {
         draft: String,
         cursor: usize,
     },
+    Notice {
+        title: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1889,6 +1898,7 @@ const AGENT_LAUNCH_MODE_OPTIONS: [AgentLaunchMode; 2] =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NewSessionKind {
     Terminal,
+    CokacDir,
     CodingAgent,
 }
 
@@ -1896,6 +1906,7 @@ impl NewSessionKind {
     fn label(self) -> &'static str {
         match self {
             NewSessionKind::Terminal => "Terminal",
+            NewSessionKind::CokacDir => "cokacdir",
             NewSessionKind::CodingAgent => "Coding agent",
         }
     }
@@ -1903,11 +1914,17 @@ impl NewSessionKind {
     fn as_str(self) -> &'static str {
         match self {
             NewSessionKind::Terminal => "terminal",
+            NewSessionKind::CokacDir => "cokacdir",
             NewSessionKind::CodingAgent => "coding_agent",
         }
     }
 }
 
+const NEW_SESSION_KIND_OPTIONS: [NewSessionKind; 3] = [
+    NewSessionKind::Terminal,
+    NewSessionKind::CokacDir,
+    NewSessionKind::CodingAgent,
+];
 const NEW_SESSION_FIELD_COUNT: usize = 4;
 const NEW_SESSION_FIELD_KIND: usize = 0;
 const NEW_SESSION_FIELD_CWD: usize = 1;
@@ -2184,6 +2201,42 @@ fn is_switchable_agent_state(state: AgentListState) -> bool {
     )
 }
 
+fn merge_live_shell_infos_with_previous_runtime_state<F>(
+    discovered: Vec<SessionInfo>,
+    previous: &[SessionInfo],
+    current_pid: u32,
+    mut read_state: F,
+) -> Vec<SessionInfo>
+where
+    F: FnMut(&AgentKey) -> AgentListState,
+{
+    let mut merged = discovered;
+    let mut seen: HashSet<AgentKey> = merged.iter().map(AgentKey::new).collect();
+    for info in previous {
+        let key = AgentKey::new(info);
+        if seen.contains(&key) {
+            continue;
+        }
+        let state = read_state(&key);
+        if state == AgentListState::Idle {
+            continue;
+        }
+        debug_log(
+            "live_shell_discover_previous_restored",
+            serde_json::json!({
+                "current_pid": current_pid,
+                "key": agent_key_debug_value(&key),
+                "state": agent_list_state_debug_value(state),
+                "info": session_info_debug_value(info),
+                "runtime_probe": agent_runtime_probe_debug_value(&key, current_pid),
+            }),
+        );
+        seen.insert(key);
+        merged.push(info.clone());
+    }
+    merged
+}
+
 fn agent_list_state_debug_value(state: AgentListState) -> serde_json::Value {
     match state {
         AgentListState::Idle => serde_json::json!({
@@ -2223,6 +2276,8 @@ fn agent_key_debug_value(key: &AgentKey) -> serde_json::Value {
 fn agent_info_kind(info: &SessionInfo) -> &'static str {
     if is_shell_session_info(info) {
         "shell"
+    } else if is_cokacdir_session_info(info) {
+        "cokacdir"
     } else if is_new_agent_session_info(info) {
         "new_agent"
     } else {
@@ -2272,6 +2327,39 @@ fn agent_alias_entries_debug_value(
         .collect();
     entries.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
     entries
+}
+
+fn agent_keys_debug_value(keys: &[AgentKey]) -> Vec<serde_json::Value> {
+    keys.iter().map(agent_key_debug_value).collect()
+}
+
+fn sorted_switchable_agent_keys(states: &HashMap<AgentKey, AgentListState>) -> Vec<AgentKey> {
+    let mut keys: Vec<AgentKey> = states
+        .iter()
+        .filter_map(|(key, state)| is_switchable_agent_state(*state).then_some(key.clone()))
+        .collect();
+    sort_agent_keys(&mut keys);
+    keys
+}
+
+fn agent_key_set_difference(left: &[AgentKey], right: &[AgentKey]) -> Vec<AgentKey> {
+    let right: HashSet<AgentKey> = right.iter().cloned().collect();
+    let mut keys: Vec<AgentKey> = left
+        .iter()
+        .filter(|key| !right.contains(*key))
+        .cloned()
+        .collect();
+    sort_agent_keys(&mut keys);
+    keys
+}
+
+fn sort_agent_keys(keys: &mut [AgentKey]) {
+    keys.sort_by(|a, b| {
+        a.provider
+            .as_str()
+            .cmp(b.provider.as_str())
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
 }
 
 struct NewAgentBackingSession {
@@ -2439,9 +2527,9 @@ impl AgentSession {
         cols: u16,
         rows: u16,
         launch_mode: AgentLaunchMode,
-        agent_programs: &AgentProgramSettings,
+        settings: &Settings,
     ) -> Result<Self> {
-        let spec = agent_launch_spec_with_programs(&info, launch_mode, agent_programs);
+        let spec = agent_launch_spec_with_settings(&info, launch_mode, settings);
         Self::spawn_with_spec(info, spec, cols, rows, launch_mode)
     }
 
@@ -2804,13 +2892,13 @@ impl AgentSession {
         true
     }
 
-    /// For shell sessions, update `info.cwd` to reflect the kernel's
+    /// For direct PTY tool sessions, update `info.cwd` to reflect the kernel's
     /// current view of the child process's cwd (e.g. after the user typed
     /// `cd ..` inside the shell). No-op for real agent sessions and on
     /// platforms without `/proc/<pid>/cwd`.
-    /// Returns true when the shell's cwd changed (e.g. user typed `cd`).
+    /// Returns true when the tool's cwd changed.
     fn refresh_shell_cwd_from_kernel(&mut self) -> bool {
-        if !is_shell_session_info(&self.info) {
+        if !is_plain_pty_tool_session_info(&self.info) {
             return false;
         }
         let Some(pid) = self.child.process_id() else {
@@ -2823,8 +2911,9 @@ impl AgentSession {
                 let cwd = target.display().to_string();
                 if !cwd.is_empty() && cwd != self.info.cwd {
                     debug_log(
-                        "agent_shell_cwd_changed",
+                        "agent_pty_tool_cwd_changed",
                         serde_json::json!({
+                            "kind": agent_info_kind(&self.info),
                             "session_id": &self.info.session_id,
                             "pid": pid,
                             "old": &self.info.cwd,
@@ -4127,7 +4216,8 @@ impl AgentClient {
     }
 
     fn activity(&self) -> AgentActivity {
-        agent_activity_from_timestamps(
+        agent_activity_from_info(
+            &self.info,
             current_epoch_ms(),
             self.last_screen_change_epoch_ms,
             self.last_output_epoch_ms,
@@ -4951,6 +5041,17 @@ impl App {
             .unwrap_or_else(|| self.status.clone())
     }
 
+    fn show_notice_dialog(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        let title = title.into();
+        let message = message.into();
+        self.status = message.clone();
+        self.input_mode = InputMode::Notice { title, message };
+    }
+
+    fn show_cokacdir_error_dialog(&mut self, message: String) {
+        self.show_notice_dialog("cokacdir failed", message);
+    }
+
     fn reject_while_data_task_running(&mut self, action: &str) -> bool {
         let Some(task) = self.data_task.as_mut() else {
             return false;
@@ -5148,22 +5249,31 @@ impl App {
     fn refresh_agent_runtime_states(&mut self) {
         self.last_agent_state_poll = Instant::now();
         let current_pid = std::process::id();
-        let previous_states_len = self.agent_states.len();
+        let previous_states = self.agent_states.clone();
+        let previous_live_shells = self.live_shells.clone();
+        let previous_states_len = previous_states.len();
         trace_log(
             "agent_runtime_refresh_start",
             serde_json::json!({
                 "current_pid": current_pid,
                 "sessions_len": self.sessions.len(),
-                "previous_live_shells_len": self.live_shells.len(),
+                "previous_live_shells_len": previous_live_shells.len(),
                 "previous_agent_states_len": previous_states_len,
                 "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
                 "show_sessions_view": self.show_sessions_view,
             }),
         );
 
-        // Refresh the live-shells list each tick — daemons can come and go
-        // independently of our own clone/attach actions.
-        self.live_shells = discover_live_shell_infos();
+        // Refresh the live-shells list each tick. If the runtime directory is
+        // momentarily partial while daemons repair their files, keep any
+        // previously visible entry whose daemon still proves live.
+        let discovered_live_shells = discover_live_shell_infos();
+        self.live_shells = merge_live_shell_infos_with_previous_runtime_state(
+            discovered_live_shells,
+            &previous_live_shells,
+            current_pid,
+            |key| read_agent_runtime_state(key, current_pid),
+        );
 
         let mut states = HashMap::new();
         let session_keys: Vec<AgentKey> = self.sessions.iter().map(AgentKey::new).collect();
@@ -5219,6 +5329,14 @@ impl App {
             );
         }
         self.apply_new_agent_backing_states(&mut states);
+        self.debug_agent_runtime_refresh_changes(
+            &previous_states,
+            &previous_live_shells,
+            &states,
+            &session_keys,
+            &shell_keys,
+            current_pid,
+        );
         self.agent_states = states;
         trace_log(
             "agent_runtime_refresh_done",
@@ -5231,6 +5349,124 @@ impl App {
                 "show_sessions_view": self.show_sessions_view,
             }),
         );
+    }
+
+    fn debug_agent_runtime_refresh_changes(
+        &self,
+        previous_states: &HashMap<AgentKey, AgentListState>,
+        previous_live_shells: &[SessionInfo],
+        next_states: &HashMap<AgentKey, AgentListState>,
+        session_keys: &[AgentKey],
+        shell_keys: &[AgentKey],
+        current_pid: u32,
+    ) {
+        if !DEBUG_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let previous_live_map: HashMap<AgentKey, &SessionInfo> = previous_live_shells
+            .iter()
+            .map(|info| (AgentKey::new(info), info))
+            .collect();
+        let next_live_map: HashMap<AgentKey, &SessionInfo> = self
+            .live_shells
+            .iter()
+            .map(|info| (AgentKey::new(info), info))
+            .collect();
+        let session_key_set: HashSet<AgentKey> = session_keys.iter().cloned().collect();
+        let shell_key_set: HashSet<AgentKey> = shell_keys.iter().cloned().collect();
+
+        let previous_switchable = sorted_switchable_agent_keys(previous_states);
+        let next_switchable = sorted_switchable_agent_keys(next_states);
+        if previous_switchable != next_switchable {
+            let removed = agent_key_set_difference(&previous_switchable, &next_switchable);
+            let added = agent_key_set_difference(&next_switchable, &previous_switchable);
+            debug_log(
+                "agent_runtime_switchable_set_changed",
+                serde_json::json!({
+                    "current_pid": current_pid,
+                    "previous_count": previous_switchable.len(),
+                    "next_count": next_switchable.len(),
+                    "removed": agent_keys_debug_value(&removed),
+                    "added": agent_keys_debug_value(&added),
+                    "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                    "show_sessions_view": self.show_sessions_view,
+                    "provider_session_count": self.sessions.len(),
+                    "previous_live_shell_count": previous_live_shells.len(),
+                    "next_live_shell_count": self.live_shells.len(),
+                }),
+            );
+        }
+
+        for key in &previous_switchable {
+            let previous_state = previous_states
+                .get(key)
+                .copied()
+                .unwrap_or(AgentListState::Idle);
+            let next_state = next_states
+                .get(key)
+                .copied()
+                .unwrap_or(AgentListState::Idle);
+            if is_switchable_agent_state(next_state) {
+                continue;
+            }
+            debug_log(
+                "agent_runtime_switchable_removed",
+                serde_json::json!({
+                    "key": agent_key_debug_value(key),
+                    "previous_state": agent_list_state_debug_value(previous_state),
+                    "next_state": agent_list_state_debug_value(next_state),
+                    "was_live_info": previous_live_map.contains_key(key),
+                    "is_live_info": next_live_map.contains_key(key),
+                    "is_provider_session": session_key_set.contains(key),
+                    "was_runtime_key_this_refresh": shell_key_set.contains(key),
+                    "previous_live_info": previous_live_map.get(key).map(|info| session_info_debug_value(info)),
+                    "next_live_info": next_live_map.get(key).map(|info| session_info_debug_value(info)),
+                    "provider_session_info": self.sessions.iter().find(|info| AgentKey::new(info) == *key).map(session_info_debug_value),
+                    "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                    "runtime_probe": agent_runtime_probe_debug_value(key, current_pid),
+                }),
+            );
+        }
+
+        for (key, previous_info) in previous_live_map.iter() {
+            if next_live_map.contains_key(key) {
+                continue;
+            }
+            debug_log(
+                "agent_runtime_live_info_removed",
+                serde_json::json!({
+                    "key": agent_key_debug_value(key),
+                    "previous_live_info": session_info_debug_value(previous_info),
+                    "previous_state": previous_states.get(key).copied().map(agent_list_state_debug_value),
+                    "next_state": next_states.get(key).copied().map(agent_list_state_debug_value),
+                    "is_provider_session": session_key_set.contains(key),
+                    "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                    "runtime_probe": agent_runtime_probe_debug_value(key, current_pid),
+                }),
+            );
+        }
+
+        if let Some(agent) = self.active_agent.as_ref() {
+            let active_key = AgentKey::new(&agent.info);
+            let active_state = next_states
+                .get(&active_key)
+                .copied()
+                .unwrap_or(AgentListState::Idle);
+            if !is_switchable_agent_state(active_state) {
+                debug_log(
+                    "agent_runtime_active_not_switchable",
+                    serde_json::json!({
+                        "key": agent_key_debug_value(&active_key),
+                        "active_info": session_info_debug_value(&agent.info),
+                        "state": agent_list_state_debug_value(active_state),
+                        "is_live_info": next_live_map.contains_key(&active_key),
+                        "is_provider_session": session_key_set.contains(&active_key),
+                        "runtime_probe": agent_runtime_probe_debug_value(&active_key, current_pid),
+                    }),
+                );
+            }
+        }
     }
 
     fn apply_new_agent_backing_states(&mut self, states: &mut HashMap<AgentKey, AgentListState>) {
@@ -5944,7 +6180,7 @@ impl App {
     /// the shell is reflected when Ctrl+N is pressed again from there).
     fn active_agent_current_cwd(&self) -> Option<String> {
         let agent = self.active_agent.as_ref()?;
-        if is_shell_session_info(&agent.info) {
+        if is_plain_pty_tool_session_info(&agent.info) {
             let key = AgentKey::new(&agent.info);
             for shell in &self.live_shells {
                 if AgentKey::new(shell) == key && !shell.cwd.is_empty() {
@@ -6042,7 +6278,7 @@ impl App {
             .filter(|_| {
                 self.active_agent
                     .as_ref()
-                    .is_some_and(|agent| !is_shell_session_info(&agent.info))
+                    .is_some_and(|agent| !is_plain_pty_tool_session_info(&agent.info))
             })
             .unwrap_or(Provider::Codex);
         self.begin_new_session(cwd, provider, "agent");
@@ -6131,6 +6367,22 @@ impl App {
         match kind {
             NewSessionKind::Terminal => {
                 self.open_shell_at_cwd(cwd, cols, rows, "new_session:terminal");
+            }
+            NewSessionKind::CokacDir => {
+                let info = cokacdir_session_info_for_cwd(cwd.clone());
+                debug_log(
+                    "cokacdir_open_start",
+                    serde_json::json!({
+                        "session_id": &info.session_id,
+                        "cwd": &cwd,
+                    }),
+                );
+                self.attach_agent_without_data_restore_prompt(
+                    info,
+                    cols,
+                    rows,
+                    AgentLaunchMode::Normal,
+                );
             }
             NewSessionKind::CodingAgent => {
                 let info = new_agent_session_info(provider, cwd.clone());
@@ -6243,8 +6495,7 @@ impl App {
     ) {
         let key = AgentKey::new(&info);
         let label = live_agent_status_label(&info);
-        let should_select_visible =
-            !is_shell_session_info(&info) && !is_new_agent_session_info(&info);
+        let should_select_visible = should_select_visible_session_for_live_info(&info);
         debug_log(
             "attach_existing_live_agent_start",
             serde_json::json!({
@@ -6643,13 +6894,20 @@ impl App {
                 }
             }
         }
-        if let Err(e) = prepare_agent_session(&info) {
-            self.status = format!(
-                "prepare {} agent {} failed: {}",
-                key.provider.as_str(),
-                truncate_width(&key.session_id, 14),
-                e
-            );
+        if let Err(e) = prepare_agent_session(&info, &self.settings) {
+            self.status = if is_plain_pty_tool_session_info(&info) {
+                format!("prepare {} failed: {}", live_agent_status_label(&info), e)
+            } else {
+                format!(
+                    "prepare {} agent {} failed: {}",
+                    key.provider.as_str(),
+                    truncate_width(&key.session_id, 14),
+                    e
+                )
+            };
+            if is_cokacdir_session_info(&info) {
+                self.show_cokacdir_error_dialog(self.status.clone());
+            }
             debug_log(
                 "attach_prepare_failed",
                 serde_json::json!({
@@ -6661,19 +6919,30 @@ impl App {
             return;
         }
         let (main_tx, reader_id) = self.agent_attach_handles();
+        let is_plain_pty_tool = is_plain_pty_tool_session_info(&info);
+        let is_cokacdir = is_cokacdir_session_info(&info);
+        let attach_label = live_agent_status_label(&info);
         match AgentClient::attach_or_start(info, cols, rows, main_tx, reader_id, launch_mode) {
             Ok((agent, started)) => {
-                self.status = format!(
-                    "{} {} agent {}{}",
-                    if started { "started" } else { "attached" },
-                    key.provider.as_str(),
-                    truncate_width(&key.session_id, 14),
-                    if started && launch_mode == AgentLaunchMode::SkipPermissions {
-                        " with skipped permissions"
-                    } else {
-                        ""
-                    }
-                );
+                self.status = if is_plain_pty_tool {
+                    format!(
+                        "{} {}",
+                        if started { "started" } else { "attached" },
+                        live_agent_status_label(&agent.info)
+                    )
+                } else {
+                    format!(
+                        "{} {} agent {}{}",
+                        if started { "started" } else { "attached" },
+                        key.provider.as_str(),
+                        truncate_width(&key.session_id, 14),
+                        if started && launch_mode == AgentLaunchMode::SkipPermissions {
+                            " with skipped permissions"
+                        } else {
+                            ""
+                        }
+                    )
+                };
                 self.show_sessions_view = false;
                 self.active_agent = Some(agent);
                 self.mark_agent_attached_locally(key.clone());
@@ -6692,12 +6961,19 @@ impl App {
                 );
             }
             Err(e) => {
-                self.status = format!(
-                    "attach {} agent {} failed: {}",
-                    key.provider.as_str(),
-                    truncate_width(&key.session_id, 14),
-                    e
-                );
+                self.status = if is_plain_pty_tool {
+                    format!("attach {} failed: {}", attach_label, e)
+                } else {
+                    format!(
+                        "attach {} agent {} failed: {}",
+                        key.provider.as_str(),
+                        truncate_width(&key.session_id, 14),
+                        e
+                    )
+                };
+                if is_cokacdir {
+                    self.show_cokacdir_error_dialog(self.status.clone());
+                }
                 self.refresh_agent_runtime_states();
                 debug_log(
                     "attach_failed",
@@ -6776,14 +7052,13 @@ impl App {
         };
         let key = AgentKey::new(&info);
         let label = live_agent_status_label(&info);
-        let should_select_visible =
-            !is_shell_session_info(&info) && !is_new_agent_session_info(&info);
+        let should_select_visible = should_select_visible_session_for_live_info(&info);
         debug_log(
             "restore_live_agent_selected",
             serde_json::json!({
                 "provider": key.provider.as_str(),
                 "session_id": &key.session_id,
-                "shell": is_shell_session_info(&info),
+                "kind": agent_info_kind(&info),
             }),
         );
         let (main_tx, reader_id) = self.agent_attach_handles();
@@ -6848,6 +7123,7 @@ impl App {
         let key = AgentKey::new(&active_agent.info);
         let provider = active_agent.info.provider;
         let session_id = active_agent.info.session_id.clone();
+        let killed_label = live_agent_status_label(&active_agent.info);
         let cols = active_agent.pty_size.cols;
         let rows = active_agent.pty_size.rows;
         let next_info = self.next_agent_after_current();
@@ -6883,19 +7159,15 @@ impl App {
                                 rows,
                                 provider,
                                 &session_id,
+                                &killed_label,
                                 pid,
                             );
                             if outcome.pty_log_deleted {
                                 self.status.push_str("; history deleted");
                             }
                         } else {
-                            self.status = format!(
-                                "killed {} agent {} (pid {}){}",
-                                provider.as_str(),
-                                truncate_width(&session_id, 14),
-                                pid,
-                                history_suffix
-                            );
+                            self.status =
+                                format!("killed {} (pid {}){}", killed_label, pid, history_suffix);
                         }
                     }
                     None => {
@@ -6906,29 +7178,21 @@ impl App {
                                 rows,
                                 provider,
                                 &session_id,
+                                &killed_label,
                                 0,
                             );
                             if outcome.pty_log_deleted {
                                 self.status.push_str("; history deleted");
                             }
                         } else {
-                            self.status = format!(
-                                "cleared {} agent {} runtime{}",
-                                provider.as_str(),
-                                truncate_width(&session_id, 14),
-                                history_suffix
-                            );
+                            self.status =
+                                format!("cleared {} runtime{}", killed_label, history_suffix);
                         }
                     }
                 }
             }
             Err(e) => {
-                self.status = format!(
-                    "kill {} agent {} failed: {}",
-                    provider.as_str(),
-                    truncate_width(&session_id, 14),
-                    e
-                );
+                self.status = format!("kill {} failed: {}", killed_label, e);
                 debug_log(
                     "kill_agent_failed",
                     serde_json::json!({
@@ -6969,9 +7233,11 @@ impl App {
         rows: u16,
         killed_provider: Provider,
         killed_session_id: &str,
+        killed_label: &str,
         killed_pid: u32,
     ) {
         let next_key = AgentKey::new(&next_info);
+        let next_label = live_agent_status_label(&next_info);
         debug_log(
             "kill_agent_switch_selected",
             serde_json::json!({
@@ -6982,44 +7248,11 @@ impl App {
                 "daemon_pid": killed_pid,
             }),
         );
-        if let Err(e) = prepare_agent_session(&next_info) {
-            self.status = format!(
-                "killed {} agent {}; prepare next {} failed: {}",
-                killed_provider.as_str(),
-                truncate_width(killed_session_id, 14),
-                truncate_width(&next_key.session_id, 14),
-                e
-            );
-            debug_log(
-                "kill_agent_switch_prepare_failed",
-                serde_json::json!({
-                    "provider": next_key.provider.as_str(),
-                    "session_id": &next_key.session_id,
-                    "error": e.to_string(),
-                }),
-            );
-            return;
-        }
-
-        let should_select_visible = !is_new_agent_session_info(&next_info);
+        let should_select_visible = should_select_visible_session_for_live_info(&next_info);
         let (main_tx, reader_id) = self.agent_attach_handles();
-        match AgentClient::attach_or_start(
-            next_info,
-            cols,
-            rows,
-            main_tx,
-            reader_id,
-            AgentLaunchMode::Normal,
-        ) {
-            Ok((next_agent, started)) => {
-                self.status = format!(
-                    "killed {} {}; switched to {} {} agent {}",
-                    killed_provider.as_str(),
-                    truncate_width(killed_session_id, 14),
-                    if started { "started" } else { "live" },
-                    next_key.provider.as_str(),
-                    truncate_width(&next_key.session_id, 14)
-                );
+        match AgentClient::attach_existing(next_info, cols, rows, main_tx, reader_id) {
+            Ok(next_agent) => {
+                self.status = format!("killed {}; switched to live {}", killed_label, next_label);
                 self.show_sessions_view = false;
                 self.active_agent = Some(next_agent);
                 self.mark_agent_attached_locally(next_key.clone());
@@ -7032,17 +7265,14 @@ impl App {
                     serde_json::json!({
                         "provider": next_key.provider.as_str(),
                         "session_id": &next_key.session_id,
-                        "started": started,
+                        "attached_existing": true,
                     }),
                 );
             }
             Err(e) => {
                 self.status = format!(
-                    "killed {} {}; switch to {} failed: {}",
-                    killed_provider.as_str(),
-                    truncate_width(killed_session_id, 14),
-                    truncate_width(&next_key.session_id, 14),
-                    e
+                    "killed {}; switch to live {} failed: {}",
+                    killed_label, next_label, e
                 );
                 self.refresh_agent_runtime_states();
                 debug_log(
@@ -7172,44 +7402,15 @@ impl App {
                 "delta": delta,
             }),
         );
-        if let Err(e) = prepare_agent_session(&next_info) {
-            self.status = format!(
-                "prepare {} agent {} failed: {}",
-                next_key.provider.as_str(),
-                truncate_width(&next_key.session_id, 14),
-                e
-            );
-            debug_log(
-                "agent_switch_prepare_failed",
-                serde_json::json!({
-                    "provider": next_key.provider.as_str(),
-                    "session_id": &next_key.session_id,
-                    "error": e.to_string(),
-                }),
-            );
-            return;
-        }
-
-        let should_select_visible = !is_new_agent_session_info(&next_info);
+        let next_label = live_agent_status_label(&next_info);
+        let should_select_visible = should_select_visible_session_for_live_info(&next_info);
         let (main_tx, reader_id) = self.agent_attach_handles();
-        match AgentClient::attach_or_start(
-            next_info,
-            cols,
-            rows,
-            main_tx,
-            reader_id,
-            AgentLaunchMode::Normal,
-        ) {
-            Ok((next_agent, started)) => {
+        match AgentClient::attach_existing(next_info, cols, rows, main_tx, reader_id) {
+            Ok(next_agent) => {
                 if let Some(old_agent) = self.active_agent.take() {
                     drop(old_agent);
                 }
-                self.status = format!(
-                    "switched to {} {} agent {}",
-                    if started { "started" } else { "live" },
-                    next_key.provider.as_str(),
-                    truncate_width(&next_key.session_id, 14)
-                );
+                self.status = format!("switched to live {}", next_label);
                 self.show_sessions_view = false;
                 self.active_agent = Some(next_agent);
                 self.mark_agent_attached_locally(next_key.clone());
@@ -7222,17 +7423,12 @@ impl App {
                     serde_json::json!({
                         "provider": next_key.provider.as_str(),
                         "session_id": &next_key.session_id,
-                        "started": started,
+                        "attached_existing": true,
                     }),
                 );
             }
             Err(e) => {
-                self.status = format!(
-                    "switch to {} agent {} failed: {}",
-                    next_key.provider.as_str(),
-                    truncate_width(&next_key.session_id, 14),
-                    e
-                );
+                self.status = format!("switch to live {} failed: {}", next_label, e);
                 self.refresh_agent_runtime_states();
                 debug_log(
                     "agent_switch_failed",
@@ -7277,15 +7473,21 @@ impl App {
         let Some(agent) = self.active_agent.as_mut() else {
             return;
         };
-        if is_shell_session_info(&agent.info) {
+        if is_plain_pty_tool_session_info(&agent.info) {
             let before = agent.scrollback_offset();
             let render_source_before = agent_scroll_render_source(agent);
             let after = agent.scroll_screen(action, page_rows);
             let render_source_after = agent_scroll_render_source(agent);
-            self.status = format!("Terminal: scrolled {}.", child_scroll_action_label(action));
+            let label = if is_cokacdir_session_info(&agent.info) {
+                "cokacdir"
+            } else {
+                "Terminal"
+            };
+            self.status = format!("{}: scrolled {}.", label, child_scroll_action_label(action));
             debug_log(
-                "agent_terminal_parent_scroll",
+                "agent_pty_tool_parent_scroll",
                 serde_json::json!({
+                    "kind": agent_info_kind(&agent.info),
                     "provider": agent.info.provider.as_str(),
                     "session_id": &agent.info.session_id,
                     "action": format!("{:?}", action),
@@ -8644,7 +8846,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             "cwd": std::env::current_dir().ok().map(|path| path.display().to_string()),
         }),
     );
-    let listener = bind_agent_listener(&key, &socket_path)?;
+    let mut listener = bind_agent_listener(&key, &socket_path)?;
     listener.set_nonblocking(true)?;
     debug_log(
         "daemon_socket_bound",
@@ -8671,24 +8873,35 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
         None,
     )?;
 
-    let mut agent =
-        match AgentSession::spawn(info, 80, 24, launch_mode, &settings.cokacmux.agent_programs) {
-            Ok(agent) => agent,
-            Err(e) => {
-                debug_log(
-                    "daemon_agent_spawn_failed",
-                    serde_json::json!({
-                        "provider": key.provider.as_str(),
-                        "session_id": &key.session_id,
-                        "error": e.to_string(),
-                    }),
-                );
-                let _ = fs::remove_file(&socket_path);
-                let _ = fs::remove_file(&meta_path);
-                let _ = remove_agent_pty_log(&key);
-                return Err(e);
-            }
-        };
+    let mut agent = match AgentSession::spawn(info, 80, 24, launch_mode, &settings) {
+        Ok(agent) => agent,
+        Err(e) => {
+            debug_log(
+                "daemon_agent_spawn_failed",
+                serde_json::json!({
+                    "provider": key.provider.as_str(),
+                    "session_id": &key.session_id,
+                    "error": e.to_string(),
+                }),
+            );
+            let _ = remove_agent_runtime_file_logged(
+                "daemon_agent_spawn_failed_cleanup",
+                Some(&key),
+                None,
+                "socket",
+                &socket_path,
+            );
+            let _ = remove_agent_runtime_file_logged(
+                "daemon_agent_spawn_failed_cleanup",
+                Some(&key),
+                None,
+                "meta",
+                &meta_path,
+            );
+            let _ = remove_agent_pty_log(&key);
+            return Err(e);
+        }
+    };
     if let Err(e) = write_agent_meta(&meta_path, &mut agent, false, None, None) {
         debug_log(
             "daemon_meta_write_failed",
@@ -8715,10 +8928,24 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     let mut attached_client_instance_id: Option<String> = None;
     let daemon_started_at = Instant::now();
     let mut last_no_output_log_at = Instant::now();
+    let mut last_runtime_file_check_at = Instant::now();
     #[cfg(windows)]
     let mut last_windows_ctrl_event_count = windows_console_ctrl_event_snapshot().0;
 
     let exit_status = loop {
+        if last_runtime_file_check_at.elapsed() >= Duration::from_millis(500) {
+            last_runtime_file_check_at = Instant::now();
+            repair_agent_daemon_runtime_files_if_missing(
+                &key,
+                &socket_path,
+                &meta_path,
+                &mut listener,
+                &mut agent,
+                attached_client_pid,
+                attached_client_instance_id.as_deref(),
+            );
+        }
+
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -9031,8 +9258,20 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             "deleted": pty_log_deleted,
         }),
     );
-    let _ = fs::remove_file(socket_path);
-    let _ = fs::remove_file(meta_path);
+    let _ = remove_agent_runtime_file_logged(
+        "daemon_child_exit_cleanup",
+        Some(&key),
+        None,
+        "socket",
+        &socket_path,
+    );
+    let _ = remove_agent_runtime_file_logged(
+        "daemon_child_exit_cleanup",
+        Some(&key),
+        None,
+        "meta",
+        &meta_path,
+    );
     Ok(())
 }
 
@@ -9096,7 +9335,8 @@ fn write_agent_meta(
         agent.last_screen_change_epoch_ms,
         agent.last_output_epoch_ms,
         agent.last_input_epoch_ms,
-        agent_activity_from_timestamps(
+        agent_activity_from_info(
+            &agent.info,
             now_ms,
             agent.last_screen_change_epoch_ms,
             agent.last_output_epoch_ms,
@@ -9210,6 +9450,176 @@ fn write_agent_meta_parts(
     Ok(())
 }
 
+fn remove_agent_runtime_file_logged(
+    reason: &str,
+    key: Option<&AgentKey>,
+    stem: Option<&str>,
+    path_kind: &str,
+    path: &Path,
+) -> bool {
+    let existed_before = path.exists();
+    match fs::remove_file(path) {
+        Ok(()) => {
+            debug_log(
+                "agent_runtime_file_remove",
+                serde_json::json!({
+                    "reason": reason,
+                    "key": key.map(agent_key_debug_value),
+                    "stem": stem,
+                    "path_kind": path_kind,
+                    "path": path.display().to_string(),
+                    "existed_before": existed_before,
+                    "removed": true,
+                    "exists_after": path.exists(),
+                }),
+            );
+            true
+        }
+        Err(e) => {
+            let value = serde_json::json!({
+                "reason": reason,
+                "key": key.map(agent_key_debug_value),
+                "stem": stem,
+                "path_kind": path_kind,
+                "path": path.display().to_string(),
+                "existed_before": existed_before,
+                "removed": false,
+                "exists_after": path.exists(),
+                "error_kind": format!("{:?}", e.kind()),
+                "error": e.to_string(),
+            });
+            if e.kind() == ErrorKind::NotFound && !existed_before {
+                trace_log("agent_runtime_file_remove", value);
+            } else {
+                debug_log("agent_runtime_file_remove", value);
+            }
+            false
+        }
+    }
+}
+
+fn repair_agent_daemon_runtime_files_if_missing(
+    key: &AgentKey,
+    socket_path: &Path,
+    meta_path: &Path,
+    listener: &mut AgentListener,
+    agent: &mut AgentSession,
+    attached_client_pid: Option<u32>,
+    attached_client_instance_id: Option<&str>,
+) {
+    let meta_exists = meta_path.exists();
+    let socket_exists = socket_path.exists();
+    if meta_exists && socket_exists {
+        return;
+    }
+
+    debug_log(
+        "daemon_runtime_files_missing",
+        serde_json::json!({
+            "key": agent_key_debug_value(key),
+            "daemon_pid": std::process::id(),
+            "child_pid": agent.child.process_id(),
+            "meta_path": meta_path.display().to_string(),
+            "socket_path": socket_path.display().to_string(),
+            "meta_exists": meta_exists,
+            "socket_exists": socket_exists,
+            "attached_client_pid": attached_client_pid,
+            "attached_client_instance_id": attached_client_instance_id,
+        }),
+    );
+
+    if !socket_exists {
+        match bind_agent_listener(key, socket_path) {
+            Ok(next_listener) => match next_listener.set_nonblocking(true) {
+                Ok(()) => {
+                    *listener = next_listener;
+                    debug_log(
+                        "daemon_socket_path_repaired",
+                        serde_json::json!({
+                            "key": agent_key_debug_value(key),
+                            "daemon_pid": std::process::id(),
+                            "socket_path": socket_path.display().to_string(),
+                            "socket_exists_after": socket_path.exists(),
+                        }),
+                    );
+                }
+                Err(e) => {
+                    debug_log(
+                        "daemon_socket_path_repair_failed",
+                        serde_json::json!({
+                            "key": agent_key_debug_value(key),
+                            "daemon_pid": std::process::id(),
+                            "socket_path": socket_path.display().to_string(),
+                            "phase": "set_nonblocking",
+                            "error_kind": format!("{:?}", e.kind()),
+                            "error": e.to_string(),
+                        }),
+                    );
+                    let _ = remove_agent_runtime_file_logged(
+                        "daemon_socket_repair_set_nonblocking_failed",
+                        Some(key),
+                        None,
+                        "socket",
+                        socket_path,
+                    );
+                }
+            },
+            Err(e) => {
+                debug_log(
+                    "daemon_socket_path_repair_failed",
+                    serde_json::json!({
+                        "key": agent_key_debug_value(key),
+                        "daemon_pid": std::process::id(),
+                        "socket_path": socket_path.display().to_string(),
+                        "phase": "bind",
+                        "error_kind": format!("{:?}", e.kind()),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    match write_agent_meta(
+        meta_path,
+        agent,
+        attached_client_pid.is_some(),
+        attached_client_pid,
+        attached_client_instance_id,
+    ) {
+        Ok(()) => {
+            debug_log(
+                "daemon_meta_path_repaired",
+                serde_json::json!({
+                    "key": agent_key_debug_value(key),
+                    "daemon_pid": std::process::id(),
+                    "child_pid": agent.child.process_id(),
+                    "meta_path": meta_path.display().to_string(),
+                    "meta_existed_before": meta_exists,
+                    "socket_existed_before": socket_exists,
+                    "meta_exists_after": meta_path.exists(),
+                    "socket_exists_after": socket_path.exists(),
+                }),
+            );
+        }
+        Err(e) => {
+            debug_log(
+                "daemon_meta_path_repair_failed",
+                serde_json::json!({
+                    "key": agent_key_debug_value(key),
+                    "daemon_pid": std::process::id(),
+                    "child_pid": agent.child.process_id(),
+                    "meta_path": meta_path.display().to_string(),
+                    "meta_existed_before": meta_exists,
+                    "socket_existed_before": socket_exists,
+                    "error_kind": format!("{:?}", e.kind()),
+                    "error": e.to_string(),
+                }),
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct AgentMetaSnapshot {
     #[serde(default)]
@@ -9233,6 +9643,8 @@ struct AgentMetaSnapshot {
     last_output_epoch_ms: u64,
     #[serde(default)]
     last_input_epoch_ms: u64,
+    #[serde(default)]
+    updated_at_epoch_s: u64,
 }
 
 fn read_agent_meta_snapshot_at(meta_path: &Path) -> Option<AgentMetaSnapshot> {
@@ -9291,12 +9703,7 @@ impl AgentMetaSnapshot {
         current_client_instance_id: Option<&str>,
         now_epoch_ms: u64,
     ) -> AgentListState {
-        let activity = agent_activity_from_timestamps(
-            now_epoch_ms,
-            self.last_screen_change_epoch_ms,
-            self.last_output_epoch_ms,
-            self.last_input_epoch_ms,
-        );
+        let activity = agent_activity_from_meta(self, now_epoch_ms);
         if self.attached {
             let Some(attached_client_pid) = self.attached_client_pid else {
                 return AgentListState::Live { activity };
@@ -9390,6 +9797,123 @@ fn read_agent_runtime_state(key: &AgentKey, current_pid: u32) -> AgentListState 
     state
 }
 
+fn agent_runtime_probe_debug_value(key: &AgentKey, current_pid: u32) -> serde_json::Value {
+    let meta_path = match agent_meta_path(key) {
+        Ok(path) => path,
+        Err(e) => {
+            return serde_json::json!({
+                "status": "meta_path_failed",
+                "key": agent_key_debug_value(key),
+                "current_pid": current_pid,
+                "error": e.to_string(),
+            });
+        }
+    };
+    let socket_path = match agent_socket_path(key) {
+        Ok(path) => path,
+        Err(e) => {
+            return serde_json::json!({
+                "status": "socket_path_failed",
+                "key": agent_key_debug_value(key),
+                "current_pid": current_pid,
+                "meta_path": meta_path.display().to_string(),
+                "meta_exists": meta_path.exists(),
+                "error": e.to_string(),
+            });
+        }
+    };
+    let meta_exists = meta_path.exists();
+    let socket_exists = socket_path.exists();
+    let content = match fs::read_to_string(&meta_path) {
+        Ok(content) => content,
+        Err(e) => {
+            return serde_json::json!({
+                "status": "meta_read_failed",
+                "key": agent_key_debug_value(key),
+                "current_pid": current_pid,
+                "meta_path": meta_path.display().to_string(),
+                "socket_path": socket_path.display().to_string(),
+                "meta_exists": meta_exists,
+                "socket_exists": socket_exists,
+                "error_kind": format!("{:?}", e.kind()),
+                "error": e.to_string(),
+            });
+        }
+    };
+    let meta_json = serde_json::from_str::<serde_json::Value>(&content).ok();
+    let meta = match serde_json::from_str::<AgentMetaSnapshot>(&content) {
+        Ok(meta) => meta,
+        Err(e) => {
+            return serde_json::json!({
+                "status": "meta_parse_failed",
+                "key": agent_key_debug_value(key),
+                "current_pid": current_pid,
+                "meta_path": meta_path.display().to_string(),
+                "socket_path": socket_path.display().to_string(),
+                "meta_exists": meta_exists,
+                "socket_exists": socket_exists,
+                "content_len": content.len(),
+                "content_sample": truncate_width(&content, 512),
+                "error": e.to_string(),
+            });
+        }
+    };
+
+    let meta_key = agent_key_from_meta(&meta);
+    let daemon_alive = process_is_alive(meta.pid);
+    let daemon_identity =
+        daemon_alive.then(|| format!("{:?}", agent_daemon_process_identity(meta.pid, key)));
+    let attached_client_alive = meta.attached_client_pid.map(process_is_alive);
+    let attached_client_identity = meta
+        .attached_client_pid
+        .filter(|_| attached_client_alive == Some(true))
+        .map(|pid| format!("{:?}", agent_client_process_identity(pid)));
+    let state = meta.list_state_with_client_identity(
+        current_pid,
+        Some(agent_client_instance_id()),
+        current_epoch_ms(),
+    );
+    let updated_age_s = (meta.updated_at_epoch_s > 0)
+        .then(|| current_epoch_s().saturating_sub(meta.updated_at_epoch_s));
+
+    serde_json::json!({
+        "status": "meta_ok",
+        "key": agent_key_debug_value(key),
+        "current_pid": current_pid,
+        "meta_path": meta_path.display().to_string(),
+        "socket_path": socket_path.display().to_string(),
+        "meta_exists": meta_exists,
+        "socket_exists": socket_exists,
+        "content_len": content.len(),
+        "meta_key": meta_key.as_ref().map(agent_key_debug_value),
+        "meta_key_matches_expected": meta_key.as_ref() == Some(key),
+        "daemon_pid": meta.pid,
+        "daemon_alive": daemon_alive,
+        "daemon_identity": daemon_identity,
+        "child_pid": meta.child_pid,
+        "child_alive": meta.child_pid.map(process_is_alive),
+        "provider": meta.provider.as_deref(),
+        "session_id": meta.session_id.as_deref(),
+        "cwd": meta.cwd.as_deref(),
+        "source": meta.source.as_deref(),
+        "phase": meta_json.as_ref().and_then(|value| value.get("phase")).and_then(serde_json::Value::as_str),
+        "activity": meta_json.as_ref().and_then(|value| value.get("activity")).and_then(serde_json::Value::as_str),
+        "launch_mode": meta_json.as_ref().and_then(|value| value.get("launch_mode")).and_then(serde_json::Value::as_str),
+        "command": meta_json.as_ref().and_then(|value| value.get("command")).and_then(serde_json::Value::as_str).map(|command| truncate_width(command, 512)),
+        "attached": meta.attached,
+        "attached_client_pid": meta.attached_client_pid,
+        "attached_client_alive": attached_client_alive,
+        "attached_client_identity": attached_client_identity,
+        "attached_client_instance_id": meta.attached_client_instance_id.as_deref(),
+        "last_screen_change_epoch_ms": meta.last_screen_change_epoch_ms,
+        "last_output_epoch_ms": meta.last_output_epoch_ms,
+        "last_input_epoch_ms": meta.last_input_epoch_ms,
+        "updated_at_epoch_s": meta.updated_at_epoch_s,
+        "updated_age_s": updated_age_s,
+        "computed_state": agent_list_state_debug_value(state),
+    })
+}
+
 #[cfg(test)]
 fn read_agent_runtime_state_at(
     meta_path: &Path,
@@ -9453,8 +9977,20 @@ fn read_agent_runtime_state_at_for_key(
             .and_then(serde_json::Value::as_u64);
         let stale_age_s =
             meta_updated_at_epoch_s.map(|updated_at| current_epoch_s().saturating_sub(updated_at));
-        let meta_removed = fs::remove_file(meta_path).is_ok();
-        let socket_removed = fs::remove_file(socket_path).is_ok();
+        let meta_removed = remove_agent_runtime_file_logged(
+            "agent_runtime_stale_cleanup",
+            expected_key,
+            None,
+            "meta",
+            meta_path,
+        );
+        let socket_removed = remove_agent_runtime_file_logged(
+            "agent_runtime_stale_cleanup",
+            expected_key,
+            None,
+            "socket",
+            socket_path,
+        );
         if debug_enabled {
             debug_log(
                 "agent_meta_stale_removed",
@@ -9492,8 +10028,20 @@ fn read_agent_runtime_state_at_for_key(
         let identity_mismatch = meta_key.as_ref() != Some(expected_key)
             || daemon_identity == AgentDaemonProcessIdentity::Other;
         if identity_mismatch {
-            let meta_removed = fs::remove_file(meta_path).is_ok();
-            let socket_removed = fs::remove_file(socket_path).is_ok();
+            let meta_removed = remove_agent_runtime_file_logged(
+                "agent_runtime_identity_mismatch_cleanup",
+                Some(expected_key),
+                None,
+                "meta",
+                meta_path,
+            );
+            let socket_removed = remove_agent_runtime_file_logged(
+                "agent_runtime_identity_mismatch_cleanup",
+                Some(expected_key),
+                None,
+                "socket",
+                socket_path,
+            );
             if debug_enabled {
                 debug_log(
                     "agent_meta_identity_mismatch_removed",
@@ -10293,6 +10841,36 @@ fn agent_activity_from_timestamps(
     }
 }
 
+fn agent_activity_from_info(
+    info: &SessionInfo,
+    now_epoch_ms: u64,
+    last_screen_change_epoch_ms: u64,
+    last_output_epoch_ms: u64,
+    last_input_epoch_ms: u64,
+) -> AgentActivity {
+    if is_cokacdir_session_info(info) {
+        return agent_activity_from_timestamps(now_epoch_ms, 0, 0, last_input_epoch_ms);
+    }
+    agent_activity_from_timestamps(
+        now_epoch_ms,
+        last_screen_change_epoch_ms,
+        last_output_epoch_ms,
+        last_input_epoch_ms,
+    )
+}
+
+fn agent_activity_from_meta(meta: &AgentMetaSnapshot, now_epoch_ms: u64) -> AgentActivity {
+    if meta.source.as_deref() == Some(COKACDIR_SESSION_SOURCE_MARKER) {
+        return agent_activity_from_timestamps(now_epoch_ms, 0, 0, meta.last_input_epoch_ms);
+    }
+    agent_activity_from_timestamps(
+        now_epoch_ms,
+        meta.last_screen_change_epoch_ms,
+        meta.last_output_epoch_ms,
+        meta.last_input_epoch_ms,
+    )
+}
+
 fn debug_command_argv(command: &CommandBuilder) -> Vec<String> {
     command
         .get_argv()
@@ -11013,12 +11591,18 @@ fn agent_daemon_requests_are_input_only(requests: &[AgentDaemonRequest]) -> bool
 }
 
 #[cfg(unix)]
-fn bind_agent_listener(_key: &AgentKey, socket_path: &Path) -> io::Result<AgentListener> {
+fn bind_agent_listener(key: &AgentKey, socket_path: &Path) -> io::Result<AgentListener> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
     }
     if socket_path.exists() {
-        let _ = fs::remove_file(socket_path);
+        let _ = remove_agent_runtime_file_logged(
+            "daemon_bind_replace_existing_socket",
+            Some(key),
+            None,
+            "socket",
+            socket_path,
+        );
     }
     let listener = AgentListener::bind(socket_path)?;
     debug_log(
@@ -11031,12 +11615,18 @@ fn bind_agent_listener(_key: &AgentKey, socket_path: &Path) -> io::Result<AgentL
 }
 
 #[cfg(windows)]
-fn bind_agent_listener(_key: &AgentKey, socket_path: &Path) -> io::Result<AgentListener> {
+fn bind_agent_listener(key: &AgentKey, socket_path: &Path) -> io::Result<AgentListener> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
     }
     if socket_path.exists() {
-        let _ = fs::remove_file(socket_path);
+        let _ = remove_agent_runtime_file_logged(
+            "daemon_bind_replace_existing_marker",
+            Some(key),
+            None,
+            "socket",
+            socket_path,
+        );
     }
     let listener = AgentListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
@@ -11266,6 +11856,13 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
                 "daemon_pid": meta.pid,
             }),
         );
+        if is_plain_pty_tool_session_info(info) {
+            return Err(anyhow::anyhow!(
+                "live {} is already running as pid {}, but its socket is unreachable; refusing to replace a background process",
+                live_agent_status_label(info),
+                meta.pid
+            ));
+        }
         return Err(anyhow::anyhow!(
             "live {} agent {} is already running as pid {}, but its socket is unreachable; refusing to replace a background process",
             key.provider.as_str(),
@@ -11276,11 +11873,23 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
     validate_session_launch_cwd(info)?;
     let meta_path = agent_meta_path(&key)?;
     if meta_path.exists() {
-        let _ = fs::remove_file(&meta_path);
+        let _ = remove_agent_runtime_file_logged(
+            "daemon_start_cleanup_before_spawn",
+            Some(&key),
+            None,
+            "meta",
+            &meta_path,
+        );
     }
     let socket_path = agent_socket_path(&key)?;
     if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path);
+        let _ = remove_agent_runtime_file_logged(
+            "daemon_start_cleanup_before_spawn",
+            Some(&key),
+            None,
+            "socket",
+            &socket_path,
+        );
     }
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
@@ -11485,14 +12094,19 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
         }
         if !process_is_alive(meta.pid) {
             report.stale = report.stale.saturating_add(1);
-            if remove_agent_runtime_files_by_stem(runtime_dir, stem) {
+            if remove_agent_runtime_files_by_stem(runtime_dir, stem, "killall_stale_daemon_cleanup")
+            {
                 report.pty_logs_deleted = report.pty_logs_deleted.saturating_add(1);
             }
             continue;
         }
         let Some(key) = agent_key_from_meta(&meta) else {
             report.stale = report.stale.saturating_add(1);
-            let _ = remove_agent_runtime_files_by_stem(runtime_dir, stem);
+            let _ = remove_agent_runtime_files_by_stem(
+                runtime_dir,
+                stem,
+                "killall_missing_key_cleanup",
+            );
             debug_log(
                 "killall_agent_unverified",
                 serde_json::json!({
@@ -11505,7 +12119,11 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
         };
         if agent_file_stem(&key) != stem || !verify_agent_daemon_identity(&key, meta.pid) {
             report.stale = report.stale.saturating_add(1);
-            let _ = remove_agent_runtime_files_by_stem(runtime_dir, stem);
+            let _ = remove_agent_runtime_files_by_stem(
+                runtime_dir,
+                stem,
+                "killall_identity_failed_cleanup",
+            );
             debug_log(
                 "killall_agent_unverified",
                 serde_json::json!({
@@ -11533,7 +12151,7 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             continue;
         }
         report.killed = report.killed.saturating_add(1);
-        if remove_agent_runtime_files_by_stem(runtime_dir, stem) {
+        if remove_agent_runtime_files_by_stem(runtime_dir, stem, "killall_killed_cleanup") {
             report.pty_logs_deleted = report.pty_logs_deleted.saturating_add(1);
         }
         debug_log(
@@ -11550,16 +12168,37 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
     report
 }
 
-fn remove_agent_runtime_files_by_stem(runtime_dir: &Path, stem: &str) -> bool {
-    let _ = fs::remove_file(runtime_dir.join(format!("{}.json", stem)));
-    let _ = fs::remove_file(runtime_dir.join(format!("{}.sock", stem)));
-    let _ = fs::remove_file(runtime_dir.join(format!("{}.tcp", stem)));
-    fs::remove_file(
-        runtime_dir
+fn remove_agent_runtime_files_by_stem(runtime_dir: &Path, stem: &str, reason: &str) -> bool {
+    let _ = remove_agent_runtime_file_logged(
+        reason,
+        None,
+        Some(stem),
+        "meta",
+        &runtime_dir.join(format!("{}.json", stem)),
+    );
+    let _ = remove_agent_runtime_file_logged(
+        reason,
+        None,
+        Some(stem),
+        "socket",
+        &runtime_dir.join(format!("{}.sock", stem)),
+    );
+    let _ = remove_agent_runtime_file_logged(
+        reason,
+        None,
+        Some(stem),
+        "tcp_marker",
+        &runtime_dir.join(format!("{}.tcp", stem)),
+    );
+    remove_agent_runtime_file_logged(
+        reason,
+        None,
+        Some(stem),
+        "pty_log",
+        &runtime_dir
             .join("scrollback")
             .join(format!("{}.ptylog", stem)),
     )
-    .is_ok()
 }
 
 fn terminate_agent_daemon(key: &AgentKey) -> Result<AgentTermination> {
@@ -11596,8 +12235,20 @@ fn terminate_agent_daemon(key: &AgentKey) -> Result<AgentTermination> {
             );
         }
     }
-    let _ = fs::remove_file(&meta_path);
-    let _ = fs::remove_file(&socket_path);
+    let _ = remove_agent_runtime_file_logged(
+        "terminate_agent_cleanup",
+        Some(key),
+        None,
+        "meta",
+        &meta_path,
+    );
+    let _ = remove_agent_runtime_file_logged(
+        "terminate_agent_cleanup",
+        Some(key),
+        None,
+        "socket",
+        &socket_path,
+    );
     let pty_log_deleted = remove_agent_pty_log(key);
     Ok(AgentTermination {
         pid: terminated_pid,
@@ -11935,9 +12586,31 @@ fn program_looks_like_current_app(program: &str) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(program);
+    if app_file_name_looks_like_cokacmux(name) {
+        return true;
+    }
     current_app_file_name()
         .as_deref()
         .is_some_and(|current| current_app_file_name_matches(name, current))
+}
+
+fn app_file_name_looks_like_cokacmux(name: &str) -> bool {
+    let name = normalized_app_file_name_for_identity(name);
+    name == "cokacmux" || name.starts_with("cokacmux-")
+}
+
+#[cfg(windows)]
+fn normalized_app_file_name_for_identity(name: &str) -> String {
+    let normalized = name.to_ascii_lowercase();
+    normalized
+        .strip_suffix(".exe")
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
+#[cfg(not(windows))]
+fn normalized_app_file_name_for_identity(name: &str) -> String {
+    name.strip_suffix(".exe").unwrap_or(name).to_string()
 }
 
 #[cfg(windows)]
@@ -12116,13 +12789,12 @@ fn agent_runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Scan `~/.cokacmux/agents/` for live daemons that are not in the provider
-/// session list: shell panes and fresh coding-agent panes. They are marked by
-/// a synthetic `source` value in the meta JSON, so the agents sidebar can list
-/// and switch to them alongside stored provider sessions.
+/// Scan `~/.cokacmux/agents/` for daemon metadata. Synthetic panes are not in
+/// the provider session list, and provider-backed daemons are returned as a
+/// runtime fallback so the sidebar is not solely dependent on history discovery.
 fn discover_live_shell_infos() -> Vec<SessionInfo> {
     let Ok(dir) = agent_runtime_dir() else {
-        trace_log(
+        debug_log(
             "live_shell_discover_failed",
             serde_json::json!({
                 "reason": "runtime_dir",
@@ -12130,8 +12802,12 @@ fn discover_live_shell_infos() -> Vec<SessionInfo> {
         );
         return Vec::new();
     };
-    let Ok(read_dir) = fs::read_dir(&dir) else {
-        trace_log(
+    discover_live_shell_infos_at(&dir)
+}
+
+fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        debug_log(
             "live_shell_discover_failed",
             serde_json::json!({
                 "reason": "read_dir",
@@ -12155,7 +12831,7 @@ fn discover_live_shell_infos() -> Vec<SessionInfo> {
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) => {
-                trace_log(
+                debug_log(
                     "live_shell_discover_skip",
                     serde_json::json!({
                         "reason": "meta_read_failed",
@@ -12169,7 +12845,7 @@ fn discover_live_shell_infos() -> Vec<SessionInfo> {
         let meta = match serde_json::from_str::<AgentMetaSnapshot>(&content) {
             Ok(meta) => meta,
             Err(e) => {
-                trace_log(
+                debug_log(
                     "live_shell_discover_skip",
                     serde_json::json!({
                         "reason": "meta_parse_failed",
@@ -12181,35 +12857,9 @@ fn discover_live_shell_infos() -> Vec<SessionInfo> {
                 continue;
             }
         };
-        let Some(source) = meta.source.as_deref() else {
-            trace_log(
-                "live_shell_discover_skip",
-                serde_json::json!({
-                    "reason": "missing_source",
-                    "path": path.display().to_string(),
-                    "daemon_pid": meta.pid,
-                    "provider": meta.provider.as_deref(),
-                    "session_id": meta.session_id.as_deref(),
-                }),
-            );
-            continue;
-        };
-        if source != SHELL_SESSION_SOURCE_MARKER && source != NEW_AGENT_SESSION_SOURCE_MARKER {
-            trace_log(
-                "live_shell_discover_skip",
-                serde_json::json!({
-                    "reason": "non_synthetic_source",
-                    "path": path.display().to_string(),
-                    "source": source,
-                    "daemon_pid": meta.pid,
-                    "provider": meta.provider.as_deref(),
-                    "session_id": meta.session_id.as_deref(),
-                }),
-            );
-            continue;
-        }
+        let source = meta.source.as_deref().unwrap_or("");
         let Some(provider) = meta.provider.as_deref().and_then(Provider::parse) else {
-            trace_log(
+            debug_log(
                 "live_shell_discover_skip",
                 serde_json::json!({
                     "reason": "invalid_provider",
@@ -12223,7 +12873,7 @@ fn discover_live_shell_infos() -> Vec<SessionInfo> {
             continue;
         };
         let Some(session_id) = meta.session_id.clone() else {
-            trace_log(
+            debug_log(
                 "live_shell_discover_skip",
                 serde_json::json!({
                     "reason": "missing_session_id",
@@ -12236,26 +12886,31 @@ fn discover_live_shell_infos() -> Vec<SessionInfo> {
             continue;
         };
         let cwd = meta.cwd.clone().unwrap_or_default();
-        let title = if source == SHELL_SESSION_SOURCE_MARKER {
-            shell_pane_title(&cwd)
-        } else {
-            new_agent_pane_title(provider, &cwd)
+        let title = match source {
+            SHELL_SESSION_SOURCE_MARKER => shell_pane_title(&cwd),
+            COKACDIR_SESSION_SOURCE_MARKER => cokacdir_pane_title(&cwd),
+            NEW_AGENT_SESSION_SOURCE_MARKER => new_agent_pane_title(provider, &cwd),
+            _ => String::new(),
         };
         let debug_session_id = session_id.clone();
         let debug_cwd = cwd.clone();
+        let is_synthetic = source == SHELL_SESSION_SOURCE_MARKER
+            || source == NEW_AGENT_SESSION_SOURCE_MARKER
+            || source == COKACDIR_SESSION_SOURCE_MARKER;
         out.push(SessionInfo {
             provider,
             session_id,
             cwd,
             source: PathBuf::from(source),
-            updated_at_epoch_s: 0,
-            title: Some(title),
+            updated_at_epoch_s: meta.updated_at_epoch_s,
+            title: (!title.is_empty()).then_some(title),
         });
         trace_log(
             "live_shell_discover_add",
             serde_json::json!({
                 "path": path.display().to_string(),
                 "source": source,
+                "synthetic": is_synthetic,
                 "daemon_pid": meta.pid,
                 "daemon_alive": process_is_alive(meta.pid),
                 "provider": provider.as_str(),
@@ -12293,8 +12948,17 @@ fn agent_file_stem(key: &AgentKey) -> String {
     )
 }
 
-fn prepare_agent_session(info: &SessionInfo) -> Result<()> {
-    let _ = info;
+fn prepare_agent_session(info: &SessionInfo, settings: &Settings) -> Result<()> {
+    if is_cokacdir_session_info(info) {
+        let program = ensure_cokacdir_program(&settings.cokacmux)?;
+        debug_log(
+            "cokacdir_prepare_ok",
+            serde_json::json!({
+                "session_id": &info.session_id,
+                "program": program.display().to_string(),
+            }),
+        );
+    }
     Ok(())
 }
 
@@ -12557,6 +13221,10 @@ fn is_shell_session_info(info: &SessionInfo) -> bool {
     info.source.as_os_str() == SHELL_SESSION_SOURCE_MARKER
 }
 
+fn is_plain_pty_tool_session_info(info: &SessionInfo) -> bool {
+    is_shell_session_info(info) || is_cokacdir_session_info(info)
+}
+
 fn shell_session_info_for_cwd(cwd: String) -> SessionInfo {
     let title = shell_pane_title(&cwd);
     SessionInfo {
@@ -12580,6 +13248,27 @@ fn is_new_agent_session_info(info: &SessionInfo) -> bool {
     info.source.as_os_str() == NEW_AGENT_SESSION_SOURCE_MARKER
 }
 
+/// Marker for a cokacdir pane launched from the new session dialog. Like shell
+/// panes, it uses the PTY daemon path and does not map to stored provider data.
+const COKACDIR_SESSION_SOURCE_MARKER: &str = "@cokacmux-cokacdir";
+
+fn is_cokacdir_session_info(info: &SessionInfo) -> bool {
+    info.source.as_os_str() == COKACDIR_SESSION_SOURCE_MARKER
+}
+
+fn cokacdir_session_info_for_cwd(cwd: String) -> SessionInfo {
+    SessionInfo {
+        // Provider is arbitrary for synthetic panes; AgentKey uses it as part
+        // of the socket/meta namespace. Keep this aligned with shell panes.
+        provider: Provider::Claude,
+        session_id: format!("cokacdir-{}", uuid::Uuid::now_v7()),
+        cwd: cwd.clone(),
+        source: PathBuf::from(COKACDIR_SESSION_SOURCE_MARKER),
+        updated_at_epoch_s: chrono::Utc::now().timestamp().max(0) as u64,
+        title: Some(cokacdir_pane_title(&cwd)),
+    }
+}
+
 fn new_agent_session_info(provider: Provider, cwd: String) -> SessionInfo {
     SessionInfo {
         provider,
@@ -12601,6 +13290,18 @@ fn new_agent_pane_title(provider: Provider, cwd: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(cwd);
     format!("new {} @ {}", provider.as_str(), basename)
+}
+
+fn cokacdir_pane_title(cwd: &str) -> String {
+    if cwd.is_empty() {
+        return "cokacdir".into();
+    }
+    let basename = Path::new(cwd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(cwd);
+    format!("cokacdir @ {}", basename)
 }
 
 fn session_cwd_eq(left: &str, right: &str) -> bool {
@@ -12784,6 +13485,12 @@ fn live_agent_status_label(info: &SessionInfo) -> String {
         } else {
             format!("shell at {}", truncate_width(&info.cwd, 40))
         }
+    } else if is_cokacdir_session_info(info) {
+        if info.cwd.is_empty() {
+            "cokacdir".into()
+        } else {
+            format!("cokacdir at {}", truncate_width(&info.cwd, 40))
+        }
     } else if is_new_agent_session_info(info) {
         if info.cwd.is_empty() {
             format!("new {} agent", info.provider.as_str())
@@ -12801,6 +13508,10 @@ fn live_agent_status_label(info: &SessionInfo) -> String {
             truncate_width(&info.session_id, 14)
         )
     }
+}
+
+fn should_select_visible_session_for_live_info(info: &SessionInfo) -> bool {
+    !is_plain_pty_tool_session_info(info) && !is_new_agent_session_info(info)
 }
 
 fn shell_launch_spec(info: &SessionInfo) -> AgentLaunchSpec {
@@ -12821,6 +13532,299 @@ fn shell_launch_spec(info: &SessionInfo) -> AgentLaunchSpec {
         args: Vec::new(),
         env: Vec::new(),
         cwd,
+    }
+}
+
+fn cokacdir_launch_spec(info: &SessionInfo, settings: &CokacmuxSettings) -> AgentLaunchSpec {
+    let cwd = if info.cwd.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(&info.cwd))
+    };
+    let args = if info.cwd.is_empty() {
+        Vec::new()
+    } else {
+        vec![info.cwd.clone()]
+    };
+    AgentLaunchSpec {
+        program: cokacdir_program_for_spec(settings),
+        args,
+        env: Vec::new(),
+        cwd,
+    }
+}
+
+fn cokacdir_program_for_spec(settings: &CokacmuxSettings) -> String {
+    if let Some(program) = configured_cokacdir_program(settings) {
+        return program;
+    }
+    resolve_cokacdir_default_program()
+        .or_else(cokacdir_installed_path)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| COKACDIR_PROGRAM_NAME.to_string())
+}
+
+fn ensure_cokacdir_program(settings: &CokacmuxSettings) -> Result<PathBuf> {
+    if let Some(program) = configured_cokacdir_program(settings) {
+        return resolve_cokacdir_program_candidate(&program).ok_or_else(|| {
+            anyhow::anyhow!(
+                "configured cokacdir_program is not runnable or not found: {}",
+                program
+            )
+        });
+    }
+    if let Some(path) = resolve_cokacdir_default_program() {
+        return Ok(path);
+    }
+    download_cokacdir_program()
+}
+
+fn resolve_cokacdir_program(settings: &CokacmuxSettings) -> Option<PathBuf> {
+    if let Some(program) = configured_cokacdir_program(settings) {
+        return resolve_cokacdir_program_candidate(&program);
+    }
+    resolve_cokacdir_default_program()
+}
+
+fn resolve_cokacdir_default_program() -> Option<PathBuf> {
+    resolve_cokacdir_program_candidate(COKACDIR_PROGRAM_NAME)
+        .or_else(cokacdir_installed_existing_path)
+}
+
+fn configured_cokacdir_program(settings: &CokacmuxSettings) -> Option<String> {
+    settings
+        .cokacdir_program
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(expand_configured_program_path)
+}
+
+#[cfg(unix)]
+fn resolve_cokacdir_program_candidate(program: &str) -> Option<PathBuf> {
+    resolve_unix_agent_program(program)
+}
+
+#[cfg(windows)]
+fn resolve_cokacdir_program_candidate(program: &str) -> Option<PathBuf> {
+    resolve_windows_agent_program_with_env(
+        program,
+        std::env::var_os("PATH"),
+        std::env::var_os("PATHEXT"),
+    )
+    .filter(|path| program_path_is_runnable(path))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn resolve_cokacdir_program_candidate(program: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(program);
+    program_path_is_runnable(&path).then_some(path)
+}
+
+fn cokacdir_installed_existing_path() -> Option<PathBuf> {
+    cokacdir_installed_path().and_then(existing_cokacdir_installed_file)
+}
+
+fn existing_cokacdir_installed_file(path: PathBuf) -> Option<PathBuf> {
+    program_path_is_runnable(&path).then_some(path)
+}
+
+fn cokacdir_installed_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join("bin").join(cokacdir_local_filename()))
+}
+
+fn cokacdir_local_filename() -> &'static str {
+    if cfg!(windows) {
+        "cokacdir.exe"
+    } else {
+        "cokacdir"
+    }
+}
+
+#[cfg(unix)]
+fn program_path_is_runnable(path: &Path) -> bool {
+    unix_runnable_file(path)
+}
+
+#[cfg(windows)]
+fn program_path_is_runnable(path: &Path) -> bool {
+    windows_agent_path_is_runnable(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn program_path_is_runnable(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn download_cokacdir_program() -> Result<PathBuf> {
+    let target = cokacdir_installed_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for cokacdir install"))?;
+    let filename = cokacdir_dist_filename()?;
+    let url = format!("{}/{}", COKACDIR_DIST_BASE_URL, filename);
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid cokacdir install path"))?;
+    fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
+
+    let tmp = target.with_file_name(format!(
+        ".{}.download-{}",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(cokacdir_local_filename()),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&tmp);
+
+    if let Err(e) = download_cokacdir_to(&url, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+
+    if target.exists() {
+        fs::remove_file(&target)?;
+    }
+    fs::rename(&tmp, &target)?;
+    #[cfg(unix)]
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+
+    if !target.is_file() {
+        anyhow::bail!("downloaded cokacdir is not a file: {}", target.display());
+    }
+    debug_log(
+        "cokacdir_downloaded",
+        serde_json::json!({
+            "url": url,
+            "target": target.display().to_string(),
+        }),
+    );
+    Ok(target)
+}
+
+fn download_cokacdir_to(url: &str, output_path: &Path) -> Result<()> {
+    let mut errors = Vec::new();
+    match download_file_with_curl(url, output_path) {
+        Ok(()) => return Ok(()),
+        Err(e) => errors.push(e),
+    }
+    match download_file_with_wget(url, output_path) {
+        Ok(()) => return Ok(()),
+        Err(e) => errors.push(e),
+    }
+    #[cfg(windows)]
+    match download_file_with_powershell(url, output_path) {
+        Ok(()) => return Ok(()),
+        Err(e) => errors.push(e),
+    }
+
+    anyhow::bail!(
+        "download cokacdir failed from {}: {}",
+        url,
+        errors
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+fn download_file_with_curl(url: &str, output_path: &Path) -> Result<()> {
+    let _ = fs::remove_file(output_path);
+    let output = Command::new("curl")
+        .arg("-fL")
+        .arg("--retry")
+        .arg("2")
+        .arg("-o")
+        .arg(output_path)
+        .arg(url)
+        .output()
+        .map_err(|e| anyhow::anyhow!("curl unavailable: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", command_output_error("curl", &output))
+    }
+}
+
+fn download_file_with_wget(url: &str, output_path: &Path) -> Result<()> {
+    let _ = fs::remove_file(output_path);
+    let output = Command::new("wget")
+        .arg("-O")
+        .arg(output_path)
+        .arg(url)
+        .output()
+        .map_err(|e| anyhow::anyhow!("wget unavailable: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", command_output_error("wget", &output))
+    }
+}
+
+#[cfg(windows)]
+fn download_file_with_powershell(url: &str, output_path: &Path) -> Result<()> {
+    let _ = fs::remove_file(output_path);
+    let output = Command::new("powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg("$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri $args[0] -OutFile $args[1]")
+        .arg(url)
+        .arg(output_path)
+        .output()
+        .map_err(|e| anyhow::anyhow!("PowerShell download unavailable: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", command_output_error("PowerShell", &output))
+    }
+}
+
+fn command_output_error(tool: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no output".to_string()
+    };
+    format!(
+        "{} exited {}: {}",
+        tool,
+        output.status,
+        truncate_width(&detail, 160)
+    )
+}
+
+fn cokacdir_dist_filename() -> Result<&'static str> {
+    cokacdir_dist_filename_for(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported platform for cokacdir download: {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })
+}
+
+fn cokacdir_dist_filename_for(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Some("cokacdir-linux-x86_64"),
+        ("linux", "aarch64") => Some("cokacdir-linux-aarch64"),
+        ("macos", "x86_64") => Some("cokacdir-macos-x86_64"),
+        ("macos", "aarch64") => Some("cokacdir-macos-aarch64"),
+        ("windows", "x86_64") => Some("cokacdir-windows-x86_64.exe"),
+        ("windows", "aarch64") => Some("cokacdir-windows-aarch64.exe"),
+        _ => None,
     }
 }
 
@@ -13100,6 +14104,9 @@ fn agent_launch_spec_with_settings(
     launch_mode: AgentLaunchMode,
     settings: &Settings,
 ) -> AgentLaunchSpec {
+    if is_cokacdir_session_info(info) {
+        return cokacdir_launch_spec(info, &settings.cokacmux);
+    }
     agent_launch_spec_with_programs(info, launch_mode, &settings.cokacmux.agent_programs)
 }
 
@@ -13110,6 +14117,9 @@ fn agent_launch_spec_with_programs(
 ) -> AgentLaunchSpec {
     if is_shell_session_info(info) {
         return shell_launch_spec(info);
+    }
+    if is_cokacdir_session_info(info) {
+        return cokacdir_launch_spec(info, &CokacmuxSettings::default());
     }
     if is_new_agent_session_info(info) {
         return new_agent_launch_spec_with_programs(info, launch_mode, agent_programs);
@@ -13336,7 +14346,9 @@ fn handle_new_session_key(
     };
 
     if let Some((kind, cwd, provider, launch_mode)) = start_action {
-        if app.start_new_session_from_modal(kind, cwd, provider, launch_mode, cols, rows) {
+        if app.start_new_session_from_modal(kind, cwd, provider, launch_mode, cols, rows)
+            && matches!(&app.input_mode, InputMode::NewSession { .. })
+        {
             app.input_mode = InputMode::Normal;
         }
     }
@@ -13362,6 +14374,9 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         } else {
             debug_log_agent_key(key, "quit_blocked");
         }
+        return;
+    }
+    if handle_notice_key(app, key) {
         return;
     }
     if matches!(app.input_mode, InputMode::NewSession { .. }) {
@@ -13463,6 +14478,23 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
     }
     let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
     app.send_key_to_active_agent(key);
+}
+
+fn handle_notice_key(app: &mut App, key: KeyEvent) -> bool {
+    if !matches!(app.input_mode, InputMode::Notice { .. }) {
+        return false;
+    }
+    if notice_dismiss_key(key) {
+        app.input_mode = InputMode::Normal;
+        debug_log_key_event(key, "notice_dismiss");
+    } else {
+        debug_log_key_event(key, "notice_ignored");
+    }
+    true
+}
+
+fn notice_dismiss_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Enter | KeyCode::Esc)
 }
 
 #[cfg(test)]
@@ -13807,6 +14839,7 @@ fn input_mode_label(mode: &InputMode) -> &'static str {
         InputMode::CloneOptions { .. } => "clone_options",
         InputMode::NewSession { .. } => "new_session",
         InputMode::TitleEdit { .. } => "title_edit",
+        InputMode::Notice { .. } => "notice",
     }
 }
 
@@ -14223,14 +15256,18 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         String::new()
     };
     let agent_help = agent_help_text(&app.keybindings);
+    let agent_status_subject = if is_plain_pty_tool_session_info(&agent.info) {
+        live_agent_status_label(&agent.info)
+    } else {
+        format!(
+            "{} {}",
+            agent.info.provider.as_str(),
+            truncate_width(&agent.info.session_id, 18)
+        )
+    };
     let status = format!(
-        " {} {}{}{} · {} · {}",
-        agent.info.provider.as_str(),
-        truncate_width(&agent.info.session_id, 18),
-        status_hint,
-        scrollback_hint,
-        agent_help,
-        &agent.command_line
+        " {}{}{} · {} · {}",
+        agent_status_subject, status_hint, scrollback_hint, agent_help, &agent.command_line
     );
     buf.set_stringn(
         status_area.x,
@@ -14240,7 +15277,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         theme_status_style(),
     );
 
-    app.refresh_agent_runtime_states();
+    app.poll_agent_runtime_states();
     if let (Some(sidebar_area), Some(active_key)) = (sidebar_area, active_key.as_ref()) {
         let candidates = app.live_agent_switch_candidates();
         f.render_widget(Clear, sidebar_area);
@@ -14343,7 +15380,7 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
             *provider,
             provider_options,
             *launch_mode,
-            &app.settings.cokacmux.agent_programs,
+            &app.settings.cokacmux,
             &app.keybindings,
         );
     } else if let InputMode::TitleEdit {
@@ -14353,10 +15390,39 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
     } = &app.input_mode
     {
         draw_title_edit_modal(f, area, source, draft, *cursor, &app.keybindings);
+    } else if let InputMode::Notice { title, message } = &app.input_mode {
+        draw_notice_modal(f, area, title, message);
     } else {
         return false;
     }
     true
+}
+
+fn draw_notice_modal(f: &mut ratatui::Frame, area: Rect, title: &str, message: &str) {
+    let lines = vec![
+        Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter / Esc close",
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ];
+    let modal_area = modal_area_for_wrapped_lines(area, title, &lines, 40, 92, 5, 12);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title(title.to_string());
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, modal_area);
+    f.render_widget(p, modal_area);
 }
 
 fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPending) {
@@ -14695,16 +15761,20 @@ fn draw_agent_sidebar(
             } else {
                 app.agent_state_for(info)
             };
-            // Shells: the agent-provider tag is meaningless (we picked one
-            // arbitrarily to namespace the daemon socket). What matters is
-            // the cwd the shell is operating in — render that as the label.
-            let (badge_span, label) = if is_shell_session_info(info) {
+            // Direct PTY tools use an arbitrary provider only for daemon
+            // namespacing; render their actual tool kind instead.
+            let (badge_span, label) = if is_plain_pty_tool_session_info(info) {
                 let cwd_label = if info.cwd.is_empty() {
                     "(no cwd)".to_string()
                 } else {
                     truncate_width(&info.cwd, id_width)
                 };
-                (shell_badge_span(), cwd_label)
+                let badge = if is_cokacdir_session_info(info) {
+                    cokacdir_badge_span()
+                } else {
+                    shell_badge_span()
+                };
+                (badge, cwd_label)
             } else {
                 let title = info.title.as_deref().unwrap_or("");
                 let label = if title.is_empty() {
@@ -14873,6 +15943,9 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         } else {
             debug_log_session_key(app, key, "global_quit_blocked");
         }
+        return;
+    }
+    if handle_notice_key(app, key) {
         return;
     }
 
@@ -16343,19 +17416,13 @@ fn draw_new_session_modal(
     provider: Provider,
     provider_options: &[Provider],
     launch_mode: AgentLaunchMode,
-    agent_programs: &AgentProgramSettings,
+    settings: &CokacmuxSettings,
     keybindings: &KeyBindings,
 ) {
     let selected = clamp_new_session_field(selected, kind);
     let help = new_session_help_text(keybindings);
-    let preview_command = new_session_preview_command(
-        kind,
-        cwd,
-        provider,
-        provider_options,
-        launch_mode,
-        agent_programs,
-    );
+    let preview_command =
+        new_session_preview_command(kind, cwd, provider, provider_options, launch_mode, settings);
     let desired_width = UnicodeWidthStr::width("Choose what to start")
         .max(UnicodeWidthStr::width(cwd).saturating_add(20))
         .max(UnicodeWidthStr::width(kind.label()).saturating_add(20))
@@ -16491,7 +17558,7 @@ fn new_session_preview_command(
     provider: Provider,
     provider_options: &[Provider],
     launch_mode: AgentLaunchMode,
-    agent_programs: &AgentProgramSettings,
+    settings: &CokacmuxSettings,
 ) -> String {
     match kind {
         NewSessionKind::Terminal => {
@@ -16504,6 +17571,17 @@ fn new_session_preview_command(
                 title: None,
             };
             shell_launch_spec(&info).command_line()
+        }
+        NewSessionKind::CokacDir => {
+            let info = SessionInfo {
+                provider: Provider::Claude,
+                session_id: "preview".into(),
+                cwd: cwd.to_string(),
+                source: PathBuf::from(COKACDIR_SESSION_SOURCE_MARKER),
+                updated_at_epoch_s: 0,
+                title: None,
+            };
+            cokacdir_launch_spec(&info, settings).command_line()
         }
         NewSessionKind::CodingAgent => {
             if provider_options.is_empty() {
@@ -16520,7 +17598,8 @@ fn new_session_preview_command(
                 updated_at_epoch_s: 0,
                 title: None,
             };
-            new_agent_launch_spec_with_programs(&info, launch_mode, agent_programs).command_line()
+            new_agent_launch_spec_with_programs(&info, launch_mode, &settings.agent_programs)
+                .command_line()
         }
     }
 }
@@ -17448,6 +18527,15 @@ fn shell_badge_span() -> Span<'static> {
         "terminal",
         Style::default()
             .fg(THEME_FG_DIM)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn cokacdir_badge_span() -> Span<'static> {
+    Span::styled(
+        "cokacdir",
+        Style::default()
+            .fg(THEME_ACCENT)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -18888,11 +19976,94 @@ mod tests {
                         Provider::Codex,
                         &[Provider::Codex],
                         AgentLaunchMode::SkipPermissions,
-                        &agent_programs,
+                        &CokacmuxSettings::default(),
                         &keybindings,
                     );
                 })
                 .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_notice_modal(
+                        f,
+                        f.area(),
+                        "cokacdir failed",
+                        "configured cokacdir_program is not runnable or not found: /missing/cokacdir",
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn notice_dialog_dismisses_on_enter_and_esc() {
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            let mut app = app_for_key_tests();
+            app.input_mode = InputMode::Notice {
+                title: "cokacdir failed".to_string(),
+                message: "boom".to_string(),
+            };
+
+            handle_key(&mut app, key, 80, 50, 20);
+
+            assert!(matches!(app.input_mode, InputMode::Normal));
+        }
+    }
+
+    #[test]
+    fn notice_dialog_keeps_focus_for_other_keys() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::Notice {
+            title: "cokacdir failed".to_string(),
+            message: "boom".to_string(),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            80,
+            50,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Notice { .. }));
+    }
+
+    #[test]
+    fn cokacdir_start_failure_keeps_notice_dialog_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().display().to_string();
+        let missing_program = dir.path().join(cokacdir_local_filename());
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.cokacdir_program = Some(missing_program.display().to_string());
+        app.input_mode = InputMode::NewSession {
+            selected: NEW_SESSION_FIELD_KIND,
+            kind: NewSessionKind::CokacDir,
+            cwd: cwd.clone(),
+            cwd_cursor: cwd.len(),
+            provider: Provider::Codex,
+            provider_options: vec![Provider::Codex],
+            launch_mode: AgentLaunchMode::Normal,
+        };
+
+        let keybindings = app.keybindings.clone();
+        handle_new_session_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            80,
+            24,
+            &keybindings,
+        );
+
+        match &app.input_mode {
+            InputMode::Notice { title, message } => {
+                assert_eq!(title, "cokacdir failed");
+                assert!(message.contains("configured cokacdir_program"));
+                assert!(message.contains(&missing_program.display().to_string()));
+            }
+            other => panic!("expected notice dialog, got {other:?}"),
         }
     }
 
@@ -20087,6 +21258,7 @@ mod tests {
                   "claude": "/opt/claude/bin/claude",
                   "future_agent": "/opt/future/bin/agent"
                 },
+                "cokacdir_program": "/opt/cokacdir/bin/cokacdir",
                 "debug": true,
                 "future": true
               },
@@ -20126,6 +21298,10 @@ mod tests {
             Some("/opt/future/bin/agent")
         );
         assert!(settings.cokacmux._debug);
+        assert_eq!(
+            settings.cokacmux.cokacdir_program.as_deref(),
+            Some("/opt/cokacdir/bin/cokacdir")
+        );
         assert_eq!(
             settings
                 .cokacmux
@@ -20178,6 +21354,12 @@ mod tests {
         assert_eq!(
             serialized
                 .pointer("/cokacmux/agent_programs/opencode")
+                .and_then(|v| v.as_str()),
+            Some("")
+        );
+        assert_eq!(
+            serialized
+                .pointer("/cokacmux/cokacdir_program")
                 .and_then(|v| v.as_str()),
             Some("")
         );
@@ -20249,6 +21431,127 @@ mod tests {
             move_provider_in_options(Provider::Codex, 1, &[]),
             Provider::Codex
         );
+    }
+
+    #[test]
+    fn new_session_kind_movement_includes_cokacdir() {
+        assert_eq!(
+            move_new_session_kind(NewSessionKind::Terminal, 1),
+            NewSessionKind::CokacDir
+        );
+        assert_eq!(
+            move_new_session_kind(NewSessionKind::CokacDir, 1),
+            NewSessionKind::CodingAgent
+        );
+        assert_eq!(
+            move_new_session_kind(NewSessionKind::CodingAgent, 1),
+            NewSessionKind::Terminal
+        );
+        assert_eq!(
+            new_session_field_count(NewSessionKind::CokacDir),
+            NEW_SESSION_FIELD_PROVIDER
+        );
+    }
+
+    #[test]
+    fn cokacdir_dist_filename_matches_supported_platforms() {
+        assert_eq!(
+            cokacdir_dist_filename_for("linux", "x86_64"),
+            Some("cokacdir-linux-x86_64")
+        );
+        assert_eq!(
+            cokacdir_dist_filename_for("linux", "aarch64"),
+            Some("cokacdir-linux-aarch64")
+        );
+        assert_eq!(
+            cokacdir_dist_filename_for("macos", "x86_64"),
+            Some("cokacdir-macos-x86_64")
+        );
+        assert_eq!(
+            cokacdir_dist_filename_for("macos", "aarch64"),
+            Some("cokacdir-macos-aarch64")
+        );
+        assert_eq!(
+            cokacdir_dist_filename_for("windows", "x86_64"),
+            Some("cokacdir-windows-x86_64.exe")
+        );
+        assert_eq!(
+            cokacdir_dist_filename_for("windows", "aarch64"),
+            Some("cokacdir-windows-aarch64.exe")
+        );
+        assert_eq!(cokacdir_dist_filename_for("freebsd", "x86_64"), None);
+    }
+
+    #[test]
+    fn cokacdir_launch_spec_uses_configured_runnable_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join(cokacdir_local_filename());
+        fs::write(&program, if cfg!(windows) { "" } else { "#!/bin/sh\n" }).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&program).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&program, perms).unwrap();
+        }
+
+        let mut settings = CokacmuxSettings::default();
+        settings.cokacdir_program = Some(program.display().to_string());
+        let info = cokacdir_session_info_for_cwd("/repo".into());
+        let spec = cokacdir_launch_spec(&info, &settings);
+
+        assert_eq!(spec.program, program.display().to_string());
+        assert_eq!(spec.args, vec!["/repo".to_string()]);
+        assert!(spec.env.is_empty());
+        assert_eq!(spec.cwd, Some(PathBuf::from("/repo")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cokacdir_installed_file_requires_execute_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join(cokacdir_local_filename());
+        fs::write(&program, "not executable yet").unwrap();
+        let mut perms = fs::metadata(&program).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&program, perms).unwrap();
+        assert!(!unix_runnable_file(&program));
+
+        assert_eq!(existing_cokacdir_installed_file(program), None);
+    }
+
+    #[test]
+    fn cokacdir_configured_missing_program_reports_error() {
+        let mut settings = CokacmuxSettings::default();
+        settings.cokacdir_program = Some("/definitely/missing/cokacdir".to_string());
+
+        let error = ensure_cokacdir_program(&settings).unwrap_err().to_string();
+
+        assert!(error.contains("configured cokacdir_program"));
+        assert!(error.contains("/definitely/missing/cokacdir"));
+    }
+
+    #[test]
+    fn live_status_labels_name_plain_pty_tools() {
+        let shell = shell_session_info_for_cwd("/repo".into());
+        let cokacdir = cokacdir_session_info_for_cwd("/repo".into());
+        let stored = session_info(Provider::Codex, "stored", "/repo");
+
+        assert_eq!(live_agent_status_label(&shell), "shell at /repo");
+        assert_eq!(live_agent_status_label(&cokacdir), "cokacdir at /repo");
+        assert_eq!(live_agent_status_label(&stored), "codex agent stored");
+    }
+
+    #[test]
+    fn live_visible_selection_skips_plain_pty_tools() {
+        let shell = shell_session_info_for_cwd("/repo".into());
+        let cokacdir = cokacdir_session_info_for_cwd("/repo".into());
+        let new_agent = new_agent_session_info(Provider::Codex, "/repo".into());
+        let stored = session_info(Provider::Codex, "stored", "/repo");
+
+        assert!(!should_select_visible_session_for_live_info(&shell));
+        assert!(!should_select_visible_session_for_live_info(&cokacdir));
+        assert!(!should_select_visible_session_for_live_info(&new_agent));
+        assert!(should_select_visible_session_for_live_info(&stored));
     }
 
     #[test]
@@ -20836,6 +22139,7 @@ mod tests {
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
+            updated_at_epoch_s: 0,
         };
 
         assert_eq!(
@@ -20862,6 +22166,7 @@ mod tests {
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
+            updated_at_epoch_s: 0,
         };
 
         assert_eq!(
@@ -20916,6 +22221,7 @@ mod tests {
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
+            updated_at_epoch_s: 0,
         };
 
         let state = meta.list_state_with_client_identity(
@@ -20981,6 +22287,69 @@ mod tests {
         let candidate = app.live_agent_restore_candidate().unwrap();
         assert!(is_shell_session_info(&candidate));
         assert_eq!(candidate.session_id, "shell-test");
+    }
+
+    #[test]
+    fn runtime_discovery_keeps_provider_backed_daemon_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("codex-real-live.json"),
+            format!(
+                r#"{{"pid":{},"provider":"codex","session_id":"real-live","cwd":"/repo","source":"/tmp/rollout.jsonl","updated_at_epoch_s":123}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+
+        let infos = discover_live_shell_infos_at(dir.path());
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].provider, Provider::Codex);
+        assert_eq!(infos[0].session_id, "real-live");
+        assert_eq!(infos[0].cwd, "/repo");
+        assert_eq!(infos[0].source, PathBuf::from("/tmp/rollout.jsonl"));
+        assert_eq!(infos[0].updated_at_epoch_s, 123);
+        assert_eq!(infos[0].title, None);
+    }
+
+    #[test]
+    fn live_shell_merge_restores_previous_non_idle_runtime_entry() {
+        let visible = session_info(Provider::Codex, "visible", "/repo");
+        let transiently_missing = session_info(Provider::Claude, "shell-missing", "/repo");
+        let missing_key = AgentKey::new(&transiently_missing);
+
+        let merged = merge_live_shell_infos_with_previous_runtime_state(
+            vec![visible.clone()],
+            &[visible.clone(), transiently_missing.clone()],
+            std::process::id(),
+            |key| {
+                if key == &missing_key {
+                    AgentListState::Live {
+                        activity: AgentActivity::Quiet,
+                    }
+                } else {
+                    AgentListState::Idle
+                }
+            },
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].session_id, "visible");
+        assert_eq!(merged[1].session_id, "shell-missing");
+    }
+
+    #[test]
+    fn live_shell_merge_drops_previous_idle_runtime_entry() {
+        let transiently_missing = session_info(Provider::Claude, "shell-dead", "/repo");
+
+        let merged = merge_live_shell_infos_with_previous_runtime_state(
+            Vec::new(),
+            &[transiently_missing],
+            std::process::id(),
+            |_| AgentListState::Idle,
+        );
+
+        assert!(merged.is_empty());
     }
 
     #[test]
@@ -21131,6 +22500,32 @@ mod tests {
             agent_activity_from_timestamps(now, 0, 0, 0),
             AgentActivity::Quiet
         );
+    }
+
+    #[test]
+    fn cokacdir_activity_ignores_idle_redraw_output() {
+        let now = 10_000;
+        let info = cokacdir_session_info_for_cwd("/repo".into());
+
+        assert_eq!(
+            agent_activity_from_info(&info, now, now - 1_000, now - 1_000, 0),
+            AgentActivity::Quiet
+        );
+        assert_eq!(
+            agent_activity_from_info(&info, now, 0, 0, now - 1_000),
+            AgentActivity::Busy
+        );
+
+        let mut meta = AgentMetaSnapshot {
+            source: Some(COKACDIR_SESSION_SOURCE_MARKER.into()),
+            last_screen_change_epoch_ms: now - 1_000,
+            last_output_epoch_ms: now - 1_000,
+            ..Default::default()
+        };
+        assert_eq!(agent_activity_from_meta(&meta, now), AgentActivity::Quiet);
+
+        meta.last_input_epoch_ms = now - 1_000;
+        assert_eq!(agent_activity_from_meta(&meta, now), AgentActivity::Busy);
     }
 
     #[test]
@@ -22740,6 +24135,36 @@ IF EXIST "%~dp0\node.exe" (
             ],
             &key,
         ));
+        assert!(agent_daemon_args_match(
+            &[
+                "/tmp/cokacmux".into(),
+                AGENT_DAEMON_ARG.into(),
+                "codex".into(),
+                "verify-match".into(),
+                "/repo".into(),
+            ],
+            &key,
+        ));
+        assert!(agent_daemon_args_match(
+            &[
+                "/tmp/cokacmux-linux-aarch64".into(),
+                AGENT_DAEMON_ARG.into(),
+                "codex".into(),
+                "verify-match".into(),
+                "/repo".into(),
+            ],
+            &key,
+        ));
+        assert!(agent_daemon_args_match(
+            &[
+                "/tmp/cokacmux-2b237626c5d395b6".into(),
+                AGENT_DAEMON_ARG.into(),
+                "codex".into(),
+                "verify-match".into(),
+                "/repo".into(),
+            ],
+            &key,
+        ));
         assert!(!agent_daemon_args_match(
             &[
                 "sleep".into(),
@@ -22755,6 +24180,15 @@ IF EXIST "%~dp0\node.exe" (
                 AGENT_DAEMON_ARG.into(),
                 "codex".into(),
                 "other-session".into(),
+            ],
+            &key,
+        ));
+        assert!(!agent_daemon_args_match(
+            &[
+                "/tmp/not-cokacmux".into(),
+                AGENT_DAEMON_ARG.into(),
+                "codex".into(),
+                "verify-match".into(),
             ],
             &key,
         ));
@@ -23061,7 +24495,7 @@ IF EXIST "%~dp0\node.exe" (
         };
         let before = fs::read_to_string(file.path()).unwrap();
 
-        prepare_agent_session(&info).unwrap();
+        prepare_agent_session(&info, &Settings::default()).unwrap();
 
         let after = fs::read_to_string(file.path()).unwrap();
         assert_eq!(after, before);

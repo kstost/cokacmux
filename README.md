@@ -87,9 +87,9 @@
 
 세션을 고르고 `e`를 누르면 해당 에이전트를 다시 실행해 대화를 이어갈 수 있습니다. 이미 cokacmux가 띄운 같은 에이전트가 살아 있으면 새로 실행하지 않고 다시 붙습니다.
 
-### 새 터미널 또는 새 코딩 에이전트 시작
+### 새 터미널, cokacdir, 새 코딩 에이전트 시작
 
-`Ctrl+N`을 누르면 새 세션 모달이 열립니다. 여기서 그냥 터미널을 열지, 지원하는 코딩 에이전트를 새 작업 폴더에서 시작할지 고를 수 있습니다. 입력한 폴더가 없으면 시작 전에 자동으로 만듭니다.
+`Ctrl+N`을 누르면 새 세션 모달이 열립니다. 여기서 그냥 터미널을 열지, `cokacdir`을 열지, 지원하는 코딩 에이전트를 새 작업 폴더에서 시작할지 고를 수 있습니다. 입력한 폴더가 없으면 시작 전에 자동으로 만듭니다.
 
 ### 백그라운드 유지와 전환
 
@@ -158,7 +158,7 @@ cokacmux
 | 미리보기 요약/전체 전환 | `Enter` |
 | 검색 | `/` |
 | 선택한 세션 이어 실행 | `e` |
-| 새 터미널/새 코딩 에이전트 시작 | `Ctrl+N` |
+| 새 터미널/cokacdir/새 코딩 에이전트 시작 | `Ctrl+N` |
 | 에이전트 화면에서 목록으로 돌아오기 | `Ctrl+]` 또는 `Ctrl+[` |
 | 세션 복제 | `c` |
 | 세션 삭제 | `Delete` 또는 `d` |
@@ -228,7 +228,7 @@ Get-Command codex
 Get-Command opencode
 ```
 
-PATH에 여러 버전이 잡혀 있거나 특정 설치본을 꼭 쓰고 싶다면 `~/.cokacmux/settings.json`의 `agent_programs`에 직접 적을 수 있습니다.
+PATH에 여러 버전이 잡혀 있거나 특정 설치본을 꼭 쓰고 싶다면 `~/.cokacmux/settings.json`의 `agent_programs`나 `cokacdir_program`에 직접 적을 수 있습니다.
 
 ```json
 {
@@ -237,7 +237,8 @@ PATH에 여러 버전이 잡혀 있거나 특정 설치본을 꼭 쓰고 싶다�
       "claude": "~/.local/bin/claude",
       "codex": "/usr/bin/codex",
       "opencode": "~/.opencode/bin/opencode"
-    }
+    },
+    "cokacdir_program": "~/.local/bin/cokacdir"
   }
 }
 ```
@@ -251,7 +252,8 @@ Windows 경로는 JSON 규칙에 맞게 `\\`로 쓰거나 `/`를 사용할 수 �
       "claude": "C:\\Users\\me\\.local\\bin\\claude.exe",
       "codex": "C:/Users/me/AppData/Roaming/npm/codex.cmd",
       "opencode": "C:/Users/me/.opencode/bin/opencode.exe"
-    }
+    },
+    "cokacdir_program": "C:/Users/me/.cokacmux/bin/cokacdir.exe"
   }
 }
 ```
@@ -275,7 +277,8 @@ Windows 경로는 JSON 규칙에 맞게 `\\`로 쓰거나 `/`를 사용할 수 �
   "cokacmux": {
     "agent_programs": {
       "codex": "/usr/bin/codex"
-    }
+    },
+    "cokacdir_program": "/usr/local/bin/cokacdir"
   }
 }
 ```
@@ -529,7 +532,7 @@ Skip permissions를 선택하면 이어 실행할 때 다음 형태가 됩니다
 
 세션 목록으로 돌아올 때 cokacmux는 디스크의 세션 목록과 실행 상태를 다시 읽어 최신 상태로 맞춥니다.
 
-### 6-6. 새 터미널 또는 새 코딩 에이전트 시작
+### 6-6. 새 터미널, cokacdir, 새 코딩 에이전트 시작
 
 `Ctrl+N`을 누르면 New session 모달이 열립니다.
 
@@ -537,14 +540,16 @@ Skip permissions를 선택하면 이어 실행할 때 다음 형태가 됩니다
 
 | 항목 | 설명 |
 |---|---|
-| Type | `Terminal` 또는 `Coding agent` |
+| Type | `Terminal`, `cokacdir`, `Coding agent` |
 | Folder | 시작할 작업 폴더 |
 | Agent | Coding agent일 때 `claude`, `codex`, `opencode` 중 선택 |
 | Permissions | Coding agent일 때 Normal 또는 Skip permissions 선택 |
 
 `Folder`에 없는 경로를 입력하면 시작 전에 자동으로 생성합니다.
 
-Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. Coding agent를 선택하면 해당 폴더에서 지원 provider의 새 세션을 시작합니다.
+Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`을 선택하면 해당 폴더에서 `cokacdir`을 엽니다. Coding agent를 선택하면 해당 폴더에서 지원 provider의 새 세션을 시작합니다.
+
+`cokacdir`이 PATH나 설정된 경로에 없으면 현재 운영체제와 CPU에 맞는 단일 바이너리를 GitHub에서 내려받아 `~/.cokacmux/bin/cokacdir`에 저장한 뒤 실행합니다. Windows에서는 `~/.cokacmux/bin/cokacdir.exe`에 저장합니다.
 
 새 코딩 에이전트를 Skip permissions로 시작하면 다음 형태가 됩니다.
 
@@ -642,7 +647,7 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. Coding age
 | `c` | 복제 대상 선택 후 세션 복제 |
 | `Delete` / `d` | 세션 삭제 확인창 열기 |
 | `e` | Agent launch 모달 열기 |
-| `Ctrl+N` | 새 터미널/새 코딩 에이전트 모달 열기 |
+| `Ctrl+N` | 새 터미널/cokacdir/새 코딩 에이전트 모달 열기 |
 | `Ctrl+K` | 선택한 실행 중 에이전트 종료 |
 | `Ctrl+]` / `Ctrl+[` | 활성 에이전트 화면으로 전환 또는 다시 연결 |
 | `Ctrl+3` / `Ctrl+5` | `Ctrl+]` / `Ctrl+[` 대체 입력 |
@@ -806,7 +811,8 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
       "codex": "",
       "claude": "",
       "opencode": ""
-    }
+    },
+    "cokacdir_program": ""
   }
 }
 ```
@@ -821,8 +827,9 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 | `agent_sidebar_visible` | 에이전트 사이드바를 처음에 보일지 정합니다. |
 | `session_view` | `"tree"` 또는 `"list"`입니다. `v` 키로도 바뀝니다. |
 | `agent_programs` | 현재 지원 provider의 실행 파일 경로를 직접 지정하는 곳입니다. |
+| `cokacdir_program` | `cokacdir` 실행 파일 경로를 직접 지정하는 곳입니다. |
 
-`agent_programs`의 빈 문자열은 placeholder입니다. 비워 두면 기존처럼 PATH에서 `codex`, `claude`, `opencode`를 찾습니다.
+`agent_programs`와 `cokacdir_program`의 빈 문자열은 placeholder입니다. 비워 두면 기존처럼 PATH에서 기본 명령 이름을 찾습니다. `cokacdir`은 PATH에서 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용하고, 그 파일도 없을 때 자동 다운로드합니다.
 
 ### `agent_programs` 자세히
 
@@ -831,6 +838,7 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 | `agent_programs.claude` | `claude` | Claude Code 세션 이어가기, 새 Claude Code 시작 |
 | `agent_programs.codex` | `codex` | Codex 세션 이어가기, 새 Codex 시작 |
 | `agent_programs.opencode` | `opencode` | OpenCode 세션 이어가기, 새 OpenCode 시작 |
+| `cokacdir_program` | `cokacdir` | New session 모달의 `cokacdir` 시작 |
 
 동작 규칙:
 
@@ -840,7 +848,8 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 - `/usr/bin/codex`처럼 경로이면 그 파일을 실행합니다.
 - `codex-beta`처럼 명령 이름이면 PATH에서 다시 찾습니다.
 - Windows에서는 `.exe`, `.cmd`, `.bat`, `.ps1` 경로를 사용할 수 있습니다.
-- 이미 실행 중인 백그라운드 에이전트에는 변경된 경로가 적용되지 않습니다. 새 경로로 실행하려면 기존 에이전트를 `Ctrl+K` 또는 `cokacmux killall`로 종료한 뒤 다시 시작하세요.
+- `cokacdir_program`이 비어 있고 PATH에서도 `cokacdir`을 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용합니다. 그 파일이 없으면 `~/.cokacmux/bin`에 자동 다운로드한 바이너리를 실행합니다.
+- 이미 실행 중인 백그라운드 에이전트나 `cokacdir`에는 변경된 경로가 적용되지 않습니다. 새 경로로 실행하려면 기존 실행 대상을 `Ctrl+K` 또는 `cokacmux killall`로 종료한 뒤 다시 시작하세요.
 
 `settings.json`은 앱 시작 시 읽습니다. 파일을 직접 고친 뒤에는 cokacmux를 재시작하는 편이 가장 명확합니다. 단축키 파일인 `keybinding.json`만 다음 키 입력 때 자동으로 다시 읽습니다.
 
@@ -975,7 +984,7 @@ Get-Command opencode
 
 `e`는 선택한 저장 세션을 이어 실행하거나 이미 실행 중인 같은 세션에 다시 붙습니다.
 
-`Ctrl+N`은 새 세션 모달을 열어 새 터미널 또는 새 코딩 에이전트를 시작합니다.
+`Ctrl+N`은 새 세션 모달을 열어 새 터미널, `cokacdir`, 새 코딩 에이전트를 시작합니다.
 
 ### Skip permissions는 언제 쓰나요?
 

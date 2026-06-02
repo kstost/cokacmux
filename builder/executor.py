@@ -247,9 +247,11 @@ exec {clang_path} "${{args[@]}}"
                 dest_name = f"cokacmux-{result.target.friendly_name}"
             dest_path = self.dist_dir / dest_name
 
+            temp_path = dest_path.with_name(f".{dest_path.name}.{os.getpid()}.tmp")
             try:
-                shutil.copy2(result.binary_path, dest_path)
-                dest_path.chmod(0o755)
+                shutil.copy2(result.binary_path, temp_path)
+                temp_path.chmod(0o755)
+                os.replace(temp_path, dest_path)
 
                 # Get file size
                 size = dest_path.stat().st_size
@@ -260,6 +262,10 @@ exec {clang_path} "${{args[@]}}"
 
             except Exception as e:
                 self.logger.error(f"Failed to copy {result.binary_path}: {e}")
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         return copied
 
@@ -429,9 +435,12 @@ def run_build(
     results = executor.build_all(resolved_targets)
 
     # Copy to dist
+    copied = []
     if any(r.success for r in results):
         copied = executor.copy_to_dist(results)
         logger.results(copied)
 
-    # Return success if all builds passed
-    return all(r.success for r in results)
+    build_success = bool(results) and all(r.success for r in results)
+    expected_copies = sum(1 for r in results if r.success)
+    copy_success = expected_copies == len(copied)
+    return build_success and copy_success

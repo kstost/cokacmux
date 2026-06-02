@@ -214,6 +214,13 @@ def collect_targets(args: argparse.Namespace) -> list:
     # Flag-based targets
     if args.all:
         targets.append("all")
+        if args.windows:
+            targets.append("windows")
+        else:
+            if args.windows_x86_64:
+                targets.append("windows-x86_64")
+            if args.windows_arm64:
+                targets.append("windows-arm64")
     else:
         if args.macos:
             targets.append("macos")
