@@ -1,6 +1,6 @@
 [package]
 name = "cokacmux"
-version = "0.2.20"
+version = "0.2.21"
 edition = "2021"
 authors = ["cokac <monogatree@gmail.com>"]
 description = "TUI multiplexer for local coding agent sessions."

@@ -90,6 +90,8 @@ const AGENT_DAEMON_START_TIMEOUT_MS: u64 = 3_000;
 const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
 const AGENT_BUSY_GRACE_MS: u64 = 3_000;
 const AGENT_ACTIVITY_META_WRITE_INTERVAL_MS: u64 = 750;
+const MAIN_EVENT_DRAIN_LIMIT: usize = 64;
+const MAIN_EVENT_DRAIN_BUDGET_MS: u64 = 8;
 const DEBUG_LOG_FILE: &str = "cokacmux.log";
 const DEBUG_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const APP_DIR_NAME: &str = ".cokacmux";
@@ -7355,13 +7357,11 @@ impl App {
         }
     }
 
-    fn switch_active_agent(&mut self, delta: i32, wrap: bool) {
+    fn switch_active_agent(&mut self, delta: i32, wrap: bool, cols: u16, rows: u16) {
         let Some(active_agent) = self.active_agent.as_ref() else {
             return;
         };
         let current_key = AgentKey::new(&active_agent.info);
-        let cols = active_agent.pty_size.cols;
-        let rows = active_agent.pty_size.rows;
 
         self.refresh_agent_runtime_states();
         let candidates = self.live_agent_switch_candidates();
@@ -8618,6 +8618,11 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
+fn should_continue_main_event_drain(processed: usize, elapsed: Duration) -> bool {
+    processed < MAIN_EVENT_DRAIN_LIMIT
+        && elapsed < Duration::from_millis(MAIN_EVENT_DRAIN_BUDGET_MS)
+}
+
 fn run(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
     let (main_tx, main_rx) = mpsc::channel::<MainEvent>();
@@ -8724,11 +8729,18 @@ fn run(terminal: &mut Tui) -> Result<()> {
             }
         }
         app.prepare_sessions_view_after_transition(&mut previous_is_agent_view, "main_event");
-        // Drain any further events that are already queued so we don't
-        // render twice in a row for a tight burst of agent output.
+        // Drain a bounded burst so tight redraw loops cannot keep UI input
+        // stuck behind agent output forever. Unprocessed events stay queued
+        // and are handled on the next loop after a render opportunity.
+        let drain_started = Instant::now();
+        let mut drained_events = 0usize;
         loop {
+            if !should_continue_main_event_drain(drained_events, drain_started.elapsed()) {
+                break;
+            }
             match main_rx.try_recv() {
                 Ok(MainEvent::Input(Event::Key(key))) if is_actionable_key_event(key) => {
+                    drained_events = drained_events.saturating_add(1);
                     if app.is_agent_view() {
                         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                         handle_agent_key(&mut app, key, cols, rows);
@@ -8748,26 +8760,35 @@ fn run(terminal: &mut Tui) -> Result<()> {
                         );
                     }
                 }
-                Ok(MainEvent::Input(_)) => {}
+                Ok(MainEvent::Input(_)) => {
+                    drained_events = drained_events.saturating_add(1);
+                }
                 Ok(MainEvent::AgentEvent { reader_id, event }) => {
+                    drained_events = drained_events.saturating_add(1);
                     app.on_agent_event(reader_id, event);
                 }
                 Ok(MainEvent::AgentReaderEnded { reader_id, reason }) => {
+                    drained_events = drained_events.saturating_add(1);
                     app.on_agent_reader_ended(reader_id, reason);
                 }
                 Ok(MainEvent::SearchResult(result)) => {
+                    drained_events = drained_events.saturating_add(1);
                     app.on_search_result(result);
                 }
                 Ok(MainEvent::DataTaskProgress(progress)) => {
+                    drained_events = drained_events.saturating_add(1);
                     app.on_data_task_progress(progress);
                 }
                 Ok(MainEvent::CloneResult(result)) => {
+                    drained_events = drained_events.saturating_add(1);
                     app.on_clone_worker_result(result);
                 }
                 Ok(MainEvent::RestoreResult(result)) => {
+                    drained_events = drained_events.saturating_add(1);
                     app.on_restore_worker_result(result);
                 }
                 Ok(MainEvent::Tick) => {
+                    drained_events = drained_events.saturating_add(1);
                     app.poll_preview_results();
                     app.poll_agent_sessions();
                     app.poll_agent_runtime_states();
@@ -14368,7 +14389,11 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         return;
     }
     let keybindings = app.keybindings.clone();
-    if keybindings.matches(KeyAction::GlobalQuit, key) {
+    let shift_shortcuts_disabled = agent_shift_shortcuts_disabled_for_active_info(
+        app.active_agent.as_ref().map(|agent| &agent.info),
+        key,
+    );
+    if !shift_shortcuts_disabled && keybindings.matches(KeyAction::GlobalQuit, key) {
         if app.request_quit("agent_global_quit", false) {
             debug_log_agent_key(key, "quit");
         } else {
@@ -14388,7 +14413,7 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         handle_new_session_key(app, key, viewport.pty_cols, viewport.pty_rows, &keybindings);
         return;
     }
-    if keybindings.matches(KeyAction::AgentToggleSessions, key) {
+    if !shift_shortcuts_disabled && keybindings.matches(KeyAction::AgentToggleSessions, key) {
         debug_log_agent_key(key, "toggle_to_sessions");
         // Ctrl+] / Ctrl+[ is a pure window toggle — show sessions list but keep
         // the agent connection alive in the background.
@@ -14403,75 +14428,96 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         app.show_sessions_view = true;
         return;
     }
-    if keybindings.matches(KeyAction::AgentKill, key) {
+    if !shift_shortcuts_disabled
+        && !agent_kill_shortcut_disabled_for_active_info(
+            app.active_agent.as_ref().map(|agent| &agent.info),
+        )
+        && keybindings.matches(KeyAction::AgentKill, key)
+    {
         debug_log_agent_key(key, "kill");
         app.kill_active_agent();
         return;
     }
-    if keybindings.matches(KeyAction::AgentNewShell, key) {
+    if !shift_shortcuts_disabled && keybindings.matches(KeyAction::AgentNewShell, key) {
         debug_log_agent_key(key, "new_session_from_agent");
         app.begin_new_session_from_active_agent();
         return;
     }
-    if keybindings.matches(KeyAction::AgentToggleSidebar, key) {
+    if !shift_shortcuts_disabled && keybindings.matches(KeyAction::AgentToggleSidebar, key) {
         debug_log_agent_key(key, "toggle_agent_sidebar");
         app.toggle_agent_sidebar_visible();
         let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
         return;
     }
-    if let Some(action) = agent_scrollback_key(&keybindings, key) {
-        debug_log_agent_key(key, "delegate_scroll");
-        let viewport = app.sync_active_agent_viewport(total_width, terminal_rows);
-        let page_rows = viewport.page_rows;
-        debug_log(
-            "agent_child_scroll_key_match",
-            serde_json::json!({
-                "code": key_code_label(key),
-                "modifiers": format!("{:?}", key.modifiers),
-                "kind": format!("{:?}", key.kind),
-                "state": format!("{:?}", key.state),
-                "action": format!("{:?}", action),
-                "terminal_cols": total_width,
-                "terminal_rows": terminal_rows,
-                "agent_area_cols": viewport.area_cols,
-                "agent_area_rows": viewport.area_rows,
-                "pty_cols": viewport.pty_cols,
-                "pty_rows": viewport.pty_rows,
-                "page_rows": page_rows,
-                "total_width": total_width,
-                "sidebar_width": app.agent_sidebar_config_width(),
-                "active_agent": app.active_agent.as_ref().map(|agent| serde_json::json!({
-                    "provider": agent.info.provider.as_str(),
-                    "session_id": &agent.info.session_id,
-                    "pty_rows": agent.pty_size.rows,
-                    "pty_cols": agent.pty_size.cols,
-                    "parser_scrollback": agent.parser.screen().scrollback(),
-                    "history_scroll_offset": agent.history_scroll_offset,
-                    "screen_history_lines": agent.screen_history.len(),
-                    "codex_transcript_overlay_assumed_open": agent.codex_transcript_overlay_assumed_open,
-                })),
-            }),
-        );
-        app.delegate_active_agent_scroll_to_child(action, key, page_rows);
-        return;
+    if !shift_shortcuts_disabled {
+        if let Some(action) = agent_scrollback_key(&keybindings, key) {
+            debug_log_agent_key(key, "delegate_scroll");
+            let viewport = app.sync_active_agent_viewport(total_width, terminal_rows);
+            let page_rows = viewport.page_rows;
+            debug_log(
+                "agent_child_scroll_key_match",
+                serde_json::json!({
+                    "code": key_code_label(key),
+                    "modifiers": format!("{:?}", key.modifiers),
+                    "kind": format!("{:?}", key.kind),
+                    "state": format!("{:?}", key.state),
+                    "action": format!("{:?}", action),
+                    "terminal_cols": total_width,
+                    "terminal_rows": terminal_rows,
+                    "agent_area_cols": viewport.area_cols,
+                    "agent_area_rows": viewport.area_rows,
+                    "pty_cols": viewport.pty_cols,
+                    "pty_rows": viewport.pty_rows,
+                    "page_rows": page_rows,
+                    "total_width": total_width,
+                    "sidebar_width": app.agent_sidebar_config_width(),
+                    "active_agent": app.active_agent.as_ref().map(|agent| serde_json::json!({
+                        "provider": agent.info.provider.as_str(),
+                        "session_id": &agent.info.session_id,
+                        "pty_rows": agent.pty_size.rows,
+                        "pty_cols": agent.pty_size.cols,
+                        "parser_scrollback": agent.parser.screen().scrollback(),
+                        "history_scroll_offset": agent.history_scroll_offset,
+                        "screen_history_lines": agent.screen_history.len(),
+                        "codex_transcript_overlay_assumed_open": agent.codex_transcript_overlay_assumed_open,
+                    })),
+                }),
+            );
+            app.delegate_active_agent_scroll_to_child(action, key, page_rows);
+            return;
+        }
     }
-    if let Some(delta) = agent_pane_resize_key(&keybindings, key) {
-        debug_log_agent_key(key, "resize");
-        app.adjust_agent_sidebar_width(delta, total_width);
-        let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
-        return;
+    if !shift_shortcuts_disabled {
+        if let Some(delta) = agent_pane_resize_key(&keybindings, key) {
+            debug_log_agent_key(key, "resize");
+            app.adjust_agent_sidebar_width(delta, total_width);
+            let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
+            return;
+        }
     }
-    if let Some(delta) = agent_sidebar_select_key(&keybindings, key) {
-        debug_log_agent_key(key, "select");
-        let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
-        app.switch_active_agent(delta, false);
-        return;
+    if !shift_shortcuts_disabled {
+        if let Some(delta) = agent_sidebar_select_key(&keybindings, key) {
+            debug_log_agent_key(key, "select");
+            let viewport = agent_viewport_for_terminal(
+                total_width,
+                terminal_rows,
+                app.agent_sidebar_config_width(),
+            );
+            app.switch_active_agent(delta, false, viewport.pty_cols, viewport.pty_rows);
+            return;
+        }
     }
-    if let Some(delta) = agent_switch_key(&keybindings, key) {
-        debug_log_agent_key(key, "switch");
-        let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
-        app.switch_active_agent(delta, true);
-        return;
+    if !shift_shortcuts_disabled {
+        if let Some(delta) = agent_switch_key(&keybindings, key) {
+            debug_log_agent_key(key, "switch");
+            let viewport = agent_viewport_for_terminal(
+                total_width,
+                terminal_rows,
+                app.agent_sidebar_config_width(),
+            );
+            app.switch_active_agent(delta, true, viewport.pty_cols, viewport.pty_rows);
+            return;
+        }
     }
     if should_log_agent_key(key) {
         debug_log_agent_key(key, "forward");
@@ -14491,6 +14537,17 @@ fn handle_notice_key(app: &mut App, key: KeyEvent) -> bool {
         debug_log_key_event(key, "notice_ignored");
     }
     true
+}
+
+fn agent_shift_shortcuts_disabled_for_active_info(
+    info: Option<&SessionInfo>,
+    key: KeyEvent,
+) -> bool {
+    key.modifiers.contains(KeyModifiers::SHIFT) && info.is_some_and(is_cokacdir_session_info)
+}
+
+fn agent_kill_shortcut_disabled_for_active_info(info: Option<&SessionInfo>) -> bool {
+    info.is_some_and(is_cokacdir_session_info)
 }
 
 fn notice_dismiss_key(key: KeyEvent) -> bool {
@@ -21862,6 +21919,26 @@ mod tests {
     }
 
     #[test]
+    fn main_event_drain_is_bounded_by_count_and_time() {
+        assert!(should_continue_main_event_drain(
+            0,
+            Duration::from_millis(0)
+        ));
+        assert!(should_continue_main_event_drain(
+            MAIN_EVENT_DRAIN_LIMIT - 1,
+            Duration::from_millis(0)
+        ));
+        assert!(!should_continue_main_event_drain(
+            MAIN_EVENT_DRAIN_LIMIT,
+            Duration::from_millis(0)
+        ));
+        assert!(!should_continue_main_event_drain(
+            0,
+            Duration::from_millis(MAIN_EVENT_DRAIN_BUDGET_MS)
+        ));
+    }
+
+    #[test]
     fn agent_terminal_width_accounts_for_sidebar() {
         assert_eq!(agent_sidebar_width(50, 0), 0);
         assert_eq!(agent_terminal_width(50, 0), 50);
@@ -22945,6 +23022,48 @@ IF EXIST "%~dp0\node.exe" (
             KeyCode::Char('q'),
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn cokacdir_active_agent_disables_shift_modified_shortcuts() {
+        let cokacdir = cokacdir_session_info_for_cwd("/repo".into());
+        let codex = session_info(Provider::Codex, "codex-id", "/repo");
+        let shift_key = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
+        let ctrl_shift_key =
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let alt_key = KeyEvent::new(KeyCode::Down, KeyModifiers::ALT);
+
+        assert!(agent_shift_shortcuts_disabled_for_active_info(
+            Some(&cokacdir),
+            shift_key
+        ));
+        assert!(agent_shift_shortcuts_disabled_for_active_info(
+            Some(&cokacdir),
+            ctrl_shift_key
+        ));
+        assert!(!agent_shift_shortcuts_disabled_for_active_info(
+            Some(&cokacdir),
+            alt_key
+        ));
+        assert!(!agent_shift_shortcuts_disabled_for_active_info(
+            Some(&codex),
+            shift_key
+        ));
+        assert!(!agent_shift_shortcuts_disabled_for_active_info(
+            None, shift_key
+        ));
+    }
+
+    #[test]
+    fn cokacdir_active_agent_disables_agent_kill_shortcut() {
+        let cokacdir = cokacdir_session_info_for_cwd("/repo".into());
+        let codex = session_info(Provider::Codex, "codex-id", "/repo");
+
+        assert!(agent_kill_shortcut_disabled_for_active_info(Some(
+            &cokacdir
+        )));
+        assert!(!agent_kill_shortcut_disabled_for_active_info(Some(&codex)));
+        assert!(!agent_kill_shortcut_disabled_for_active_info(None));
     }
 
     #[test]
