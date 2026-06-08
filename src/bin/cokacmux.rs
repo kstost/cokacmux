@@ -90,6 +90,7 @@ const AGENT_DAEMON_START_TIMEOUT_MS: u64 = 3_000;
 const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
 const AGENT_BUSY_GRACE_MS: u64 = 3_000;
 const AGENT_ACTIVITY_META_WRITE_INTERVAL_MS: u64 = 750;
+const NEW_AGENT_BACKING_PROBE_INTERVAL_MS: u64 = 5_000;
 const MAIN_EVENT_DRAIN_LIMIT: usize = 64;
 const MAIN_EVENT_DRAIN_BUDGET_MS: u64 = 8;
 const DEBUG_LOG_FILE: &str = "cokacmux.log";
@@ -2223,16 +2224,18 @@ where
         if state == AgentListState::Idle {
             continue;
         }
-        debug_log(
-            "live_shell_discover_previous_restored",
-            serde_json::json!({
-                "current_pid": current_pid,
-                "key": agent_key_debug_value(&key),
-                "state": agent_list_state_debug_value(state),
-                "info": session_info_debug_value(info),
-                "runtime_probe": agent_runtime_probe_debug_value(&key, current_pid),
-            }),
-        );
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            debug_log(
+                "live_shell_discover_previous_restored",
+                serde_json::json!({
+                    "current_pid": current_pid,
+                    "key": agent_key_debug_value(&key),
+                    "state": agent_list_state_debug_value(state),
+                    "info": session_info_debug_value(info),
+                    "runtime_probe": agent_runtime_probe_debug_value(&key, current_pid),
+                }),
+            );
+        }
         seen.insert(key);
         merged.push(info.clone());
     }
@@ -4321,6 +4324,8 @@ enum MainEvent {
     /// preview results / agent runtime state polls get a chance to run
     /// even when the user is idle. Not a latency knob.
     Tick,
+    /// Runtime state discovery/probing completed off the UI thread.
+    RuntimeStateResult(AgentRuntimeRefreshResult),
     /// Full-session search completed in the background.
     SearchResult(SearchWorkerResult),
     /// Data-task worker progress update.
@@ -4329,6 +4334,47 @@ enum MainEvent {
     CloneResult(CloneWorkerResult),
     /// Saved folder-data restore completed in the background.
     RestoreResult(RestoreWorkerResult),
+}
+
+struct AgentRuntimeRefreshRequest {
+    seq: u64,
+    current_pid: u32,
+    previous_states: HashMap<AgentKey, AgentListState>,
+    previous_live_shells: Vec<SessionInfo>,
+    active_info: Option<SessionInfo>,
+    show_sessions_view: bool,
+    provider_session_count: usize,
+    session_keys: Vec<AgentKey>,
+    new_agent_backing_aliases: HashMap<AgentKey, AgentKey>,
+    new_agent_backing_probe_after: HashMap<AgentKey, Instant>,
+}
+
+struct AgentRuntimeRefreshResult {
+    seq: u64,
+    live_shells: Vec<SessionInfo>,
+    agent_states: HashMap<AgentKey, AgentListState>,
+    new_agent_backing_aliases: HashMap<AgentKey, AgentKey>,
+    new_agent_backing_probe_after: HashMap<AgentKey, Instant>,
+}
+
+enum PendingRuntimeAction {
+    LaunchSelected {
+        info: SessionInfo,
+        cols: u16,
+        rows: u16,
+    },
+    RestoreLive {
+        selected_key: Option<AgentKey>,
+        cols: u16,
+        rows: u16,
+    },
+    SwitchActive {
+        current_key: AgentKey,
+        delta: i32,
+        wrap: bool,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 struct App {
@@ -4345,6 +4391,7 @@ struct App {
     clone_links: Vec<session::clone_tree::CloneLink>,
     agent_states: HashMap<AgentKey, AgentListState>,
     new_agent_backing_aliases: HashMap<AgentKey, AgentKey>,
+    new_agent_backing_probe_after: HashMap<AgentKey, Instant>,
     last_agent_state_poll: Instant,
     list_state: ListState,
     session_view: SessionViewMode,
@@ -4373,6 +4420,14 @@ struct App {
     /// handed to each agent reader thread on attach so they can forward
     /// `AgentDaemonEvent`s back to the main loop.
     main_tx: Option<Sender<MainEvent>>,
+    /// Runtime discovery/probing worker. The UI thread only sends small
+    /// snapshot requests and applies returned results.
+    runtime_tx: Option<Sender<AgentRuntimeRefreshRequest>>,
+    runtime_refresh_seq: u64,
+    runtime_refresh_applied_seq: u64,
+    runtime_refresh_pending: bool,
+    runtime_refresh_queued: bool,
+    pending_runtime_action: Option<PendingRuntimeAction>,
     /// Monotonic id assigned to each agent reader thread. Used to ignore
     /// late events from a thread whose AgentClient has already been
     /// dropped/replaced.
@@ -4410,6 +4465,7 @@ impl App {
             clone_links: Vec::new(),
             agent_states: HashMap::new(),
             new_agent_backing_aliases: HashMap::new(),
+            new_agent_backing_probe_after: HashMap::new(),
             last_agent_state_poll: Instant::now(),
             list_state: ListState::default(),
             session_view,
@@ -4435,11 +4491,16 @@ impl App {
             active_agent: None,
             should_quit: false,
             main_tx: None,
+            runtime_tx: None,
+            runtime_refresh_seq: 0,
+            runtime_refresh_applied_seq: 0,
+            runtime_refresh_pending: false,
+            runtime_refresh_queued: false,
+            pending_runtime_action: None,
             next_reader_id: 0,
             show_sessions_view: true,
         };
         app.refresh();
-        app.refresh_agent_runtime_states();
         debug_log(
             "app_new",
             serde_json::json!({
@@ -5193,6 +5254,7 @@ impl App {
 
     fn agent_state_for(&self, info: &SessionInfo) -> AgentListState {
         let key = AgentKey::new(info);
+        let trace_enabled = TRACE_ENABLED.load(Ordering::Relaxed);
         if let Some(agent) = self.active_agent.as_ref() {
             if AgentKey::new(&agent.info) == key {
                 let cached_state = self.agent_states.get(&key).copied();
@@ -5207,35 +5269,39 @@ impl App {
                     mine: true,
                     activity,
                 };
-                trace_log(
-                    "agent_state_for_active",
-                    serde_json::json!({
-                        "key": agent_key_debug_value(&key),
-                        "info": session_info_debug_value(info),
-                        "cached_state": optional_agent_list_state_debug_value(cached_state),
-                        "client_activity": client_activity.label(),
-                        "result": agent_list_state_debug_value(result),
-                        "show_sessions_view": self.show_sessions_view,
-                    }),
-                );
+                if trace_enabled {
+                    trace_log(
+                        "agent_state_for_active",
+                        serde_json::json!({
+                            "key": agent_key_debug_value(&key),
+                            "info": session_info_debug_value(info),
+                            "cached_state": optional_agent_list_state_debug_value(cached_state),
+                            "client_activity": client_activity.label(),
+                            "result": agent_list_state_debug_value(result),
+                            "show_sessions_view": self.show_sessions_view,
+                        }),
+                    );
+                }
                 return result;
             }
         }
         let cached_state = self.agent_states.get(&key).copied();
         let result = cached_state.unwrap_or(AgentListState::Idle);
-        trace_log(
-            "agent_state_for",
-            serde_json::json!({
-                "key": agent_key_debug_value(&key),
-                "info": session_info_debug_value(info),
-                "cached_state": optional_agent_list_state_debug_value(cached_state),
-                "result": agent_list_state_debug_value(result),
-                "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
-                "show_sessions_view": self.show_sessions_view,
-                "agent_states_len": self.agent_states.len(),
-                "live_shells_len": self.live_shells.len(),
-            }),
-        );
+        if trace_enabled {
+            trace_log(
+                "agent_state_for",
+                serde_json::json!({
+                    "key": agent_key_debug_value(&key),
+                    "info": session_info_debug_value(info),
+                    "cached_state": optional_agent_list_state_debug_value(cached_state),
+                    "result": agent_list_state_debug_value(result),
+                    "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                    "show_sessions_view": self.show_sessions_view,
+                    "agent_states_len": self.agent_states.len(),
+                    "live_shells_len": self.live_shells.len(),
+                }),
+            );
+        }
         result
     }
 
@@ -5250,288 +5316,190 @@ impl App {
 
     fn refresh_agent_runtime_states(&mut self) {
         self.last_agent_state_poll = Instant::now();
-        let current_pid = std::process::id();
-        let previous_states = self.agent_states.clone();
-        let previous_live_shells = self.live_shells.clone();
-        let previous_states_len = previous_states.len();
-        trace_log(
-            "agent_runtime_refresh_start",
-            serde_json::json!({
-                "current_pid": current_pid,
-                "sessions_len": self.sessions.len(),
-                "previous_live_shells_len": previous_live_shells.len(),
-                "previous_agent_states_len": previous_states_len,
-                "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
-                "show_sessions_view": self.show_sessions_view,
-            }),
-        );
-
-        // Refresh the live-shells list each tick. If the runtime directory is
-        // momentarily partial while daemons repair their files, keep any
-        // previously visible entry whose daemon still proves live.
-        let discovered_live_shells = discover_live_shell_infos();
-        self.live_shells = merge_live_shell_infos_with_previous_runtime_state(
-            discovered_live_shells,
-            &previous_live_shells,
-            current_pid,
-            |key| read_agent_runtime_state(key, current_pid),
-        );
-
-        let mut states = HashMap::new();
-        let session_keys: Vec<AgentKey> = self.sessions.iter().map(AgentKey::new).collect();
-        let shell_keys: Vec<AgentKey> = self.live_shells.iter().map(AgentKey::new).collect();
-        trace_log(
-            "agent_runtime_refresh_keys",
-            serde_json::json!({
-                "session_key_count": session_keys.len(),
-                "shell_key_count": shell_keys.len(),
-                "shells": self.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
-            }),
-        );
-        for key in session_keys.iter().chain(shell_keys.iter()) {
-            let state = read_agent_runtime_state(key, current_pid);
-            trace_log(
-                "agent_runtime_refresh_key",
-                serde_json::json!({
-                    "key": agent_key_debug_value(key),
-                    "state": agent_list_state_debug_value(state),
-                }),
+        let Some(tx) = self.runtime_tx.clone() else {
+            self.overlay_active_agent_runtime_state();
+            apply_cached_new_agent_backing_states(
+                &self.live_shells,
+                &self.new_agent_backing_aliases,
+                &mut self.agent_states,
             );
-            if state != AgentListState::Idle {
-                states.insert(key.clone(), state);
+            return;
+        };
+        if self.runtime_refresh_pending {
+            self.runtime_refresh_queued = true;
+            return;
+        }
+
+        self.runtime_refresh_seq = self.runtime_refresh_seq.saturating_add(1);
+        let seq = self.runtime_refresh_seq;
+        let request = self.agent_runtime_refresh_request(seq);
+        match tx.send(request) {
+            Ok(()) => {
+                self.runtime_refresh_pending = true;
+            }
+            Err(e) => {
+                self.runtime_tx = None;
+                self.runtime_refresh_pending = false;
+                self.runtime_refresh_queued = false;
+                debug_log(
+                    "agent_runtime_refresh_request_failed",
+                    serde_json::json!({
+                        "seq": seq,
+                        "error": e.to_string(),
+                    }),
+                );
             }
         }
-        if let Some(agent) = self.active_agent.as_ref() {
-            let key = AgentKey::new(&agent.info);
-            let previous_state = states.get(&key).copied();
-            let client_activity = agent.activity();
-            let activity = states
-                .get(&key)
-                .map(|state| state.activity())
-                .unwrap_or(AgentActivity::Quiet)
-                .combine(client_activity);
-            states.insert(
-                key.clone(),
-                AgentListState::Attached {
-                    mine: true,
-                    activity,
-                },
+    }
+
+    fn agent_runtime_refresh_request(&self, seq: u64) -> AgentRuntimeRefreshRequest {
+        let debug_enabled = DEBUG_ENABLED.load(Ordering::Relaxed);
+        AgentRuntimeRefreshRequest {
+            seq,
+            current_pid: std::process::id(),
+            previous_states: self.agent_states.clone(),
+            previous_live_shells: self.live_shells.clone(),
+            active_info: self.active_agent.as_ref().map(|agent| agent.info.clone()),
+            show_sessions_view: self.show_sessions_view,
+            provider_session_count: self.sessions.len(),
+            session_keys: if debug_enabled {
+                self.sessions.iter().map(AgentKey::new).collect()
+            } else {
+                Vec::new()
+            },
+            new_agent_backing_aliases: self.new_agent_backing_aliases.clone(),
+            new_agent_backing_probe_after: self.new_agent_backing_probe_after.clone(),
+        }
+    }
+
+    fn on_runtime_state_result(&mut self, result: AgentRuntimeRefreshResult) {
+        self.runtime_refresh_pending = false;
+        let refresh_queued = self.runtime_refresh_queued;
+        self.runtime_refresh_queued = false;
+        if result.seq < self.runtime_refresh_applied_seq {
+            debug_log(
+                "agent_runtime_refresh_result_stale",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "applied_seq": self.runtime_refresh_applied_seq,
+                }),
             );
+        } else {
+            self.apply_agent_runtime_refresh_result(result);
+        }
+        if refresh_queued && !self.runtime_refresh_pending {
+            self.refresh_agent_runtime_states();
+        } else if refresh_queued {
+            self.runtime_refresh_queued = true;
+        }
+    }
+
+    fn discard_pending_agent_runtime_refresh(&mut self) {
+        self.pending_runtime_action = None;
+        if self.runtime_refresh_pending {
+            self.runtime_refresh_applied_seq = self
+                .runtime_refresh_applied_seq
+                .max(self.runtime_refresh_seq.saturating_add(1));
+            self.runtime_refresh_queued = true;
+        }
+    }
+
+    fn agent_runtime_refresh_in_flight(&self) -> bool {
+        self.runtime_refresh_pending || self.runtime_refresh_queued
+    }
+
+    fn apply_agent_runtime_refresh_result(&mut self, result: AgentRuntimeRefreshResult) {
+        self.runtime_refresh_applied_seq = self.runtime_refresh_applied_seq.max(result.seq);
+        self.live_shells = result.live_shells;
+        self.agent_states = result.agent_states;
+        self.new_agent_backing_aliases = result.new_agent_backing_aliases;
+        self.new_agent_backing_probe_after = result.new_agent_backing_probe_after;
+        self.overlay_active_agent_runtime_state();
+        apply_cached_new_agent_backing_states(
+            &self.live_shells,
+            &self.new_agent_backing_aliases,
+            &mut self.agent_states,
+        );
+        if self.pending_runtime_action.is_none()
+            && (self.status == "checking live agents..."
+                || self.status.starts_with("checking live state for "))
+        {
+            self.status = "live agents updated.".into();
+        }
+        self.continue_pending_runtime_action();
+        if TRACE_ENABLED.load(Ordering::Relaxed) {
+            trace_log(
+                "agent_runtime_refresh_applied",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "agent_states_len": self.agent_states.len(),
+                    "states": agent_state_entries_debug_value(&self.agent_states),
+                    "new_agent_backing_aliases": agent_alias_entries_debug_value(&self.new_agent_backing_aliases),
+                    "live_shells_len": self.live_shells.len(),
+                    "show_sessions_view": self.show_sessions_view,
+                    "pending": self.runtime_refresh_pending,
+                    "queued": self.runtime_refresh_queued,
+                }),
+            );
+        }
+    }
+
+    fn continue_pending_runtime_action(&mut self) {
+        let Some(action) = self.pending_runtime_action.take() else {
+            return;
+        };
+        match action {
+            PendingRuntimeAction::LaunchSelected { info, cols, rows } => {
+                if self.reject_while_data_task_running("launching an agent") {
+                    return;
+                }
+                self.resolve_agent_launch(info, cols, rows, false);
+            }
+            PendingRuntimeAction::RestoreLive {
+                selected_key,
+                cols,
+                rows,
+            } => {
+                self.resolve_restore_live_agent(selected_key.as_ref(), cols, rows, false);
+            }
+            PendingRuntimeAction::SwitchActive {
+                current_key,
+                delta,
+                wrap,
+                cols,
+                rows,
+            } => {
+                self.resolve_switch_active_agent(current_key, delta, wrap, cols, rows, false);
+            }
+        }
+    }
+
+    fn overlay_active_agent_runtime_state(&mut self) {
+        let Some(agent) = self.active_agent.as_ref() else {
+            return;
+        };
+        let key = AgentKey::new(&agent.info);
+        let previous_state = self.agent_states.get(&key).copied();
+        let client_activity = agent.activity();
+        let activity = previous_state
+            .map(|state| state.activity())
+            .unwrap_or(AgentActivity::Quiet)
+            .combine(client_activity);
+        let overlay_state = AgentListState::Attached {
+            mine: true,
+            activity,
+        };
+        self.agent_states.insert(key.clone(), overlay_state);
+        if TRACE_ENABLED.load(Ordering::Relaxed) {
             trace_log(
                 "agent_runtime_refresh_active_overlay",
                 serde_json::json!({
                     "key": agent_key_debug_value(&key),
                     "previous_state": optional_agent_list_state_debug_value(previous_state),
                     "client_activity": client_activity.label(),
-                    "overlay_state": agent_list_state_debug_value(AgentListState::Attached {
-                        mine: true,
-                        activity,
-                    }),
+                    "overlay_state": agent_list_state_debug_value(overlay_state),
                 }),
             );
-        }
-        self.apply_new_agent_backing_states(&mut states);
-        self.debug_agent_runtime_refresh_changes(
-            &previous_states,
-            &previous_live_shells,
-            &states,
-            &session_keys,
-            &shell_keys,
-            current_pid,
-        );
-        self.agent_states = states;
-        trace_log(
-            "agent_runtime_refresh_done",
-            serde_json::json!({
-                "current_pid": current_pid,
-                "agent_states_len": self.agent_states.len(),
-                "states": agent_state_entries_debug_value(&self.agent_states),
-                "new_agent_backing_aliases": agent_alias_entries_debug_value(&self.new_agent_backing_aliases),
-                "live_shells_len": self.live_shells.len(),
-                "show_sessions_view": self.show_sessions_view,
-            }),
-        );
-    }
-
-    fn debug_agent_runtime_refresh_changes(
-        &self,
-        previous_states: &HashMap<AgentKey, AgentListState>,
-        previous_live_shells: &[SessionInfo],
-        next_states: &HashMap<AgentKey, AgentListState>,
-        session_keys: &[AgentKey],
-        shell_keys: &[AgentKey],
-        current_pid: u32,
-    ) {
-        if !DEBUG_ENABLED.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let previous_live_map: HashMap<AgentKey, &SessionInfo> = previous_live_shells
-            .iter()
-            .map(|info| (AgentKey::new(info), info))
-            .collect();
-        let next_live_map: HashMap<AgentKey, &SessionInfo> = self
-            .live_shells
-            .iter()
-            .map(|info| (AgentKey::new(info), info))
-            .collect();
-        let session_key_set: HashSet<AgentKey> = session_keys.iter().cloned().collect();
-        let shell_key_set: HashSet<AgentKey> = shell_keys.iter().cloned().collect();
-
-        let previous_switchable = sorted_switchable_agent_keys(previous_states);
-        let next_switchable = sorted_switchable_agent_keys(next_states);
-        if previous_switchable != next_switchable {
-            let removed = agent_key_set_difference(&previous_switchable, &next_switchable);
-            let added = agent_key_set_difference(&next_switchable, &previous_switchable);
-            debug_log(
-                "agent_runtime_switchable_set_changed",
-                serde_json::json!({
-                    "current_pid": current_pid,
-                    "previous_count": previous_switchable.len(),
-                    "next_count": next_switchable.len(),
-                    "removed": agent_keys_debug_value(&removed),
-                    "added": agent_keys_debug_value(&added),
-                    "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
-                    "show_sessions_view": self.show_sessions_view,
-                    "provider_session_count": self.sessions.len(),
-                    "previous_live_shell_count": previous_live_shells.len(),
-                    "next_live_shell_count": self.live_shells.len(),
-                }),
-            );
-        }
-
-        for key in &previous_switchable {
-            let previous_state = previous_states
-                .get(key)
-                .copied()
-                .unwrap_or(AgentListState::Idle);
-            let next_state = next_states
-                .get(key)
-                .copied()
-                .unwrap_or(AgentListState::Idle);
-            if is_switchable_agent_state(next_state) {
-                continue;
-            }
-            debug_log(
-                "agent_runtime_switchable_removed",
-                serde_json::json!({
-                    "key": agent_key_debug_value(key),
-                    "previous_state": agent_list_state_debug_value(previous_state),
-                    "next_state": agent_list_state_debug_value(next_state),
-                    "was_live_info": previous_live_map.contains_key(key),
-                    "is_live_info": next_live_map.contains_key(key),
-                    "is_provider_session": session_key_set.contains(key),
-                    "was_runtime_key_this_refresh": shell_key_set.contains(key),
-                    "previous_live_info": previous_live_map.get(key).map(|info| session_info_debug_value(info)),
-                    "next_live_info": next_live_map.get(key).map(|info| session_info_debug_value(info)),
-                    "provider_session_info": self.sessions.iter().find(|info| AgentKey::new(info) == *key).map(session_info_debug_value),
-                    "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
-                    "runtime_probe": agent_runtime_probe_debug_value(key, current_pid),
-                }),
-            );
-        }
-
-        for (key, previous_info) in previous_live_map.iter() {
-            if next_live_map.contains_key(key) {
-                continue;
-            }
-            debug_log(
-                "agent_runtime_live_info_removed",
-                serde_json::json!({
-                    "key": agent_key_debug_value(key),
-                    "previous_live_info": session_info_debug_value(previous_info),
-                    "previous_state": previous_states.get(key).copied().map(agent_list_state_debug_value),
-                    "next_state": next_states.get(key).copied().map(agent_list_state_debug_value),
-                    "is_provider_session": session_key_set.contains(key),
-                    "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
-                    "runtime_probe": agent_runtime_probe_debug_value(key, current_pid),
-                }),
-            );
-        }
-
-        if let Some(agent) = self.active_agent.as_ref() {
-            let active_key = AgentKey::new(&agent.info);
-            let active_state = next_states
-                .get(&active_key)
-                .copied()
-                .unwrap_or(AgentListState::Idle);
-            if !is_switchable_agent_state(active_state) {
-                debug_log(
-                    "agent_runtime_active_not_switchable",
-                    serde_json::json!({
-                        "key": agent_key_debug_value(&active_key),
-                        "active_info": session_info_debug_value(&agent.info),
-                        "state": agent_list_state_debug_value(active_state),
-                        "is_live_info": next_live_map.contains_key(&active_key),
-                        "is_provider_session": session_key_set.contains(&active_key),
-                        "runtime_probe": agent_runtime_probe_debug_value(&active_key, current_pid),
-                    }),
-                );
-            }
-        }
-    }
-
-    fn apply_new_agent_backing_states(&mut self, states: &mut HashMap<AgentKey, AgentListState>) {
-        for info in &self.live_shells {
-            if !is_new_agent_session_info(info) || info.provider != Provider::Codex {
-                continue;
-            }
-            let synthetic_key = AgentKey::new(info);
-            let Some(state) = states.get(&synthetic_key).copied() else {
-                continue;
-            };
-            if state == AgentListState::Idle {
-                continue;
-            }
-            if let Some(backing_key) = self.new_agent_backing_aliases.get(&synthetic_key).cloned() {
-                if backing_key != synthetic_key {
-                    let previous_state = states.insert(backing_key.clone(), state);
-                    trace_log(
-                        "new_agent_backing_cached_state_applied",
-                        serde_json::json!({
-                            "synthetic": agent_key_debug_value(&synthetic_key),
-                            "backing": agent_key_debug_value(&backing_key),
-                            "state": agent_list_state_debug_value(state),
-                            "previous_state": optional_agent_list_state_debug_value(previous_state),
-                        }),
-                    );
-                }
-                continue;
-            }
-            let Some(backing) = new_agent_backing_session_for_key(&synthetic_key) else {
-                continue;
-            };
-            if backing.key == synthetic_key {
-                continue;
-            }
-            let previous_state = states.insert(backing.key.clone(), state);
-            let previous_alias = self
-                .new_agent_backing_aliases
-                .insert(synthetic_key.clone(), backing.key.clone());
-            if previous_alias.as_ref() != Some(&backing.key) {
-                debug_log(
-                    "new_agent_backing_session_linked",
-                    serde_json::json!({
-                        "synthetic": agent_key_debug_value(&synthetic_key),
-                        "backing": agent_key_debug_value(&backing.key),
-                        "rollout_path": backing.rollout_path.display().to_string(),
-                        "state": agent_list_state_debug_value(state),
-                        "previous_alias": previous_alias.as_ref().map(agent_key_debug_value),
-                        "previous_state": optional_agent_list_state_debug_value(previous_state),
-                    }),
-                );
-            } else {
-                trace_log(
-                    "new_agent_backing_state_applied",
-                    serde_json::json!({
-                        "synthetic": agent_key_debug_value(&synthetic_key),
-                        "backing": agent_key_debug_value(&backing.key),
-                        "rollout_path": backing.rollout_path.display().to_string(),
-                        "state": agent_list_state_debug_value(state),
-                        "previous_state": optional_agent_list_state_debug_value(previous_state),
-                    }),
-                );
-            }
         }
     }
 
@@ -5579,7 +5547,14 @@ impl App {
 
     fn live_agent_restore_candidate(&self) -> Option<SessionInfo> {
         let selected_key = self.current().map(AgentKey::new);
-        if let Some(selected_key) = selected_key.as_ref() {
+        self.live_agent_restore_candidate_for(selected_key.as_ref())
+    }
+
+    fn live_agent_restore_candidate_for(
+        &self,
+        selected_key: Option<&AgentKey>,
+    ) -> Option<SessionInfo> {
+        if let Some(selected_key) = selected_key {
             if let Some(info) = self.synthetic_new_agent_for_backing_key(selected_key) {
                 return Some(info.clone());
             }
@@ -5591,7 +5566,7 @@ impl App {
         if let Some(selected_key) = selected_key {
             if let Some(info) = candidates
                 .iter()
-                .find(|info| AgentKey::new(info) == selected_key)
+                .find(|info| AgentKey::new(info) == *selected_key)
             {
                 return Some(info.clone());
             }
@@ -5928,15 +5903,17 @@ impl App {
         let session_id = info.session_id.clone();
         let mode = key.mode;
         if self.preview_cache.contains_key(&key) {
-            trace_log(
-                "preview_request_cache_hit",
-                serde_json::json!({
-                    "provider": key.provider.as_str(),
-                    "session_id": &key.session_id,
-                    "mode": preview_mode_label(key.mode),
-                    "width": width,
-                }),
-            );
+            if TRACE_ENABLED.load(Ordering::Relaxed) {
+                trace_log(
+                    "preview_request_cache_hit",
+                    serde_json::json!({
+                        "provider": key.provider.as_str(),
+                        "session_id": &key.session_id,
+                        "mode": preview_mode_label(key.mode),
+                        "width": width,
+                    }),
+                );
+            }
             return;
         }
         if self
@@ -5945,15 +5922,17 @@ impl App {
             .map(|(requested_key, _)| requested_key == &key)
             .unwrap_or(false)
         {
-            trace_log(
-                "preview_request_already_pending",
-                serde_json::json!({
-                    "provider": key.provider.as_str(),
-                    "session_id": &key.session_id,
-                    "mode": preview_mode_label(key.mode),
-                    "width": width,
-                }),
-            );
+            if TRACE_ENABLED.load(Ordering::Relaxed) {
+                trace_log(
+                    "preview_request_already_pending",
+                    serde_json::json!({
+                        "provider": key.provider.as_str(),
+                        "session_id": &key.session_id,
+                        "mode": preview_mode_label(key.mode),
+                        "width": width,
+                    }),
+                );
+            }
             return;
         }
 
@@ -6121,6 +6100,7 @@ impl App {
             let provider = agent.info.provider;
             let session_id = agent.info.session_id.clone();
             self.active_agent = None;
+            self.discard_pending_agent_runtime_refresh();
             self.status = format!(
                 "{} agent {} exited ({})",
                 provider.as_str(),
@@ -6232,6 +6212,7 @@ impl App {
                 self.active_agent = Some(agent);
                 self.show_sessions_view = false;
                 self.mark_agent_attached_locally(key.clone());
+                self.discard_pending_agent_runtime_refresh();
                 self.refresh_agent_runtime_states();
                 debug_log(
                     "shell_open_ok",
@@ -6425,6 +6406,10 @@ impl App {
         if self.main_tx.is_some() {
             self.refresh_agent_runtime_states();
         }
+        self.resolve_agent_launch(info, cols, rows, true);
+    }
+
+    fn resolve_agent_launch(&mut self, info: SessionInfo, cols: u16, rows: u16, allow_defer: bool) {
         let runtime_info = self.runtime_info_for_selected_agent(&info);
         let key = AgentKey::new(&runtime_info);
         if self
@@ -6471,6 +6456,25 @@ impl App {
                 return;
             }
             AgentListState::Idle => {}
+        }
+        if allow_defer && self.agent_runtime_refresh_in_flight() {
+            self.pending_runtime_action = Some(PendingRuntimeAction::LaunchSelected {
+                info: info.clone(),
+                cols,
+                rows,
+            });
+            self.status = format!(
+                "checking live state for {}...",
+                live_agent_status_label(&runtime_info)
+            );
+            debug_log(
+                "agent_launch_deferred_runtime_refresh",
+                serde_json::json!({
+                    "provider": key.provider.as_str(),
+                    "session_id": &key.session_id,
+                }),
+            );
+            return;
         }
         let key = AgentKey::new(&info);
         debug_log(
@@ -6527,6 +6531,7 @@ impl App {
                 self.show_sessions_view = false;
                 self.active_agent = Some(agent);
                 self.mark_agent_attached_locally(key.clone());
+                self.discard_pending_agent_runtime_refresh();
                 if should_select_visible {
                     self.select_visible_session(&key);
                 }
@@ -6948,6 +6953,7 @@ impl App {
                 self.show_sessions_view = false;
                 self.active_agent = Some(agent);
                 self.mark_agent_attached_locally(key.clone());
+                self.discard_pending_agent_runtime_refresh();
                 self.refresh_agent_runtime_states();
                 debug_log(
                     "attach_ready",
@@ -7047,7 +7053,27 @@ impl App {
             return;
         }
         self.refresh_agent_runtime_states();
-        let Some(info) = self.live_agent_restore_candidate() else {
+        let selected_key = self.current().map(AgentKey::new);
+        self.resolve_restore_live_agent(selected_key.as_ref(), cols, rows, true);
+    }
+
+    fn resolve_restore_live_agent(
+        &mut self,
+        selected_key: Option<&AgentKey>,
+        cols: u16,
+        rows: u16,
+        allow_defer: bool,
+    ) {
+        let Some(info) = self.live_agent_restore_candidate_for(selected_key) else {
+            if allow_defer && self.agent_runtime_refresh_in_flight() {
+                self.pending_runtime_action = Some(PendingRuntimeAction::RestoreLive {
+                    selected_key: selected_key.cloned(),
+                    cols,
+                    rows,
+                });
+                self.status = "checking live agents...".into();
+                return;
+            }
             self.status =
                 "no active agent to switch to; press e/Enter to start selected agent".into();
             return;
@@ -7070,6 +7096,7 @@ impl App {
                 self.show_sessions_view = false;
                 self.active_agent = Some(agent);
                 self.mark_agent_attached_locally(key.clone());
+                self.discard_pending_agent_runtime_refresh();
                 if should_select_visible {
                     self.select_visible_session(&key);
                 }
@@ -7102,6 +7129,7 @@ impl App {
             let provider = agent.info.provider;
             let session_id = agent.info.session_id.clone();
             drop(agent);
+            self.discard_pending_agent_runtime_refresh();
             self.status = format!(
                 "detached {} agent {}",
                 provider.as_str(),
@@ -7137,6 +7165,7 @@ impl App {
 
         let result = terminate_agent_daemon(&key);
         self.agent_states.remove(&key);
+        self.discard_pending_agent_runtime_refresh();
         self.refresh_agent_runtime_states();
 
         match result {
@@ -7258,6 +7287,7 @@ impl App {
                 self.show_sessions_view = false;
                 self.active_agent = Some(next_agent);
                 self.mark_agent_attached_locally(next_key.clone());
+                self.discard_pending_agent_runtime_refresh();
                 if should_select_visible {
                     self.select_visible_session(&next_key);
                 }
@@ -7300,6 +7330,7 @@ impl App {
         let result = terminate_agent_daemon(&runtime_key);
         self.agent_states.remove(&selected_key);
         self.agent_states.remove(&runtime_key);
+        self.discard_pending_agent_runtime_refresh();
         self.refresh_agent_runtime_states();
 
         match result {
@@ -7364,8 +7395,39 @@ impl App {
         let current_key = AgentKey::new(&active_agent.info);
 
         self.refresh_agent_runtime_states();
+        self.resolve_switch_active_agent(current_key, delta, wrap, cols, rows, true);
+    }
+
+    fn resolve_switch_active_agent(
+        &mut self,
+        current_key: AgentKey,
+        delta: i32,
+        wrap: bool,
+        cols: u16,
+        rows: u16,
+        allow_defer: bool,
+    ) {
+        if !self
+            .active_agent
+            .as_ref()
+            .is_some_and(|agent| AgentKey::new(&agent.info) == current_key)
+        {
+            self.status = "active agent changed; switch cancelled.".into();
+            return;
+        }
         let candidates = self.live_agent_switch_candidates();
         if candidates.len() <= 1 {
+            if allow_defer && self.agent_runtime_refresh_in_flight() {
+                self.pending_runtime_action = Some(PendingRuntimeAction::SwitchActive {
+                    current_key: current_key.clone(),
+                    delta,
+                    wrap,
+                    cols,
+                    rows,
+                });
+                self.status = "checking live agents...".into();
+                return;
+            }
             self.status = "no other live agent.".into();
             debug_log(
                 "agent_switch_no_target",
@@ -7414,6 +7476,7 @@ impl App {
                 self.show_sessions_view = false;
                 self.active_agent = Some(next_agent);
                 self.mark_agent_attached_locally(next_key.clone());
+                self.discard_pending_agent_runtime_refresh();
                 if should_select_visible {
                     self.select_visible_session(&next_key);
                 }
@@ -8444,6 +8507,366 @@ fn preview_worker(request_rx: Receiver<PreviewRequest>, result_tx: Sender<Previe
     debug_log("preview_worker_stop", serde_json::json!({}));
 }
 
+fn spawn_agent_runtime_worker(
+    result_tx: Sender<MainEvent>,
+) -> io::Result<Sender<AgentRuntimeRefreshRequest>> {
+    let (request_tx, request_rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+    thread::Builder::new()
+        .name("cokacmux-agent-runtime".to_string())
+        .spawn(move || agent_runtime_worker(request_rx, result_tx))?;
+    debug_log("agent_runtime_worker_spawned", serde_json::json!({}));
+    Ok(request_tx)
+}
+
+fn agent_runtime_worker(
+    request_rx: Receiver<AgentRuntimeRefreshRequest>,
+    result_tx: Sender<MainEvent>,
+) {
+    while let Ok(mut request) = request_rx.recv() {
+        let first_seq = request.seq;
+        let mut drained = 0usize;
+        while let Ok(newer) = request_rx.try_recv() {
+            request = newer;
+            drained = drained.saturating_add(1);
+        }
+        let seq = request.seq;
+        let started = Instant::now();
+        let result = compute_agent_runtime_refresh(request);
+        debug_log(
+            "agent_runtime_worker_result",
+            serde_json::json!({
+                "first_seq": first_seq,
+                "seq": seq,
+                "drained": drained,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "live_shells": result.live_shells.len(),
+                "agent_states": result.agent_states.len(),
+            }),
+        );
+        if result_tx
+            .send(MainEvent::RuntimeStateResult(result))
+            .is_err()
+        {
+            break;
+        }
+    }
+    debug_log("agent_runtime_worker_stop", serde_json::json!({}));
+}
+
+fn compute_agent_runtime_refresh(
+    mut request: AgentRuntimeRefreshRequest,
+) -> AgentRuntimeRefreshResult {
+    let trace_enabled = TRACE_ENABLED.load(Ordering::Relaxed);
+    let debug_enabled = DEBUG_ENABLED.load(Ordering::Relaxed);
+    let previous_states_len = request.previous_states.len();
+    if trace_enabled {
+        trace_log(
+            "agent_runtime_refresh_start",
+            serde_json::json!({
+                "seq": request.seq,
+                "current_pid": request.current_pid,
+                "sessions_len": request.provider_session_count,
+                "previous_live_shells_len": request.previous_live_shells.len(),
+                "previous_agent_states_len": previous_states_len,
+                "active_agent": request.active_info.as_ref().map(session_info_debug_value),
+                "show_sessions_view": request.show_sessions_view,
+            }),
+        );
+    }
+
+    let discovered_live_shells = discover_live_shell_infos();
+    let live_shells = merge_live_shell_infos_with_previous_runtime_state(
+        discovered_live_shells,
+        &request.previous_live_shells,
+        request.current_pid,
+        |key| read_agent_runtime_state(key, request.current_pid),
+    );
+
+    let mut states = HashMap::new();
+    let mut runtime_keys: Vec<AgentKey> = live_shells.iter().map(AgentKey::new).collect();
+    runtime_keys.extend(request.previous_states.keys().cloned());
+    if let Some(active_info) = request.active_info.as_ref() {
+        runtime_keys.push(AgentKey::new(active_info));
+    }
+    sort_agent_keys(&mut runtime_keys);
+    runtime_keys.dedup();
+
+    let shell_keys: Vec<AgentKey> = live_shells.iter().map(AgentKey::new).collect();
+    if trace_enabled {
+        trace_log(
+            "agent_runtime_refresh_keys",
+            serde_json::json!({
+                "seq": request.seq,
+                "provider_session_count": request.provider_session_count,
+                "runtime_key_count": runtime_keys.len(),
+                "shell_key_count": shell_keys.len(),
+                "previous_state_key_count": request.previous_states.len(),
+                "shells": live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    for key in &runtime_keys {
+        let state = read_agent_runtime_state(key, request.current_pid);
+        if trace_enabled {
+            trace_log(
+                "agent_runtime_refresh_key",
+                serde_json::json!({
+                    "seq": request.seq,
+                    "key": agent_key_debug_value(key),
+                    "state": agent_list_state_debug_value(state),
+                }),
+            );
+        }
+        if state != AgentListState::Idle {
+            states.insert(key.clone(), state);
+        }
+    }
+
+    apply_new_agent_backing_states_to_snapshot(
+        &live_shells,
+        &mut request.new_agent_backing_aliases,
+        &mut request.new_agent_backing_probe_after,
+        &mut states,
+        true,
+    );
+    if debug_enabled {
+        debug_agent_runtime_refresh_changes_for_snapshot(
+            &request.previous_states,
+            &request.previous_live_shells,
+            &live_shells,
+            &states,
+            &request.session_keys,
+            &shell_keys,
+            request.provider_session_count,
+            request.current_pid,
+            request.active_info.as_ref(),
+            request.show_sessions_view,
+        );
+    }
+    if trace_enabled {
+        trace_log(
+            "agent_runtime_refresh_done",
+            serde_json::json!({
+                "seq": request.seq,
+                "current_pid": request.current_pid,
+                "agent_states_len": states.len(),
+                "states": agent_state_entries_debug_value(&states),
+                "new_agent_backing_aliases": agent_alias_entries_debug_value(&request.new_agent_backing_aliases),
+                "live_shells_len": live_shells.len(),
+                "show_sessions_view": request.show_sessions_view,
+            }),
+        );
+    }
+
+    AgentRuntimeRefreshResult {
+        seq: request.seq,
+        live_shells,
+        agent_states: states,
+        new_agent_backing_aliases: request.new_agent_backing_aliases,
+        new_agent_backing_probe_after: request.new_agent_backing_probe_after,
+    }
+}
+
+fn debug_agent_runtime_refresh_changes_for_snapshot(
+    previous_states: &HashMap<AgentKey, AgentListState>,
+    previous_live_shells: &[SessionInfo],
+    next_live_shells: &[SessionInfo],
+    next_states: &HashMap<AgentKey, AgentListState>,
+    session_keys: &[AgentKey],
+    shell_keys: &[AgentKey],
+    provider_session_count: usize,
+    current_pid: u32,
+    active_info: Option<&SessionInfo>,
+    show_sessions_view: bool,
+) {
+    let previous_live_map: HashMap<AgentKey, &SessionInfo> = previous_live_shells
+        .iter()
+        .map(|info| (AgentKey::new(info), info))
+        .collect();
+    let next_live_map: HashMap<AgentKey, &SessionInfo> = next_live_shells
+        .iter()
+        .map(|info| (AgentKey::new(info), info))
+        .collect();
+    let session_key_set: HashSet<AgentKey> = session_keys.iter().cloned().collect();
+    let shell_key_set: HashSet<AgentKey> = shell_keys.iter().cloned().collect();
+
+    let previous_switchable = sorted_switchable_agent_keys(previous_states);
+    let next_switchable = sorted_switchable_agent_keys(next_states);
+    if previous_switchable != next_switchable {
+        let removed = agent_key_set_difference(&previous_switchable, &next_switchable);
+        let added = agent_key_set_difference(&next_switchable, &previous_switchable);
+        debug_log(
+            "agent_runtime_switchable_set_changed",
+            serde_json::json!({
+                "current_pid": current_pid,
+                "previous_count": previous_switchable.len(),
+                "next_count": next_switchable.len(),
+                "removed": agent_keys_debug_value(&removed),
+                "added": agent_keys_debug_value(&added),
+                "active_agent": active_info.map(session_info_debug_value),
+                "show_sessions_view": show_sessions_view,
+                "provider_session_count": provider_session_count,
+                "previous_live_shell_count": previous_live_shells.len(),
+                "next_live_shell_count": next_live_shells.len(),
+            }),
+        );
+    }
+
+    for key in &previous_switchable {
+        let previous_state = previous_states
+            .get(key)
+            .copied()
+            .unwrap_or(AgentListState::Idle);
+        let next_state = next_states
+            .get(key)
+            .copied()
+            .unwrap_or(AgentListState::Idle);
+        if is_switchable_agent_state(next_state) {
+            continue;
+        }
+        debug_log(
+            "agent_runtime_switchable_removed",
+            serde_json::json!({
+                "key": agent_key_debug_value(key),
+                "previous_state": agent_list_state_debug_value(previous_state),
+                "next_state": agent_list_state_debug_value(next_state),
+                "was_live_info": previous_live_map.contains_key(key),
+                "is_live_info": next_live_map.contains_key(key),
+                "is_provider_session": session_key_set.contains(key),
+                "was_runtime_key_this_refresh": shell_key_set.contains(key),
+                "previous_live_info": previous_live_map.get(key).map(|info| session_info_debug_value(info)),
+                "next_live_info": next_live_map.get(key).map(|info| session_info_debug_value(info)),
+                "active_agent": active_info.map(session_info_debug_value),
+                "runtime_probe": agent_runtime_probe_debug_value(key, current_pid),
+            }),
+        );
+    }
+}
+
+fn apply_cached_new_agent_backing_states(
+    live_shells: &[SessionInfo],
+    aliases: &HashMap<AgentKey, AgentKey>,
+    states: &mut HashMap<AgentKey, AgentListState>,
+) {
+    for info in live_shells {
+        if !is_new_agent_session_info(info) || info.provider != Provider::Codex {
+            continue;
+        }
+        let synthetic_key = AgentKey::new(info);
+        let Some(state) = states.get(&synthetic_key).copied() else {
+            continue;
+        };
+        let Some(backing_key) = aliases.get(&synthetic_key) else {
+            continue;
+        };
+        if backing_key != &synthetic_key {
+            states.insert(backing_key.clone(), state);
+        }
+    }
+}
+
+fn apply_new_agent_backing_states_to_snapshot(
+    live_shells: &[SessionInfo],
+    aliases: &mut HashMap<AgentKey, AgentKey>,
+    probe_after: &mut HashMap<AgentKey, Instant>,
+    states: &mut HashMap<AgentKey, AgentListState>,
+    allow_probe: bool,
+) {
+    let now = Instant::now();
+    let trace_enabled = TRACE_ENABLED.load(Ordering::Relaxed);
+    let live_new_keys: HashSet<AgentKey> = live_shells
+        .iter()
+        .filter(|info| is_new_agent_session_info(info) && info.provider == Provider::Codex)
+        .map(AgentKey::new)
+        .collect();
+    probe_after.retain(|key, _| live_new_keys.contains(key));
+
+    for info in live_shells {
+        if !is_new_agent_session_info(info) || info.provider != Provider::Codex {
+            continue;
+        }
+        let synthetic_key = AgentKey::new(info);
+        let Some(state) = states.get(&synthetic_key).copied() else {
+            continue;
+        };
+        if state == AgentListState::Idle {
+            continue;
+        }
+        if let Some(backing_key) = aliases.get(&synthetic_key).cloned() {
+            if backing_key != synthetic_key {
+                let previous_state = states.insert(backing_key.clone(), state);
+                if trace_enabled {
+                    trace_log(
+                        "new_agent_backing_cached_state_applied",
+                        serde_json::json!({
+                            "synthetic": agent_key_debug_value(&synthetic_key),
+                            "backing": agent_key_debug_value(&backing_key),
+                            "state": agent_list_state_debug_value(state),
+                            "previous_state": optional_agent_list_state_debug_value(previous_state),
+                        }),
+                    );
+                }
+            }
+            continue;
+        }
+        if !allow_probe {
+            continue;
+        }
+        if probe_after
+            .get(&synthetic_key)
+            .is_some_and(|next_probe| *next_probe > now)
+        {
+            continue;
+        }
+        probe_after.insert(
+            synthetic_key.clone(),
+            now + Duration::from_millis(NEW_AGENT_BACKING_PROBE_INTERVAL_MS),
+        );
+        let Some(backing) = new_agent_backing_session_for_key(&synthetic_key) else {
+            if trace_enabled {
+                trace_log(
+                    "new_agent_backing_probe_miss",
+                    serde_json::json!({
+                        "synthetic": agent_key_debug_value(&synthetic_key),
+                        "next_probe_ms": NEW_AGENT_BACKING_PROBE_INTERVAL_MS,
+                    }),
+                );
+            }
+            continue;
+        };
+        if backing.key == synthetic_key {
+            continue;
+        }
+        probe_after.remove(&synthetic_key);
+        let previous_state = states.insert(backing.key.clone(), state);
+        let previous_alias = aliases.insert(synthetic_key.clone(), backing.key.clone());
+        if previous_alias.as_ref() != Some(&backing.key) {
+            debug_log(
+                "new_agent_backing_session_linked",
+                serde_json::json!({
+                    "synthetic": agent_key_debug_value(&synthetic_key),
+                    "backing": agent_key_debug_value(&backing.key),
+                    "rollout_path": backing.rollout_path.display().to_string(),
+                    "state": agent_list_state_debug_value(state),
+                    "previous_alias": previous_alias.as_ref().map(agent_key_debug_value),
+                    "previous_state": optional_agent_list_state_debug_value(previous_state),
+                }),
+            );
+        } else if trace_enabled {
+            trace_log(
+                "new_agent_backing_state_applied",
+                serde_json::json!({
+                    "synthetic": agent_key_debug_value(&synthetic_key),
+                    "backing": agent_key_debug_value(&backing.key),
+                    "rollout_path": backing.rollout_path.display().to_string(),
+                    "state": agent_list_state_debug_value(state),
+                    "previous_state": optional_agent_list_state_debug_value(previous_state),
+                }),
+            );
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let debug_enabled = args.iter().any(|a| a == "--debug");
@@ -8627,6 +9050,8 @@ fn run(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
     let (main_tx, main_rx) = mpsc::channel::<MainEvent>();
     app.main_tx = Some(main_tx.clone());
+    app.runtime_tx = Some(spawn_agent_runtime_worker(main_tx.clone())?);
+    app.refresh_agent_runtime_states();
 
     // Input forwarder: blocks on crossterm event::poll/read in its own
     // thread and forwards events to the main loop. The long timeout is
@@ -8710,6 +9135,9 @@ fn run(terminal: &mut Tui) -> Result<()> {
             MainEvent::AgentReaderEnded { reader_id, reason } => {
                 app.on_agent_reader_ended(reader_id, reason);
             }
+            MainEvent::RuntimeStateResult(result) => {
+                app.on_runtime_state_result(result);
+            }
             MainEvent::SearchResult(result) => {
                 app.on_search_result(result);
             }
@@ -8770,6 +9198,10 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 Ok(MainEvent::AgentReaderEnded { reader_id, reason }) => {
                     drained_events = drained_events.saturating_add(1);
                     app.on_agent_reader_ended(reader_id, reason);
+                }
+                Ok(MainEvent::RuntimeStateResult(result)) => {
+                    drained_events = drained_events.saturating_add(1);
+                    app.on_runtime_state_result(result);
                 }
                 Ok(MainEvent::SearchResult(result)) => {
                     drained_events = drained_events.saturating_add(1);
@@ -9771,50 +10203,57 @@ fn agent_key_from_meta(meta: &AgentMetaSnapshot) -> Option<AgentKey> {
 }
 
 fn read_agent_runtime_state(key: &AgentKey, current_pid: u32) -> AgentListState {
+    let trace_enabled = TRACE_ENABLED.load(Ordering::Relaxed);
     let meta_path = match agent_meta_path(key) {
         Ok(path) => path,
         Err(e) => {
-            trace_log(
-                "agent_runtime_state_path_failed",
-                serde_json::json!({
-                    "key": agent_key_debug_value(key),
-                    "path_kind": "meta",
-                    "current_pid": current_pid,
-                    "error": e.to_string(),
-                }),
-            );
+            if trace_enabled {
+                trace_log(
+                    "agent_runtime_state_path_failed",
+                    serde_json::json!({
+                        "key": agent_key_debug_value(key),
+                        "path_kind": "meta",
+                        "current_pid": current_pid,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
             return AgentListState::Idle;
         }
     };
     let socket_path = match agent_socket_path(key) {
         Ok(path) => path,
         Err(e) => {
-            trace_log(
-                "agent_runtime_state_path_failed",
-                serde_json::json!({
-                    "key": agent_key_debug_value(key),
-                    "path_kind": "socket",
-                    "current_pid": current_pid,
-                    "error": e.to_string(),
-                }),
-            );
+            if trace_enabled {
+                trace_log(
+                    "agent_runtime_state_path_failed",
+                    serde_json::json!({
+                        "key": agent_key_debug_value(key),
+                        "path_kind": "socket",
+                        "current_pid": current_pid,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
             return AgentListState::Idle;
         }
     };
     let state =
         read_agent_runtime_state_at_for_key(Some(key), &meta_path, &socket_path, current_pid);
-    trace_log(
-        "agent_runtime_state_read",
-        serde_json::json!({
-            "key": agent_key_debug_value(key),
-            "current_pid": current_pid,
-            "meta_path": meta_path.display().to_string(),
-            "socket_path": socket_path.display().to_string(),
-            "meta_exists": meta_path.exists(),
-            "socket_exists": socket_path.exists(),
-            "result": agent_list_state_debug_value(state),
-        }),
-    );
+    if trace_enabled {
+        trace_log(
+            "agent_runtime_state_read",
+            serde_json::json!({
+                "key": agent_key_debug_value(key),
+                "current_pid": current_pid,
+                "meta_path": meta_path.display().to_string(),
+                "socket_path": socket_path.display().to_string(),
+                "meta_exists": meta_path.exists(),
+                "socket_exists": socket_path.exists(),
+                "result": agent_list_state_debug_value(state),
+            }),
+        );
+    }
     state
 }
 
@@ -9951,41 +10390,46 @@ fn read_agent_runtime_state_at_for_key(
     current_pid: u32,
 ) -> AgentListState {
     let debug_enabled = DEBUG_ENABLED.load(Ordering::Relaxed);
+    let trace_enabled = TRACE_ENABLED.load(Ordering::Relaxed);
     let content = match fs::read_to_string(meta_path) {
         Ok(content) => content,
         Err(e) => {
-            trace_log(
-                "agent_runtime_state_idle",
-                serde_json::json!({
-                    "reason": "meta_read_failed",
-                    "current_pid": current_pid,
-                    "meta_path": meta_path.display().to_string(),
-                    "socket_path": socket_path.display().to_string(),
-                    "meta_exists": meta_path.exists(),
-                    "socket_exists": socket_path.exists(),
-                    "error_kind": format!("{:?}", e.kind()),
-                    "error": e.to_string(),
-                }),
-            );
+            if trace_enabled {
+                trace_log(
+                    "agent_runtime_state_idle",
+                    serde_json::json!({
+                        "reason": "meta_read_failed",
+                        "current_pid": current_pid,
+                        "meta_path": meta_path.display().to_string(),
+                        "socket_path": socket_path.display().to_string(),
+                        "meta_exists": meta_path.exists(),
+                        "socket_exists": socket_path.exists(),
+                        "error_kind": format!("{:?}", e.kind()),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
             return AgentListState::Idle;
         }
     };
     let meta = match serde_json::from_str::<AgentMetaSnapshot>(&content) {
         Ok(meta) => meta,
         Err(e) => {
-            trace_log(
-                "agent_runtime_state_idle",
-                serde_json::json!({
-                    "reason": "meta_parse_failed",
-                    "current_pid": current_pid,
-                    "meta_path": meta_path.display().to_string(),
-                    "socket_path": socket_path.display().to_string(),
-                    "meta_exists": meta_path.exists(),
-                    "socket_exists": socket_path.exists(),
-                    "error": e.to_string(),
-                    "content_sample": truncate_width(&content, 512),
-                }),
-            );
+            if trace_enabled {
+                trace_log(
+                    "agent_runtime_state_idle",
+                    serde_json::json!({
+                        "reason": "meta_parse_failed",
+                        "current_pid": current_pid,
+                        "meta_path": meta_path.display().to_string(),
+                        "socket_path": socket_path.display().to_string(),
+                        "meta_exists": meta_path.exists(),
+                        "socket_exists": socket_path.exists(),
+                        "error": e.to_string(),
+                        "content_sample": truncate_width(&content, 512),
+                    }),
+                );
+            }
             return AgentListState::Idle;
         }
     };
@@ -10097,30 +10541,32 @@ fn read_agent_runtime_state_at_for_key(
     } else {
         meta.list_state(current_pid, now_epoch_ms)
     };
-    trace_log(
-        "agent_runtime_state_meta_ok",
-        serde_json::json!({
-            "current_pid": current_pid,
-            "meta_path": meta_path.display().to_string(),
-            "socket_path": socket_path.display().to_string(),
-            "socket_exists": socket_path.exists(),
-            "daemon_pid": meta.pid,
-            "daemon_alive": daemon_alive,
-            "child_pid": meta.child_pid,
-            "child_alive": meta.child_pid.map(process_is_alive),
-            "provider": meta.provider.as_deref(),
-            "session_id": meta.session_id.as_deref(),
-            "cwd": meta.cwd.as_deref(),
-            "source": meta.source.as_deref(),
-            "attached": meta.attached,
-            "attached_client_pid": meta.attached_client_pid,
-            "attached_client_alive": meta.attached_client_pid.map(process_is_alive),
-            "last_screen_change_epoch_ms": meta.last_screen_change_epoch_ms,
-            "last_output_epoch_ms": meta.last_output_epoch_ms,
-            "last_input_epoch_ms": meta.last_input_epoch_ms,
-            "result": agent_list_state_debug_value(state),
-        }),
-    );
+    if trace_enabled {
+        trace_log(
+            "agent_runtime_state_meta_ok",
+            serde_json::json!({
+                "current_pid": current_pid,
+                "meta_path": meta_path.display().to_string(),
+                "socket_path": socket_path.display().to_string(),
+                "socket_exists": socket_path.exists(),
+                "daemon_pid": meta.pid,
+                "daemon_alive": daemon_alive,
+                "child_pid": meta.child_pid,
+                "child_alive": meta.child_pid.map(process_is_alive),
+                "provider": meta.provider.as_deref(),
+                "session_id": meta.session_id.as_deref(),
+                "cwd": meta.cwd.as_deref(),
+                "source": meta.source.as_deref(),
+                "attached": meta.attached,
+                "attached_client_pid": meta.attached_client_pid,
+                "attached_client_alive": meta.attached_client_pid.map(process_is_alive),
+                "last_screen_change_epoch_ms": meta.last_screen_change_epoch_ms,
+                "last_output_epoch_ms": meta.last_output_epoch_ms,
+                "last_input_epoch_ms": meta.last_input_epoch_ms,
+                "result": agent_list_state_debug_value(state),
+            }),
+        );
+    }
     state
 }
 
@@ -12837,12 +13283,15 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
         );
         return Vec::new();
     };
-    trace_log(
-        "live_shell_discover_start",
-        serde_json::json!({
-            "dir": dir.display().to_string(),
-        }),
-    );
+    let trace_enabled = TRACE_ENABLED.load(Ordering::Relaxed);
+    if trace_enabled {
+        trace_log(
+            "live_shell_discover_start",
+            serde_json::json!({
+                "dir": dir.display().to_string(),
+            }),
+        );
+    }
     let mut out: Vec<SessionInfo> = Vec::new();
     for entry in read_dir.flatten() {
         let path = entry.path();
@@ -12926,29 +13375,33 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
             updated_at_epoch_s: meta.updated_at_epoch_s,
             title: (!title.is_empty()).then_some(title),
         });
+        if trace_enabled {
+            trace_log(
+                "live_shell_discover_add",
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "source": source,
+                    "synthetic": is_synthetic,
+                    "daemon_pid": meta.pid,
+                    "daemon_alive": process_is_alive(meta.pid),
+                    "provider": provider.as_str(),
+                    "session_id": &debug_session_id,
+                    "cwd": &debug_cwd,
+                    "attached": meta.attached,
+                    "attached_client_pid": meta.attached_client_pid,
+                }),
+            );
+        }
+    }
+    if trace_enabled {
         trace_log(
-            "live_shell_discover_add",
+            "live_shell_discover_done",
             serde_json::json!({
-                "path": path.display().to_string(),
-                "source": source,
-                "synthetic": is_synthetic,
-                "daemon_pid": meta.pid,
-                "daemon_alive": process_is_alive(meta.pid),
-                "provider": provider.as_str(),
-                "session_id": &debug_session_id,
-                "cwd": &debug_cwd,
-                "attached": meta.attached,
-                "attached_client_pid": meta.attached_client_pid,
+                "count": out.len(),
+                "items": out.iter().map(session_info_debug_value).collect::<Vec<_>>(),
             }),
         );
     }
-    trace_log(
-        "live_shell_discover_done",
-        serde_json::json!({
-            "count": out.len(),
-            "items": out.iter().map(session_info_debug_value).collect::<Vec<_>>(),
-        }),
-    );
     out
 }
 
@@ -19260,6 +19713,7 @@ mod tests {
             clone_links: Vec::new(),
             agent_states: HashMap::new(),
             new_agent_backing_aliases: HashMap::new(),
+            new_agent_backing_probe_after: HashMap::new(),
             last_agent_state_poll: Instant::now(),
             list_state: ListState::default(),
             session_view: SessionViewMode::Tree,
@@ -19285,6 +19739,12 @@ mod tests {
             active_agent: None,
             should_quit: false,
             main_tx: None,
+            runtime_tx: None,
+            runtime_refresh_seq: 0,
+            runtime_refresh_applied_seq: 0,
+            runtime_refresh_pending: false,
+            runtime_refresh_queued: false,
+            pending_runtime_action: None,
             next_reader_id: 0,
             show_sessions_view: true,
         }
