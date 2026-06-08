@@ -19,7 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -87,12 +87,15 @@ const AGENT_OUTPUT_POLL_LIMIT: usize = 256;
 const TERMINAL_RESPONSE_SCAN_TAIL_BYTES: usize = 4;
 const AGENT_DAEMON_ARG: &str = "--agent-daemon";
 const AGENT_DAEMON_START_TIMEOUT_MS: u64 = 3_000;
+const AGENT_ATTACH_WRITE_TIMEOUT_MS: u64 = 3_000;
+const AGENT_DETACH_WRITE_TIMEOUT_MS: u64 = 300;
 const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
 const AGENT_BUSY_GRACE_MS: u64 = 3_000;
 const AGENT_ACTIVITY_META_WRITE_INTERVAL_MS: u64 = 750;
 const NEW_AGENT_BACKING_PROBE_INTERVAL_MS: u64 = 5_000;
 const MAIN_EVENT_DRAIN_LIMIT: usize = 64;
 const MAIN_EVENT_DRAIN_BUDGET_MS: u64 = 8;
+const AGENT_CLIENT_OUTPUT_DRAIN_BYTES: usize = 64 * 1024;
 const DEBUG_LOG_FILE: &str = "cokacmux.log";
 const DEBUG_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const APP_DIR_NAME: &str = ".cokacmux";
@@ -3442,7 +3445,7 @@ fn open_agent_pty_log_for_new_run(path: &Path, info: &SessionInfo) -> Option<fs:
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AgentDaemonRequest {
     Attach {
@@ -3460,6 +3463,13 @@ enum AgentDaemonRequest {
         data: Vec<u8>,
     },
     Detach,
+}
+
+type AgentWriterCompletion = Sender<std::result::Result<(), String>>;
+
+struct AgentWriterRequest {
+    request: AgentDaemonRequest,
+    completion: Option<AgentWriterCompletion>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3496,13 +3506,40 @@ enum AgentDaemonEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentOutputKind {
+    Output,
+    Snapshot,
+}
+
+#[derive(Debug)]
+struct AgentOutputSegment {
+    kind: AgentOutputKind,
+    data: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct AgentOutputChunk {
+    kind: AgentOutputKind,
+    data: Vec<u8>,
+    segment_done: bool,
+}
+
+#[derive(Debug, Default)]
+struct AgentOutputBuffer {
+    segments: VecDeque<AgentOutputSegment>,
+    wake_pending: bool,
+}
+
 struct AgentClient {
     info: SessionInfo,
     command_line: String,
     parser: vt100::Parser,
     screen_history: ScreenHistory,
     history_scroll_offset: usize,
-    stream: AgentStream,
+    output_buffer: Arc<Mutex<AgentOutputBuffer>>,
+    request_tx: Sender<AgentWriterRequest>,
+    shutdown_stream: AgentStream,
     pty_size: PtySize,
     exited: Option<String>,
     screen_hash: u64,
@@ -3510,16 +3547,19 @@ struct AgentClient {
     last_output_epoch_ms: u64,
     last_input_epoch_ms: u64,
     pending_snapshot_output: bool,
+    snapshot_parse_in_progress: bool,
     startup_spinner_started_at: Option<Instant>,
     debug_output_events: u32,
     codex_transcript_overlay_assumed_open: bool,
-    /// Monotonic id identifying the reader thread that owns the read side
-    /// of `stream`. Forwarded inside every `MainEvent::AgentEvent` so the
-    /// main loop can ignore events that belong to a previous attach.
+    /// Monotonic id identifying the reader/writer threads for this attach.
+    /// Forwarded inside socket-thread events so the main loop can ignore
+    /// events that belong to a previous attach.
     reader_id: u64,
-    /// Handle to the agent-socket reader thread. Joined on drop after the
-    /// stream is shut down to wake the thread out of its blocking read.
+    /// Handles to the agent-socket threads. Drop shuts the stream down and
+    /// detaches the handles instead of joining, because joining from the UI
+    /// thread can freeze the whole TUI if the OS socket operation is slow.
     reader_thread: Option<JoinHandle<()>>,
+    writer_thread: Option<JoinHandle<()>>,
 }
 
 fn agent_client_instance_id() -> &'static str {
@@ -3554,7 +3594,10 @@ impl Drop for AgentClient {
             }),
         );
         if self.exited.is_none() {
-            match self.send_request(&AgentDaemonRequest::Detach) {
+            match self.send_request_and_wait(
+                AgentDaemonRequest::Detach,
+                Duration::from_millis(AGENT_DETACH_WRITE_TIMEOUT_MS),
+            ) {
                 Ok(()) => {
                     detach_sent = true;
                     debug_log(
@@ -3577,12 +3620,8 @@ impl Drop for AgentClient {
                 ),
             }
         }
-        let shutdown_mode = if detach_sent {
-            std::net::Shutdown::Write
-        } else {
-            std::net::Shutdown::Both
-        };
-        let shutdown_result = self.stream.shutdown(shutdown_mode);
+        let shutdown_mode = std::net::Shutdown::Both;
+        let shutdown_result = self.shutdown_stream.shutdown(shutdown_mode);
         debug_log(
             "agent_client_drop_shutdown",
             serde_json::json!({
@@ -3590,28 +3629,32 @@ impl Drop for AgentClient {
                 "session_id": &self.info.session_id,
                 "reader_id": self.reader_id,
                 "shutdown": shutdown_mode_debug_label(shutdown_mode),
+                "detach_queued": detach_sent,
                 "ok": shutdown_result.is_ok(),
                 "error": shutdown_result.err().map(|e| e.to_string()),
             }),
         );
         if let Some(handle) = self.reader_thread.take() {
             debug_log(
-                "agent_client_drop_reader_join_start",
+                "agent_client_drop_reader_detach",
                 serde_json::json!({
                     "provider": self.info.provider.as_str(),
                     "session_id": &self.info.session_id,
                     "reader_id": self.reader_id,
                 }),
             );
-            let _ = handle.join();
+            drop(handle);
+        }
+        if let Some(handle) = self.writer_thread.take() {
             debug_log(
-                "agent_client_drop_reader_join_done",
+                "agent_client_drop_writer_detach",
                 serde_json::json!({
                     "provider": self.info.provider.as_str(),
                     "session_id": &self.info.session_id,
                     "reader_id": self.reader_id,
                 }),
             );
+            drop(handle);
         }
     }
 }
@@ -3729,7 +3772,7 @@ impl AgentClient {
         reader_id: u64,
         launch_mode: AgentLaunchMode,
     ) -> Result<Self> {
-        let mut client = Self::new(info, stream, cols, rows, main_tx, reader_id, launch_mode)?;
+        let client = Self::new(info, stream, cols, rows, main_tx, reader_id, launch_mode)?;
         debug_log(
             "agent_client_attach_request_send",
             serde_json::json!({
@@ -3742,12 +3785,15 @@ impl AgentClient {
                 "reader_id": reader_id,
             }),
         );
-        client.send_request(&AgentDaemonRequest::Attach {
-            cols: client.pty_size.cols,
-            rows: client.pty_size.rows,
-            client_pid: std::process::id(),
-            client_instance_id: Some(agent_client_instance_id().to_string()),
-        })?;
+        client.send_request_and_wait(
+            AgentDaemonRequest::Attach {
+                cols: client.pty_size.cols,
+                rows: client.pty_size.rows,
+                client_pid: std::process::id(),
+                client_instance_id: Some(agent_client_instance_id().to_string()),
+            },
+            Duration::from_millis(AGENT_ATTACH_WRITE_TIMEOUT_MS),
+        )?;
         Ok(client)
     }
 
@@ -3760,20 +3806,23 @@ impl AgentClient {
         reader_id: u64,
         launch_mode: AgentLaunchMode,
     ) -> Result<Self> {
-        // The reader thread uses a blocking clone of the stream; the main
-        // thread keeps `self.stream` for writes only.
+        // Reader and writer threads own blocking stream clones. The UI
+        // thread only queues requests, so a slow daemon socket cannot stall
+        // rendering or input handling.
         let read_stream = stream.try_clone()?;
+        let shutdown_stream = stream.try_clone()?;
         read_stream.set_nonblocking(false)?;
-        // Main thread's stream stays blocking too — write_json_line writes
-        // are small and we want full-write semantics. We never `read` from
-        // it on the main thread anymore.
+        stream.set_nonblocking(false)?;
         let pty_size = agent_pty_size(cols, rows);
         let parser = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
         let screen_hash = screen_activity_hash(parser.screen());
 
         let provider = info.provider;
         let session_id = info.session_id.clone();
+        let output_buffer = Arc::new(Mutex::new(AgentOutputBuffer::default()));
+        let reader_output_buffer = output_buffer.clone();
         let thread_tx = main_tx.clone();
+        let writer_tx = main_tx.clone();
         let thread_session_id = session_id.clone();
         let reader_thread = thread::Builder::new()
             .name(format!(
@@ -3790,7 +3839,12 @@ impl AgentClient {
                         "reader_id": reader_id,
                     }),
                 );
-                let reason = run_agent_reader_thread(read_stream, &thread_tx, reader_id);
+                let reason = run_agent_reader_thread(
+                    read_stream,
+                    &thread_tx,
+                    reader_output_buffer,
+                    reader_id,
+                );
                 let _ = thread_tx.send(MainEvent::AgentReaderEnded { reader_id, reason });
                 debug_log(
                     "agent_reader_thread_exit",
@@ -3801,6 +3855,49 @@ impl AgentClient {
                     }),
                 );
             })?;
+        let (request_tx, request_rx) = mpsc::channel();
+        let writer_provider = provider;
+        let writer_session_id = session_id.clone();
+        let writer_log_session_id = session_id.clone();
+        let writer_thread = match thread::Builder::new()
+            .name(format!(
+                "cokacmux-agent-writer-{}-{}",
+                writer_provider.as_str(),
+                truncate_width(&writer_session_id, 8)
+            ))
+            .spawn(move || {
+                debug_log(
+                    "agent_writer_thread_start",
+                    serde_json::json!({
+                        "provider": writer_provider.as_str(),
+                        "session_id": &writer_log_session_id,
+                        "reader_id": reader_id,
+                    }),
+                );
+                let reason = run_agent_writer_thread(
+                    stream,
+                    request_rx,
+                    writer_provider,
+                    writer_session_id,
+                    reader_id,
+                );
+                let _ = writer_tx.send(MainEvent::AgentWriterEnded { reader_id, reason });
+                debug_log(
+                    "agent_writer_thread_exit",
+                    serde_json::json!({
+                        "provider": writer_provider.as_str(),
+                        "session_id": writer_log_session_id,
+                        "reader_id": reader_id,
+                    }),
+                );
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                let _ = shutdown_stream.shutdown(std::net::Shutdown::Both);
+                let _ = reader_thread.join();
+                return Err(e.into());
+            }
+        };
 
         let settings = Settings::load();
         let command_line =
@@ -3812,7 +3909,9 @@ impl AgentClient {
             parser,
             screen_history: ScreenHistory::default(),
             history_scroll_offset: 0,
-            stream,
+            output_buffer,
+            request_tx,
+            shutdown_stream,
             pty_size,
             exited: None,
             screen_hash,
@@ -3820,11 +3919,13 @@ impl AgentClient {
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
             pending_snapshot_output: false,
+            snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
             debug_output_events: 0,
             codex_transcript_overlay_assumed_open: false,
             reader_id,
             reader_thread: Some(reader_thread),
+            writer_thread: Some(writer_thread),
         })
     }
 
@@ -3960,6 +4061,19 @@ impl AgentClient {
     }
 
     fn process_agent_output(&mut self, data: &[u8], counts_as_activity: bool) {
+        self.process_agent_output_inner(data, counts_as_activity, true);
+    }
+
+    fn process_agent_snapshot_output(&mut self, data: &[u8]) {
+        self.process_agent_output_inner(data, false, false);
+    }
+
+    fn process_agent_output_inner(
+        &mut self,
+        data: &[u8],
+        counts_as_activity: bool,
+        capture_history: bool,
+    ) {
         let now_ms = current_epoch_ms();
         let visible_rows = self.pty_size.rows as usize;
         let should_debug = DEBUG_ENABLED.load(Ordering::Relaxed)
@@ -3969,11 +4083,16 @@ impl AgentClient {
         if counts_as_activity {
             self.last_output_epoch_ms = now_ms;
         }
+        let screen_history = if capture_history {
+            Some(&mut self.screen_history)
+        } else {
+            None
+        };
         let screen_changed = process_parser_output(
             &mut self.parser,
             data,
             &mut self.screen_hash,
-            Some(&mut self.screen_history),
+            screen_history,
         );
         if screen_changed {
             self.history_scroll_offset = self.history_scroll_offset.min(
@@ -4013,6 +4132,12 @@ impl AgentClient {
     }
 
     fn process_agent_snapshot(&mut self, data: &[u8]) {
+        self.begin_agent_snapshot(data);
+        self.process_agent_snapshot_output(data);
+        self.finish_agent_snapshot();
+    }
+
+    fn begin_agent_snapshot(&mut self, first_chunk: &[u8]) {
         let visible_rows = self.pty_size.rows as usize;
         let should_debug = DEBUG_ENABLED.load(Ordering::Relaxed);
         let state_before = should_debug
@@ -4023,7 +4148,7 @@ impl AgentClient {
                 serde_json::json!({
                     "provider": self.info.provider.as_str(),
                     "session_id": &self.info.session_id,
-                    "data": debug_terminal_data_summary(data, 1024),
+                    "data": debug_terminal_data_summary(first_chunk, 1024),
                     "state_before": state_before,
                 }),
             );
@@ -4037,7 +4162,12 @@ impl AgentClient {
         self.history_scroll_offset = 0;
         self.codex_transcript_overlay_assumed_open = false;
         self.screen_hash = screen_activity_hash(self.parser.screen());
-        self.process_agent_output(data, false);
+        self.snapshot_parse_in_progress = true;
+    }
+
+    fn finish_agent_snapshot(&mut self) {
+        let visible_rows = self.pty_size.rows as usize;
+        let should_debug = DEBUG_ENABLED.load(Ordering::Relaxed);
         let sanitize = sanitize_snapshot_visible_screen_duplicates(&mut self.parser);
         if let Some(sanitize) = sanitize {
             self.history_scroll_offset = 0;
@@ -4073,6 +4203,49 @@ impl AgentClient {
                 }),
             );
         }
+        self.snapshot_parse_in_progress = false;
+    }
+
+    fn process_agent_snapshot_chunk(&mut self, chunk: AgentOutputChunk) {
+        if !self.snapshot_parse_in_progress {
+            self.begin_agent_snapshot(&chunk.data);
+        }
+        if !chunk.data.is_empty() {
+            self.process_agent_snapshot_output(&chunk.data);
+        }
+        if chunk.segment_done {
+            self.finish_agent_snapshot();
+        }
+    }
+
+    fn drain_pending_output(&mut self, max_bytes: usize) -> bool {
+        let (chunk, has_more) = take_agent_output_chunk(&self.output_buffer, max_bytes);
+        if let Some(chunk) = chunk {
+            match chunk.kind {
+                AgentOutputKind::Output => {
+                    let is_legacy_snapshot = self.snapshot_parse_in_progress
+                        || std::mem::take(&mut self.pending_snapshot_output);
+                    if is_legacy_snapshot {
+                        self.process_agent_snapshot_chunk(AgentOutputChunk {
+                            kind: AgentOutputKind::Snapshot,
+                            data: chunk.data,
+                            segment_done: chunk.segment_done,
+                        });
+                    } else if !chunk.data.is_empty() {
+                        self.process_agent_output(&chunk.data, true);
+                    }
+                }
+                AgentOutputKind::Snapshot => {
+                    self.pending_snapshot_output = false;
+                    self.process_agent_snapshot_chunk(chunk);
+                }
+            }
+        }
+        has_more
+    }
+
+    fn drain_pending_output_fully(&mut self) {
+        while self.drain_pending_output(usize::MAX) {}
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
@@ -4092,7 +4265,7 @@ impl AgentClient {
         self.history_scroll_offset = self
             .history_scroll_offset
             .min(self.screen_history.max_scroll_offset(next.rows as usize));
-        let send_result = self.send_request(&AgentDaemonRequest::Resize {
+        let send_result = self.send_request(AgentDaemonRequest::Resize {
             cols: next.cols,
             rows: next.rows,
         });
@@ -4204,7 +4377,7 @@ impl AgentClient {
                 self.history_scroll_offset = 0;
             }
             self.last_input_epoch_ms = current_epoch_ms();
-            let send_result = self.send_request(&AgentDaemonRequest::Input { data });
+            let send_result = self.send_request(AgentDaemonRequest::Input { data });
             if DEBUG_ENABLED.load(Ordering::Relaxed) {
                 debug_log(
                     "agent_client_forward_key_sent",
@@ -4241,31 +4414,68 @@ impl AgentClient {
         }
     }
 
-    fn send_request(&mut self, request: &AgentDaemonRequest) -> io::Result<()> {
-        let request_kind = match request {
-            AgentDaemonRequest::Attach { .. } => "attach",
-            AgentDaemonRequest::Resize { .. } => "resize",
-            AgentDaemonRequest::Input { .. } => "input",
-            AgentDaemonRequest::Detach => "detach",
-        };
+    fn send_request(&self, request: AgentDaemonRequest) -> io::Result<()> {
+        self.queue_request(request, None)
+    }
+
+    fn send_request_and_wait(
+        &self,
+        request: AgentDaemonRequest,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let request_kind = agent_daemon_request_kind(&request);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        self.queue_request(request, Some(completion_tx))?;
+        match completion_rx.recv_timeout(timeout) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(io::Error::new(ErrorKind::BrokenPipe, error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "agent writer did not send {} request within {}ms",
+                    request_kind,
+                    timeout.as_millis()
+                ),
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "agent writer stopped before reporting request write result",
+            )),
+        }
+    }
+
+    fn queue_request(
+        &self,
+        request: AgentDaemonRequest,
+        completion: Option<AgentWriterCompletion>,
+    ) -> io::Result<()> {
+        let request_kind = agent_daemon_request_kind(&request);
         if DEBUG_ENABLED.load(Ordering::Relaxed) {
             let details = serde_json::json!({
                 "provider": self.info.provider.as_str(),
                 "session_id": &self.info.session_id,
                 "reader_id": self.reader_id,
                 "request": request_kind,
-                "detail": request,
+                "detail": &request,
             });
             if matches!(request, AgentDaemonRequest::Input { .. }) {
-                trace_log("agent_client_request_send", details);
+                trace_log("agent_client_request_queue", details);
             } else {
-                debug_log("agent_client_request_send", details);
+                debug_log("agent_client_request_queue", details);
             }
         }
-        let result = write_json_line(&mut self.stream, request);
+        let result = self
+            .request_tx
+            .send(AgentWriterRequest {
+                request,
+                completion,
+            })
+            .map_err(|_| {
+                io::Error::new(ErrorKind::BrokenPipe, "agent writer thread is not running")
+            });
         if let Err(e) = result.as_ref() {
             debug_log(
-                "agent_client_request_send_failed",
+                "agent_client_request_queue_failed",
                 serde_json::json!({
                     "provider": self.info.provider.as_str(),
                     "session_id": &self.info.session_id,
@@ -4278,6 +4488,107 @@ impl AgentClient {
         }
         result
     }
+}
+
+fn agent_daemon_request_kind(request: &AgentDaemonRequest) -> &'static str {
+    match request {
+        AgentDaemonRequest::Attach { .. } => "attach",
+        AgentDaemonRequest::Resize { .. } => "resize",
+        AgentDaemonRequest::Input { .. } => "input",
+        AgentDaemonRequest::Detach => "detach",
+    }
+}
+
+fn queue_agent_output(
+    output_buffer: &Arc<Mutex<AgentOutputBuffer>>,
+    tx: &Sender<MainEvent>,
+    reader_id: u64,
+    kind: AgentOutputKind,
+    data: Vec<u8>,
+) -> std::result::Result<(), String> {
+    let should_wake = {
+        let mut pending = lock_agent_output_buffer(output_buffer);
+        if kind == AgentOutputKind::Output {
+            let can_merge = pending
+                .segments
+                .back()
+                .is_some_and(|segment| segment.kind == AgentOutputKind::Output);
+            if can_merge {
+                pending
+                    .segments
+                    .back_mut()
+                    .expect("mergeable output segment exists")
+                    .data
+                    .extend_from_slice(&data);
+            } else {
+                pending
+                    .segments
+                    .push_back(AgentOutputSegment { kind, data });
+            }
+        } else {
+            pending
+                .segments
+                .push_back(AgentOutputSegment { kind, data });
+        }
+        if pending.wake_pending {
+            false
+        } else {
+            pending.wake_pending = true;
+            true
+        }
+    };
+    if should_wake {
+        tx.send(MainEvent::AgentOutputAvailable { reader_id })
+            .map_err(|_| "main receiver dropped".to_string())?;
+    }
+    Ok(())
+}
+
+fn take_agent_output_chunk(
+    output_buffer: &Arc<Mutex<AgentOutputBuffer>>,
+    max_bytes: usize,
+) -> (Option<AgentOutputChunk>, bool) {
+    let mut pending = lock_agent_output_buffer(output_buffer);
+    let max_bytes = max_bytes.max(1);
+    let Some(front) = pending.segments.front_mut() else {
+        pending.wake_pending = false;
+        return (None, false);
+    };
+
+    if front.data.len() <= max_bytes {
+        let segment = pending.segments.pop_front().expect("front segment exists");
+        let has_more = !pending.segments.is_empty();
+        pending.wake_pending = has_more;
+        return (
+            Some(AgentOutputChunk {
+                kind: segment.kind,
+                data: segment.data,
+                segment_done: true,
+            }),
+            has_more,
+        );
+    }
+
+    let kind = front.kind;
+    let rest = front.data.split_off(max_bytes);
+    let data = std::mem::replace(&mut front.data, rest);
+    pending.wake_pending = true;
+    (
+        Some(AgentOutputChunk {
+            kind,
+            data,
+            segment_done: false,
+        }),
+        true,
+    )
+}
+
+fn lock_agent_output_buffer(
+    output_buffer: &Arc<Mutex<AgentOutputBuffer>>,
+) -> std::sync::MutexGuard<'_, AgentOutputBuffer> {
+    output_buffer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 struct DaemonConnection {
@@ -4317,9 +4628,16 @@ enum MainEvent {
         reader_id: u64,
         event: AgentDaemonEvent,
     },
+    /// Coalesced agent output/snapshot bytes are ready in the active
+    /// client's shared buffer. The bytes stay out of the main-event FIFO so
+    /// bursts cannot bury input events behind thousands of individual chunks.
+    AgentOutputAvailable { reader_id: u64 },
     /// The agent reader thread terminated (socket EOF or error). Main loop
     /// treats this like a daemon-exit notification.
     AgentReaderEnded { reader_id: u64, reason: String },
+    /// The agent writer thread terminated. This should only matter while
+    /// the matching AgentClient is still active; late events are ignored.
+    AgentWriterEnded { reader_id: u64, reason: String },
     /// Housekeeping tick — fires every `AGENT_STATE_POLL_INTERVAL_MS` so
     /// preview results / agent runtime state polls get a chance to run
     /// even when the user is idle. Not a latency knob.
@@ -6099,6 +6417,7 @@ impl App {
         if let Some(exit_status) = agent.exited.clone() {
             let provider = agent.info.provider;
             let session_id = agent.info.session_id.clone();
+            agent.drain_pending_output_fully();
             self.active_agent = None;
             self.discard_pending_agent_runtime_refresh();
             self.status = format!(
@@ -6127,7 +6446,7 @@ impl App {
 
     /// Apply a `MainEvent::AgentEvent` to the active agent if it still
     /// matches `reader_id`. Late events from a replaced agent are silently
-    /// dropped — that AgentClient's Drop already joined its reader.
+    /// dropped.
     fn on_agent_event(&mut self, reader_id: u64, event: AgentDaemonEvent) {
         let Some(agent) = self.active_agent.as_mut() else {
             return;
@@ -6135,7 +6454,30 @@ impl App {
         if agent.reader_id != reader_id {
             return;
         }
+        if matches!(
+            &event,
+            AgentDaemonEvent::Exited { .. } | AgentDaemonEvent::Error { .. }
+        ) {
+            agent.drain_pending_output_fully();
+        }
         agent.process_agent_event(event);
+    }
+
+    fn on_agent_output_available(&mut self, reader_id: u64) {
+        let has_more = {
+            let Some(agent) = self.active_agent.as_mut() else {
+                return;
+            };
+            if agent.reader_id != reader_id {
+                return;
+            }
+            agent.drain_pending_output(AGENT_CLIENT_OUTPUT_DRAIN_BYTES)
+        };
+        if has_more {
+            if let Some(tx) = self.main_tx.clone() {
+                let _ = tx.send(MainEvent::AgentOutputAvailable { reader_id });
+            }
+        }
     }
 
     /// Apply a reader-thread exit signal. Treated like a daemon-disconnect.
@@ -6147,7 +6489,23 @@ impl App {
             return;
         }
         if agent.exited.is_none() {
+            agent.drain_pending_output_fully();
             agent.exited = Some(format!("daemon connection ended: {}", reason));
+        }
+    }
+
+    /// Apply a writer-thread exit signal. This only affects the active
+    /// matching attach; late writer exits from detached clients are ignored.
+    fn on_agent_writer_ended(&mut self, reader_id: u64, reason: String) {
+        let Some(agent) = self.active_agent.as_mut() else {
+            return;
+        };
+        if agent.reader_id != reader_id {
+            return;
+        }
+        if agent.exited.is_none() {
+            agent.drain_pending_output_fully();
+            agent.exited = Some(format!("daemon request writer ended: {}", reason));
         }
     }
 
@@ -9132,8 +9490,14 @@ fn run(terminal: &mut Tui) -> Result<()> {
             MainEvent::AgentEvent { reader_id, event } => {
                 app.on_agent_event(reader_id, event);
             }
+            MainEvent::AgentOutputAvailable { reader_id } => {
+                app.on_agent_output_available(reader_id);
+            }
             MainEvent::AgentReaderEnded { reader_id, reason } => {
                 app.on_agent_reader_ended(reader_id, reason);
+            }
+            MainEvent::AgentWriterEnded { reader_id, reason } => {
+                app.on_agent_writer_ended(reader_id, reason);
             }
             MainEvent::RuntimeStateResult(result) => {
                 app.on_runtime_state_result(result);
@@ -9195,9 +9559,17 @@ fn run(terminal: &mut Tui) -> Result<()> {
                     drained_events = drained_events.saturating_add(1);
                     app.on_agent_event(reader_id, event);
                 }
+                Ok(MainEvent::AgentOutputAvailable { reader_id }) => {
+                    drained_events = drained_events.saturating_add(1);
+                    app.on_agent_output_available(reader_id);
+                }
                 Ok(MainEvent::AgentReaderEnded { reader_id, reason }) => {
                     drained_events = drained_events.saturating_add(1);
                     app.on_agent_reader_ended(reader_id, reason);
+                }
+                Ok(MainEvent::AgentWriterEnded { reader_id, reason }) => {
+                    drained_events = drained_events.saturating_add(1);
+                    app.on_agent_writer_ended(reader_id, reason);
                 }
                 Ok(MainEvent::RuntimeStateResult(result)) => {
                     drained_events = drained_events.saturating_add(1);
@@ -11911,6 +12283,7 @@ fn write_all_retry(writer: &mut AgentStream, mut bytes: &[u8]) -> io::Result<()>
 fn run_agent_reader_thread(
     mut stream: AgentStream,
     tx: &Sender<MainEvent>,
+    output_buffer: Arc<Mutex<AgentOutputBuffer>>,
     reader_id: u64,
 ) -> String {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
@@ -11930,6 +12303,28 @@ fn run_agent_reader_thread(
                 continue;
             }
             match serde_json::from_slice::<AgentDaemonEvent>(line) {
+                Ok(AgentDaemonEvent::Output { data }) => {
+                    if let Err(reason) = queue_agent_output(
+                        &output_buffer,
+                        tx,
+                        reader_id,
+                        AgentOutputKind::Output,
+                        data,
+                    ) {
+                        return reason;
+                    }
+                }
+                Ok(AgentDaemonEvent::Snapshot { data }) => {
+                    if let Err(reason) = queue_agent_output(
+                        &output_buffer,
+                        tx,
+                        reader_id,
+                        AgentOutputKind::Snapshot,
+                        data,
+                    ) {
+                        return reason;
+                    }
+                }
                 Ok(event) => {
                     if tx.send(MainEvent::AgentEvent { reader_id, event }).is_err() {
                         return "main receiver dropped".into();
@@ -11941,6 +12336,58 @@ fn run_agent_reader_thread(
             }
         }
     }
+}
+
+/// Body of the per-AgentClient writer thread. This is the only client-side
+/// path that performs blocking socket writes to the daemon.
+fn run_agent_writer_thread(
+    mut stream: AgentStream,
+    rx: Receiver<AgentWriterRequest>,
+    provider: Provider,
+    session_id: String,
+    reader_id: u64,
+) -> String {
+    while let Ok(envelope) = rx.recv() {
+        let AgentWriterRequest {
+            request,
+            completion,
+        } = envelope;
+        let request_kind = agent_daemon_request_kind(&request);
+        if let Err(e) = write_json_line(&mut stream, &request) {
+            let error_kind = format!("{:?}", e.kind());
+            let error = e.to_string();
+            if let Some(completion) = completion {
+                let _ = completion.send(Err(error.clone()));
+            }
+            debug_log(
+                "agent_writer_request_failed",
+                serde_json::json!({
+                    "provider": provider.as_str(),
+                    "session_id": &session_id,
+                    "reader_id": reader_id,
+                    "request": request_kind,
+                    "error_kind": error_kind,
+                    "error": &error,
+                }),
+            );
+            return format!("write error: {}", error);
+        }
+        if let Some(completion) = completion {
+            let _ = completion.send(Ok(()));
+        }
+        let details = serde_json::json!({
+            "provider": provider.as_str(),
+            "session_id": &session_id,
+            "reader_id": reader_id,
+            "request": request_kind,
+        });
+        if matches!(request, AgentDaemonRequest::Input { .. }) {
+            trace_log("agent_writer_request_sent", details);
+        } else {
+            debug_log("agent_writer_request_sent", details);
+        }
+    }
+    "request channel closed".into()
 }
 
 fn read_agent_daemon_requests(
@@ -22745,6 +23192,14 @@ mod tests {
             .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
             .spawn()
             .unwrap();
+        for _ in 0..100 {
+            if agent_client_process_identity(foreign_client.id())
+                != AgentClientProcessIdentity::Unknown
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let meta = AgentMetaSnapshot {
             pid: current_pid,
             child_pid: None,
@@ -24021,13 +24476,16 @@ IF EXIST "%~dp0\node.exe" (
         let second_snapshot = parser_snapshot_bytes(&mut second, true);
 
         let (stream, _peer) = AgentStream::pair().unwrap();
+        let (request_tx, _request_rx) = mpsc::channel();
         let mut client = AgentClient {
             info: session_info(Provider::Claude, "snapshot-replace", "/repo"),
             command_line: "test".into(),
             parser: vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES),
             screen_history: ScreenHistory::default(),
             history_scroll_offset: 0,
-            stream,
+            output_buffer: Arc::new(Mutex::new(AgentOutputBuffer::default())),
+            request_tx,
+            shutdown_stream: stream,
             pty_size,
             exited: Some("test".into()),
             screen_hash: 0,
@@ -24035,11 +24493,13 @@ IF EXIST "%~dp0\node.exe" (
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
             pending_snapshot_output: false,
+            snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
             debug_output_events: 0,
             codex_transcript_overlay_assumed_open: false,
             reader_id: 0,
             reader_thread: None,
+            writer_thread: None,
         };
         client.screen_hash = screen_activity_hash(client.parser.screen());
 
@@ -24062,6 +24522,196 @@ IF EXIST "%~dp0\node.exe" (
             "replacement snapshot must not keep previous parser contents in scrollback: {:?}",
             top_text
         );
+    }
+
+    #[cfg(unix)]
+    fn buffered_output_test_client(session_id: &str, reader_id: u64) -> AgentClient {
+        let (stream, _peer) = AgentStream::pair().unwrap();
+        let (request_tx, _request_rx) = mpsc::channel();
+        let pty_size = agent_pty_size(80, 8);
+        let mut client = AgentClient {
+            info: session_info(Provider::Claude, session_id, "/repo"),
+            command_line: "test".into(),
+            parser: vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES),
+            screen_history: ScreenHistory::default(),
+            history_scroll_offset: 0,
+            output_buffer: Arc::new(Mutex::new(AgentOutputBuffer::default())),
+            request_tx,
+            shutdown_stream: stream,
+            pty_size,
+            exited: None,
+            screen_hash: 0,
+            last_screen_change_epoch_ms: 0,
+            last_output_epoch_ms: 0,
+            last_input_epoch_ms: 0,
+            pending_snapshot_output: false,
+            snapshot_parse_in_progress: false,
+            startup_spinner_started_at: None,
+            debug_output_events: 0,
+            codex_transcript_overlay_assumed_open: false,
+            reader_id,
+            reader_thread: None,
+            writer_thread: None,
+        };
+        client.screen_hash = screen_activity_hash(client.parser.screen());
+        client
+    }
+
+    fn large_output_with_tail_marker() -> Vec<u8> {
+        let mut out = Vec::new();
+        for line in 0..10_000 {
+            out.extend_from_slice(format!("BUFFERED-LINE-{line:05}\r\n").as_bytes());
+        }
+        out.extend_from_slice(b"COKACMUX_TAIL_MARKER\r\n");
+        out
+    }
+
+    fn active_agent_visible_text(app: &mut App) -> String {
+        let agent = app.active_agent.as_mut().unwrap();
+        parser_visible_plain_lines(&mut agent.parser, 0).join("\n")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_event_flushes_large_pending_output_before_exit() {
+        let reader_id = 19;
+        let mut app = app_for_key_tests();
+        app.active_agent = Some(buffered_output_test_client("large-output-exit", reader_id));
+
+        let (tx, _rx) = mpsc::channel::<MainEvent>();
+        let output_buffer = app.active_agent.as_ref().unwrap().output_buffer.clone();
+        queue_agent_output(
+            &output_buffer,
+            &tx,
+            reader_id,
+            AgentOutputKind::Output,
+            large_output_with_tail_marker(),
+        )
+        .unwrap();
+
+        app.on_agent_output_available(reader_id);
+        assert!(!active_agent_visible_text(&mut app).contains("COKACMUX_TAIL_MARKER"));
+
+        app.on_agent_event(
+            reader_id,
+            AgentDaemonEvent::Exited {
+                status: "done".into(),
+            },
+        );
+
+        let text = active_agent_visible_text(&mut app);
+        assert!(
+            text.contains("COKACMUX_TAIL_MARKER"),
+            "terminal event must flush pending output before marking exit: {:?}",
+            text
+        );
+        assert_eq!(
+            app.active_agent.as_ref().unwrap().exited.as_deref(),
+            Some("done")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_end_flushes_large_pending_output_before_exit() {
+        let reader_id = 23;
+        let mut app = app_for_key_tests();
+        app.active_agent = Some(buffered_output_test_client(
+            "large-output-reader-end",
+            reader_id,
+        ));
+
+        let (tx, _rx) = mpsc::channel::<MainEvent>();
+        let output_buffer = app.active_agent.as_ref().unwrap().output_buffer.clone();
+        queue_agent_output(
+            &output_buffer,
+            &tx,
+            reader_id,
+            AgentOutputKind::Output,
+            large_output_with_tail_marker(),
+        )
+        .unwrap();
+
+        app.on_agent_output_available(reader_id);
+        assert!(!active_agent_visible_text(&mut app).contains("COKACMUX_TAIL_MARKER"));
+
+        app.on_agent_reader_ended(reader_id, "eof".into());
+
+        let text = active_agent_visible_text(&mut app);
+        assert!(
+            text.contains("COKACMUX_TAIL_MARKER"),
+            "reader end must flush pending output before marking exit: {:?}",
+            text
+        );
+        assert!(app
+            .active_agent
+            .as_ref()
+            .unwrap()
+            .exited
+            .as_deref()
+            .is_some_and(|status| status.contains("daemon connection ended")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_snapshot_output_uses_buffered_output_path() {
+        let (stream, _peer) = AgentStream::pair().unwrap();
+        let (request_tx, _request_rx) = mpsc::channel();
+        let pty_size = agent_pty_size(40, 6);
+        let mut client = AgentClient {
+            info: session_info(Provider::Claude, "legacy-snapshot-buffer", "/repo"),
+            command_line: "test".into(),
+            parser: vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES),
+            screen_history: ScreenHistory::default(),
+            history_scroll_offset: 0,
+            output_buffer: Arc::new(Mutex::new(AgentOutputBuffer::default())),
+            request_tx,
+            shutdown_stream: stream,
+            pty_size,
+            exited: Some("test".into()),
+            screen_hash: 0,
+            last_screen_change_epoch_ms: 0,
+            last_output_epoch_ms: 0,
+            last_input_epoch_ms: 0,
+            pending_snapshot_output: false,
+            snapshot_parse_in_progress: false,
+            startup_spinner_started_at: None,
+            debug_output_events: 0,
+            codex_transcript_overlay_assumed_open: false,
+            reader_id: 7,
+            reader_thread: None,
+            writer_thread: None,
+        };
+        client.screen_hash = screen_activity_hash(client.parser.screen());
+        client.process_agent_output(b"OLD SCREEN\r\n", true);
+        client.process_agent_event(AgentDaemonEvent::Attached {
+            provider: Provider::Claude,
+            session_id: "legacy-snapshot-buffer".into(),
+            command: "test".into(),
+            daemon_pid: 0,
+            child_pid: None,
+            snapshot_event: false,
+            last_screen_change_epoch_ms: 0,
+            last_output_epoch_ms: 0,
+            last_input_epoch_ms: 0,
+        });
+
+        let (tx, _rx) = mpsc::channel::<MainEvent>();
+        queue_agent_output(
+            &client.output_buffer,
+            &tx,
+            client.reader_id,
+            AgentOutputKind::Output,
+            b"NEW SNAPSHOT\r\n".to_vec(),
+        )
+        .unwrap();
+        assert!(!client.drain_pending_output(AGENT_CLIENT_OUTPUT_DRAIN_BYTES));
+
+        let text = parser_visible_plain_lines(&mut client.parser, 0).join("\n");
+        assert!(text.contains("NEW SNAPSHOT"));
+        assert!(!text.contains("OLD SCREEN"));
+        assert!(!client.pending_snapshot_output);
+        assert!(!client.snapshot_parse_in_progress);
     }
 
     #[test]
@@ -24262,6 +24912,7 @@ IF EXIST "%~dp0\node.exe" (
     #[test]
     fn agent_client_scrolls_screen_history_when_parser_scrollback_is_empty() {
         let (stream, _peer) = AgentStream::pair().unwrap();
+        let (request_tx, _request_rx) = mpsc::channel();
         let pty_size = agent_pty_size(40, 6);
         let parser = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
         let mut client = AgentClient {
@@ -24270,7 +24921,9 @@ IF EXIST "%~dp0\node.exe" (
             parser,
             screen_history: ScreenHistory::default(),
             history_scroll_offset: 0,
-            stream,
+            output_buffer: Arc::new(Mutex::new(AgentOutputBuffer::default())),
+            request_tx,
+            shutdown_stream: stream,
             pty_size,
             exited: Some("test".into()),
             screen_hash: 0,
@@ -24278,11 +24931,13 @@ IF EXIST "%~dp0\node.exe" (
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
             pending_snapshot_output: false,
+            snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
             debug_output_events: 0,
             codex_transcript_overlay_assumed_open: false,
             reader_id: 0,
             reader_thread: None,
+            writer_thread: None,
         };
         client.screen_hash = screen_activity_hash(client.parser.screen());
 
@@ -24315,6 +24970,7 @@ IF EXIST "%~dp0\node.exe" (
     #[test]
     fn terminal_session_scroll_uses_parent_scrollback() {
         let (stream, _peer) = AgentStream::pair().unwrap();
+        let (request_tx, _request_rx) = mpsc::channel();
         let pty_size = agent_pty_size(40, 6);
         let mut parser = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
         for line in 1..=18 {
@@ -24333,7 +24989,9 @@ IF EXIST "%~dp0\node.exe" (
             parser,
             screen_history: ScreenHistory::default(),
             history_scroll_offset: 0,
-            stream,
+            output_buffer: Arc::new(Mutex::new(AgentOutputBuffer::default())),
+            request_tx,
+            shutdown_stream: stream,
             pty_size,
             exited: Some("test".into()),
             screen_hash: 0,
@@ -24341,11 +24999,13 @@ IF EXIST "%~dp0\node.exe" (
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
             pending_snapshot_output: false,
+            snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
             debug_output_events: 0,
             codex_transcript_overlay_assumed_open: false,
             reader_id: 0,
             reader_thread: None,
+            writer_thread: None,
         };
         client.screen_hash = screen_activity_hash(client.parser.screen());
         app.active_agent = Some(client);
