@@ -84,18 +84,24 @@ const AGENT_SIDEBAR_RESIZE_STEP: u16 = PANE_RESIZE_STEP_COLUMNS;
 const AGENT_MIN_PTY_COLS: u16 = 20;
 const AGENT_MIN_PTY_ROWS: u16 = 5;
 const AGENT_OUTPUT_POLL_LIMIT: usize = 256;
+const AGENT_OUTPUT_DRAIN_BUDGET_MS: u64 = 8;
 const TERMINAL_RESPONSE_SCAN_TAIL_BYTES: usize = 4;
 const AGENT_DAEMON_ARG: &str = "--agent-daemon";
 const AGENT_DAEMON_START_TIMEOUT_MS: u64 = 3_000;
 const AGENT_ATTACH_WRITE_TIMEOUT_MS: u64 = 3_000;
 const AGENT_DETACH_WRITE_TIMEOUT_MS: u64 = 300;
 const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
+const LIVE_SHELL_DISCOVERY_INTERVAL_MS: u64 = 10_000;
+const PENDING_RUNTIME_ACTION_MAX_WAIT_MS: u64 = 500;
 const AGENT_BUSY_GRACE_MS: u64 = 3_000;
 const AGENT_ACTIVITY_META_WRITE_INTERVAL_MS: u64 = 750;
 const NEW_AGENT_BACKING_PROBE_INTERVAL_MS: u64 = 5_000;
 const MAIN_EVENT_DRAIN_LIMIT: usize = 64;
 const MAIN_EVENT_DRAIN_BUDGET_MS: u64 = 8;
-const AGENT_CLIENT_OUTPUT_DRAIN_BYTES: usize = 64 * 1024;
+const AGENT_CLIENT_OUTPUT_DRAIN_BYTES: usize = 16 * 1024;
+const PERF_LOG_THRESHOLD_MS: u128 = 50;
+const MIN_PREVIEW_PANE_WIDTH: u16 = 24;
+const MIN_PREVIEW_WRAP_WIDTH: u16 = 20;
 const DEBUG_LOG_FILE: &str = "cokacmux.log";
 const DEBUG_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const APP_DIR_NAME: &str = ".cokacmux";
@@ -1959,14 +1965,17 @@ struct PreviewEntry {
     text: String,
     wrap_width: usize,
     lines: Vec<String>,
+    summary_style_states: Vec<PreviewSummaryStyleState>,
 }
 
 impl PreviewEntry {
     fn new(text: String, wrap_width: usize, lines: Vec<String>) -> Self {
+        let summary_style_states = preview_summary_style_states_for_lines(&lines);
         Self {
             text,
             wrap_width,
             lines,
+            summary_style_states,
         }
     }
 }
@@ -1976,6 +1985,7 @@ struct PreviewRequest {
     key: PreviewKey,
     info: SessionInfo,
     width: usize,
+    wake_tx: Option<Sender<MainEvent>>,
 }
 
 struct PreviewResult {
@@ -1990,12 +2000,22 @@ struct SearchPending {
     seq: u64,
     query: String,
     started_at: Instant,
+    cancel: Arc<AtomicBool>,
 }
 
 struct SearchWorkerResult {
     seq: u64,
     query: String,
     hits: std::result::Result<Vec<session::SearchHit>, String>,
+    queued_at_epoch_ms: u64,
+}
+
+struct SessionRefreshResult {
+    seq: u64,
+    sessions: std::result::Result<Vec<SessionInfo>, String>,
+    clone_links: std::result::Result<Vec<session::clone_tree::CloneLink>, String>,
+    elapsed_ms: u128,
+    queued_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2375,6 +2395,13 @@ struct NewAgentBackingSession {
     rollout_path: PathBuf,
 }
 
+#[derive(Debug, Default)]
+struct AgentPtyOutputDrain {
+    chunks: Vec<Vec<u8>>,
+    activity_changed: bool,
+    has_more: bool,
+}
+
 struct AgentSession {
     info: SessionInfo,
     spec: AgentLaunchSpec,
@@ -2692,14 +2719,14 @@ impl AgentSession {
         })
     }
 
-    fn drain_output_chunks(&mut self) -> (Vec<Vec<u8>>, bool) {
-        let mut chunks = Vec::new();
-        let mut activity_changed = false;
-        for _ in 0..AGENT_OUTPUT_POLL_LIMIT {
+    fn drain_output_chunks(&mut self) -> AgentPtyOutputDrain {
+        let mut drain = AgentPtyOutputDrain::default();
+        let started = Instant::now();
+        while should_continue_agent_output_drain(drain.chunks.len(), started.elapsed()) {
             match self.output_rx.try_recv() {
                 Ok(bytes) => {
                     self.last_output_epoch_ms = current_epoch_ms();
-                    activity_changed = true;
+                    drain.activity_changed = true;
                     self.append_pty_log(&bytes);
                     if process_parser_output(
                         &mut self.parser,
@@ -2708,7 +2735,7 @@ impl AgentSession {
                         Some(&mut self.screen_history),
                     ) {
                         self.last_screen_change_epoch_ms = current_epoch_ms();
-                        activity_changed = true;
+                        drain.activity_changed = true;
                     }
                     let mut terminal_response_scan = self.terminal_response_scan_tail.clone();
                     let previous_scan_len = terminal_response_scan.len();
@@ -2749,15 +2776,21 @@ impl AgentSession {
                             }
                         }
                     }
-                    chunks.push(bytes);
+                    drain.chunks.push(bytes);
                 }
                 Err(_) => break,
             }
         }
-        if DEBUG_ENABLED.load(Ordering::Relaxed) && !chunks.is_empty() && self.debug_drain_logs < 20
-        {
-            let total_bytes: usize = chunks.iter().map(Vec::len).sum();
-            let chunk_summaries = chunks
+        drain.has_more = !drain.chunks.is_empty()
+            && !should_continue_agent_output_drain(drain.chunks.len(), started.elapsed());
+        let elapsed_ms = started.elapsed().as_millis();
+        let should_debug_drain = DEBUG_ENABLED.load(Ordering::Relaxed)
+            && !drain.chunks.is_empty()
+            && (self.debug_drain_logs < 20 || should_log_perf_timing(elapsed_ms, None));
+        if should_debug_drain {
+            let total_bytes: usize = drain.chunks.iter().map(Vec::len).sum();
+            let chunk_summaries = drain
+                .chunks
                 .iter()
                 .take(8)
                 .map(|chunk| debug_terminal_data_summary(chunk, 512))
@@ -2771,10 +2804,12 @@ impl AgentSession {
                     "provider": self.info.provider.as_str(),
                     "session_id": &self.info.session_id,
                     "event": self.debug_drain_logs,
-                    "chunk_count": chunks.len(),
+                    "chunk_count": drain.chunks.len(),
                     "total_bytes": total_bytes,
+                    "elapsed_ms": elapsed_ms,
                     "chunk_summaries": chunk_summaries,
-                    "screen_changed": activity_changed,
+                    "screen_changed": drain.activity_changed,
+                    "has_more": drain.has_more,
                     "screen_history_lines": self.screen_history.len(),
                     "visible": screen_has_visible_content(self.parser.screen()),
                     "last_screen_change_epoch_ms": self.last_screen_change_epoch_ms,
@@ -2784,7 +2819,7 @@ impl AgentSession {
                 }),
             );
         }
-        (chunks, activity_changed)
+        drain
     }
 
     fn append_pty_log(&mut self, bytes: &[u8]) {
@@ -3470,6 +3505,7 @@ type AgentWriterCompletion = Sender<std::result::Result<(), String>>;
 struct AgentWriterRequest {
     request: AgentDaemonRequest,
     completion: Option<AgentWriterCompletion>,
+    queued_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3512,6 +3548,13 @@ enum AgentOutputKind {
     Snapshot,
 }
 
+fn agent_output_kind_label(kind: AgentOutputKind) -> &'static str {
+    match kind {
+        AgentOutputKind::Output => "output",
+        AgentOutputKind::Snapshot => "snapshot",
+    }
+}
+
 #[derive(Debug)]
 struct AgentOutputSegment {
     kind: AgentOutputKind,
@@ -3546,6 +3589,9 @@ struct AgentClient {
     last_screen_change_epoch_ms: u64,
     last_output_epoch_ms: u64,
     last_input_epoch_ms: u64,
+    pending_input_since_epoch_ms: Option<u64>,
+    pending_input_key: Option<String>,
+    pending_input_count: u64,
     pending_snapshot_output: bool,
     snapshot_parse_in_progress: bool,
     startup_spinner_started_at: Option<Instant>,
@@ -3918,6 +3964,9 @@ impl AgentClient {
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
+            pending_input_since_epoch_ms: None,
+            pending_input_key: None,
+            pending_input_count: 0,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -4219,8 +4268,11 @@ impl AgentClient {
     }
 
     fn drain_pending_output(&mut self, max_bytes: usize) -> bool {
+        let started = Instant::now();
         let (chunk, has_more) = take_agent_output_chunk(&self.output_buffer, max_bytes);
+        let mut processed_chunk: Option<(AgentOutputKind, usize, bool)> = None;
         if let Some(chunk) = chunk {
+            processed_chunk = Some((chunk.kind, chunk.data.len(), chunk.segment_done));
             match chunk.kind {
                 AgentOutputKind::Output => {
                     let is_legacy_snapshot = self.snapshot_parse_in_progress
@@ -4241,11 +4293,54 @@ impl AgentClient {
                 }
             }
         }
+        if let Some((kind, bytes, segment_done)) = processed_chunk {
+            self.log_pending_input_output_latency(bytes, kind);
+            let elapsed_ms = started.elapsed().as_millis();
+            if should_log_perf_timing(elapsed_ms, None) {
+                debug_log(
+                    "agent_client_output_drain_timing",
+                    serde_json::json!({
+                        "provider": self.info.provider.as_str(),
+                        "session_id": &self.info.session_id,
+                        "kind": agent_output_kind_label(kind),
+                        "bytes": bytes,
+                        "segment_done": segment_done,
+                        "has_more": has_more,
+                        "max_bytes": max_bytes,
+                        "elapsed_ms": elapsed_ms,
+                    }),
+                );
+            }
+        }
         has_more
     }
 
-    fn drain_pending_output_fully(&mut self) {
-        while self.drain_pending_output(usize::MAX) {}
+    fn log_pending_input_output_latency(&mut self, output_bytes: usize, kind: AgentOutputKind) {
+        let Some(input_epoch_ms) = self.pending_input_since_epoch_ms.take() else {
+            return;
+        };
+        let input_key = self.pending_input_key.take();
+        let latency_ms = current_epoch_ms().saturating_sub(input_epoch_ms);
+        if should_log_perf_timing(u128::from(latency_ms), None) {
+            debug_log(
+                "agent_input_to_output_latency",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "reader_id": self.reader_id,
+                    "input_count": self.pending_input_count,
+                    "input_key": input_key,
+                    "output_kind": agent_output_kind_label(kind),
+                    "output_bytes": output_bytes,
+                    "latency_ms": latency_ms,
+                }),
+            );
+        }
+    }
+
+    fn has_pending_output(&self) -> bool {
+        let pending = lock_agent_output_buffer(&self.output_buffer);
+        !pending.segments.is_empty()
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
@@ -4377,7 +4472,14 @@ impl AgentClient {
                 self.history_scroll_offset = 0;
             }
             self.last_input_epoch_ms = current_epoch_ms();
+            self.pending_input_since_epoch_ms = Some(self.last_input_epoch_ms);
+            self.pending_input_key = Some(key_code_label(key));
+            self.pending_input_count = self.pending_input_count.saturating_add(1);
             let send_result = self.send_request(AgentDaemonRequest::Input { data });
+            if send_result.is_err() {
+                self.pending_input_since_epoch_ms = None;
+                self.pending_input_key = None;
+            }
             if DEBUG_ENABLED.load(Ordering::Relaxed) {
                 debug_log(
                     "agent_client_forward_key_sent",
@@ -4469,6 +4571,7 @@ impl AgentClient {
             .send(AgentWriterRequest {
                 request,
                 completion,
+                queued_at_epoch_ms: current_epoch_ms(),
             })
             .map_err(|_| {
                 io::Error::new(ErrorKind::BrokenPipe, "agent writer thread is not running")
@@ -4538,8 +4641,11 @@ fn queue_agent_output(
         }
     };
     if should_wake {
-        tx.send(MainEvent::AgentOutputAvailable { reader_id })
-            .map_err(|_| "main receiver dropped".to_string())?;
+        tx.send(MainEvent::AgentOutputAvailable {
+            reader_id,
+            queued_at_epoch_ms: current_epoch_ms(),
+        })
+        .map_err(|_| "main receiver dropped".to_string())?;
     }
     Ok(())
 }
@@ -4620,7 +4726,10 @@ impl DaemonConnection {
 /// output, or the housekeeping tick. There is no fallback latency timer.
 enum MainEvent {
     /// A crossterm input event read off stdin in a dedicated thread.
-    Input(Event),
+    Input {
+        event: Event,
+        queued_at_epoch_ms: u64,
+    },
     /// One decoded `AgentDaemonEvent` forwarded from the agent reader
     /// thread. The event id helps the main loop ignore events from a
     /// reader thread that belongs to a now-detached/old agent.
@@ -4631,7 +4740,10 @@ enum MainEvent {
     /// Coalesced agent output/snapshot bytes are ready in the active
     /// client's shared buffer. The bytes stay out of the main-event FIFO so
     /// bursts cannot bury input events behind thousands of individual chunks.
-    AgentOutputAvailable { reader_id: u64 },
+    AgentOutputAvailable {
+        reader_id: u64,
+        queued_at_epoch_ms: u64,
+    },
     /// The agent reader thread terminated (socket EOF or error). Main loop
     /// treats this like a daemon-exit notification.
     AgentReaderEnded { reader_id: u64, reason: String },
@@ -4639,11 +4751,16 @@ enum MainEvent {
     /// the matching AgentClient is still active; late events are ignored.
     AgentWriterEnded { reader_id: u64, reason: String },
     /// Housekeeping tick — fires every `AGENT_STATE_POLL_INTERVAL_MS` so
-    /// preview results / agent runtime state polls get a chance to run
-    /// even when the user is idle. Not a latency knob.
-    Tick,
+    /// agent runtime state polls get a chance to run even when the user is
+    /// idle. Not a latency knob.
+    Tick { queued_at_epoch_ms: u64 },
+    /// A preview worker result is ready in `preview_rx`; wake the main loop
+    /// immediately instead of waiting for the housekeeping tick.
+    PreviewReady { queued_at_epoch_ms: u64 },
     /// Runtime state discovery/probing completed off the UI thread.
     RuntimeStateResult(AgentRuntimeRefreshResult),
+    /// Session list refresh completed off the UI thread.
+    SessionRefreshResult(SessionRefreshResult),
     /// Full-session search completed in the background.
     SearchResult(SearchWorkerResult),
     /// Data-task worker progress update.
@@ -4657,6 +4774,7 @@ enum MainEvent {
 struct AgentRuntimeRefreshRequest {
     seq: u64,
     current_pid: u32,
+    discover_live_shells: bool,
     previous_states: HashMap<AgentKey, AgentListState>,
     previous_live_shells: Vec<SessionInfo>,
     active_info: Option<SessionInfo>,
@@ -4711,6 +4829,7 @@ struct App {
     new_agent_backing_aliases: HashMap<AgentKey, AgentKey>,
     new_agent_backing_probe_after: HashMap<AgentKey, Instant>,
     last_agent_state_poll: Instant,
+    last_live_shell_discovery: Instant,
     list_state: ListState,
     session_view: SessionViewMode,
     provider_filter: ProviderFilter,
@@ -4744,8 +4863,13 @@ struct App {
     runtime_refresh_seq: u64,
     runtime_refresh_applied_seq: u64,
     runtime_refresh_pending: bool,
+    runtime_refresh_started_at: Option<Instant>,
     runtime_refresh_queued: bool,
     pending_runtime_action: Option<PendingRuntimeAction>,
+    session_refresh_seq: u64,
+    session_refresh_pending: bool,
+    session_refresh_restore_key: Option<AgentKey>,
+    session_refresh_preserve_status: Option<String>,
     /// Monotonic id assigned to each agent reader thread. Used to ignore
     /// late events from a thread whose AgentClient has already been
     /// dropped/replaced.
@@ -4785,6 +4909,8 @@ impl App {
             new_agent_backing_aliases: HashMap::new(),
             new_agent_backing_probe_after: HashMap::new(),
             last_agent_state_poll: Instant::now(),
+            last_live_shell_discovery: Instant::now()
+                - Duration::from_millis(LIVE_SHELL_DISCOVERY_INTERVAL_MS),
             list_state: ListState::default(),
             session_view,
             provider_filter: ProviderFilter::All,
@@ -4813,8 +4939,13 @@ impl App {
             runtime_refresh_seq: 0,
             runtime_refresh_applied_seq: 0,
             runtime_refresh_pending: false,
+            runtime_refresh_started_at: None,
             runtime_refresh_queued: false,
             pending_runtime_action: None,
+            session_refresh_seq: 0,
+            session_refresh_pending: false,
+            session_refresh_restore_key: None,
+            session_refresh_preserve_status: None,
             next_reader_id: 0,
             show_sessions_view: true,
         };
@@ -5069,43 +5200,8 @@ impl App {
         );
         match session::list_all() {
             Ok(all) => {
-                self.sessions = all;
-                let clone_tree_error = match session::clone_tree::load_links() {
-                    Ok(links) => {
-                        self.clone_links = links;
-                        None
-                    }
-                    Err(e) => {
-                        self.clone_links.clear();
-                        Some(e.to_string())
-                    }
-                };
-                self.status = if let Some(error) = clone_tree_error {
-                    format!(
-                        "{} sessions (clone tree error: {})",
-                        self.visible().len(),
-                        error
-                    )
-                } else {
-                    format!("{} sessions", self.visible().len())
-                };
-                if !self.visible_rows().is_empty() {
-                    self.list_state.select(Some(0));
-                } else {
-                    self.list_state.select(None);
-                }
-                self.clear_preview_cache();
-                self.preview_scroll = 0;
-                self.refresh_agent_runtime_states();
-                debug_log(
-                    "sessions_refresh_ok",
-                    serde_json::json!({
-                        "sessions": self.sessions.len(),
-                        "visible": self.visible().len(),
-                        "clone_links": self.clone_links.len(),
-                        "status": &self.status,
-                    }),
-                );
+                let clone_links = session::clone_tree::load_links().map_err(|e| e.to_string());
+                self.apply_session_refresh(all, clone_links);
             }
             Err(e) => {
                 self.status = format!("list error: {}", e);
@@ -5117,6 +5213,204 @@ impl App {
                 );
             }
         }
+    }
+
+    fn request_session_refresh(&mut self) {
+        self.request_session_refresh_with_context(Some("refreshing sessions..."), None, None);
+    }
+
+    fn request_session_refresh_preserving_status(&mut self) {
+        self.request_session_refresh_with_context(None, None, None);
+    }
+
+    fn request_session_refresh_with_context(
+        &mut self,
+        pending_status: Option<&'static str>,
+        restore_key: Option<AgentKey>,
+        preserve_status: Option<String>,
+    ) {
+        if self.session_refresh_pending {
+            if pending_status.is_some() {
+                self.status = "refresh already running".to_string();
+            }
+            debug_log(
+                "sessions_refresh_request_ignored",
+                serde_json::json!({
+                    "reason": "pending",
+                    "seq": self.session_refresh_seq,
+                    "preserve_status": preserve_status.is_some(),
+                    "restore_key": restore_key.as_ref().map(agent_key_debug_value),
+                }),
+            );
+            return;
+        }
+        self.session_refresh_seq = self.session_refresh_seq.saturating_add(1);
+        let seq = self.session_refresh_seq;
+        let Some(tx) = self.main_tx.clone() else {
+            self.refresh();
+            if let Some(key) = restore_key.as_ref() {
+                self.restore_visible_selection(key);
+            }
+            if let Some(status) = preserve_status {
+                self.status = status;
+            }
+            return;
+        };
+        self.session_refresh_pending = true;
+        self.session_refresh_restore_key = restore_key;
+        self.session_refresh_preserve_status = preserve_status;
+        if let Some(status) = pending_status {
+            self.status = status.to_string();
+        }
+        debug_log(
+            "sessions_refresh_request",
+            serde_json::json!({
+                "seq": seq,
+                "session_view": self.session_view.label(),
+                "provider_filter": self.provider_filter.label(),
+                "text_filter": &self.text_filter,
+                "preserve_status": self.session_refresh_preserve_status.is_some(),
+                "restore_key": self.session_refresh_restore_key.as_ref().map(agent_key_debug_value),
+            }),
+        );
+        match thread::Builder::new()
+            .name("cokacmux-refresh".to_string())
+            .spawn(move || {
+                let started = Instant::now();
+                let sessions = session::list_all().map_err(|e| e.to_string());
+                let clone_links = if sessions.is_ok() {
+                    session::clone_tree::load_links().map_err(|e| e.to_string())
+                } else {
+                    Ok(Vec::new())
+                };
+                let _ = tx.send(MainEvent::SessionRefreshResult(SessionRefreshResult {
+                    seq,
+                    sessions,
+                    clone_links,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    queued_at_epoch_ms: current_epoch_ms(),
+                }));
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                self.session_refresh_pending = false;
+                self.session_refresh_restore_key = None;
+                self.session_refresh_preserve_status = None;
+                self.status = format!(
+                    "refresh worker failed: {}",
+                    truncate_width(&e.to_string(), 80)
+                );
+                debug_log(
+                    "sessions_refresh_spawn_failed",
+                    serde_json::json!({
+                        "seq": seq,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn on_session_refresh_result(&mut self, result: SessionRefreshResult) {
+        if !self.session_refresh_pending || result.seq != self.session_refresh_seq {
+            debug_log(
+                "sessions_refresh_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "current_seq": self.session_refresh_seq,
+                    "pending": self.session_refresh_pending,
+                    "reason": "stale",
+                }),
+            );
+            return;
+        }
+        self.session_refresh_pending = false;
+        let restore_key = self.session_refresh_restore_key.take();
+        let preserve_status = self.session_refresh_preserve_status.take();
+        match result.sessions {
+            Ok(all) => {
+                self.apply_session_refresh(all, result.clone_links);
+                let restored_key = restore_key
+                    .as_ref()
+                    .is_some_and(|key| self.restore_visible_selection(key));
+                let preserved_status = preserve_status.is_some();
+                if let Some(status) = preserve_status {
+                    self.status = status;
+                }
+                debug_log(
+                    "sessions_refresh_async_ok",
+                    serde_json::json!({
+                        "seq": result.seq,
+                        "elapsed_ms": result.elapsed_ms,
+                        "sessions": self.sessions.len(),
+                        "visible": self.visible().len(),
+                        "restored_key": restored_key,
+                        "preserved_status": preserved_status,
+                    }),
+                );
+            }
+            Err(e) => {
+                self.status = format!("list error: {}", e);
+                debug_log(
+                    "sessions_refresh_failed",
+                    serde_json::json!({
+                        "seq": result.seq,
+                        "elapsed_ms": result.elapsed_ms,
+                        "error": e,
+                    }),
+                );
+            }
+        }
+    }
+
+    fn apply_session_refresh(
+        &mut self,
+        all: Vec<SessionInfo>,
+        clone_links: std::result::Result<Vec<session::clone_tree::CloneLink>, String>,
+    ) {
+        let previous_selection = self.current().map(AgentKey::new);
+        self.sessions = all;
+        let clone_tree_error = match clone_links {
+            Ok(links) => {
+                self.clone_links = links;
+                None
+            }
+            Err(e) => {
+                self.clone_links.clear();
+                Some(e)
+            }
+        };
+        self.status = if let Some(error) = clone_tree_error {
+            format!(
+                "{} sessions (clone tree error: {})",
+                self.visible().len(),
+                error
+            )
+        } else {
+            format!("{} sessions", self.visible().len())
+        };
+        let restored_previous = previous_selection
+            .as_ref()
+            .is_some_and(|key| self.restore_visible_selection(key));
+        if restored_previous {
+            self.preview_scroll = 0;
+        } else if !self.visible_rows().is_empty() {
+            self.list_state.select(Some(0));
+        } else {
+            self.list_state.select(None);
+        }
+        self.clear_preview_cache();
+        self.preview_scroll = 0;
+        self.refresh_agent_runtime_states();
+        debug_log(
+            "sessions_refresh_ok",
+            serde_json::json!({
+                "sessions": self.sessions.len(),
+                "visible": self.visible().len(),
+                "clone_links": self.clone_links.len(),
+                "status": &self.status,
+            }),
+        );
     }
 
     fn prepare_sessions_view(&mut self, reason: &str) {
@@ -5141,33 +5435,24 @@ impl App {
             }),
         );
 
-        self.refresh();
-
-        let refresh_failed = self.status.starts_with("list error:");
         let active_backing_key = self.active_agent_backing_key();
-        let restored_active_backing = active_backing_key
+        let restore_key = active_backing_key.or_else(|| selected_key.clone());
+        let restored_now = restore_key
             .as_ref()
             .is_some_and(|key| self.restore_visible_selection(key));
-        if !restored_active_backing {
-            if let Some(key) = selected_key.as_ref() {
-                self.restore_visible_selection(key);
-            }
-        }
-        if let Some(key) = active_backing_key.as_ref() {
+        if let Some(key) = restore_key.as_ref() {
             debug_log(
-                "sessions_view_active_backing_selection",
+                "sessions_view_restore_selection",
                 serde_json::json!({
-                    "backing": agent_key_debug_value(key),
-                    "restored": restored_active_backing,
+                    "key": agent_key_debug_value(key),
+                    "restored": restored_now,
                 }),
             );
         }
-        if !refresh_failed {
-            self.status = previous_status;
-        }
+        self.request_session_refresh_with_context(None, restore_key, Some(previous_status));
 
         debug_log(
-            "sessions_view_prepare_ok",
+            "sessions_view_prepare_queued",
             serde_json::json!({
                 "reason": reason,
                 "sessions": self.sessions.len(),
@@ -5177,6 +5462,7 @@ impl App {
                     "session_id": &info.session_id,
                 })),
                 "status": &self.status,
+                "restored_now": restored_now,
                 "agent_states_after": agent_state_entries_debug_value(&self.agent_states),
                 "live_shells_after": self.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
                 "show_sessions_view": self.show_sessions_view,
@@ -5201,16 +5487,18 @@ impl App {
     }
 
     fn visible_rows(&self) -> Vec<VisibleSessionRow<'_>> {
+        let text_filter = (!self.text_filter.is_empty()).then(|| self.text_filter.to_lowercase());
+        let text_filter = text_filter.as_deref();
         match self.session_view {
             SessionViewMode::List => self
                 .sessions
                 .iter()
-                .filter(|s| self.matches_session_filters(s))
+                .filter(|s| self.matches_session_filters(s, text_filter))
                 .map(|info| VisibleSessionRow { info, depth: 0 })
                 .collect(),
             SessionViewMode::Tree => {
                 session::clone_tree::visible_tree_rows(&self.sessions, &self.clone_links, |info| {
-                    self.matches_session_filters(info)
+                    self.matches_session_filters(info, text_filter)
                 })
                 .into_iter()
                 .map(|row| VisibleSessionRow {
@@ -5222,15 +5510,16 @@ impl App {
         }
     }
 
-    fn matches_session_filters(&self, s: &SessionInfo) -> bool {
+    fn matches_session_filters(&self, s: &SessionInfo, text_filter: Option<&str>) -> bool {
         if !self.provider_filter.matches(s.provider) {
             return false;
         }
-        let q = self.text_filter.to_lowercase();
-        q.is_empty()
-            || s.session_id.to_lowercase().contains(&q)
-            || s.cwd.to_lowercase().contains(&q)
-            || s.title.as_deref().unwrap_or("").to_lowercase().contains(&q)
+        let Some(q) = text_filter else {
+            return true;
+        };
+        s.session_id.to_lowercase().contains(q)
+            || s.cwd.to_lowercase().contains(q)
+            || s.title.as_deref().unwrap_or("").to_lowercase().contains(q)
             || self.text_filter_matches.contains(&AgentKey::new(s))
     }
 
@@ -5248,12 +5537,28 @@ impl App {
         );
     }
 
+    fn cancel_pending_search(&mut self, reason: &'static str) -> bool {
+        let Some(pending) = self.search_pending.take() else {
+            return false;
+        };
+        pending.cancel.store(true, Ordering::Relaxed);
+        debug_log(
+            "filter_search_cancel_requested",
+            serde_json::json!({
+                "seq": pending.seq,
+                "query_len": pending.query.chars().count(),
+                "reason": reason,
+            }),
+        );
+        true
+    }
+
     fn start_text_search(&mut self, query: String) {
         let query = query.trim().to_string();
         if query.is_empty() {
             self.text_filter.clear();
             self.text_filter_matches.clear();
-            self.search_pending = None;
+            self.cancel_pending_search("clear");
             self.input_mode = InputMode::Normal;
             self.focus = FocusPane::Sessions;
             self.select_first();
@@ -5264,10 +5569,12 @@ impl App {
 
         self.search_seq = self.search_seq.saturating_add(1);
         let seq = self.search_seq;
+        let cancel = Arc::new(AtomicBool::new(false));
         self.search_pending = Some(SearchPending {
             seq,
             query: query.clone(),
             started_at: Instant::now(),
+            cancel: cancel.clone(),
         });
         self.focus = FocusPane::Sessions;
         self.status = format!("searching \"{}\"...", truncate_width(&query, 24));
@@ -5280,19 +5587,27 @@ impl App {
         );
 
         let Some(tx) = self.main_tx.clone() else {
-            let hits = session::search_all(&query, true).map_err(|e| e.to_string());
-            self.on_search_result(SearchWorkerResult { seq, query, hits });
+            let hits = session::search_all_with_cancel(&query, true, Some(&cancel))
+                .map_err(|e| e.to_string());
+            self.on_search_result(SearchWorkerResult {
+                seq,
+                query,
+                hits,
+                queued_at_epoch_ms: current_epoch_ms(),
+            });
             return;
         };
         let worker_query = query.clone();
         match thread::Builder::new()
             .name("cokacmux-search".to_string())
             .spawn(move || {
-                let hits = session::search_all(&worker_query, true).map_err(|e| e.to_string());
+                let hits = session::search_all_with_cancel(&worker_query, true, Some(&cancel))
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(MainEvent::SearchResult(SearchWorkerResult {
                     seq,
                     query: worker_query,
                     hits,
+                    queued_at_epoch_ms: current_epoch_ms(),
                 }));
             }) {
             Ok(_) => {}
@@ -5624,6 +5939,7 @@ impl App {
     }
 
     fn poll_agent_runtime_states(&mut self) {
+        self.continue_timed_out_pending_runtime_action();
         if self.last_agent_state_poll.elapsed()
             < Duration::from_millis(AGENT_STATE_POLL_INTERVAL_MS)
         {
@@ -5650,14 +5966,21 @@ impl App {
 
         self.runtime_refresh_seq = self.runtime_refresh_seq.saturating_add(1);
         let seq = self.runtime_refresh_seq;
-        let request = self.agent_runtime_refresh_request(seq);
+        let discover_live_shells = self.last_live_shell_discovery.elapsed()
+            >= Duration::from_millis(LIVE_SHELL_DISCOVERY_INTERVAL_MS);
+        if discover_live_shells {
+            self.last_live_shell_discovery = self.last_agent_state_poll;
+        }
+        let request = self.agent_runtime_refresh_request(seq, discover_live_shells);
         match tx.send(request) {
             Ok(()) => {
                 self.runtime_refresh_pending = true;
+                self.runtime_refresh_started_at = Some(self.last_agent_state_poll);
             }
             Err(e) => {
                 self.runtime_tx = None;
                 self.runtime_refresh_pending = false;
+                self.runtime_refresh_started_at = None;
                 self.runtime_refresh_queued = false;
                 debug_log(
                     "agent_runtime_refresh_request_failed",
@@ -5670,11 +5993,16 @@ impl App {
         }
     }
 
-    fn agent_runtime_refresh_request(&self, seq: u64) -> AgentRuntimeRefreshRequest {
+    fn agent_runtime_refresh_request(
+        &self,
+        seq: u64,
+        discover_live_shells: bool,
+    ) -> AgentRuntimeRefreshRequest {
         let debug_enabled = DEBUG_ENABLED.load(Ordering::Relaxed);
         AgentRuntimeRefreshRequest {
             seq,
             current_pid: std::process::id(),
+            discover_live_shells,
             previous_states: self.agent_states.clone(),
             previous_live_shells: self.live_shells.clone(),
             active_info: self.active_agent.as_ref().map(|agent| agent.info.clone()),
@@ -5692,6 +6020,7 @@ impl App {
 
     fn on_runtime_state_result(&mut self, result: AgentRuntimeRefreshResult) {
         self.runtime_refresh_pending = false;
+        self.runtime_refresh_started_at = None;
         let refresh_queued = self.runtime_refresh_queued;
         self.runtime_refresh_queued = false;
         if result.seq < self.runtime_refresh_applied_seq {
@@ -5724,6 +6053,27 @@ impl App {
 
     fn agent_runtime_refresh_in_flight(&self) -> bool {
         self.runtime_refresh_pending || self.runtime_refresh_queued
+    }
+
+    fn continue_timed_out_pending_runtime_action(&mut self) {
+        if self.pending_runtime_action.is_none() {
+            return;
+        }
+        let Some(started_at) = self.runtime_refresh_started_at else {
+            return;
+        };
+        let elapsed = started_at.elapsed();
+        if elapsed < Duration::from_millis(PENDING_RUNTIME_ACTION_MAX_WAIT_MS) {
+            return;
+        }
+        debug_log(
+            "pending_runtime_action_timeout",
+            serde_json::json!({
+                "runtime_refresh_seq": self.runtime_refresh_seq,
+                "elapsed_ms": elapsed.as_millis(),
+            }),
+        );
+        self.continue_pending_runtime_action();
     }
 
     fn apply_agent_runtime_refresh_result(&mut self, result: AgentRuntimeRefreshResult) {
@@ -6261,6 +6611,7 @@ impl App {
             key: key.clone(),
             info,
             width: width.max(1),
+            wake_tx: self.main_tx.clone(),
         };
         if self.preview_tx.send(request).is_ok() {
             self.preview_requested = Some((key, seq));
@@ -6298,6 +6649,7 @@ impl App {
         wrap_width: usize,
         lines: Vec<String>,
     ) {
+        let started = Instant::now();
         let line_count = lines.len();
         self.preview_cache_order.retain(|existing| existing != &key);
         self.preview_cache_order.push_back(key.clone());
@@ -6324,6 +6676,7 @@ impl App {
                 "wrap_width": wrap_width,
                 "lines": line_count,
                 "entries": self.preview_cache_order.len(),
+                "elapsed_ms": started.elapsed().as_millis(),
             }),
         );
     }
@@ -6361,6 +6714,7 @@ impl App {
         if entry.wrap_width != width {
             let before = entry.wrap_width;
             entry.lines = wrap_preview_lines(&entry.text, width);
+            entry.summary_style_states = preview_summary_style_states_for_lines(&entry.lines);
             entry.wrap_width = width;
             debug_log(
                 "preview_rewrap",
@@ -6397,13 +6751,16 @@ impl App {
         key: &PreviewKey,
         start: usize,
     ) -> PreviewSummaryStyleState {
-        let mut state = PreviewSummaryStyleState::default();
-        if let Some(entry) = self.preview_cache.get(key) {
-            for line in entry.lines.iter().take(start) {
-                preview_summary_update_style_state_after_line(&mut state, line);
-            }
-        }
-        state
+        self.preview_cache
+            .get(key)
+            .and_then(|entry| {
+                entry
+                    .summary_style_states
+                    .get(start)
+                    .copied()
+                    .or_else(|| entry.summary_style_states.last().copied())
+            })
+            .unwrap_or_default()
     }
 
     /// Reap the active agent if its reader thread (or daemon) signaled
@@ -6417,7 +6774,11 @@ impl App {
         if let Some(exit_status) = agent.exited.clone() {
             let provider = agent.info.provider;
             let session_id = agent.info.session_id.clone();
-            agent.drain_pending_output_fully();
+            let reader_id = agent.reader_id;
+            if agent.drain_pending_output(AGENT_CLIENT_OUTPUT_DRAIN_BYTES) {
+                self.schedule_agent_output_available(reader_id);
+                return;
+            }
             self.active_agent = None;
             self.discard_pending_agent_runtime_refresh();
             self.status = format!(
@@ -6426,7 +6787,7 @@ impl App {
                 truncate_width(&session_id, 14),
                 exit_status
             );
-            self.refresh();
+            self.request_session_refresh_preserving_status();
             self.refresh_agent_runtime_states();
         }
     }
@@ -6444,23 +6805,37 @@ impl App {
         (tx, id)
     }
 
+    fn schedule_agent_output_available(&self, reader_id: u64) {
+        if let Some(tx) = self.main_tx.clone() {
+            let _ = tx.send(MainEvent::AgentOutputAvailable {
+                reader_id,
+                queued_at_epoch_ms: current_epoch_ms(),
+            });
+        }
+    }
+
     /// Apply a `MainEvent::AgentEvent` to the active agent if it still
     /// matches `reader_id`. Late events from a replaced agent are silently
     /// dropped.
     fn on_agent_event(&mut self, reader_id: u64, event: AgentDaemonEvent) {
+        let mut should_schedule_output = false;
         let Some(agent) = self.active_agent.as_mut() else {
             return;
         };
         if agent.reader_id != reader_id {
             return;
         }
-        if matches!(
+        let terminal_event = matches!(
             &event,
             AgentDaemonEvent::Exited { .. } | AgentDaemonEvent::Error { .. }
-        ) {
-            agent.drain_pending_output_fully();
-        }
+        );
         agent.process_agent_event(event);
+        if terminal_event && agent.has_pending_output() {
+            should_schedule_output = true;
+        }
+        if should_schedule_output {
+            self.schedule_agent_output_available(reader_id);
+        }
     }
 
     fn on_agent_output_available(&mut self, reader_id: u64) {
@@ -6474,14 +6849,13 @@ impl App {
             agent.drain_pending_output(AGENT_CLIENT_OUTPUT_DRAIN_BYTES)
         };
         if has_more {
-            if let Some(tx) = self.main_tx.clone() {
-                let _ = tx.send(MainEvent::AgentOutputAvailable { reader_id });
-            }
+            self.schedule_agent_output_available(reader_id);
         }
     }
 
     /// Apply a reader-thread exit signal. Treated like a daemon-disconnect.
     fn on_agent_reader_ended(&mut self, reader_id: u64, reason: String) {
+        let mut should_schedule_output = false;
         let Some(agent) = self.active_agent.as_mut() else {
             return;
         };
@@ -6489,14 +6863,20 @@ impl App {
             return;
         }
         if agent.exited.is_none() {
-            agent.drain_pending_output_fully();
             agent.exited = Some(format!("daemon connection ended: {}", reason));
+            if agent.has_pending_output() {
+                should_schedule_output = true;
+            }
+        }
+        if should_schedule_output {
+            self.schedule_agent_output_available(reader_id);
         }
     }
 
     /// Apply a writer-thread exit signal. This only affects the active
     /// matching attach; late writer exits from detached clients are ignored.
     fn on_agent_writer_ended(&mut self, reader_id: u64, reason: String) {
+        let mut should_schedule_output = false;
         let Some(agent) = self.active_agent.as_mut() else {
             return;
         };
@@ -6504,8 +6884,13 @@ impl App {
             return;
         }
         if agent.exited.is_none() {
-            agent.drain_pending_output_fully();
             agent.exited = Some(format!("daemon request writer ended: {}", reason));
+            if agent.has_pending_output() {
+                should_schedule_output = true;
+            }
+        }
+        if should_schedule_output {
+            self.schedule_agent_output_available(reader_id);
         }
     }
 
@@ -8045,9 +8430,9 @@ impl App {
                         truncate_width(&title, 40)
                     )
                 };
-                self.refresh();
+                self.status = status.clone();
+                self.request_session_refresh_with_context(None, Some(key.clone()), Some(status));
                 self.select_visible_session(&key);
-                self.status = status;
                 debug_log(
                     "title_save_ok",
                     serde_json::json!({
@@ -8110,12 +8495,30 @@ impl App {
                 } else {
                     ""
                 };
-                self.refresh();
-                let next_selection =
-                    selection_index_after_removed_row(self.visible().len(), removed_index);
+                let deleted_key = AgentKey::new(&info);
+                let restore_key = removed_index.and_then(|index| {
+                    let candidates = self
+                        .visible()
+                        .into_iter()
+                        .map(AgentKey::new)
+                        .filter(|key| key != &deleted_key)
+                        .collect::<Vec<_>>();
+                    if candidates.is_empty() {
+                        None
+                    } else {
+                        candidates
+                            .get(index.min(candidates.len().saturating_sub(1)))
+                            .cloned()
+                    }
+                });
+                self.status = status.clone();
+                self.request_session_refresh_with_context(None, restore_key, Some(status));
+                let next_selection = selection_index_after_removed_row(
+                    self.visible().len().saturating_sub(1),
+                    removed_index,
+                );
                 self.list_state.select(next_selection);
                 self.preview_scroll = 0;
-                self.status = status;
                 debug_log(
                     "delete_ok",
                     serde_json::json!({
@@ -8303,11 +8706,16 @@ impl App {
                 if let Some(e) = clone_tree_error.as_ref() {
                     status.push_str(&format!(" (clone tree save failed: {})", e));
                 }
-                self.refresh();
                 let new_key = AgentKey {
                     provider: report.target_provider,
                     session_id: report.new_session_id.clone(),
                 };
+                self.status = status.clone();
+                self.request_session_refresh_with_context(
+                    None,
+                    Some(new_key.clone()),
+                    Some(status),
+                );
                 let focused_index = self
                     .visible()
                     .iter()
@@ -8316,7 +8724,6 @@ impl App {
                     self.list_state.select(Some(idx));
                     self.preview_scroll = 0;
                 }
-                self.status = status;
                 debug_log(
                     "clone_ok",
                     serde_json::json!({
@@ -8340,12 +8747,17 @@ impl App {
                 deleted_file,
                 deleted_rows,
             } => {
-                self.refresh();
-                self.status = format!(
+                let status = format!(
                     "clone {} -> {} aborted: folder data copy failed; cloned session removed ({})",
                     source.provider.as_str(),
                     target_provider.as_str(),
                     truncate_width(&data_error, 56)
+                );
+                self.status = status.clone();
+                self.request_session_refresh_with_context(
+                    None,
+                    Some(AgentKey::new(&source)),
+                    Some(status),
                 );
                 debug_log(
                     "clone_data_snapshot_failed_rolled_back",
@@ -8368,7 +8780,6 @@ impl App {
                 deleted_rows,
                 cleanup_error,
             } => {
-                self.refresh();
                 let mut status = match target_session_id.as_ref() {
                     Some(session_id) => format!(
                         "clone {} -> {} cancelled; cloned session removed: {}",
@@ -8385,7 +8796,12 @@ impl App {
                 if let Some(error) = cleanup_error.as_ref() {
                     status.push_str(&format!(" (cleanup failed: {})", truncate_width(error, 56)));
                 }
-                self.status = status;
+                self.status = status.clone();
+                self.request_session_refresh_with_context(
+                    None,
+                    Some(AgentKey::new(&source)),
+                    Some(status),
+                );
                 debug_log(
                     "clone_cancelled",
                     serde_json::json!({
@@ -8843,6 +9259,7 @@ fn preview_worker(request_rx: Receiver<PreviewRequest>, result_tx: Sender<Previe
             }),
         );
 
+        let wake_tx = request.wake_tx.clone();
         if result_tx
             .send(PreviewResult {
                 seq: request.seq,
@@ -8860,6 +9277,11 @@ fn preview_worker(request_rx: Receiver<PreviewRequest>, result_tx: Sender<Previe
                 }),
             );
             break;
+        }
+        if let Some(tx) = wake_tx {
+            let _ = tx.send(MainEvent::PreviewReady {
+                queued_at_epoch_ms: current_epoch_ms(),
+            });
         }
     }
     debug_log("preview_worker_stop", serde_json::json!({}));
@@ -8923,6 +9345,7 @@ fn compute_agent_runtime_refresh(
             serde_json::json!({
                 "seq": request.seq,
                 "current_pid": request.current_pid,
+                "discover_live_shells": request.discover_live_shells,
                 "sessions_len": request.provider_session_count,
                 "previous_live_shells_len": request.previous_live_shells.len(),
                 "previous_agent_states_len": previous_states_len,
@@ -8932,13 +9355,22 @@ fn compute_agent_runtime_refresh(
         );
     }
 
-    let discovered_live_shells = discover_live_shell_infos();
+    let step_started = Instant::now();
+    let discovered_live_shells = if request.discover_live_shells {
+        discover_live_shell_infos()
+    } else {
+        Vec::new()
+    };
+    debug_agent_runtime_refresh_step(request.seq, "discover_live_shells", step_started.elapsed());
+
+    let step_started = Instant::now();
     let live_shells = merge_live_shell_infos_with_previous_runtime_state(
         discovered_live_shells,
         &request.previous_live_shells,
         request.current_pid,
         |key| read_agent_runtime_state(key, request.current_pid),
     );
+    debug_agent_runtime_refresh_step(request.seq, "merge_live_shells", step_started.elapsed());
 
     let mut states = HashMap::new();
     let mut runtime_keys: Vec<AgentKey> = live_shells.iter().map(AgentKey::new).collect();
@@ -8956,6 +9388,7 @@ fn compute_agent_runtime_refresh(
             serde_json::json!({
                 "seq": request.seq,
                 "provider_session_count": request.provider_session_count,
+                "discover_live_shells": request.discover_live_shells,
                 "runtime_key_count": runtime_keys.len(),
                 "shell_key_count": shell_keys.len(),
                 "previous_state_key_count": request.previous_states.len(),
@@ -8963,6 +9396,7 @@ fn compute_agent_runtime_refresh(
             }),
         );
     }
+    let step_started = Instant::now();
     for key in &runtime_keys {
         let state = read_agent_runtime_state(key, request.current_pid);
         if trace_enabled {
@@ -8979,15 +9413,27 @@ fn compute_agent_runtime_refresh(
             states.insert(key.clone(), state);
         }
     }
+    debug_agent_runtime_refresh_step(request.seq, "read_runtime_states", step_started.elapsed());
 
+    let step_started = Instant::now();
+    // The periodic runtime poll must stay cheap. Existing aliases are still
+    // applied here, but fresh backing discovery scans process file
+    // descriptors and rollout files, so it is deliberately kept off this
+    // 500ms path.
     apply_new_agent_backing_states_to_snapshot(
         &live_shells,
         &mut request.new_agent_backing_aliases,
         &mut request.new_agent_backing_probe_after,
         &mut states,
-        true,
+        false,
+    );
+    debug_agent_runtime_refresh_step(
+        request.seq,
+        "apply_new_agent_backing_states",
+        step_started.elapsed(),
     );
     if debug_enabled {
+        let step_started = Instant::now();
         debug_agent_runtime_refresh_changes_for_snapshot(
             &request.previous_states,
             &request.previous_live_shells,
@@ -8999,6 +9445,11 @@ fn compute_agent_runtime_refresh(
             request.current_pid,
             request.active_info.as_ref(),
             request.show_sessions_view,
+        );
+        debug_agent_runtime_refresh_step(
+            request.seq,
+            "debug_runtime_refresh_changes",
+            step_started.elapsed(),
         );
     }
     if trace_enabled {
@@ -9022,6 +9473,20 @@ fn compute_agent_runtime_refresh(
         agent_states: states,
         new_agent_backing_aliases: request.new_agent_backing_aliases,
         new_agent_backing_probe_after: request.new_agent_backing_probe_after,
+    }
+}
+
+fn debug_agent_runtime_refresh_step(seq: u64, step: &'static str, elapsed: Duration) {
+    let elapsed_ms = elapsed.as_millis();
+    if should_log_perf_timing(elapsed_ms, None) {
+        debug_log(
+            "agent_runtime_refresh_step_timing",
+            serde_json::json!({
+                "seq": seq,
+                "step": step,
+                "elapsed_ms": elapsed_ms,
+            }),
+        );
     }
 }
 
@@ -9404,6 +9869,190 @@ fn should_continue_main_event_drain(processed: usize, elapsed: Duration) -> bool
         && elapsed < Duration::from_millis(MAIN_EVENT_DRAIN_BUDGET_MS)
 }
 
+fn should_continue_agent_output_drain(processed: usize, elapsed: Duration) -> bool {
+    processed < AGENT_OUTPUT_POLL_LIMIT
+        && (processed == 0 || elapsed < Duration::from_millis(AGENT_OUTPUT_DRAIN_BUDGET_MS))
+}
+
+fn should_log_perf_timing(elapsed_ms: u128, queued_latency_ms: Option<u64>) -> bool {
+    if !DEBUG_ENABLED.load(Ordering::Relaxed) {
+        return false;
+    }
+    TRACE_ENABLED.load(Ordering::Relaxed)
+        || elapsed_ms >= PERF_LOG_THRESHOLD_MS
+        || queued_latency_ms
+            .map(u128::from)
+            .is_some_and(|latency| latency >= PERF_LOG_THRESHOLD_MS)
+}
+
+fn main_event_kind(event: &MainEvent) -> &'static str {
+    match event {
+        MainEvent::Input { event, .. } => input_event_kind(event),
+        MainEvent::AgentEvent { .. } => "agent_event",
+        MainEvent::AgentOutputAvailable { .. } => "agent_output_available",
+        MainEvent::AgentReaderEnded { .. } => "agent_reader_ended",
+        MainEvent::AgentWriterEnded { .. } => "agent_writer_ended",
+        MainEvent::Tick { .. } => "tick",
+        MainEvent::PreviewReady { .. } => "preview_ready",
+        MainEvent::RuntimeStateResult(_) => "runtime_state_result",
+        MainEvent::SessionRefreshResult(_) => "session_refresh_result",
+        MainEvent::SearchResult(_) => "search_result",
+        MainEvent::DataTaskProgress(_) => "data_task_progress",
+        MainEvent::CloneResult(_) => "clone_result",
+        MainEvent::RestoreResult(_) => "restore_result",
+    }
+}
+
+fn input_event_kind(event: &Event) -> &'static str {
+    match event {
+        Event::Key(key) if is_actionable_key_event(*key) => "input_key",
+        Event::Key(_) => "input_key_ignored",
+        Event::Mouse(_) => "input_mouse",
+        Event::Resize(_, _) => "input_resize",
+        Event::FocusGained => "input_focus_gained",
+        Event::FocusLost => "input_focus_lost",
+        Event::Paste(_) => "input_paste",
+    }
+}
+
+fn main_event_queued_latency_ms(event: &MainEvent) -> Option<u64> {
+    let queued_at_epoch_ms = match event {
+        MainEvent::Input {
+            queued_at_epoch_ms, ..
+        }
+        | MainEvent::AgentOutputAvailable {
+            queued_at_epoch_ms, ..
+        }
+        | MainEvent::PreviewReady {
+            queued_at_epoch_ms, ..
+        }
+        | MainEvent::Tick {
+            queued_at_epoch_ms, ..
+        } => *queued_at_epoch_ms,
+        MainEvent::SessionRefreshResult(result) => result.queued_at_epoch_ms,
+        MainEvent::SearchResult(result) => result.queued_at_epoch_ms,
+        _ => return None,
+    };
+    Some(current_epoch_ms().saturating_sub(queued_at_epoch_ms))
+}
+
+fn handle_actionable_input_event(app: &mut App, key: KeyEvent) {
+    if app.is_agent_view() {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        handle_agent_key(app, key, cols, rows);
+    } else {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let agent_viewport =
+            agent_viewport_for_terminal(cols, rows, app.agent_sidebar_config_width());
+        handle_key(
+            app,
+            key,
+            cols,
+            agent_viewport.pty_cols,
+            agent_viewport.pty_rows,
+        );
+    }
+}
+
+fn handle_main_event(
+    app: &mut App,
+    event: MainEvent,
+    previous_is_agent_view: &mut bool,
+    reason: &'static str,
+) {
+    let event_kind = main_event_kind(&event);
+    let queued_latency_ms = main_event_queued_latency_ms(&event);
+    let started = Instant::now();
+    match event {
+        MainEvent::Input {
+            event: Event::Key(key),
+            ..
+        } if is_actionable_key_event(key) => {
+            handle_actionable_input_event(app, key);
+        }
+        MainEvent::Input { .. } => {}
+        MainEvent::AgentEvent { reader_id, event } => {
+            app.on_agent_event(reader_id, event);
+        }
+        MainEvent::AgentOutputAvailable { reader_id, .. } => {
+            app.on_agent_output_available(reader_id);
+        }
+        MainEvent::AgentReaderEnded { reader_id, reason } => {
+            app.on_agent_reader_ended(reader_id, reason);
+        }
+        MainEvent::AgentWriterEnded { reader_id, reason } => {
+            app.on_agent_writer_ended(reader_id, reason);
+        }
+        MainEvent::RuntimeStateResult(result) => {
+            app.on_runtime_state_result(result);
+        }
+        MainEvent::SessionRefreshResult(result) => {
+            app.on_session_refresh_result(result);
+        }
+        MainEvent::SearchResult(result) => {
+            app.on_search_result(result);
+        }
+        MainEvent::DataTaskProgress(progress) => {
+            app.on_data_task_progress(progress);
+        }
+        MainEvent::CloneResult(result) => {
+            app.on_clone_worker_result(result);
+        }
+        MainEvent::RestoreResult(result) => {
+            app.on_restore_worker_result(result);
+        }
+        MainEvent::Tick { .. } => {
+            app.poll_preview_results();
+            app.poll_agent_sessions();
+            app.poll_agent_runtime_states();
+        }
+        MainEvent::PreviewReady { .. } => {
+            app.poll_preview_results();
+        }
+    }
+    app.prepare_sessions_view_after_transition(previous_is_agent_view, reason);
+    let elapsed_ms = started.elapsed().as_millis();
+    if should_log_perf_timing(elapsed_ms, queued_latency_ms) {
+        debug_log(
+            "main_event_timing",
+            serde_json::json!({
+                "kind": event_kind,
+                "reason": reason,
+                "handler_elapsed_ms": elapsed_ms,
+                "queued_latency_ms": queued_latency_ms,
+                "agent_view": app.is_agent_view(),
+                "show_sessions_view": app.show_sessions_view,
+                "active_agent": app.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+            }),
+        );
+    }
+}
+
+fn draw_app_frame(terminal: &mut Tui, app: &mut App, reason: &'static str) -> Result<()> {
+    let started = Instant::now();
+    terminal.draw(|f| {
+        if app.is_agent_view() {
+            ui_agent(f, app);
+        } else {
+            ui(f, app);
+        }
+    })?;
+    let elapsed_ms = started.elapsed().as_millis();
+    if should_log_perf_timing(elapsed_ms, None) {
+        debug_log(
+            "main_draw_timing",
+            serde_json::json!({
+                "reason": reason,
+                "elapsed_ms": elapsed_ms,
+                "agent_view": app.is_agent_view(),
+                "show_sessions_view": app.show_sessions_view,
+                "active_agent": app.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+            }),
+        );
+    }
+    Ok(())
+}
+
 fn run(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
     let (main_tx, main_rx) = mpsc::channel::<MainEvent>();
@@ -9423,7 +10072,13 @@ fn run(terminal: &mut Tui) -> Result<()> {
             match event::poll(Duration::from_secs(60)) {
                 Ok(true) => match event::read() {
                     Ok(ev) => {
-                        if input_tx.send(MainEvent::Input(ev)).is_err() {
+                        if input_tx
+                            .send(MainEvent::Input {
+                                event: ev,
+                                queued_at_epoch_ms: current_epoch_ms(),
+                            })
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -9435,13 +10090,19 @@ fn run(terminal: &mut Tui) -> Result<()> {
         })?;
 
     // Housekeeping ticker: fires at the existing agent-state poll
-    // cadence. Not a latency knob — agent output/input are channel-driven.
+    // cadence. Not a latency knob — input, agent output, and preview
+    // readiness are channel-driven.
     let tick_tx = main_tx.clone();
     let _tick_thread = thread::Builder::new()
         .name("cokacmux-tick".into())
         .spawn(move || loop {
             thread::sleep(Duration::from_millis(AGENT_STATE_POLL_INTERVAL_MS));
-            if tick_tx.send(MainEvent::Tick).is_err() {
+            if tick_tx
+                .send(MainEvent::Tick {
+                    queued_at_epoch_ms: current_epoch_ms(),
+                })
+                .is_err()
+            {
                 return;
             }
         })?;
@@ -9452,13 +10113,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
     app.poll_preview_results();
     app.poll_agent_sessions();
     app.poll_agent_runtime_states();
-    terminal.draw(|f| {
-        if app.is_agent_view() {
-            ui_agent(f, &mut app);
-        } else {
-            ui(f, &mut app);
-        }
-    })?;
+    draw_app_frame(terminal, &mut app, "initial")?;
     let mut previous_is_agent_view = app.is_agent_view();
 
     while !app.should_quit {
@@ -9468,59 +10123,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
             Ok(ev) => ev,
             Err(_) => break, // all senders dropped
         };
-        match event {
-            MainEvent::Input(Event::Key(key)) if is_actionable_key_event(key) => {
-                if app.is_agent_view() {
-                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                    handle_agent_key(&mut app, key, cols, rows);
-                } else {
-                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                    let agent_viewport =
-                        agent_viewport_for_terminal(cols, rows, app.agent_sidebar_config_width());
-                    handle_key(
-                        &mut app,
-                        key,
-                        cols,
-                        agent_viewport.pty_cols,
-                        agent_viewport.pty_rows,
-                    );
-                }
-            }
-            MainEvent::Input(_) => {}
-            MainEvent::AgentEvent { reader_id, event } => {
-                app.on_agent_event(reader_id, event);
-            }
-            MainEvent::AgentOutputAvailable { reader_id } => {
-                app.on_agent_output_available(reader_id);
-            }
-            MainEvent::AgentReaderEnded { reader_id, reason } => {
-                app.on_agent_reader_ended(reader_id, reason);
-            }
-            MainEvent::AgentWriterEnded { reader_id, reason } => {
-                app.on_agent_writer_ended(reader_id, reason);
-            }
-            MainEvent::RuntimeStateResult(result) => {
-                app.on_runtime_state_result(result);
-            }
-            MainEvent::SearchResult(result) => {
-                app.on_search_result(result);
-            }
-            MainEvent::DataTaskProgress(progress) => {
-                app.on_data_task_progress(progress);
-            }
-            MainEvent::CloneResult(result) => {
-                app.on_clone_worker_result(result);
-            }
-            MainEvent::RestoreResult(result) => {
-                app.on_restore_worker_result(result);
-            }
-            MainEvent::Tick => {
-                app.poll_preview_results();
-                app.poll_agent_sessions();
-                app.poll_agent_runtime_states();
-            }
-        }
-        app.prepare_sessions_view_after_transition(&mut previous_is_agent_view, "main_event");
+        handle_main_event(&mut app, event, &mut previous_is_agent_view, "main_event");
         // Drain a bounded burst so tight redraw loops cannot keep UI input
         // stuck behind agent output forever. Unprocessed events stay queued
         // and are handled on the next loop after a render opportunity.
@@ -9531,90 +10134,34 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 break;
             }
             match main_rx.try_recv() {
-                Ok(MainEvent::Input(Event::Key(key))) if is_actionable_key_event(key) => {
+                Ok(event) => {
                     drained_events = drained_events.saturating_add(1);
-                    if app.is_agent_view() {
-                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                        handle_agent_key(&mut app, key, cols, rows);
-                    } else {
-                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                        let agent_viewport = agent_viewport_for_terminal(
-                            cols,
-                            rows,
-                            app.agent_sidebar_config_width(),
-                        );
-                        handle_key(
-                            &mut app,
-                            key,
-                            cols,
-                            agent_viewport.pty_cols,
-                            agent_viewport.pty_rows,
-                        );
-                    }
-                }
-                Ok(MainEvent::Input(_)) => {
-                    drained_events = drained_events.saturating_add(1);
-                }
-                Ok(MainEvent::AgentEvent { reader_id, event }) => {
-                    drained_events = drained_events.saturating_add(1);
-                    app.on_agent_event(reader_id, event);
-                }
-                Ok(MainEvent::AgentOutputAvailable { reader_id }) => {
-                    drained_events = drained_events.saturating_add(1);
-                    app.on_agent_output_available(reader_id);
-                }
-                Ok(MainEvent::AgentReaderEnded { reader_id, reason }) => {
-                    drained_events = drained_events.saturating_add(1);
-                    app.on_agent_reader_ended(reader_id, reason);
-                }
-                Ok(MainEvent::AgentWriterEnded { reader_id, reason }) => {
-                    drained_events = drained_events.saturating_add(1);
-                    app.on_agent_writer_ended(reader_id, reason);
-                }
-                Ok(MainEvent::RuntimeStateResult(result)) => {
-                    drained_events = drained_events.saturating_add(1);
-                    app.on_runtime_state_result(result);
-                }
-                Ok(MainEvent::SearchResult(result)) => {
-                    drained_events = drained_events.saturating_add(1);
-                    app.on_search_result(result);
-                }
-                Ok(MainEvent::DataTaskProgress(progress)) => {
-                    drained_events = drained_events.saturating_add(1);
-                    app.on_data_task_progress(progress);
-                }
-                Ok(MainEvent::CloneResult(result)) => {
-                    drained_events = drained_events.saturating_add(1);
-                    app.on_clone_worker_result(result);
-                }
-                Ok(MainEvent::RestoreResult(result)) => {
-                    drained_events = drained_events.saturating_add(1);
-                    app.on_restore_worker_result(result);
-                }
-                Ok(MainEvent::Tick) => {
-                    drained_events = drained_events.saturating_add(1);
-                    app.poll_preview_results();
-                    app.poll_agent_sessions();
-                    app.poll_agent_runtime_states();
+                    handle_main_event(&mut app, event, &mut previous_is_agent_view, "queued_event");
                 }
                 Err(_) => break,
             }
-            app.prepare_sessions_view_after_transition(&mut previous_is_agent_view, "queued_event");
         }
         if app.should_quit {
             break;
         }
         // Reap exited agent (channel-driven path no longer routes through
         // poll_agent_sessions automatically when no Tick is pending).
+        let pre_draw_started = Instant::now();
         app.poll_agent_sessions();
         app.prepare_sessions_view_after_transition(&mut previous_is_agent_view, "pre_draw");
-        terminal.draw(|f| {
-            if app.is_agent_view() {
-                ui_agent(f, &mut app);
-            } else {
-                ui(f, &mut app);
-            }
-        })?;
+        let pre_draw_elapsed_ms = pre_draw_started.elapsed().as_millis();
+        if should_log_perf_timing(pre_draw_elapsed_ms, None) {
+            debug_log(
+                "main_pre_draw_timing",
+                serde_json::json!({
+                    "elapsed_ms": pre_draw_elapsed_ms,
+                    "agent_view": app.is_agent_view(),
+                    "show_sessions_view": app.show_sessions_view,
+                    "active_agent": app.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                }),
+            );
+        }
+        draw_app_frame(terminal, &mut app, "main_loop")?;
     }
     debug_log("tui_stop", serde_json::json!({}));
     Ok(())
@@ -9822,12 +10369,12 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             }
         }
 
-        let (output_chunks, screen_changed) = agent.drain_output_chunks();
+        let output_drain = agent.drain_output_chunks();
         // Track shell cwd changes on every tick (cheap /proc readlink) and
         // force an immediate meta write on change so the sidebar reflects
         // `cd` without waiting for the activity-meta rate limit.
         let cwd_changed = agent.refresh_shell_cwd_from_kernel();
-        if cwd_changed || (screen_changed && agent.should_write_activity_meta()) {
+        if cwd_changed || (output_drain.activity_changed && agent.should_write_activity_meta()) {
             let _ = write_agent_meta(
                 &meta_path,
                 &mut agent,
@@ -9836,7 +10383,8 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 attached_client_instance_id.as_deref(),
             );
         }
-        for bytes in output_chunks {
+        let output_backlog_remaining = output_drain.has_more;
+        for bytes in output_drain.chunks {
             if let Some(conn) = client.as_mut() {
                 if conn
                     .send_event(&AgentDaemonEvent::Output { data: bytes })
@@ -10056,7 +10604,11 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             }
         }
 
-        thread::sleep(Duration::from_millis(30));
+        if output_backlog_remaining {
+            thread::yield_now();
+        } else {
+            thread::sleep(Duration::from_millis(30));
+        }
     };
     debug_log(
         "daemon_child_exit",
@@ -12351,8 +12903,11 @@ fn run_agent_writer_thread(
         let AgentWriterRequest {
             request,
             completion,
+            queued_at_epoch_ms,
         } = envelope;
         let request_kind = agent_daemon_request_kind(&request);
+        let write_started = Instant::now();
+        let write_started_epoch_ms = current_epoch_ms();
         if let Err(e) = write_json_line(&mut stream, &request) {
             let error_kind = format!("{:?}", e.kind());
             let error = e.to_string();
@@ -12372,6 +12927,9 @@ fn run_agent_writer_thread(
             );
             return format!("write error: {}", error);
         }
+        let write_elapsed_ms = write_started.elapsed().as_millis();
+        let queue_wait_ms = write_started_epoch_ms.saturating_sub(queued_at_epoch_ms);
+        let total_elapsed_ms = current_epoch_ms().saturating_sub(queued_at_epoch_ms);
         if let Some(completion) = completion {
             let _ = completion.send(Ok(()));
         }
@@ -12380,8 +12938,13 @@ fn run_agent_writer_thread(
             "session_id": &session_id,
             "reader_id": reader_id,
             "request": request_kind,
+            "queue_wait_ms": queue_wait_ms,
+            "write_elapsed_ms": write_elapsed_ms,
+            "total_elapsed_ms": total_elapsed_ms,
         });
-        if matches!(request, AgentDaemonRequest::Input { .. }) {
+        if matches!(request, AgentDaemonRequest::Input { .. })
+            && !should_log_perf_timing(write_elapsed_ms, Some(total_elapsed_ms))
+        {
             trace_log("agent_writer_request_sent", details);
         } else {
             debug_log("agent_writer_request_sent", details);
@@ -16647,7 +17210,15 @@ fn sessions_pane_width(
     let configured_width = configured_width.unwrap_or_else(|| {
         ((u32::from(total_width) * u32::from(fallback_percent.min(100))) / 100) as u16
     });
-    configured_width.min(total_width)
+    configured_width.min(max_sessions_pane_width(total_width))
+}
+
+fn max_sessions_pane_width(total_width: u16) -> u16 {
+    if total_width > MIN_PREVIEW_PANE_WIDTH {
+        total_width - MIN_PREVIEW_PANE_WIDTH
+    } else {
+        total_width
+    }
 }
 
 fn agent_screen_size_for_area(area: Rect) -> (u16, u16) {
@@ -16670,7 +17241,7 @@ fn adjusted_sessions_pane_width(
 ) -> (u16, bool) {
     adjusted_visible_pane_width(
         sessions_pane_width(total_width, configured_width, fallback_percent),
-        total_width,
+        max_sessions_pane_width(total_width),
         delta,
     )
 }
@@ -17482,9 +18053,11 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     if let InputMode::Filter { draft, cursor } = &mut app.input_mode {
         let mut next_mode: Option<InputMode> = None;
         let mut apply_query: Option<String> = None;
+        let mut cancel_search_reason: Option<&'static str> = None;
+        let mut quit_after_filter: Option<bool> = None;
         if keybindings.matches(KeyAction::FilterCancel, key) {
             next_mode = Some(InputMode::Normal);
-            app.search_pending = None;
+            cancel_search_reason = Some("cancel");
             app.status = "cancelled.".into();
             debug_log(
                 "filter_cancel",
@@ -17493,6 +18066,19 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                     "searching": filter_is_searching,
                 }),
             );
+        } else if filter_is_searching
+            && (keybindings.matches(KeyAction::GlobalQuit, key)
+                || keybindings.matches(KeyAction::SessionQuit, key))
+        {
+            next_mode = Some(InputMode::Normal);
+            cancel_search_reason = Some("quit");
+            quit_after_filter = Some(false);
+            debug_log_key_event(key, "filter_searching_quit");
+        } else if filter_is_searching && keybindings.matches(KeyAction::SessionForceQuit, key) {
+            next_mode = Some(InputMode::Normal);
+            cancel_search_reason = Some("force_quit");
+            quit_after_filter = Some(true);
+            debug_log_key_event(key, "filter_searching_force_quit");
         } else if filter_is_searching {
             debug_log_key_event(key, "filter_searching_ignored");
         } else if keybindings.matches(KeyAction::FilterApply, key) {
@@ -17573,8 +18159,15 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         } else {
             debug_log_key_event(key, "filter_ignored");
         }
+        if let Some(reason) = cancel_search_reason {
+            app.cancel_pending_search(reason);
+        }
         if let Some(mode) = next_mode {
             app.input_mode = mode;
+        }
+        if let Some(force) = quit_after_filter {
+            app.request_quit("filter_searching_quit", force);
+            return;
         }
         if let Some(query) = apply_query {
             app.start_text_search(query);
@@ -17681,7 +18274,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     } else if keybindings.matches(KeyAction::SessionToggleView, key) {
         app.toggle_session_view();
     } else if keybindings.matches(KeyAction::SessionRefresh, key) {
-        app.refresh();
+        app.request_session_refresh();
     } else if keybindings.matches(KeyAction::SessionDelete, key) {
         if app.reject_while_data_task_running("deleting a session") {
             return;
@@ -18833,7 +19426,10 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let mut lines = Vec::new();
     let mut summary_style_state = PreviewSummaryStyleState::default();
     let mut max_scroll = 0u16;
-    let title = if let Some(info) = current {
+    let title = if inner.width < MIN_PREVIEW_WRAP_WIDTH {
+        app.preview_scroll = 0;
+        " preview ".to_string()
+    } else if let Some(info) = current {
         let key = PreviewKey::new(&info, app.preview_mode);
         app.request_preview(info.clone(), key.clone(), inner.width as usize);
         if let Some(line_count) = app.ensure_wrapped_preview(&key, inner.width as usize) {
@@ -18982,6 +19578,17 @@ fn preview_summary_update_style_state_after_line(state: &mut PreviewSummaryStyle
     {
         state.body_context = PreviewSummaryBodyContext::Plain;
     }
+}
+
+fn preview_summary_style_states_for_lines(lines: &[String]) -> Vec<PreviewSummaryStyleState> {
+    let mut states = Vec::with_capacity(lines.len().saturating_add(1));
+    let mut state = PreviewSummaryStyleState::default();
+    states.push(state);
+    for line in lines {
+        preview_summary_update_style_state_after_line(&mut state, line);
+        states.push(state);
+    }
+    states
 }
 
 fn preview_summary_line_starts_new_block(line: &str) -> bool {
@@ -20162,6 +20769,8 @@ mod tests {
             new_agent_backing_aliases: HashMap::new(),
             new_agent_backing_probe_after: HashMap::new(),
             last_agent_state_poll: Instant::now(),
+            last_live_shell_discovery: Instant::now()
+                - Duration::from_millis(LIVE_SHELL_DISCOVERY_INTERVAL_MS),
             list_state: ListState::default(),
             session_view: SessionViewMode::Tree,
             provider_filter: ProviderFilter::All,
@@ -20190,8 +20799,13 @@ mod tests {
             runtime_refresh_seq: 0,
             runtime_refresh_applied_seq: 0,
             runtime_refresh_pending: false,
+            runtime_refresh_started_at: None,
             runtime_refresh_queued: false,
             pending_runtime_action: None,
+            session_refresh_seq: 0,
+            session_refresh_pending: false,
+            session_refresh_restore_key: None,
+            session_refresh_preserve_status: None,
             next_reader_id: 0,
             show_sessions_view: true,
         }
@@ -21304,10 +21918,11 @@ mod tests {
         let info = session_info(Provider::Codex, "sid", "/repo");
 
         app.text_filter = "needle".to_string();
-        assert!(!app.matches_session_filters(&info));
+        let text_filter = app.text_filter.to_lowercase();
+        assert!(!app.matches_session_filters(&info, Some(&text_filter)));
 
         app.text_filter_matches.insert(AgentKey::new(&info));
-        assert!(app.matches_session_filters(&info));
+        assert!(app.matches_session_filters(&info, Some(&text_filter)));
     }
 
     #[test]
@@ -21323,6 +21938,7 @@ mod tests {
             seq: 7,
             query: "needle".to_string(),
             started_at: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
         });
 
         app.on_search_result(SearchWorkerResult {
@@ -21333,6 +21949,7 @@ mod tests {
                 matches: 1,
                 snippet: "needle".to_string(),
             }]),
+            queued_at_epoch_ms: current_epoch_ms(),
         });
 
         assert!(matches!(app.input_mode, InputMode::Normal));
@@ -21350,6 +21967,7 @@ mod tests {
             seq: 7,
             query: "needle".to_string(),
             started_at: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
         });
         app.input_mode = InputMode::Filter {
             draft: "needle".to_string(),
@@ -21371,11 +21989,40 @@ mod tests {
                 matches: 1,
                 snippet: "needle".to_string(),
             }]),
+            queued_at_epoch_ms: current_epoch_ms(),
         });
 
         assert_eq!(app.text_filter, "old");
         assert!(app.text_filter_matches.is_empty());
         assert!(app.search_pending.is_none());
+    }
+
+    #[test]
+    fn quit_key_cancels_pending_filter_search() {
+        let mut app = app_for_key_tests();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.search_pending = Some(SearchPending {
+            seq: 7,
+            query: "needle".to_string(),
+            started_at: Instant::now(),
+            cancel: cancel.clone(),
+        });
+        app.input_mode = InputMode::Filter {
+            draft: "needle".to_string(),
+            cursor: "needle".len(),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.search_pending.is_none());
+        assert!(app.should_quit);
     }
 
     #[test]
@@ -22200,6 +22847,29 @@ mod tests {
     }
 
     #[test]
+    fn preview_summary_style_state_cache_tracks_context_before_each_line() {
+        let lines = vec![
+            "  tool use: Bash [abc123]".to_string(),
+            "    cmd: ls -la".to_string(),
+            "USER #1".to_string(),
+            "plain".to_string(),
+        ];
+
+        let states = preview_summary_style_states_for_lines(&lines);
+
+        assert_eq!(states[0].body_context, PreviewSummaryBodyContext::Plain);
+        assert_eq!(
+            states[1].body_context,
+            PreviewSummaryBodyContext::ToolUseArgs
+        );
+        assert_eq!(
+            states[2].body_context,
+            PreviewSummaryBodyContext::ToolUseArgs
+        );
+        assert_eq!(states[3].body_context, PreviewSummaryBodyContext::Plain);
+    }
+
+    #[test]
     fn preview_summary_tool_result_error_status_must_be_terminal_detail() {
         let ok_with_error_name = preview_summary_line("  tool result: error checker [abc123] · ok");
         assert_eq!(ok_with_error_name.spans[0].style.fg, Some(THEME_POSITIVE));
@@ -22846,6 +23516,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_output_drain_is_bounded_but_processes_at_least_one_chunk() {
+        assert!(should_continue_agent_output_drain(
+            0,
+            Duration::from_millis(AGENT_OUTPUT_DRAIN_BUDGET_MS)
+        ));
+        assert!(should_continue_agent_output_drain(
+            AGENT_OUTPUT_POLL_LIMIT - 1,
+            Duration::from_millis(0)
+        ));
+        assert!(!should_continue_agent_output_drain(
+            AGENT_OUTPUT_POLL_LIMIT,
+            Duration::from_millis(0)
+        ));
+        assert!(!should_continue_agent_output_drain(
+            1,
+            Duration::from_millis(AGENT_OUTPUT_DRAIN_BUDGET_MS)
+        ));
+    }
+
+    #[test]
     fn agent_terminal_width_accounts_for_sidebar() {
         assert_eq!(agent_sidebar_width(50, 0), 0);
         assert_eq!(agent_terminal_width(50, 0), 50);
@@ -22893,8 +23583,15 @@ mod tests {
             45
         );
         assert_eq!(sessions_pane_width(100, Some(40), 45), 40);
-        assert_eq!(sessions_pane_width(70, Some(u16::MAX), 45), 70);
-        assert_eq!(sessions_pane_width(100, None, 150), 100);
+        assert_eq!(
+            sessions_pane_width(70, Some(u16::MAX), 45),
+            70 - MIN_PREVIEW_PANE_WIDTH
+        );
+        assert_eq!(
+            sessions_pane_width(100, None, 150),
+            100 - MIN_PREVIEW_PANE_WIDTH
+        );
+        assert_eq!(sessions_pane_width(20, Some(u16::MAX), 45), 20);
     }
 
     #[test]
@@ -22909,13 +23606,58 @@ mod tests {
         );
         assert_eq!(
             adjusted_sessions_pane_width(Some(100), 100, 45, 2),
-            (100, true)
+            (100 - MIN_PREVIEW_PANE_WIDTH, true)
         );
         assert_eq!(
             adjusted_sessions_pane_width(Some(u16::MAX), 100, 45, -2),
-            (98, false)
+            (100 - MIN_PREVIEW_PANE_WIDTH - 2, false)
         );
         assert_eq!(adjusted_sessions_pane_width(None, 100, 45, 2), (47, false));
+    }
+
+    #[test]
+    fn narrow_preview_does_not_request_expensive_wrap() {
+        let mut app = app_for_key_tests();
+        app.sessions
+            .push(session_info(Provider::Codex, "narrow-preview", "/repo"));
+        app.list_state.select(Some(0));
+
+        let backend = ratatui::backend::TestBackend::new(18, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_preview(f, &mut app, Rect::new(0, 0, 18, 8)))
+            .unwrap();
+
+        assert!(app.preview_requested.is_none());
+        assert_eq!(app.preview_seq, 0);
+    }
+
+    #[test]
+    fn preview_worker_wakes_main_loop_when_result_is_ready() {
+        let (request_tx, request_rx) = mpsc::channel::<PreviewRequest>();
+        let (result_tx, result_rx) = mpsc::channel::<PreviewResult>();
+        let (main_tx, main_rx) = mpsc::channel::<MainEvent>();
+        let info = session_info(Provider::Codex, "preview-wake", "/repo");
+        let key = PreviewKey::new(&info, Mode::Summary);
+
+        request_tx
+            .send(PreviewRequest {
+                seq: 7,
+                key,
+                info,
+                width: 80,
+                wake_tx: Some(main_tx),
+            })
+            .unwrap();
+        drop(request_tx);
+
+        preview_worker(request_rx, result_tx);
+
+        assert_eq!(result_rx.try_recv().unwrap().seq, 7);
+        assert!(matches!(
+            main_rx.try_recv().unwrap(),
+            MainEvent::PreviewReady { .. }
+        ));
     }
 
     #[test]
@@ -24492,6 +25234,9 @@ IF EXIST "%~dp0\node.exe" (
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
+            pending_input_since_epoch_ms: None,
+            pending_input_key: None,
+            pending_input_count: 0,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -24544,6 +25289,9 @@ IF EXIST "%~dp0\node.exe" (
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
+            pending_input_since_epoch_ms: None,
+            pending_input_key: None,
+            pending_input_count: 0,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -24571,9 +25319,25 @@ IF EXIST "%~dp0\node.exe" (
         parser_visible_plain_lines(&mut agent.parser, 0).join("\n")
     }
 
+    fn active_agent_has_pending_output(app: &App) -> bool {
+        app.active_agent
+            .as_ref()
+            .is_some_and(AgentClient::has_pending_output)
+    }
+
+    fn drain_active_agent_output_until_idle(app: &mut App, reader_id: u64) {
+        for _ in 0..100 {
+            if !active_agent_has_pending_output(app) {
+                return;
+            }
+            app.on_agent_output_available(reader_id);
+        }
+        panic!("active agent output did not drain within the iteration limit");
+    }
+
     #[cfg(unix)]
     #[test]
-    fn terminal_event_flushes_large_pending_output_before_exit() {
+    fn terminal_event_defers_large_pending_output_and_preserves_tail() {
         let reader_id = 19;
         let mut app = app_for_key_tests();
         app.active_agent = Some(buffered_output_test_client("large-output-exit", reader_id));
@@ -24599,21 +25363,27 @@ IF EXIST "%~dp0\node.exe" (
             },
         );
 
-        let text = active_agent_visible_text(&mut app);
-        assert!(
-            text.contains("COKACMUX_TAIL_MARKER"),
-            "terminal event must flush pending output before marking exit: {:?}",
-            text
-        );
         assert_eq!(
             app.active_agent.as_ref().unwrap().exited.as_deref(),
             Some("done")
         );
+        assert!(active_agent_has_pending_output(&app));
+        assert!(!active_agent_visible_text(&mut app).contains("COKACMUX_TAIL_MARKER"));
+
+        drain_active_agent_output_until_idle(&mut app, reader_id);
+        let text = active_agent_visible_text(&mut app);
+        assert!(
+            text.contains("COKACMUX_TAIL_MARKER"),
+            "terminal output tail should survive incremental exit draining: {:?}",
+            text
+        );
+        app.poll_agent_sessions();
+        assert!(app.active_agent.is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn reader_end_flushes_large_pending_output_before_exit() {
+    fn reader_end_defers_large_pending_output_and_preserves_tail() {
         let reader_id = 23;
         let mut app = app_for_key_tests();
         app.active_agent = Some(buffered_output_test_client(
@@ -24637,12 +25407,6 @@ IF EXIST "%~dp0\node.exe" (
 
         app.on_agent_reader_ended(reader_id, "eof".into());
 
-        let text = active_agent_visible_text(&mut app);
-        assert!(
-            text.contains("COKACMUX_TAIL_MARKER"),
-            "reader end must flush pending output before marking exit: {:?}",
-            text
-        );
         assert!(app
             .active_agent
             .as_ref()
@@ -24650,6 +25414,18 @@ IF EXIST "%~dp0\node.exe" (
             .exited
             .as_deref()
             .is_some_and(|status| status.contains("daemon connection ended")));
+        assert!(active_agent_has_pending_output(&app));
+        assert!(!active_agent_visible_text(&mut app).contains("COKACMUX_TAIL_MARKER"));
+
+        drain_active_agent_output_until_idle(&mut app, reader_id);
+        let text = active_agent_visible_text(&mut app);
+        assert!(
+            text.contains("COKACMUX_TAIL_MARKER"),
+            "reader-end output tail should survive incremental exit draining: {:?}",
+            text
+        );
+        app.poll_agent_sessions();
+        assert!(app.active_agent.is_none());
     }
 
     #[cfg(unix)]
@@ -24673,6 +25449,9 @@ IF EXIST "%~dp0\node.exe" (
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
+            pending_input_since_epoch_ms: None,
+            pending_input_key: None,
+            pending_input_count: 0,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -24930,6 +25709,9 @@ IF EXIST "%~dp0\node.exe" (
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
+            pending_input_since_epoch_ms: None,
+            pending_input_key: None,
+            pending_input_count: 0,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -24998,6 +25780,9 @@ IF EXIST "%~dp0\node.exe" (
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
+            pending_input_since_epoch_ms: None,
+            pending_input_key: None,
+            pending_input_count: 0,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,

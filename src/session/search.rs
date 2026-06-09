@@ -1,5 +1,7 @@
 //! Full-text search across all known sessions.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::error::Result;
 use crate::providers::discovery::SessionInfo;
 
@@ -17,6 +19,14 @@ pub struct SearchHit {
 /// Search across all enabled providers for sessions whose rendered full
 /// session data contains `query`.
 pub fn search_all(query: &str, case_insensitive: bool) -> Result<Vec<SearchHit>> {
+    search_all_with_cancel(query, case_insensitive, None)
+}
+
+pub fn search_all_with_cancel(
+    query: &str,
+    case_insensitive: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<SearchHit>> {
     crate::debug::log(
         "search_library_start",
         serde_json::json!({
@@ -43,6 +53,16 @@ pub fn search_all(query: &str, case_insensitive: bool) -> Result<Vec<SearchHit>>
     let mut hits: Vec<SearchHit> = Vec::new();
     let mut load_errors = 0usize;
     for info in infos {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            crate::debug::log(
+                "search_library_cancelled",
+                serde_json::json!({
+                    "hits": hits.len(),
+                    "load_errors": load_errors,
+                }),
+            );
+            return Ok(hits);
+        }
         let session = match super::load(&info) {
             Ok(session) => session,
             Err(error) => {
@@ -58,7 +78,27 @@ pub fn search_all(query: &str, case_insensitive: bool) -> Result<Vec<SearchHit>>
                 continue;
             }
         };
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            crate::debug::log(
+                "search_library_cancelled",
+                serde_json::json!({
+                    "hits": hits.len(),
+                    "load_errors": load_errors,
+                }),
+            );
+            return Ok(hits);
+        }
         let text = render(&session, Mode::Full);
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            crate::debug::log(
+                "search_library_cancelled",
+                serde_json::json!({
+                    "hits": hits.len(),
+                    "load_errors": load_errors,
+                }),
+            );
+            return Ok(hits);
+        }
         let haystack = if case_insensitive {
             text.to_lowercase()
         } else {

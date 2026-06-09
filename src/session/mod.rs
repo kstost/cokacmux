@@ -17,7 +17,7 @@ use crate::error::{ConvertError, Result};
 use crate::providers::discovery::{self, SessionInfo};
 use crate::universal::{Provider, UniversalSession};
 
-pub use search::{search_all, SearchHit};
+pub use search::{search_all, search_all_with_cancel, SearchHit};
 
 /// List every session known to every enabled provider, most-recent first.
 #[cfg(feature = "discovery")]
