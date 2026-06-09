@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(windows)]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -92,6 +92,8 @@ const AGENT_ATTACH_WRITE_TIMEOUT_MS: u64 = 3_000;
 const AGENT_DETACH_WRITE_TIMEOUT_MS: u64 = 300;
 const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
 const LIVE_SHELL_DISCOVERY_INTERVAL_MS: u64 = 10_000;
+const LIVE_SHELL_DISCOVERY_SLOW_LOG_MS: u64 = 2_000;
+const LIVE_SHELL_DISCOVERY_SLOW_LOG_INTERVAL_MS: u64 = 10_000;
 const PENDING_RUNTIME_ACTION_MAX_WAIT_MS: u64 = 500;
 const AGENT_BUSY_GRACE_MS: u64 = 3_000;
 const AGENT_ACTIVITY_META_WRITE_INTERVAL_MS: u64 = 750;
@@ -100,9 +102,13 @@ const MAIN_EVENT_DRAIN_LIMIT: usize = 64;
 const MAIN_EVENT_DRAIN_BUDGET_MS: u64 = 8;
 const AGENT_CLIENT_OUTPUT_DRAIN_BYTES: usize = 16 * 1024;
 const PERF_LOG_THRESHOLD_MS: u128 = 50;
+const UI_STALL_LOG_THRESHOLD_MS: u64 = 2_000;
+const UI_STALL_LOG_COOLDOWN_MS: u64 = 2_000;
+const UI_STALL_WATCHDOG_INTERVAL_MS: u64 = 500;
 const MIN_PREVIEW_PANE_WIDTH: u16 = 24;
 const MIN_PREVIEW_WRAP_WIDTH: u16 = 20;
 const DEBUG_LOG_FILE: &str = "cokacmux.log";
+const DEBUG_STALL_LOG_FILE: &str = "cokacmux-stalls.log";
 const DEBUG_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const APP_DIR_NAME: &str = ".cokacmux";
 const COKACDIR_PROGRAM_NAME: &str = "cokacdir";
@@ -169,6 +175,8 @@ const CLAUDE_CODE_NO_FLICKER_ENV: &str = "CLAUDE_CODE_NO_FLICKER";
 const CLAUDE_CODE_NO_FLICKER_VALUE: &str = "1";
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+static MAIN_LOOP_HEARTBEAT_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+static UI_STALL_WATCHDOG_NEXT_LOG_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(windows)]
 static WINDOWS_DAEMON_CTRL_EVENT_COUNT: AtomicU32 = AtomicU32::new(0);
 #[cfg(windows)]
@@ -2978,7 +2986,8 @@ impl AgentSession {
     fn screen_snapshot_bytes(&mut self, include_scrollback: bool) -> Vec<u8> {
         let visible_rows = self.pty_size.rows as usize;
         let should_debug = DEBUG_ENABLED.load(Ordering::Relaxed);
-        let before = should_debug
+        let verbose_debug = TRACE_ENABLED.load(Ordering::Relaxed);
+        let before = verbose_debug
             .then(|| debug_agent_session_state_value(self, visible_rows, visible_rows.min(120)));
         let snapshot = parser_snapshot_bytes_with_history(
             &mut self.parser,
@@ -2986,7 +2995,9 @@ impl AgentSession {
             &self.screen_history,
         );
         if should_debug {
-            let after = debug_agent_session_state_value(self, visible_rows, visible_rows.min(120));
+            let after = verbose_debug.then(|| {
+                debug_agent_session_state_value(self, visible_rows, visible_rows.min(120))
+            });
             debug_log(
                 "daemon_screen_snapshot_generated",
                 serde_json::json!({
@@ -2994,6 +3005,7 @@ impl AgentSession {
                     "session_id": &self.info.session_id,
                     "include_scrollback": include_scrollback,
                     "snapshot": debug_terminal_data_summary(&snapshot, 1024),
+                    "verbose": verbose_debug,
                     "before": before,
                     "after": after,
                 }),
@@ -3018,6 +3030,7 @@ fn parser_snapshot_bytes_with_history(
     let mut replay_source = "disabled";
     let mut replay_debug: Option<serde_json::Value> = None;
     let mut visible_debug: Option<serde_json::Value> = None;
+    let verbose_debug = TRACE_ENABLED.load(Ordering::Relaxed);
 
     if include_scrollback {
         let mut replay_lines = parser_scrollback_plain_lines(parser);
@@ -3029,7 +3042,7 @@ fn parser_snapshot_bytes_with_history(
             replay_source = "parser_scrollback";
             screen_history.trim_trailing_current_snapshot(&mut replay_lines, &visible_lines);
         }
-        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        if verbose_debug {
             replay_debug = Some(debug_lines_value(
                 &replay_lines,
                 replay_lines.len().min(120),
@@ -3059,6 +3072,7 @@ fn parser_snapshot_bytes_with_history(
                 "replay_source": replay_source,
                 "replay": replay_debug,
                 "visible": visible_debug,
+                "verbose": verbose_debug,
                 "screen_history_lines": screen_history.len(),
                 "snapshot": debug_terminal_data_summary(&bytes, 1024),
             }),
@@ -4759,6 +4773,8 @@ enum MainEvent {
     PreviewReady { queued_at_epoch_ms: u64 },
     /// Runtime state discovery/probing completed off the UI thread.
     RuntimeStateResult(AgentRuntimeRefreshResult),
+    /// Full live-shell metadata scan completed off the runtime-state path.
+    LiveShellDiscoveryResult(LiveShellDiscoveryResult),
     /// Session list refresh completed off the UI thread.
     SessionRefreshResult(SessionRefreshResult),
     /// Full-session search completed in the background.
@@ -4791,6 +4807,14 @@ struct AgentRuntimeRefreshResult {
     agent_states: HashMap<AgentKey, AgentListState>,
     new_agent_backing_aliases: HashMap<AgentKey, AgentKey>,
     new_agent_backing_probe_after: HashMap<AgentKey, Instant>,
+}
+
+struct LiveShellDiscoveryResult {
+    seq: u64,
+    live_shells: Vec<SessionInfo>,
+    started_at_epoch_ms: u64,
+    queued_at_epoch_ms: u64,
+    elapsed_ms: u128,
 }
 
 enum PendingRuntimeAction {
@@ -4866,6 +4890,12 @@ struct App {
     runtime_refresh_started_at: Option<Instant>,
     runtime_refresh_queued: bool,
     pending_runtime_action: Option<PendingRuntimeAction>,
+    live_shell_discovery_seq: u64,
+    live_shell_discovery_pending: bool,
+    live_shell_discovery_started_at: Option<Instant>,
+    live_shell_discovery_last_slow_log_at: Option<Instant>,
+    last_ui_stall_log_at: Option<Instant>,
+    ui_stall_log_count: u64,
     session_refresh_seq: u64,
     session_refresh_pending: bool,
     session_refresh_restore_key: Option<AgentKey>,
@@ -4942,6 +4972,12 @@ impl App {
             runtime_refresh_started_at: None,
             runtime_refresh_queued: false,
             pending_runtime_action: None,
+            live_shell_discovery_seq: 0,
+            live_shell_discovery_pending: false,
+            live_shell_discovery_started_at: None,
+            live_shell_discovery_last_slow_log_at: None,
+            last_ui_stall_log_at: None,
+            ui_stall_log_count: 0,
             session_refresh_seq: 0,
             session_refresh_pending: false,
             session_refresh_restore_key: None,
@@ -5945,7 +5981,111 @@ impl App {
         {
             return;
         }
+        self.poll_live_shell_discovery();
         self.refresh_agent_runtime_states();
+    }
+
+    fn poll_live_shell_discovery(&mut self) {
+        if self.live_shell_discovery_pending {
+            self.maybe_log_slow_live_shell_discovery();
+            return;
+        }
+        if self.last_live_shell_discovery.elapsed()
+            < Duration::from_millis(LIVE_SHELL_DISCOVERY_INTERVAL_MS)
+        {
+            return;
+        }
+        self.start_live_shell_discovery();
+    }
+
+    fn maybe_log_slow_live_shell_discovery(&mut self) {
+        let Some(started_at) = self.live_shell_discovery_started_at else {
+            return;
+        };
+        let elapsed = started_at.elapsed();
+        if elapsed < Duration::from_millis(LIVE_SHELL_DISCOVERY_SLOW_LOG_MS) {
+            return;
+        }
+        if self
+            .live_shell_discovery_last_slow_log_at
+            .is_some_and(|last| {
+                last.elapsed() < Duration::from_millis(LIVE_SHELL_DISCOVERY_SLOW_LOG_INTERVAL_MS)
+            })
+        {
+            return;
+        }
+        self.live_shell_discovery_last_slow_log_at = Some(Instant::now());
+        debug_log(
+            "live_shell_discovery_still_pending",
+            serde_json::json!({
+                "seq": self.live_shell_discovery_seq,
+                "elapsed_ms": elapsed.as_millis(),
+                "live_shells_len": self.live_shells.len(),
+                "agent_states_len": self.agent_states.len(),
+            }),
+        );
+    }
+
+    fn start_live_shell_discovery(&mut self) {
+        let Some(tx) = self.main_tx.clone() else {
+            return;
+        };
+        self.live_shell_discovery_seq = self.live_shell_discovery_seq.saturating_add(1);
+        let seq = self.live_shell_discovery_seq;
+        let started_at = Instant::now();
+        let started_at_epoch_ms = current_epoch_ms();
+        self.live_shell_discovery_pending = true;
+        self.live_shell_discovery_started_at = Some(started_at);
+        self.live_shell_discovery_last_slow_log_at = None;
+        debug_log(
+            "live_shell_discovery_requested",
+            serde_json::json!({
+                "seq": seq,
+                "live_shells_len": self.live_shells.len(),
+                "agent_states_len": self.agent_states.len(),
+            }),
+        );
+        match thread::Builder::new()
+            .name("cokacmux-live-discovery".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let live_shells = discover_live_shell_infos();
+                let elapsed_ms = started.elapsed().as_millis();
+                let live_shell_count = live_shells.len();
+                let result_sent = tx
+                    .send(MainEvent::LiveShellDiscoveryResult(
+                        LiveShellDiscoveryResult {
+                            seq,
+                            live_shells,
+                            started_at_epoch_ms,
+                            queued_at_epoch_ms: current_epoch_ms(),
+                            elapsed_ms,
+                        },
+                    ))
+                    .is_ok();
+                debug_log(
+                    "live_shell_discovery_worker_result",
+                    serde_json::json!({
+                        "seq": seq,
+                        "elapsed_ms": elapsed_ms,
+                        "live_shells": live_shell_count,
+                        "result_sent": result_sent,
+                    }),
+                );
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                self.live_shell_discovery_pending = false;
+                self.live_shell_discovery_started_at = None;
+                debug_log(
+                    "live_shell_discovery_spawn_failed",
+                    serde_json::json!({
+                        "seq": seq,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
     }
 
     fn refresh_agent_runtime_states(&mut self) {
@@ -5966,12 +6106,7 @@ impl App {
 
         self.runtime_refresh_seq = self.runtime_refresh_seq.saturating_add(1);
         let seq = self.runtime_refresh_seq;
-        let discover_live_shells = self.last_live_shell_discovery.elapsed()
-            >= Duration::from_millis(LIVE_SHELL_DISCOVERY_INTERVAL_MS);
-        if discover_live_shells {
-            self.last_live_shell_discovery = self.last_agent_state_poll;
-        }
-        let request = self.agent_runtime_refresh_request(seq, discover_live_shells);
+        let request = self.agent_runtime_refresh_request(seq, false);
         match tx.send(request) {
             Ok(()) => {
                 self.runtime_refresh_pending = true;
@@ -6018,6 +6153,67 @@ impl App {
         }
     }
 
+    fn maybe_log_ui_stall(
+        &mut self,
+        event_kind: &'static str,
+        reason: &'static str,
+        queued_at_epoch_ms: Option<u64>,
+        observed_at_epoch_ms: u64,
+        queued_latency_ms: Option<u64>,
+    ) {
+        let Some(latency_ms) = queued_latency_ms else {
+            return;
+        };
+        if !is_ui_stall_latency_ms(latency_ms) {
+            return;
+        }
+        if self
+            .last_ui_stall_log_at
+            .is_some_and(|last| last.elapsed() < Duration::from_millis(UI_STALL_LOG_COOLDOWN_MS))
+        {
+            return;
+        }
+
+        self.last_ui_stall_log_at = Some(Instant::now());
+        self.ui_stall_log_count = self.ui_stall_log_count.saturating_add(1);
+        let pending_runtime_action = match self.pending_runtime_action.as_ref() {
+            Some(PendingRuntimeAction::LaunchSelected { .. }) => Some("launch_selected"),
+            Some(PendingRuntimeAction::RestoreLive { .. }) => Some("restore_live"),
+            Some(PendingRuntimeAction::SwitchActive { .. }) => Some("switch_active"),
+            None => None,
+        };
+        let runtime_refresh_pending_elapsed_ms = self
+            .runtime_refresh_started_at
+            .map(|started_at| started_at.elapsed().as_millis());
+        let stalled_since_epoch_ms =
+            queued_at_epoch_ms.unwrap_or_else(|| observed_at_epoch_ms.saturating_sub(latency_ms));
+
+        debug_log(
+            "ui_stall_detected",
+            serde_json::json!({
+                "count": self.ui_stall_log_count,
+                "kind": event_kind,
+                "reason": reason,
+                "queued_latency_ms": latency_ms,
+                "threshold_ms": UI_STALL_LOG_THRESHOLD_MS,
+                "queued_at_epoch_ms": queued_at_epoch_ms,
+                "observed_at_epoch_ms": observed_at_epoch_ms,
+                "stalled_since_epoch_ms": stalled_since_epoch_ms,
+                "agent_view": self.is_agent_view(),
+                "show_sessions_view": self.show_sessions_view,
+                "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                "runtime_refresh_pending": self.runtime_refresh_pending,
+                "runtime_refresh_queued": self.runtime_refresh_queued,
+                "runtime_refresh_seq": self.runtime_refresh_seq,
+                "runtime_refresh_pending_elapsed_ms": runtime_refresh_pending_elapsed_ms,
+                "pending_runtime_action": pending_runtime_action,
+                "sessions_len": self.sessions.len(),
+                "live_shells_len": self.live_shells.len(),
+                "agent_states_len": self.agent_states.len(),
+            }),
+        );
+    }
+
     fn on_runtime_state_result(&mut self, result: AgentRuntimeRefreshResult) {
         self.runtime_refresh_pending = false;
         self.runtime_refresh_started_at = None;
@@ -6038,6 +6234,97 @@ impl App {
             self.refresh_agent_runtime_states();
         } else if refresh_queued {
             self.runtime_refresh_queued = true;
+        }
+    }
+
+    fn on_live_shell_discovery_result(&mut self, result: LiveShellDiscoveryResult) {
+        self.live_shell_discovery_pending = false;
+        self.live_shell_discovery_started_at = None;
+        self.live_shell_discovery_last_slow_log_at = None;
+        if result.seq < self.live_shell_discovery_seq {
+            debug_log(
+                "live_shell_discovery_result_stale",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "current_seq": self.live_shell_discovery_seq,
+                    "elapsed_ms": result.elapsed_ms,
+                }),
+            );
+            return;
+        }
+        self.last_live_shell_discovery = Instant::now();
+
+        let previous_live_shells = self.live_shells.clone();
+        let previous_keys: HashSet<AgentKey> =
+            previous_live_shells.iter().map(AgentKey::new).collect();
+        let mut next_live_shells = result.live_shells;
+        let mut seen: HashSet<AgentKey> = next_live_shells.iter().map(AgentKey::new).collect();
+        let mut preserved_keys = Vec::new();
+        for info in previous_live_shells {
+            let key = AgentKey::new(&info);
+            if seen.contains(&key) {
+                continue;
+            }
+            if self
+                .agent_states
+                .get(&key)
+                .copied()
+                .is_some_and(is_switchable_agent_state)
+            {
+                seen.insert(key.clone());
+                preserved_keys.push(key);
+                next_live_shells.push(info);
+            }
+        }
+        if let Some(active_info) = self.active_agent.as_ref().map(|agent| agent.info.clone()) {
+            let active_key = AgentKey::new(&active_info);
+            if !seen.contains(&active_key) {
+                seen.insert(active_key);
+                next_live_shells.push(active_info);
+            }
+        }
+        let next_keys = seen;
+        let removed_keys = previous_keys
+            .difference(&next_keys)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &removed_keys {
+            self.agent_states.remove(key);
+            self.new_agent_backing_aliases.remove(key);
+            self.new_agent_backing_probe_after.remove(key);
+        }
+
+        let added_keys = next_keys
+            .difference(&previous_keys)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.live_shells = next_live_shells;
+        self.overlay_active_agent_runtime_state();
+        apply_cached_new_agent_backing_states(
+            &self.live_shells,
+            &self.new_agent_backing_aliases,
+            &mut self.agent_states,
+        );
+
+        debug_log(
+            "live_shell_discovery_applied",
+            serde_json::json!({
+                "seq": result.seq,
+                "elapsed_ms": result.elapsed_ms,
+                "started_at_epoch_ms": result.started_at_epoch_ms,
+                "queued_latency_ms": current_epoch_ms().saturating_sub(result.queued_at_epoch_ms),
+                "previous_count": previous_keys.len(),
+                "next_count": self.live_shells.len(),
+                "added": added_keys.iter().map(agent_key_debug_value).collect::<Vec<_>>(),
+                "removed": removed_keys.iter().map(agent_key_debug_value).collect::<Vec<_>>(),
+                "preserved_missing": preserved_keys.iter().map(agent_key_debug_value).collect::<Vec<_>>(),
+            }),
+        );
+
+        if self.runtime_refresh_pending {
+            self.runtime_refresh_queued = true;
+        } else {
+            self.refresh_agent_runtime_states();
         }
     }
 
@@ -6189,6 +6476,72 @@ impl App {
                 }),
             );
         }
+    }
+
+    fn mark_agent_live_locally(&mut self, key: AgentKey, activity: AgentActivity) {
+        let debug_key = key.clone();
+        self.agent_states
+            .insert(key, AgentListState::Live { activity });
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            debug_log(
+                "agent_state_mark_live_locally",
+                serde_json::json!({
+                    "key": agent_key_debug_value(&debug_key),
+                    "activity": activity.label(),
+                    "agent_states_len": self.agent_states.len(),
+                }),
+            );
+        }
+    }
+
+    fn remember_live_info_locally(&mut self, info: &SessionInfo) {
+        let key = AgentKey::new(info);
+        let is_provider_session = self
+            .sessions
+            .iter()
+            .any(|session| AgentKey::new(session) == key);
+        if is_provider_session
+            && !is_plain_pty_tool_session_info(info)
+            && !is_new_agent_session_info(info)
+        {
+            return;
+        }
+        let mut replaced = false;
+        if let Some(existing) = self
+            .live_shells
+            .iter_mut()
+            .find(|existing| AgentKey::new(existing) == key)
+        {
+            *existing = info.clone();
+            replaced = true;
+        } else {
+            self.live_shells.push(info.clone());
+        }
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            debug_log(
+                "live_shell_remembered_locally",
+                serde_json::json!({
+                    "key": agent_key_debug_value(&key),
+                    "replaced": replaced,
+                    "live_shells_len": self.live_shells.len(),
+                    "info": session_info_debug_value(info),
+                }),
+            );
+        }
+    }
+
+    fn set_active_agent(&mut self, agent: AgentClient) {
+        if let Some(old_agent) = self.active_agent.take() {
+            let old_info = old_agent.info.clone();
+            let old_key = AgentKey::new(&old_info);
+            let old_activity = old_agent.activity();
+            self.remember_live_info_locally(&old_info);
+            self.mark_agent_live_locally(old_key, old_activity);
+            drop(old_agent);
+        }
+        let info = agent.info.clone();
+        self.remember_live_info_locally(&info);
+        self.active_agent = Some(agent);
     }
 
     fn live_agent_restore_candidates(&self) -> Vec<SessionInfo> {
@@ -6952,7 +7305,7 @@ impl App {
                     if started { "started" } else { "attached" },
                     truncate_width(&cwd, 40),
                 );
-                self.active_agent = Some(agent);
+                self.set_active_agent(agent);
                 self.show_sessions_view = false;
                 self.mark_agent_attached_locally(key.clone());
                 self.discard_pending_agent_runtime_refresh();
@@ -7272,7 +7625,7 @@ impl App {
             Ok(agent) => {
                 self.status = format!("switched to live {}", label);
                 self.show_sessions_view = false;
-                self.active_agent = Some(agent);
+                self.set_active_agent(agent);
                 self.mark_agent_attached_locally(key.clone());
                 self.discard_pending_agent_runtime_refresh();
                 if should_select_visible {
@@ -7694,7 +8047,7 @@ impl App {
                     )
                 };
                 self.show_sessions_view = false;
-                self.active_agent = Some(agent);
+                self.set_active_agent(agent);
                 self.mark_agent_attached_locally(key.clone());
                 self.discard_pending_agent_runtime_refresh();
                 self.refresh_agent_runtime_states();
@@ -7837,7 +8190,7 @@ impl App {
             Ok(agent) => {
                 self.status = format!("switched to live {}", label);
                 self.show_sessions_view = false;
-                self.active_agent = Some(agent);
+                self.set_active_agent(agent);
                 self.mark_agent_attached_locally(key.clone());
                 self.discard_pending_agent_runtime_refresh();
                 if should_select_visible {
@@ -8028,7 +8381,7 @@ impl App {
             Ok(next_agent) => {
                 self.status = format!("killed {}; switched to live {}", killed_label, next_label);
                 self.show_sessions_view = false;
-                self.active_agent = Some(next_agent);
+                self.set_active_agent(next_agent);
                 self.mark_agent_attached_locally(next_key.clone());
                 self.discard_pending_agent_runtime_refresh();
                 if should_select_visible {
@@ -8212,12 +8565,9 @@ impl App {
         let (main_tx, reader_id) = self.agent_attach_handles();
         match AgentClient::attach_existing(next_info, cols, rows, main_tx, reader_id) {
             Ok(next_agent) => {
-                if let Some(old_agent) = self.active_agent.take() {
-                    drop(old_agent);
-                }
                 self.status = format!("switched to live {}", next_label);
                 self.show_sessions_view = false;
-                self.active_agent = Some(next_agent);
+                self.set_active_agent(next_agent);
                 self.mark_agent_attached_locally(next_key.clone());
                 self.discard_pending_agent_runtime_refresh();
                 if should_select_visible {
@@ -9312,21 +9662,25 @@ fn agent_runtime_worker(
         let seq = request.seq;
         let started = Instant::now();
         let result = compute_agent_runtime_refresh(request);
+        let elapsed_ms = started.elapsed().as_millis();
+        let live_shells = result.live_shells.len();
+        let agent_states = result.agent_states.len();
+        let result_sent = result_tx
+            .send(MainEvent::RuntimeStateResult(result))
+            .is_ok();
         debug_log(
             "agent_runtime_worker_result",
             serde_json::json!({
                 "first_seq": first_seq,
                 "seq": seq,
                 "drained": drained,
-                "elapsed_ms": started.elapsed().as_millis(),
-                "live_shells": result.live_shells.len(),
-                "agent_states": result.agent_states.len(),
+                "elapsed_ms": elapsed_ms,
+                "live_shells": live_shells,
+                "agent_states": agent_states,
+                "result_sent": result_sent,
             }),
         );
-        if result_tx
-            .send(MainEvent::RuntimeStateResult(result))
-            .is_err()
-        {
+        if !result_sent {
             break;
         }
     }
@@ -9359,7 +9713,7 @@ fn compute_agent_runtime_refresh(
     let discovered_live_shells = if request.discover_live_shells {
         discover_live_shell_infos()
     } else {
-        Vec::new()
+        request.previous_live_shells.clone()
     };
     debug_agent_runtime_refresh_step(request.seq, "discover_live_shells", step_started.elapsed());
 
@@ -9398,7 +9752,17 @@ fn compute_agent_runtime_refresh(
     }
     let step_started = Instant::now();
     for key in &runtime_keys {
-        let state = read_agent_runtime_state(key, request.current_pid);
+        let mut state = read_agent_runtime_state(key, request.current_pid);
+        if state == AgentListState::Idle && !request.discover_live_shells {
+            if let Some(previous_state) = request
+                .previous_states
+                .get(key)
+                .copied()
+                .filter(|previous_state| *previous_state != AgentListState::Idle)
+            {
+                state = previous_state;
+            }
+        }
         if trace_enabled {
             trace_log(
                 "agent_runtime_refresh_key",
@@ -9885,6 +10249,10 @@ fn should_log_perf_timing(elapsed_ms: u128, queued_latency_ms: Option<u64>) -> b
             .is_some_and(|latency| latency >= PERF_LOG_THRESHOLD_MS)
 }
 
+fn is_ui_stall_latency_ms(latency_ms: u64) -> bool {
+    latency_ms >= UI_STALL_LOG_THRESHOLD_MS
+}
+
 fn main_event_kind(event: &MainEvent) -> &'static str {
     match event {
         MainEvent::Input { event, .. } => input_event_kind(event),
@@ -9895,6 +10263,7 @@ fn main_event_kind(event: &MainEvent) -> &'static str {
         MainEvent::Tick { .. } => "tick",
         MainEvent::PreviewReady { .. } => "preview_ready",
         MainEvent::RuntimeStateResult(_) => "runtime_state_result",
+        MainEvent::LiveShellDiscoveryResult(_) => "live_shell_discovery_result",
         MainEvent::SessionRefreshResult(_) => "session_refresh_result",
         MainEvent::SearchResult(_) => "search_result",
         MainEvent::DataTaskProgress(_) => "data_task_progress",
@@ -9915,8 +10284,8 @@ fn input_event_kind(event: &Event) -> &'static str {
     }
 }
 
-fn main_event_queued_latency_ms(event: &MainEvent) -> Option<u64> {
-    let queued_at_epoch_ms = match event {
+fn main_event_queued_at_epoch_ms(event: &MainEvent) -> Option<u64> {
+    match event {
         MainEvent::Input {
             queued_at_epoch_ms, ..
         }
@@ -9931,9 +10300,89 @@ fn main_event_queued_latency_ms(event: &MainEvent) -> Option<u64> {
         } => *queued_at_epoch_ms,
         MainEvent::SessionRefreshResult(result) => result.queued_at_epoch_ms,
         MainEvent::SearchResult(result) => result.queued_at_epoch_ms,
+        MainEvent::LiveShellDiscoveryResult(result) => result.queued_at_epoch_ms,
         _ => return None,
-    };
-    Some(current_epoch_ms().saturating_sub(queued_at_epoch_ms))
+    }
+    .into()
+}
+
+fn debug_ui_slow_operation(
+    app: &App,
+    operation: &'static str,
+    reason: &'static str,
+    elapsed_ms: u128,
+    event_kind: Option<&'static str>,
+    queued_latency_ms: Option<u64>,
+) {
+    if elapsed_ms < u128::from(UI_STALL_LOG_THRESHOLD_MS) {
+        return;
+    }
+    let observed_at_epoch_ms = current_epoch_ms();
+    let elapsed_ms_u64 = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+    debug_log(
+        "ui_slow_operation_detected",
+        serde_json::json!({
+            "operation": operation,
+            "reason": reason,
+            "kind": event_kind,
+            "elapsed_ms": elapsed_ms,
+            "threshold_ms": UI_STALL_LOG_THRESHOLD_MS,
+            "queued_latency_ms": queued_latency_ms,
+            "started_at_epoch_ms": observed_at_epoch_ms.saturating_sub(elapsed_ms_u64),
+            "observed_at_epoch_ms": observed_at_epoch_ms,
+            "agent_view": app.is_agent_view(),
+            "show_sessions_view": app.show_sessions_view,
+            "active_agent": app.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+            "runtime_refresh_pending": app.runtime_refresh_pending,
+            "runtime_refresh_queued": app.runtime_refresh_queued,
+            "runtime_refresh_seq": app.runtime_refresh_seq,
+            "sessions_len": app.sessions.len(),
+            "live_shells_len": app.live_shells.len(),
+            "agent_states_len": app.agent_states.len(),
+        }),
+    );
+}
+
+fn record_main_loop_heartbeat() {
+    MAIN_LOOP_HEARTBEAT_EPOCH_MS.store(current_epoch_ms(), Ordering::Relaxed);
+}
+
+fn spawn_ui_stall_watchdog() -> io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("cokacmux-ui-watchdog".into())
+        .spawn(move || loop {
+            thread::sleep(Duration::from_millis(UI_STALL_WATCHDOG_INTERVAL_MS));
+            if !DEBUG_ENABLED.load(Ordering::Relaxed) {
+                continue;
+            }
+            let last_heartbeat_epoch_ms = MAIN_LOOP_HEARTBEAT_EPOCH_MS.load(Ordering::Relaxed);
+            if last_heartbeat_epoch_ms == 0 {
+                continue;
+            }
+            let observed_at_epoch_ms = current_epoch_ms();
+            let stalled_ms = observed_at_epoch_ms.saturating_sub(last_heartbeat_epoch_ms);
+            if !is_ui_stall_latency_ms(stalled_ms) {
+                continue;
+            }
+            let next_log_epoch_ms = UI_STALL_WATCHDOG_NEXT_LOG_EPOCH_MS.load(Ordering::Relaxed);
+            if observed_at_epoch_ms < next_log_epoch_ms {
+                continue;
+            }
+            UI_STALL_WATCHDOG_NEXT_LOG_EPOCH_MS.store(
+                observed_at_epoch_ms.saturating_add(UI_STALL_LOG_COOLDOWN_MS),
+                Ordering::Relaxed,
+            );
+            debug_log(
+                "ui_watchdog_stall_detected",
+                serde_json::json!({
+                    "stalled_ms": stalled_ms,
+                    "threshold_ms": UI_STALL_LOG_THRESHOLD_MS,
+                    "last_heartbeat_epoch_ms": last_heartbeat_epoch_ms,
+                    "observed_at_epoch_ms": observed_at_epoch_ms,
+                    "watchdog_interval_ms": UI_STALL_WATCHDOG_INTERVAL_MS,
+                }),
+            );
+        })
 }
 
 fn handle_actionable_input_event(app: &mut App, key: KeyEvent) {
@@ -9961,7 +10410,17 @@ fn handle_main_event(
     reason: &'static str,
 ) {
     let event_kind = main_event_kind(&event);
-    let queued_latency_ms = main_event_queued_latency_ms(&event);
+    let observed_at_epoch_ms = current_epoch_ms();
+    let queued_at_epoch_ms = main_event_queued_at_epoch_ms(&event);
+    let queued_latency_ms =
+        queued_at_epoch_ms.map(|queued_at| observed_at_epoch_ms.saturating_sub(queued_at));
+    app.maybe_log_ui_stall(
+        event_kind,
+        reason,
+        queued_at_epoch_ms,
+        observed_at_epoch_ms,
+        queued_latency_ms,
+    );
     let started = Instant::now();
     match event {
         MainEvent::Input {
@@ -9985,6 +10444,9 @@ fn handle_main_event(
         }
         MainEvent::RuntimeStateResult(result) => {
             app.on_runtime_state_result(result);
+        }
+        MainEvent::LiveShellDiscoveryResult(result) => {
+            app.on_live_shell_discovery_result(result);
         }
         MainEvent::SessionRefreshResult(result) => {
             app.on_session_refresh_result(result);
@@ -10026,6 +10488,14 @@ fn handle_main_event(
             }),
         );
     }
+    debug_ui_slow_operation(
+        app,
+        "event_handler",
+        reason,
+        elapsed_ms,
+        Some(event_kind),
+        queued_latency_ms,
+    );
 }
 
 fn draw_app_frame(terminal: &mut Tui, app: &mut App, reason: &'static str) -> Result<()> {
@@ -10050,6 +10520,7 @@ fn draw_app_frame(terminal: &mut Tui, app: &mut App, reason: &'static str) -> Re
             }),
         );
     }
+    debug_ui_slow_operation(app, "draw", reason, elapsed_ms, None, None);
     Ok(())
 }
 
@@ -10059,6 +10530,8 @@ fn run(terminal: &mut Tui) -> Result<()> {
     app.main_tx = Some(main_tx.clone());
     app.runtime_tx = Some(spawn_agent_runtime_worker(main_tx.clone())?);
     app.refresh_agent_runtime_states();
+    record_main_loop_heartbeat();
+    let _ui_stall_watchdog_thread = spawn_ui_stall_watchdog()?;
 
     // Input forwarder: blocks on crossterm event::poll/read in its own
     // thread and forwards events to the main loop. The long timeout is
@@ -10114,16 +10587,20 @@ fn run(terminal: &mut Tui) -> Result<()> {
     app.poll_agent_sessions();
     app.poll_agent_runtime_states();
     draw_app_frame(terminal, &mut app, "initial")?;
+    record_main_loop_heartbeat();
     let mut previous_is_agent_view = app.is_agent_view();
 
     while !app.should_quit {
+        record_main_loop_heartbeat();
         // Block until ANY producer fires. Output bytes, input keys, and
         // housekeeping ticks all wake us here — no fallback timer.
         let event = match main_rx.recv() {
             Ok(ev) => ev,
             Err(_) => break, // all senders dropped
         };
+        record_main_loop_heartbeat();
         handle_main_event(&mut app, event, &mut previous_is_agent_view, "main_event");
+        record_main_loop_heartbeat();
         // Drain a bounded burst so tight redraw loops cannot keep UI input
         // stuck behind agent output forever. Unprocessed events stay queued
         // and are handled on the next loop after a render opportunity.
@@ -10137,6 +10614,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 Ok(event) => {
                     drained_events = drained_events.saturating_add(1);
                     handle_main_event(&mut app, event, &mut previous_is_agent_view, "queued_event");
+                    record_main_loop_heartbeat();
                 }
                 Err(_) => break,
             }
@@ -10161,7 +10639,16 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 }),
             );
         }
+        debug_ui_slow_operation(
+            &app,
+            "pre_draw",
+            "main_loop",
+            pre_draw_elapsed_ms,
+            None,
+            None,
+        );
         draw_app_frame(terminal, &mut app, "main_loop")?;
+        record_main_loop_heartbeat();
     }
     debug_log("tui_stop", serde_json::json!({}));
     Ok(())
@@ -12752,8 +13239,13 @@ fn windows_console_ctrl_event_snapshot() -> (u32, Option<u32>) {
     (count, last_event)
 }
 
-fn debug_log_file_for(_event: &str) -> &'static str {
-    DEBUG_LOG_FILE
+fn debug_log_file_for(event: &str) -> &'static str {
+    match event {
+        "ui_stall_detected" | "ui_slow_operation_detected" | "ui_watchdog_stall_detected" => {
+            DEBUG_STALL_LOG_FILE
+        }
+        _ => DEBUG_LOG_FILE,
+    }
 }
 
 fn debug_log_to(filename: &str, msg: &str) {
@@ -20678,7 +21170,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_log_file_for_uses_single_runtime_log() {
+    fn debug_log_file_for_routes_stall_events_to_stall_log() {
         for event in [
             "main_start",
             "agent_client_output_processed",
@@ -20694,6 +21186,19 @@ mod tests {
         ] {
             assert_eq!(debug_log_file_for(event), DEBUG_LOG_FILE);
         }
+        for event in [
+            "ui_stall_detected",
+            "ui_slow_operation_detected",
+            "ui_watchdog_stall_detected",
+        ] {
+            assert_eq!(debug_log_file_for(event), DEBUG_STALL_LOG_FILE);
+        }
+    }
+
+    #[test]
+    fn ui_stall_latency_threshold_starts_at_two_seconds() {
+        assert!(!is_ui_stall_latency_ms(UI_STALL_LOG_THRESHOLD_MS - 1));
+        assert!(is_ui_stall_latency_ms(UI_STALL_LOG_THRESHOLD_MS));
     }
 
     fn session_info(provider: Provider, session_id: &str, cwd: &str) -> SessionInfo {
@@ -20802,6 +21307,12 @@ mod tests {
             runtime_refresh_started_at: None,
             runtime_refresh_queued: false,
             pending_runtime_action: None,
+            live_shell_discovery_seq: 0,
+            live_shell_discovery_pending: false,
+            live_shell_discovery_started_at: None,
+            live_shell_discovery_last_slow_log_at: None,
+            last_ui_stall_log_at: None,
+            ui_stall_log_count: 0,
             session_refresh_seq: 0,
             session_refresh_pending: false,
             session_refresh_restore_key: None,
@@ -24047,6 +24558,128 @@ mod tests {
     }
 
     #[test]
+    fn runtime_refresh_without_discovery_preserves_cached_live_shell() {
+        let live = new_agent_info(Provider::Codex, "/repo");
+        let key = AgentKey::new(&live);
+        let mut previous_states = HashMap::new();
+        previous_states.insert(
+            key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+
+        let result = compute_agent_runtime_refresh(AgentRuntimeRefreshRequest {
+            seq: 1,
+            current_pid: std::process::id(),
+            discover_live_shells: false,
+            previous_states,
+            previous_live_shells: vec![live.clone()],
+            active_info: None,
+            show_sessions_view: false,
+            provider_session_count: 0,
+            session_keys: Vec::new(),
+            new_agent_backing_aliases: HashMap::new(),
+            new_agent_backing_probe_after: HashMap::new(),
+        });
+
+        assert_eq!(result.live_shells.len(), 1);
+        assert_eq!(AgentKey::new(&result.live_shells[0]), key);
+        assert_eq!(
+            result.agent_states.get(&key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_refresh_request_keeps_live_discovery_off_runtime_worker() {
+        let mut app = app_for_key_tests();
+        let (tx, rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+        app.runtime_tx = Some(tx);
+        app.last_live_shell_discovery =
+            Instant::now() - Duration::from_millis(LIVE_SHELL_DISCOVERY_INTERVAL_MS * 2);
+
+        app.refresh_agent_runtime_states();
+
+        let request = rx.try_recv().unwrap();
+        assert!(
+            !request.discover_live_shells,
+            "full live discovery must not run inside the runtime refresh worker"
+        );
+    }
+
+    #[test]
+    fn live_shell_discovery_result_removes_missing_cached_shell() {
+        let mut app = app_for_key_tests();
+        let kept = session_info(Provider::Claude, "shell-kept", "/repo");
+        let removed = session_info(Provider::Claude, "shell-removed", "/repo");
+        let kept_key = AgentKey::new(&kept);
+        let removed_key = AgentKey::new(&removed);
+        app.live_shells = vec![kept.clone(), removed];
+        app.agent_states.insert(
+            kept_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.live_shell_discovery_seq = 7;
+        app.live_shell_discovery_pending = true;
+
+        app.on_live_shell_discovery_result(LiveShellDiscoveryResult {
+            seq: 7,
+            live_shells: vec![kept.clone()],
+            started_at_epoch_ms: current_epoch_ms(),
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 1,
+        });
+
+        assert_eq!(app.live_shells.len(), 1);
+        assert_eq!(AgentKey::new(&app.live_shells[0]), kept_key);
+        assert!(app.agent_states.contains_key(&kept_key));
+        assert!(!app.agent_states.contains_key(&removed_key));
+    }
+
+    #[test]
+    fn live_shell_discovery_result_preserves_missing_non_idle_shell() {
+        let mut app = app_for_key_tests();
+        let kept = session_info(Provider::Claude, "shell-kept", "/repo");
+        let missing_live = session_info(Provider::Claude, "shell-live", "/repo");
+        let missing_live_key = AgentKey::new(&missing_live);
+        app.live_shells = vec![kept.clone(), missing_live.clone()];
+        app.agent_states.insert(
+            missing_live_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Busy,
+            },
+        );
+        app.live_shell_discovery_seq = 8;
+        app.live_shell_discovery_pending = true;
+
+        app.on_live_shell_discovery_result(LiveShellDiscoveryResult {
+            seq: 8,
+            live_shells: vec![kept],
+            started_at_epoch_ms: current_epoch_ms(),
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 1,
+        });
+
+        assert!(
+            app.live_shells
+                .iter()
+                .any(|info| AgentKey::new(info) == missing_live_key),
+            "non-idle cached shell should survive a transient discovery miss"
+        );
+        assert_eq!(
+            app.agent_states.get(&missing_live_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Busy
+            })
+        );
+    }
+
+    #[test]
     fn live_shell_merge_restores_previous_non_idle_runtime_entry() {
         let visible = session_info(Provider::Codex, "visible", "/repo");
         let transiently_missing = session_info(Provider::Claude, "shell-missing", "/repo");
@@ -25303,6 +25936,42 @@ IF EXIST "%~dp0\node.exe" (
         };
         client.screen_hash = screen_activity_hash(client.parser.screen());
         client
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_active_agent_keeps_previous_new_agent_in_sidebar_candidates() {
+        let mut app = app_for_key_tests();
+        let mut previous_info = new_agent_info(Provider::Codex, "/repo");
+        previous_info.session_id = "new-previous".into();
+        let previous_key = AgentKey::new(&previous_info);
+        let mut previous = buffered_output_test_client("previous", 10);
+        previous.info = previous_info.clone();
+        app.set_active_agent(previous);
+        app.mark_agent_attached_locally(previous_key.clone());
+
+        let mut next_info = new_agent_info(Provider::Codex, "/repo");
+        next_info.session_id = "new-next".into();
+        let next_key = AgentKey::new(&next_info);
+        assert_ne!(previous_key, next_key);
+        let mut next = buffered_output_test_client("next", 11);
+        next.info = next_info;
+        app.set_active_agent(next);
+        app.mark_agent_attached_locally(next_key);
+
+        let candidates = app.live_agent_switch_candidates();
+        assert!(
+            candidates
+                .iter()
+                .any(|info| AgentKey::new(info) == previous_key),
+            "previous synthetic agent should stay visible until discovery catches up"
+        );
+        assert_eq!(
+            app.agent_states.get(&previous_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet
+            })
+        );
     }
 
     fn large_output_with_tail_marker() -> Vec<u8> {
