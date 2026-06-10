@@ -302,10 +302,11 @@ fn handle_event_msg(
             idx += 1;
         }
         "token_count" => {
-            let usage = extract_usage_from_token_count(payload);
-            session.usage_total = usage.clone().or(session.usage_total.take());
+            let total_usage = extract_usage_from_token_count(payload);
+            let last_usage = extract_last_usage_from_token_count(payload);
+            session.usage_total = total_usage.clone().or(session.usage_total.take());
             let mut m = make_meta_msg(val, &source, idx, ts, payload.clone());
-            m.usage = usage;
+            m.usage = last_usage.or(total_usage);
             session.messages.push(m);
             idx += 1;
         }
@@ -987,7 +988,7 @@ fn dedupe_previous_codex_user_image_event(session: &mut UniversalSession, blocks
     if image_keys.is_empty() {
         return;
     }
-    let Some(previous) = session.messages.last() else {
+    let Some(previous) = session.messages.last_mut() else {
         return;
     };
     if previous.provenance.source_event_type != "codex:event_msg.user_message" {
@@ -1006,7 +1007,9 @@ fn dedupe_previous_codex_user_image_event(session: &mut UniversalSession, blocks
         .filter_map(content_block_image_key)
         .collect::<std::collections::BTreeSet<_>>();
     if !previous_keys.is_empty() && previous_keys.is_subset(&image_keys) {
-        session.messages.pop();
+        previous.role = Role::System;
+        previous.content.clear();
+        previous.flags.is_meta = true;
     }
 }
 
@@ -1094,10 +1097,18 @@ fn codex_source_is_compaction(source: &str) -> bool {
 }
 
 fn extract_usage_from_token_count(payload: &Value) -> Option<Usage> {
+    extract_usage_from_token_count_key(payload, "total_token_usage")
+        .or_else(|| extract_usage_from_token_count_key(payload, "last_token_usage"))
+}
+
+fn extract_last_usage_from_token_count(payload: &Value) -> Option<Usage> {
+    extract_usage_from_token_count_key(payload, "last_token_usage")
+        .or_else(|| extract_usage_from_token_count_key(payload, "total_token_usage"))
+}
+
+fn extract_usage_from_token_count_key(payload: &Value, key: &str) -> Option<Usage> {
     let info = payload.get("info")?;
-    let last = info
-        .get("last_token_usage")
-        .or_else(|| info.get("total_token_usage"))?;
+    let last = info.get(key)?;
     Some(Usage {
         input_tokens: last.get("input_tokens").and_then(|v| v.as_u64()),
         output_tokens: last.get("output_tokens").and_then(|v| v.as_u64()),

@@ -30,7 +30,8 @@
 
 #![forbid(unsafe_code)]
 
-mod debug;
+#[doc(hidden)]
+pub mod debug;
 pub mod error;
 pub mod ids;
 pub mod jsonl;

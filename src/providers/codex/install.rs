@@ -279,6 +279,15 @@ fn index_threads_row(
             })
         })
         .unwrap_or(0) as i64;
+    let has_user_event = if session
+        .messages
+        .iter()
+        .any(|m| m.role == crate::universal::Role::User && !m.flags.is_meta)
+    {
+        1i64
+    } else {
+        0i64
+    };
 
     let has_thread_source = cols.contains("thread_source");
     let has_preview = cols.contains("preview");
@@ -298,11 +307,11 @@ fn index_threads_row(
                     ?1, ?2, ?3, ?4,
                     ?5, ?6, ?7, ?8,
                     '{\"type\":\"read-only\"}', ?9,
-                    ?10, 0, 0,
-                    ?11, ?12,
-                    'enabled', ?13, ?14,
-                    ?15, ?16, ?17,
-                    ?18, ?19, ?20, ?21
+                    ?10, ?11, 0,
+                    ?12, ?13,
+                    'enabled', ?14, ?15,
+                    ?16, ?17, ?18,
+                    ?19, ?20, ?21, ?22
                 )",
                 rusqlite::params![
                     session.session_id,
@@ -315,6 +324,7 @@ fn index_threads_row(
                     title,
                     approval_mode,
                     tokens_used,
+                    has_user_event,
                     cli_version,
                     first_user,
                     model_id,
@@ -344,11 +354,11 @@ fn index_threads_row(
                     ?1, ?2, ?3, ?4,
                     ?5, ?6, ?7, ?8,
                     '{\"type\":\"read-only\"}', ?9,
-                    ?10, 0, 0,
-                    ?11, ?12,
-                    'enabled', ?13, ?14,
-                    ?15, ?16, ?17,
-                    ?18, ?19, ?20
+                    ?10, ?11, 0,
+                    ?12, ?13,
+                    'enabled', ?14, ?15,
+                    ?16, ?17, ?18,
+                    ?19, ?20, ?21
                 )",
                 rusqlite::params![
                     session.session_id,
@@ -361,6 +371,7 @@ fn index_threads_row(
                     title,
                     approval_mode,
                     tokens_used,
+                    has_user_event,
                     cli_version,
                     first_user,
                     model_id,
@@ -389,11 +400,11 @@ fn index_threads_row(
                     ?1, ?2, ?3, ?4,
                     ?5, ?6, ?7, ?8,
                     '{\"type\":\"read-only\"}', ?9,
-                    ?10, 0, 0,
-                    ?11, ?12,
-                    'enabled', ?13, ?14,
-                    ?15, ?16, ?17,
-                    ?18, ?19, ?20
+                    ?10, ?11, 0,
+                    ?12, ?13,
+                    'enabled', ?14, ?15,
+                    ?16, ?17, ?18,
+                    ?19, ?20, ?21
                 )",
                 rusqlite::params![
                     session.session_id,
@@ -406,6 +417,7 @@ fn index_threads_row(
                     title,
                     approval_mode,
                     tokens_used,
+                    has_user_event,
                     cli_version,
                     first_user,
                     model_id,
@@ -434,11 +446,11 @@ fn index_threads_row(
                     ?1, ?2, ?3, ?4,
                     ?5, ?6, ?7, ?8,
                     '{\"type\":\"read-only\"}', ?9,
-                    ?10, 0, 0,
-                    ?11, ?12,
-                    'enabled', ?13, ?14,
-                    ?15, ?16, ?17,
-                    ?18, ?19
+                    ?10, ?11, 0,
+                    ?12, ?13,
+                    'enabled', ?14, ?15,
+                    ?16, ?17, ?18,
+                    ?19, ?20
                 )",
                 rusqlite::params![
                     session.session_id,
@@ -451,6 +463,7 @@ fn index_threads_row(
                     title,
                     approval_mode,
                     tokens_used,
+                    has_user_event,
                     cli_version,
                     first_user,
                     model_id,

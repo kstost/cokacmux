@@ -58,10 +58,9 @@ pub fn from_jsonl_path(path: &Path, ctx: &CodexReadCtx) -> Result<UniversalSessi
     // The session UUID is the last 36 chars of the file stem (before .jsonl).
     if ctx.session_id.is_none() {
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            if stem.len() >= 36 {
-                let candidate = &stem[stem.len() - 36..];
-                if is_uuid(candidate) {
-                    session.session_id = candidate.to_string();
+            if let Some(candidate) = trailing_uuid_candidate(stem) {
+                if is_uuid(&candidate) {
+                    session.session_id = candidate;
                 }
             }
         }
@@ -120,4 +119,12 @@ pub fn from_jsonl_str(jsonl: &str, ctx: &CodexReadCtx) -> Result<UniversalSessio
 
 fn is_uuid(s: &str) -> bool {
     s.len() == 36 && uuid::Uuid::parse_str(s).is_ok()
+}
+
+fn trailing_uuid_candidate(stem: &str) -> Option<String> {
+    let chars = stem.chars().collect::<Vec<_>>();
+    if chars.len() < 36 {
+        return None;
+    }
+    Some(chars[chars.len() - 36..].iter().collect())
 }

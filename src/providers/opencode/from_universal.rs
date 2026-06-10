@@ -126,6 +126,12 @@ pub fn build_session(
         &session.workspace_id,
     );
     insert_opt_string(&mut s.extras, "opencode_path", &session.path);
+    if session.tokens_cache_write != 0 {
+        s.extras.insert(
+            "opencode_tokens_cache_write".into(),
+            json!(session.tokens_cache_write),
+        );
+    }
     for row in session_messages {
         let data = row.parse_data();
         match row.type_tag.as_str() {
@@ -158,6 +164,7 @@ pub fn build_session(
             .and_then(extract_model)
             .or_else(|| extract_model(&data));
         let usage = data.get("tokens").and_then(extract_usage);
+        let extras = opencode_usage_extras(&data);
 
         // Collect part rows for this message in order.
         let my_parts: Vec<&PartRow> = parts.iter().filter(|p| p.message_id == m.id).collect();
@@ -184,7 +191,7 @@ pub fn build_session(
                 source_event_type: format!("opencode:message.{}", role_str(role)),
                 raw: json!({ "message": data, "parts": my_parts.iter().map(|p| p.parse_data()).collect::<Vec<_>>() }),
             },
-            extras: BTreeMap::new(),
+            extras,
         };
         s.messages.push(umsg);
         idx += 1;
@@ -299,6 +306,7 @@ fn session_message_to_primary_umessage(row: &SessionMessageRow, idx: u32) -> UMe
         _ => None,
     };
     let usage = data.get("tokens").and_then(extract_usage);
+    let extras = opencode_usage_extras(&data);
     let stop_reason = data
         .get("finish")
         .and_then(|v| v.as_str())
@@ -320,7 +328,7 @@ fn session_message_to_primary_umessage(row: &SessionMessageRow, idx: u32) -> UMe
             source_event_type: format!("opencode:session_message.{}", row.type_tag),
             raw: session_message_raw(row, data),
         },
-        extras: BTreeMap::new(),
+        extras,
     }
 }
 
@@ -722,6 +730,21 @@ fn extract_usage(v: &Value) -> Option<Usage> {
         total_tokens: v.get("total").and_then(|x| x.as_u64()),
         cost_usd: None,
     })
+}
+
+fn opencode_usage_extras(data: &Value) -> BTreeMap<String, Value> {
+    let mut extras = BTreeMap::new();
+    if let Some(cache_write) = data
+        .get("tokens")
+        .and_then(|tokens| tokens.get("cache"))
+        .and_then(|cache| cache.get("write"))
+        .and_then(|value| value.as_u64())
+    {
+        if cache_write != 0 {
+            extras.insert("opencode_tokens_cache_write".into(), json!(cache_write));
+        }
+    }
+    extras
 }
 
 fn parse_role(s: &str) -> Role {

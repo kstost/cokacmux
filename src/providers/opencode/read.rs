@@ -72,13 +72,6 @@ pub fn from_db_path(path: &Path, session_id: &str) -> Result<UniversalSession> {
         }
     };
     s.origin.source_path = Some(format!("{}#{}", path.display(), session_id));
-    if let Ok(meta) = path.metadata() {
-        if let Ok(mtime) = meta.modified() {
-            if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                s.updated_at = crate::time::from_epoch_s(d.as_secs() as i64);
-            }
-        }
-    }
     debug::log(
         "provider_opencode_read_db_ok",
         serde_json::json!({
@@ -164,8 +157,7 @@ pub fn from_db_connection(conn: &Connection, session_id: &str) -> Result<Univers
                 data: row.get(4)?,
             })
         })?
-        .filter_map(Result_alias)
-        .collect();
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     // parts (we'll group by message_id)
     let mut stmt = conn.prepare(
@@ -182,8 +174,7 @@ pub fn from_db_connection(conn: &Connection, session_id: &str) -> Result<Univers
                 data: row.get(5)?,
             })
         })?
-        .filter_map(Result_alias)
-        .collect();
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let session_message_rows = if table_exists(conn, "session_message")? {
         let mut stmt = conn.prepare(
@@ -203,8 +194,7 @@ pub fn from_db_connection(conn: &Connection, session_id: &str) -> Result<Univers
                     data: row.get(5)?,
                 })
             })?
-            .filter_map(Result_alias)
-            .collect();
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     } else {
         Vec::new()
@@ -243,11 +233,6 @@ pub fn from_db_connection(conn: &Connection, session_id: &str) -> Result<Univers
         ),
     }
     result
-}
-
-#[allow(non_snake_case)]
-fn Result_alias<T>(r: std::result::Result<T, rusqlite::Error>) -> Option<T> {
-    r.ok()
 }
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {

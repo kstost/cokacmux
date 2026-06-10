@@ -1,7 +1,7 @@
 //! JSONL (newline-delimited JSON) read/write helpers.
 
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 use serde_json::Value;
@@ -28,25 +28,49 @@ pub fn read_lines(path: &Path) -> Result<Vec<Value>> {
 
 /// Write `values` to `path` as JSONL (one compact JSON per line).
 pub fn write_lines(path: &Path, values: &[Value]) -> Result<()> {
-    let f = File::create(path).map_err(ConvertError::Io)?;
-    let mut w = BufWriter::new(f);
+    let mut text = String::new();
     for v in values {
-        let s = serde_json::to_string(v).map_err(ConvertError::Json)?;
-        w.write_all(s.as_bytes()).map_err(ConvertError::Io)?;
-        w.write_all(b"\n").map_err(ConvertError::Io)?;
+        text.push_str(&serde_json::to_string(v).map_err(ConvertError::Json)?);
+        text.push('\n');
     }
-    w.flush().map_err(ConvertError::Io)?;
-    Ok(())
+    write_text_atomic(path, &text)
 }
 
-/// Atomic write — write to `<path>.tmp` then rename. Defends against crash
-/// mid-write leaving a half-written file at `path`.
+/// Atomic text write — write to a sibling temp file, fsync it, then rename.
+/// This prevents process crashes from leaving a half-written file at `path`.
+pub fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("jsonl");
+    let tmp = path.with_file_name(format!(".{}.tmp-{}", file_name, uuid::Uuid::now_v7()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        match fs::rename(&tmp, path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(path)?;
+                fs::rename(&tmp, path)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = File::open(parent).and_then(|dir| dir.sync_all());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Atomic write — write to a sibling temp file then rename. Defends against
+/// process crashes mid-write leaving a half-written file at `path`.
 pub fn write_lines_atomic(path: &Path, values: &[Value]) -> Result<()> {
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|s| s.to_str()).unwrap_or("")
-    ));
-    write_lines(&tmp, values)?;
-    std::fs::rename(&tmp, path).map_err(ConvertError::Io)?;
-    Ok(())
+    write_lines(path, values)
 }

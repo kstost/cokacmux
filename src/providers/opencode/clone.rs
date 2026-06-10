@@ -69,7 +69,7 @@ pub fn clone_session_rows(
     // before we open our real one.
     {
         let probe = super::db::open_readwrite(db_path)?;
-        if let Err(e) = probe.execute("BEGIN IMMEDIATE; ROLLBACK;", []) {
+        if let Err(e) = probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
             return Err(ConvertError::Other(format!(
                 "could not acquire write lock on {} (is opencode running?): {}",
                 db_path.display(),
@@ -474,11 +474,9 @@ fn rewrite_message_data_json(
 
 fn opencode_session_path_for_cwd(cwd: &str) -> String {
     // Mirror the synthesis used by writer's `opencode_session_path`.
-    let safe: String = cwd
-        .chars()
+    cwd.chars()
         .map(|c| if c == '/' { '-' } else { c })
-        .collect();
-    safe
+        .collect()
 }
 
 #[cfg(test)]

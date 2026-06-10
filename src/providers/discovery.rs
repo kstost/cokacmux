@@ -259,11 +259,14 @@ fn walk_codex(
     };
     for e in entries.flatten() {
         let p = e.path();
-        if p.is_dir() {
+        let Ok(file_type) = e.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             walk_codex(&p, titles, out);
-        } else if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+        } else if file_type.is_file() && p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
             let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if stem.len() < 36 {
+            let Some(sid_candidate) = trailing_uuid_candidate(stem) else {
                 crate::debug::log(
                     "discovery_codex_skip_non_uuid_rollout",
                     serde_json::json!({
@@ -272,9 +275,8 @@ fn walk_codex(
                     }),
                 );
                 continue;
-            }
-            let sid_candidate = &stem[stem.len() - 36..];
-            if uuid::Uuid::parse_str(sid_candidate).is_err() {
+            };
+            if uuid::Uuid::parse_str(&sid_candidate).is_err() {
                 crate::debug::log(
                     "discovery_codex_skip_non_uuid_rollout",
                     serde_json::json!({
@@ -285,7 +287,7 @@ fn walk_codex(
                 );
                 continue;
             }
-            let session_id = sid_candidate.to_string();
+            let session_id = sid_candidate;
             let title = titles.get(&session_id).cloned().filter(|t| !t.is_empty());
             let mtime = p
                 .metadata()
@@ -305,6 +307,14 @@ fn walk_codex(
             });
         }
     }
+}
+
+fn trailing_uuid_candidate(stem: &str) -> Option<String> {
+    let chars = stem.chars().collect::<Vec<_>>();
+    if chars.len() < 36 {
+        return None;
+    }
+    Some(chars[chars.len() - 36..].iter().collect())
 }
 
 #[cfg(feature = "opencode")]

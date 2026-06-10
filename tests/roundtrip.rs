@@ -289,7 +289,7 @@ fn opencode_writer_emits_cli_compatible_message_data() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(path, "home/kst/123");
+    assert_eq!(path, "-home-kst-123");
 
     let user: String = conn
         .query_row("SELECT data FROM message WHERE id = 'msg_user'", [], |r| {

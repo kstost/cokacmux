@@ -370,11 +370,7 @@ fn read_store(path: &Path) -> Result<CloneTreeStore> {
 }
 
 fn write_store(path: &Path, store: &CloneTreeStore) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_string_pretty(store)? + "\n")?;
-    Ok(())
+    crate::jsonl::write_text_atomic(path, &(serde_json::to_string_pretty(store)? + "\n"))
 }
 
 fn current_epoch_s() -> u64 {

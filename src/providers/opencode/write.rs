@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 use crate::debug;
 use crate::error::Result;
 use crate::universal::{ImageSource, Role, UMessage, UniversalSession};
@@ -147,6 +149,7 @@ pub fn to_db_connection_with_opts(
     let model_str = session_model_json(&session_model).to_string();
     let title = session.title.clone().unwrap_or_default();
     let usage = session.usage_total.clone().unwrap_or_default();
+    let tokens_cache_write = extra_i64(session, "opencode_tokens_cache_write").unwrap_or(0);
     let session_path = extra_string(session, "opencode_path")
         .unwrap_or_else(|| opencode_session_path(&session.cwd));
     let parent_id = extra_string(session, "opencode_parent_id");
@@ -161,19 +164,11 @@ pub fn to_db_connection_with_opts(
     let time_archived = extra_i64(session, "opencode_time_archived");
     let workspace_id = extra_string(session, "opencode_workspace_id");
 
-    // OpenCode session list expects non-empty `slug` and a `version`
-    // (it uses these when rendering the picker). We synthesize a short
-    // hex slug from the session id and use this crate's version as the
-    // `version` column.
-    let slug: String = extra_string(session, "opencode_slug").unwrap_or_else(|| {
-        session
-            .session_id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .take(8)
-            .collect::<String>()
-            .to_lowercase()
-    });
+    // OpenCode session list expects non-empty `slug` and a `version`.
+    // Preserve native slugs; otherwise synthesize a stable hash-based slug
+    // from the full session identity instead of a time-prefixed id fragment.
+    let slug: String =
+        extra_string(session, "opencode_slug").unwrap_or_else(|| synthesized_slug(session));
     let version = extra_string(session, "opencode_version")
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
@@ -213,7 +208,7 @@ pub fn to_db_connection_with_opts(
             usage.output_tokens.unwrap_or(0) as i64,
             usage.reasoning_output_tokens.unwrap_or(0) as i64,
             usage.cached_input_tokens.unwrap_or(0) as i64,
-            0i64,
+            tokens_cache_write,
             time_created,
             time_updated,
             slug,
@@ -521,6 +516,24 @@ fn extra_i64(session: &UniversalSession, key: &str) -> Option<i64> {
     session.extras.get(key).and_then(|value| value.as_i64())
 }
 
+fn synthesized_slug(session: &UniversalSession) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(session.session_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(session.cwd.as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("cokac-{suffix}")
+}
+
+fn message_extra_u64(message: &crate::universal::UMessage, key: &str) -> Option<u64> {
+    message.extras.get(key).and_then(|value| value.as_u64())
+}
+
 fn message_model_ref(
     session: &UniversalSession,
     message: &crate::universal::UMessage,
@@ -608,7 +621,9 @@ fn should_merge_assistant_messages(prev: &UMessage, next: &UMessage) -> bool {
 }
 
 fn opencode_session_path(cwd: &str) -> String {
-    cwd.trim_start_matches('/').to_string()
+    cwd.chars()
+        .map(|c| if c == '/' { '-' } else { c })
+        .collect()
 }
 
 fn message_data_json(
@@ -649,7 +664,7 @@ fn message_data_json(
                     "root": "/",
                 },
                 "cost": cost_json(usage.and_then(|u| u.cost_usd).unwrap_or(0.0)),
-                "tokens": usage_json(usage),
+                "tokens": usage_json(usage, Some(message)),
                 "modelID": model.model_id.as_str(),
                 "providerID": model.provider_id.as_str(),
                 "finish": message
@@ -681,12 +696,17 @@ fn message_data_json(
     }
 }
 
-fn usage_json(usage: Option<&crate::universal::Usage>) -> serde_json::Value {
+fn usage_json(
+    usage: Option<&crate::universal::Usage>,
+    message: Option<&crate::universal::UMessage>,
+) -> serde_json::Value {
     let input = usage.and_then(|u| u.input_tokens).unwrap_or(0);
     let output = usage.and_then(|u| u.output_tokens).unwrap_or(0);
     let reasoning = usage.and_then(|u| u.reasoning_output_tokens).unwrap_or(0);
     let cache_read = usage.and_then(|u| u.cached_input_tokens).unwrap_or(0);
-    let cache_write = 0u64;
+    let cache_write = message
+        .and_then(|m| message_extra_u64(m, "opencode_tokens_cache_write"))
+        .unwrap_or(0);
     let total = usage
         .and_then(|u| u.total_tokens)
         .unwrap_or(input + output + reasoning + cache_read + cache_write);
@@ -783,11 +803,14 @@ fn opencode_session_message_write_row(
         .and_then(|r| r.get("time_updated"))
         .and_then(|v| v.as_i64())
         .unwrap_or(time_created);
-    // Treat the Universal message id as the canonical row id. This matters for
-    // clone: raw OpenCode provenance still contains the source `evt_...` id,
-    // and reusing it would `INSERT OR REPLACE` the original session_message
-    // row because `session_message.id` is globally primary-keyed.
-    let id = if message.id.starts_with("evt_") {
+    let raw_session_id = raw_row
+        .and_then(|r| r.get("session_id"))
+        .and_then(|v| v.as_str());
+    // Preserve row ids only when writing back to the same session. When a
+    // UniversalSession was cloned by changing `session_id`, reusing the
+    // source evt_ id would replace the origin row because session_message.id
+    // is globally primary-keyed.
+    let id = if raw_session_id == Some(session_id) && message.id.starts_with("evt_") {
         message.id.clone()
     } else {
         opencode_event_id()
@@ -871,7 +894,7 @@ fn step_finish_part_data(message: &crate::universal::UMessage) -> serde_json::Va
             .filter(|reason| !reason.trim().is_empty())
             .unwrap_or_else(|| infer_finish(message)),
         "type": "step-finish",
-        "tokens": usage_json(usage),
+        "tokens": usage_json(usage, Some(message)),
         "cost": cost_json(usage.and_then(|u| u.cost_usd).unwrap_or(0.0)),
     })
 }

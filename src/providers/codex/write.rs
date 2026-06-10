@@ -1,6 +1,5 @@
 //! UniversalSession → Codex rollout JSONL.
 
-use std::io::Write;
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
@@ -28,8 +27,7 @@ pub fn to_jsonl_path(session: &UniversalSession, path: &Path, opts: &CodexWriteO
             std::fs::create_dir_all(parent)?;
         }
     }
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(s.as_bytes())?;
+    crate::jsonl::write_text_atomic(path, &s)?;
     debug::log(
         "provider_codex_write_file_ok",
         serde_json::json!({

@@ -618,14 +618,14 @@ fn is_opencode_native_id(id: &str, prefix: &str) -> bool {
     let Some(body) = id.strip_prefix(prefix) else {
         return false;
     };
-    if body.len() != 26 {
+    if body.chars().count() != 26 {
         return false;
     }
-    let (time_hex, random) = body.split_at(12);
+    let mut chars = body.chars();
+    let time_hex = chars.by_ref().take(12).collect::<String>();
+    let random = chars.collect::<String>();
     time_hex.chars().all(|c| c.is_ascii_hexdigit())
-        && random
-            .chars()
-            .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase() || c.is_ascii_lowercase())
+        && random.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 #[cfg(feature = "opencode")]

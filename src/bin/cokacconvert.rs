@@ -320,8 +320,11 @@ fn provider_arg_label(provider: ProviderArg) -> &'static str {
 }
 
 fn parse_source(arg: &str, prov: LibProvider) -> Result<SessionSource> {
-    if let Some((db, sid)) = arg.split_once('#') {
+    if let Some((db, sid)) = arg.rsplit_once('#') {
         if prov == LibProvider::OpenCode {
+            if sid.trim().is_empty() {
+                bail!("OpenCode input must use db_path#session_id with a non-empty session id");
+            }
             debug_log(
                 "parse_source",
                 serde_json::json!({
@@ -336,6 +339,9 @@ fn parse_source(arg: &str, prov: LibProvider) -> Result<SessionSource> {
                 session_id: sid.to_string(),
             });
         }
+    }
+    if prov == LibProvider::OpenCode {
+        bail!("OpenCode input must use db_path#session_id");
     }
     debug_log(
         "parse_source",
@@ -355,7 +361,7 @@ fn detect_provider(input: &str) -> Result<LibProvider> {
             "input": input,
         }),
     );
-    if let Some((db, _)) = input.split_once('#') {
+    if let Some((db, _)) = input.rsplit_once('#') {
         if std::path::Path::new(db)
             .extension()
             .and_then(|e| e.to_str())
@@ -507,6 +513,7 @@ fn run_session(cmd: SessionCmd) -> Result<()> {
             tree,
             limit,
         } => {
+            let provider_filter = provider.map(|p| p.to_lib()).transpose()?;
             debug_log(
                 "session_ls_start",
                 serde_json::json!({
@@ -525,11 +532,9 @@ fn run_session(cmd: SessionCmd) -> Result<()> {
                 }),
             );
             let matches = |s: &cokacmux::providers::discovery::SessionInfo| {
-                if let Some(p) = provider {
-                    if let Ok(lp) = p.to_lib() {
-                        if s.provider != lp {
-                            return false;
-                        }
+                if let Some(lp) = provider_filter {
+                    if s.provider != lp {
+                        return false;
                     }
                 }
                 if let Some(c) = &cwd {

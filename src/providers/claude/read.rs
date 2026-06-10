@@ -6,7 +6,7 @@ use crate::debug;
 use crate::error::Result;
 use crate::universal::UniversalSession;
 
-use super::from_universal::parse_lines;
+use super::from_universal::{parse_lines, parse_lines_with_sidecar_root};
 use super::ClaudeReadCtx;
 
 pub fn from_jsonl_path(path: &Path, ctx: &ClaudeReadCtx) -> Result<UniversalSession> {
@@ -42,7 +42,8 @@ pub fn from_jsonl_path(path: &Path, ctx: &ClaudeReadCtx) -> Result<UniversalSess
             return Err(error.into());
         }
     };
-    let mut session = match parse_lines(&content, ctx) {
+    let sidecar_root = path.with_extension("").join("tool-results");
+    let mut session = match parse_lines_with_sidecar_root(&content, ctx, Some(&sidecar_root)) {
         Ok(session) => session,
         Err(error) => {
             debug::log(

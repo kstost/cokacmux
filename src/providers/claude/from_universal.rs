@@ -12,6 +12,7 @@
 //!   verbatim in `provenance.raw`. No silent drops.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -28,6 +29,14 @@ use super::sidecar;
 use super::ClaudeReadCtx;
 
 pub fn parse_lines(content: &str, ctx: &ClaudeReadCtx) -> Result<UniversalSession> {
+    parse_lines_with_sidecar_root(content, ctx, None)
+}
+
+pub(crate) fn parse_lines_with_sidecar_root(
+    content: &str,
+    ctx: &ClaudeReadCtx,
+    sidecar_root: Option<&Path>,
+) -> Result<UniversalSession> {
     let total_lines = content.lines().count();
     debug::log(
         "provider_claude_parse_start",
@@ -141,7 +150,8 @@ pub fn parse_lines(content: &str, ctx: &ClaudeReadCtx) -> Result<UniversalSessio
         }
 
         // Compose the UMessage.
-        let umessage = build_umessage(&val, &line_type, idx, ts, is_sidechain, ctx, lineno);
+        let umessage =
+            build_umessage(&val, &line_type, idx, ts, is_sidechain, ctx, sidecar_root, lineno);
         if umessage.flags.is_meta {
             meta_messages = meta_messages.saturating_add(1);
         } else {
@@ -183,6 +193,7 @@ fn build_umessage(
     ts: Option<chrono::DateTime<chrono::Utc>>,
     is_sidechain: bool,
     ctx: &ClaudeReadCtx,
+    sidecar_root: Option<&Path>,
     lineno: usize,
 ) -> UMessage {
     // Derive a stable id. Claude JSONL lines have:
@@ -210,7 +221,7 @@ fn build_umessage(
         .map(String::from);
 
     let (role, content, model, usage, source_tag, mut flags) = match line_type {
-        "user" => parse_user_line(val, ctx),
+        "user" => parse_user_line(val, ctx, sidecar_root),
         "assistant" | "message" => parse_assistant_line(val),
         // Claude's `attachment` lines carry a typed payload under the
         // `attachment` key — e.g. `attachment.type = "deferred_tools_delta"`,
@@ -286,6 +297,7 @@ fn build_umessage(
 fn parse_user_line(
     val: &Value,
     ctx: &ClaudeReadCtx,
+    sidecar_root: Option<&Path>,
 ) -> (
     Role,
     Vec<ContentBlock>,
@@ -320,7 +332,7 @@ fn parse_user_line(
                         .get("is_error")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    let (output, extras) = extract_tool_result_output(item, ctx);
+                    let (output, extras) = extract_tool_result_output(item, ctx, sidecar_root);
                     blocks.push(ContentBlock::ToolResult {
                         call_id,
                         output,
@@ -354,7 +366,10 @@ fn parse_user_line(
         None,
         None,
         "claude:user".to_string(),
-        MessageFlags::default(),
+        MessageFlags {
+            is_meta: val.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false),
+            ..Default::default()
+        },
     )
 }
 
@@ -507,6 +522,7 @@ fn parse_role(s: &str) -> Role {
 fn extract_tool_result_output(
     item: &Value,
     ctx: &ClaudeReadCtx,
+    sidecar_root: Option<&Path>,
 ) -> (Value, BTreeMap<String, Value>) {
     let mut extras = BTreeMap::new();
     // `content` may be a string OR an array of content blocks. Preserve a
@@ -524,8 +540,18 @@ fn extract_tool_result_output(
     // Inline sidecar hydrate.
     if ctx.inline_tool_results {
         if let Some(side) = sidecar::extract_sidecar_ref(&raw_text) {
-            if let Some(full) = sidecar::read_sidecar(&side) {
-                return (Value::String(full), extras);
+            if sidecar_root
+                .map(|root| sidecar::is_valid_sidecar_path(&side, root))
+                .unwrap_or(false)
+            {
+                if let Some(full) = sidecar::read_sidecar(&side) {
+                    return (Value::String(full), extras);
+                }
+            } else {
+                extras.insert(
+                    "claude_tool_result_untrusted_sidecar_ref".into(),
+                    Value::String(side.display().to_string()),
+                );
             }
         }
     }

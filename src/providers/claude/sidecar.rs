@@ -28,6 +28,16 @@ pub fn read_sidecar(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+pub fn is_valid_sidecar_path(path: &Path, sidecar_root: &Path) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(root) = sidecar_root.canonicalize() else {
+        return false;
+    };
+    path.starts_with(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

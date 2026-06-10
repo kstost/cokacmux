@@ -21,8 +21,8 @@ pub fn synth_id(seed: &str) -> String {
     format!("ut_{}", hex)
 }
 
-static OPENCODE_LAST_MS: AtomicU64 = AtomicU64::new(0);
-static OPENCODE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static OPENCODE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static OPENCODE_RANDOM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate an OpenCode-style monotonic identifier body.
 ///
@@ -35,18 +35,23 @@ pub fn opencode_identifier(descending: bool) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0);
-    let last = OPENCODE_LAST_MS.load(Ordering::SeqCst);
-    let counter = if last == unix_ms {
-        OPENCODE_COUNTER
-            .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1)
-    } else {
-        OPENCODE_LAST_MS.store(unix_ms, Ordering::SeqCst);
-        OPENCODE_COUNTER.store(1, Ordering::SeqCst);
-        1
+    let base = unix_ms.wrapping_mul(0x1000);
+    let sequence = loop {
+        let last = OPENCODE_SEQUENCE.load(Ordering::SeqCst);
+        let next = if last < base {
+            base.wrapping_add(1)
+        } else {
+            last.wrapping_add(1)
+        };
+        if OPENCODE_SEQUENCE
+            .compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            break next;
+        }
     };
     let mask = 0xffff_ffff_ffffu64;
-    let mut prefix = unix_ms.wrapping_mul(0x1000).wrapping_add(counter) & mask;
+    let mut prefix = sequence & mask;
     if descending {
         prefix = (!prefix) & mask;
     }
@@ -74,11 +79,21 @@ fn random_base62_from_uuid(len: usize) -> String {
     let mut out = String::with_capacity(len);
     while out.len() < len {
         let uuid = uuid::Uuid::now_v7();
-        for byte in uuid.as_bytes() {
+        let counter = OPENCODE_RANDOM_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut hasher = Sha256::new();
+        hasher.update(uuid.as_bytes());
+        hasher.update(counter.to_le_bytes());
+        hasher.update(now.to_le_bytes());
+        let digest = hasher.finalize();
+        for byte in digest {
             if out.len() >= len {
                 break;
             }
-            out.push(CHARS[*byte as usize % CHARS.len()] as char);
+            out.push(CHARS[byte as usize % CHARS.len()] as char);
         }
     }
     out

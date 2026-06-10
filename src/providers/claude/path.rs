@@ -1,7 +1,7 @@
 //! Claude Code's filesystem encoding for `~/.claude/projects/<encoded-cwd>/`.
 //!
-//! Encoding: every path separator plus `.`, `_`, and Windows drive `:` in the
-//! absolute path is replaced with `-`.
+//! Encoding: every non-ASCII-alphanumeric character in the absolute path is
+//! replaced with `-`.
 //! No length limit. Example:
 //!   `/mnt/hgfs/vmware_ubuntu_shared/cokacmux`
 //! → `-mnt-hgfs-vmware-ubuntu-shared-cokacmux`
@@ -13,10 +13,7 @@
 pub fn encode_cwd(abs_path: &str) -> String {
     abs_path
         .chars()
-        .map(|c| match c {
-            '/' | '\\' | '.' | '_' | ':' => '-',
-            other => other,
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }
 
@@ -38,5 +35,10 @@ mod tests {
             encode_cwd(r"C:\Users\kst\repo.name"),
             "C--Users-kst-repo-name"
         );
+        assert_eq!(
+            encode_cwd("/home/kst/my project(1)"),
+            "-home-kst-my-project-1-"
+        );
+        assert_eq!(encode_cwd("/home/kst/한글"), "-home-kst---");
     }
 }

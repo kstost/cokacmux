@@ -8,7 +8,6 @@
 //!    records need the usual CLI fields, and provider meta/system records
 //!    should not be emitted as visible conversation rows.
 
-use std::io::Write;
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
@@ -34,14 +33,13 @@ pub fn to_jsonl_path(
             "sidecar_threshold_bytes": opts.sidecar_threshold_bytes,
         }),
     );
-    let s = to_jsonl_string(session, opts)?;
+    let s = to_jsonl_file_string(session, path, opts)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(s.as_bytes())?;
+    crate::jsonl::write_text_atomic(path, &s)?;
     debug::log(
         "provider_claude_write_file_ok",
         serde_json::json!({
@@ -55,6 +53,18 @@ pub fn to_jsonl_path(
 }
 
 const SYNTHETIC_CLAUDE_VERSION: &str = "2.1.147";
+
+fn to_jsonl_file_string(
+    session: &UniversalSession,
+    path: &Path,
+    opts: &ClaudeWriteOpts,
+) -> Result<String> {
+    let output = to_jsonl_string(session, opts)?;
+    if opts.sidecar_threshold_bytes == 0 || should_replay_claude_raw(session) {
+        return Ok(output);
+    }
+    externalize_large_tool_results(&output, path, opts.sidecar_threshold_bytes)
+}
 
 pub fn to_jsonl_string(session: &UniversalSession, _opts: &ClaudeWriteOpts) -> Result<String> {
     let replay_raw = should_replay_claude_raw(session);
@@ -121,6 +131,12 @@ fn synthesize_session(session: &UniversalSession) -> Result<String> {
         .find(|m| m.role == Role::User)
         .and_then(prepared_text)
         .unwrap_or_default();
+    let last_prompt = prepared
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .and_then(prepared_text)
+        .unwrap_or_default();
     let first_ts = prepared
         .iter()
         .find(|m| m.role == Role::User)
@@ -166,13 +182,13 @@ fn synthesize_session(session: &UniversalSession) -> Result<String> {
         values.push(top);
     }
 
-    if !first_prompt.is_empty() {
+    if !last_prompt.is_empty() {
         let leaf = leaf_uuid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
         values.push(json!({
             "type": "last-prompt",
-            "lastPrompt": first_prompt.clone(),
+            "lastPrompt": last_prompt.clone(),
             "leafUuid": leaf,
             "sessionId": session.session_id,
         }));
@@ -197,6 +213,68 @@ fn synthesize_session(session: &UniversalSession) -> Result<String> {
         out.push('\n');
     }
     Ok(out)
+}
+
+fn externalize_large_tool_results(jsonl: &str, path: &Path, threshold: usize) -> Result<String> {
+    let sidecar_root = path.with_extension("").join("tool-results");
+    let mut values = Vec::new();
+    for line in jsonl.lines() {
+        if line.trim().is_empty() {
+            values.push(Value::Null);
+            continue;
+        }
+        let mut value: Value = serde_json::from_str(line)?;
+        externalize_value_tool_results(&mut value, &sidecar_root, threshold)?;
+        values.push(value);
+    }
+    let mut out = String::new();
+    for value in values {
+        if value.is_null() {
+            out.push('\n');
+        } else {
+            out.push_str(&serde_json::to_string(&value)?);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+fn externalize_value_tool_results(
+    value: &mut Value,
+    sidecar_root: &Path,
+    threshold: usize,
+) -> Result<()> {
+    let Some(content) = value
+        .get_mut("message")
+        .and_then(|message| message.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let Some(text) = block.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if text.len() <= threshold {
+            continue;
+        }
+        let full_text = text.to_string();
+        let byte_len = full_text.len();
+        std::fs::create_dir_all(sidecar_root)?;
+        let sidecar_path = sidecar_root.join(format!("{}.txt", uuid::Uuid::now_v7()));
+        crate::jsonl::write_text_atomic(&sidecar_path, &full_text)?;
+        let preview: String = full_text.chars().take(4096).collect();
+        block["content"] = Value::String(format!(
+            "Output too large ({} bytes). Full output saved to: {}\n\n{}",
+            byte_len,
+            sidecar_path.display(),
+            preview
+        ));
+    }
+    Ok(())
 }
 
 struct PreparedMessage<'a> {

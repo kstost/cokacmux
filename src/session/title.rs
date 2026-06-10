@@ -160,11 +160,7 @@ fn read_title_store(path: &Path) -> Result<TitleStore> {
 }
 
 fn write_title_store(path: &Path, store: &TitleStore) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_string_pretty(store)? + "\n")?;
-    Ok(())
+    crate::jsonl::write_text_atomic(path, &(serde_json::to_string_pretty(store)? + "\n"))
 }
 
 #[cfg(test)]

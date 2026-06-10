@@ -38,8 +38,10 @@ impl Default for ClaudeReadCtx {
 
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeWriteOpts {
-    /// Emit a `<basename>/tool-results/` sidecar directory for tool results
-    /// larger than this threshold (in bytes). 0 disables sidecar emission.
+    /// When writing to a file, emit a `<basename>/tool-results/` sidecar
+    /// directory for tool results larger than this threshold (in bytes).
+    /// 0 disables sidecar emission. String-only serialization remains inline
+    /// because it has no filesystem location for sidecar files.
     pub sidecar_threshold_bytes: usize,
 }
 

@@ -232,7 +232,7 @@ fn clone_codex_same_provider_at_home(
         &new_cwd,
         opts.overwrite,
     ) {
-        let _ = remove_installed_clone_artifact(Provider::Codex, &new_id, &new_cwd, &artifact);
+        let _ = fs::remove_file(&target);
         return Err(error);
     }
 
@@ -424,11 +424,11 @@ fn patch_claude_jsonl_lines(
 }
 
 fn repair_claude_parent_chain(lines: &mut [JsonLine]) -> usize {
-    let mut previous_uuid: Option<String> = None;
     let mut leaf_uuid: Option<String> = None;
     let mut updated = 0usize;
+    let mut conversation_uuids = std::collections::HashSet::new();
 
-    for line in lines.iter_mut() {
+    for line in lines.iter() {
         let JsonLine::Json(Value::Object(map)) = line else {
             continue;
         };
@@ -438,22 +438,21 @@ fn repair_claude_parent_chain(lines: &mut [JsonLine]) -> usize {
         if !matches!(kind, "user" | "assistant") {
             continue;
         }
+        if map
+            .get("isSidechain")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let Some(uuid) = map.get("uuid").and_then(Value::as_str).map(str::to_string) else {
             continue;
         };
-        map.insert(
-            "parentUuid".into(),
-            previous_uuid
-                .as_ref()
-                .map(|parent| Value::String(parent.clone()))
-                .unwrap_or(Value::Null),
-        );
-        updated = updated.saturating_add(1);
-        previous_uuid = Some(uuid.clone());
+        conversation_uuids.insert(uuid.clone());
         leaf_uuid = Some(uuid);
     }
 
-    let Some(leaf_uuid) = leaf_uuid else {
+    let Some(fallback_leaf_uuid) = leaf_uuid else {
         return updated;
     };
     for line in lines {
@@ -461,8 +460,14 @@ fn repair_claude_parent_chain(lines: &mut [JsonLine]) -> usize {
             continue;
         };
         if map.get("type").and_then(Value::as_str) == Some("last-prompt") {
-            map.insert("leafUuid".into(), Value::String(leaf_uuid.clone()));
-            updated = updated.saturating_add(1);
+            let current = map.get("leafUuid").and_then(Value::as_str);
+            let needs_repair = current
+                .map(|uuid| !conversation_uuids.contains(uuid))
+                .unwrap_or(true);
+            if needs_repair {
+                map.insert("leafUuid".into(), Value::String(fallback_leaf_uuid.clone()));
+                updated = updated.saturating_add(1);
+            }
         }
     }
     updated

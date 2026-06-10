@@ -742,10 +742,10 @@ pub fn sanitize_for_terminal(s: &str) -> String {
 }
 
 fn short_id(s: &str) -> String {
-    if s.len() <= 12 {
+    if s.chars().count() <= 12 {
         s.to_string()
     } else {
-        format!("{}…", &s[..12])
+        format!("{}…", s.chars().take(12).collect::<String>())
     }
 }
 

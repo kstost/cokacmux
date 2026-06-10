@@ -134,26 +134,36 @@ fn count_matches(haystack: &str, query: &str) -> usize {
 
 fn snippet_for(text: &str, query: &str, ci: bool) -> String {
     const CONTEXT: usize = 40;
-    let haystack = if ci {
-        text.to_lowercase()
-    } else {
-        text.to_string()
-    };
     let q = if ci {
         query.to_lowercase()
     } else {
         query.to_string()
     };
-    let i = match haystack.find(&q) {
-        Some(p) => p,
-        None => return text.chars().take(80).collect(),
+    let (match_start, match_end) = if ci {
+        let (haystack, ranges) = lowercase_with_original_ranges(text);
+        match haystack.find(&q) {
+            Some(p) if !q.is_empty() => {
+                let start = ranges.get(p).map(|range| range.0).unwrap_or(0);
+                let end = ranges
+                    .get(p + q.len().saturating_sub(1))
+                    .map(|range| range.1)
+                    .unwrap_or(text.len());
+                (start, end)
+            }
+            _ => return text.chars().take(80).collect(),
+        }
+    } else {
+        match text.find(query) {
+            Some(p) => (p, p + query.len()),
+            None => return text.chars().take(80).collect(),
+        }
     };
-    let start = i.saturating_sub(CONTEXT);
+    let start = match_start.saturating_sub(CONTEXT);
     let mut start = start;
     while start > 0 && !text.is_char_boundary(start) {
         start -= 1;
     }
-    let end = (i + query.len() + CONTEXT).min(text.len());
+    let end = match_end.saturating_add(CONTEXT).min(text.len());
     let mut end = end;
     while end < text.len() && !text.is_char_boundary(end) {
         end += 1;
@@ -166,6 +176,23 @@ fn snippet_for(text: &str, query: &str, ci: bool) -> String {
         &text[start..end].replace('\n', " "),
         suffix
     )
+}
+
+fn lowercase_with_original_ranges(text: &str) -> (String, Vec<(usize, usize)>) {
+    let mut folded = String::new();
+    let mut ranges = Vec::new();
+    for (start, ch) in text.char_indices() {
+        let end = start + ch.len_utf8();
+        for lower in ch.to_lowercase() {
+            let mut buf = [0u8; 4];
+            let lower = lower.encode_utf8(&mut buf);
+            folded.push_str(lower);
+            for _ in 0..lower.len() {
+                ranges.push((start, end));
+            }
+        }
+    }
+    (folded, ranges)
 }
 
 #[cfg(test)]

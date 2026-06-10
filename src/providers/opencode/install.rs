@@ -54,7 +54,7 @@ pub fn install_to_default_db(
     // exclusive lock.
     {
         let conn = super::db::open_readwrite(&db)?;
-        if let Err(e) = conn.execute("BEGIN IMMEDIATE; ROLLBACK;", []) {
+        if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
             crate::debug::log(
                 "provider_opencode_install_lock_error",
                 serde_json::json!({
