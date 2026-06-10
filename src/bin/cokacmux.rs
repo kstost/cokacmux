@@ -104,6 +104,21 @@ const DAEMON_DISK_QUEUE_MAX_JOBS: usize = 512;
 /// healthy peer drains within milliseconds; one that stays full this long is
 /// gone or wedged, and blocking the pump on it would freeze the agent pane.
 const AGENT_STREAM_WRITE_STALL_TIMEOUT_MS: u64 = 10_000;
+/// Upper bound on the daemon→client outbound queue (serialized event
+/// bytes). A client that lets this much pile up has its queued output
+/// frames discarded — with accounting — and is resynced from the live
+/// screen snapshot once it drains; the daemon loop itself never sleeps on
+/// a slow peer. Control frames (attach handshake, exit notices, snapshots)
+/// are never discarded.
+const DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES: usize = 512 * 1024;
+/// After a discard, the resync snapshot is queued once the outbound queue
+/// has drained below this, so it reaches the client promptly instead of
+/// behind a long backlog.
+const DAEMON_CLIENT_OUTBOUND_RESYNC_BYTES: usize = 16 * 1024;
+/// On child exit the daemon flushes the queued exit notice for at most
+/// this long before cleaning up its runtime files; a peer that cannot
+/// drain by then learns of the exit from the socket EOF instead.
+const DAEMON_EXIT_FLUSH_TIMEOUT_MS: u64 = 2_000;
 const AGENT_DETACH_WRITE_TIMEOUT_MS: u64 = 300;
 const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
 const LIVE_SHELL_DISCOVERY_INTERVAL_MS: u64 = 10_000;
@@ -2424,7 +2439,9 @@ fn sort_agent_keys(keys: &mut [AgentKey]) {
 
 struct NewAgentBackingSession {
     key: AgentKey,
-    rollout_path: PathBuf,
+    /// Where the backing session was located: codex rollout file, claude
+    /// session jsonl, or the opencode db. Diagnostics only.
+    backing_path: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -4948,9 +4965,94 @@ fn lock_agent_output_buffer(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundFrameKind {
+    /// Pty output. May be discarded under backpressure; the live screen is
+    /// recovered afterwards by a snapshot resync.
+    Output,
+    /// Everything else (attach handshake, snapshots, exit notices). Never
+    /// discarded.
+    Control,
+}
+
+#[derive(Debug)]
+struct OutboundFrame {
+    kind: OutboundFrameKind,
+    bytes: Vec<u8>,
+}
+
+/// Write as much queued data as the stream accepts without blocking.
+/// `front_written` tracks how much of the front frame already went out so a
+/// frame interrupted by `WouldBlock` resumes mid-frame and line framing is
+/// preserved. Returns true when at least one byte was written.
+fn flush_outbound_frames<W: Write>(
+    stream: &mut W,
+    frames: &mut VecDeque<OutboundFrame>,
+    front_written: &mut usize,
+    pending_bytes: &mut usize,
+) -> io::Result<bool> {
+    let mut progress = false;
+    while let Some(front) = frames.front() {
+        let remaining = &front.bytes[*front_written..];
+        match stream.write(remaining) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::WriteZero,
+                    "socket write returned 0",
+                ))
+            }
+            Ok(n) => {
+                progress = true;
+                *pending_bytes = pending_bytes.saturating_sub(n);
+                *front_written += n;
+                if *front_written >= front.bytes.len() {
+                    frames.pop_front();
+                    *front_written = 0;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(progress)
+}
+
+/// Drop queued output frames, keeping control frames and a front frame
+/// whose first bytes are already on the wire (removing that one would
+/// corrupt line framing). Returns (frames, bytes) removed.
+fn discard_queued_output_frames(
+    frames: &mut VecDeque<OutboundFrame>,
+    front_written: usize,
+    pending_bytes: &mut usize,
+) -> (u64, u64) {
+    let mut dropped_frames = 0u64;
+    let mut dropped_bytes = 0u64;
+    let mut index = 0usize;
+    frames.retain(|frame| {
+        let keep_partial_front = index == 0 && front_written > 0;
+        index += 1;
+        if keep_partial_front || frame.kind != OutboundFrameKind::Output {
+            return true;
+        }
+        dropped_frames += 1;
+        dropped_bytes += frame.bytes.len() as u64;
+        false
+    });
+    *pending_bytes = pending_bytes.saturating_sub(dropped_bytes as usize);
+    (dropped_frames, dropped_bytes)
+}
+
 struct DaemonConnection {
     stream: AgentStream,
     read_buf: Vec<u8>,
+    out_frames: VecDeque<OutboundFrame>,
+    out_front_written: usize,
+    out_pending_bytes: usize,
+    out_last_progress_at: Instant,
+    out_discarded_frames: u64,
+    out_discarded_bytes: u64,
+    needs_resync: bool,
 }
 
 impl DaemonConnection {
@@ -4959,11 +5061,107 @@ impl DaemonConnection {
         Ok(Self {
             stream,
             read_buf: Vec::new(),
+            out_frames: VecDeque::new(),
+            out_front_written: 0,
+            out_pending_bytes: 0,
+            out_last_progress_at: Instant::now(),
+            out_discarded_frames: 0,
+            out_discarded_bytes: 0,
+            needs_resync: false,
         })
     }
 
+    /// Queue an event and write whatever the socket accepts right now.
+    /// Never sleeps: a slow peer accumulates in the bounded outbound queue,
+    /// where output frames are discarded past the budget and recovered by a
+    /// snapshot resync. Errors are hard stream failures only.
     fn send_event(&mut self, event: &AgentDaemonEvent) -> io::Result<()> {
-        write_json_line(&mut self.stream, event)
+        let kind = if matches!(event, AgentDaemonEvent::Output { .. }) {
+            OutboundFrameKind::Output
+        } else {
+            OutboundFrameKind::Control
+        };
+        // Once output has been discarded, sending newer output before the
+        // resync snapshot would render a screen with a hole in its history;
+        // drop it into the same accounting until the snapshot goes out.
+        if kind == OutboundFrameKind::Output && self.needs_resync {
+            self.out_discarded_frames += 1;
+            return Ok(());
+        }
+        let mut bytes =
+            serde_json::to_vec(event).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        bytes.push(b'\n');
+        self.out_pending_bytes += bytes.len();
+        self.out_frames.push_back(OutboundFrame { kind, bytes });
+        self.flush_outbound()?;
+        self.enforce_outbound_budget();
+        Ok(())
+    }
+
+    fn flush_outbound(&mut self) -> io::Result<()> {
+        let progress = flush_outbound_frames(
+            &mut self.stream,
+            &mut self.out_frames,
+            &mut self.out_front_written,
+            &mut self.out_pending_bytes,
+        )?;
+        if progress || self.out_pending_bytes == 0 {
+            self.out_last_progress_at = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn enforce_outbound_budget(&mut self) {
+        if self.out_pending_bytes <= DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES {
+            return;
+        }
+        let (frames, bytes) = discard_queued_output_frames(
+            &mut self.out_frames,
+            self.out_front_written,
+            &mut self.out_pending_bytes,
+        );
+        if frames == 0 {
+            return;
+        }
+        self.out_discarded_frames += frames;
+        self.out_discarded_bytes += bytes;
+        self.needs_resync = true;
+        debug_log(
+            "daemon_client_output_discarded",
+            serde_json::json!({
+                "dropped_frames": frames,
+                "dropped_bytes": bytes,
+                "total_discarded_frames": self.out_discarded_frames,
+                "total_discarded_bytes": self.out_discarded_bytes,
+                "pending_bytes": self.out_pending_bytes,
+            }),
+        );
+    }
+
+    fn has_pending_outbound(&self) -> bool {
+        self.out_pending_bytes > 0
+    }
+
+    /// A peer with queued data that has not accepted a single byte for the
+    /// stall window is gone or wedged.
+    fn outbound_stalled(&self) -> bool {
+        self.out_pending_bytes > 0
+            && self.out_last_progress_at.elapsed()
+                >= Duration::from_millis(AGENT_STREAM_WRITE_STALL_TIMEOUT_MS)
+    }
+
+    fn should_resync(&self) -> bool {
+        self.needs_resync && self.out_pending_bytes <= DAEMON_CLIENT_OUTBOUND_RESYNC_BYTES
+    }
+
+    /// Clear the resync state, returning the (frames, bytes) accounting
+    /// accumulated since the discard for logging.
+    fn finish_resync(&mut self) -> (u64, u64) {
+        self.needs_resync = false;
+        (
+            std::mem::take(&mut self.out_discarded_frames),
+            std::mem::take(&mut self.out_discarded_bytes),
+        )
     }
 
     fn read_requests(&mut self) -> io::Result<Vec<AgentDaemonRequest>> {
@@ -10537,8 +10735,9 @@ fn compute_agent_runtime_refresh(
     debug_agent_runtime_refresh_step(request.seq, "read_runtime_states", step_started.elapsed());
 
     let step_started = Instant::now();
-    // Fresh backing discovery scans process file descriptors and rollout
-    // files, which is too expensive to run for every key on every 500ms
+    // Fresh backing discovery hits provider session storage (codex fd/rollout
+    // scan, claude session-file stat, opencode db query), which is too
+    // expensive to run for every key on every 500ms
     // poll — but `probe_after` already throttles it to one probe per
     // unlinked agent per NEW_AGENT_BACKING_PROBE_INTERVAL_MS, and this runs
     // on the worker thread. Probing must stay enabled here: this is the
@@ -10697,7 +10896,7 @@ fn apply_cached_new_agent_backing_states(
     states: &mut HashMap<AgentKey, AgentListState>,
 ) {
     for info in live_shells {
-        if !is_new_agent_session_info(info) || info.provider != Provider::Codex {
+        if !is_new_agent_session_info(info) {
             continue;
         }
         let synthetic_key = AgentKey::new(info);
@@ -10724,13 +10923,13 @@ fn apply_new_agent_backing_states_to_snapshot(
     let trace_enabled = TRACE_ENABLED.load(Ordering::Relaxed);
     let live_new_keys: HashSet<AgentKey> = live_shells
         .iter()
-        .filter(|info| is_new_agent_session_info(info) && info.provider == Provider::Codex)
+        .filter(|info| is_new_agent_session_info(info))
         .map(AgentKey::new)
         .collect();
     probe_after.retain(|key, _| live_new_keys.contains(key));
 
     for info in live_shells {
-        if !is_new_agent_session_info(info) || info.provider != Provider::Codex {
+        if !is_new_agent_session_info(info) {
             continue;
         }
         let synthetic_key = AgentKey::new(info);
@@ -10794,7 +10993,7 @@ fn apply_new_agent_backing_states_to_snapshot(
                 serde_json::json!({
                     "synthetic": agent_key_debug_value(&synthetic_key),
                     "backing": agent_key_debug_value(&backing.key),
-                    "rollout_path": backing.rollout_path.display().to_string(),
+                    "backing_path": backing.backing_path.display().to_string(),
                     "state": agent_list_state_debug_value(state),
                     "previous_alias": previous_alias.as_ref().map(agent_key_debug_value),
                     "previous_state": optional_agent_list_state_debug_value(previous_state),
@@ -10806,7 +11005,7 @@ fn apply_new_agent_backing_states_to_snapshot(
                 serde_json::json!({
                     "synthetic": agent_key_debug_value(&synthetic_key),
                     "backing": agent_key_debug_value(&backing.key),
-                    "rollout_path": backing.rollout_path.display().to_string(),
+                    "backing_path": backing.backing_path.display().to_string(),
                     "state": agent_list_state_debug_value(state),
                     "previous_state": optional_agent_list_state_debug_value(previous_state),
                 }),
@@ -12041,6 +12240,57 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             }
         }
 
+        // Keep the queued outbound bytes moving every tick without ever
+        // sleeping on the peer: a peer that stops draining entirely is
+        // dropped, and one that fell far enough behind to lose output is
+        // resynced from the live screen once its queue empties.
+        if let Some(conn) = client.as_mut() {
+            let flush_failed = conn.flush_outbound().is_err();
+            if flush_failed || conn.outbound_stalled() {
+                client = None;
+                attached_client_pid = None;
+                attached_client_instance_id = None;
+                let _ = write_agent_meta(&meta_path, &mut agent, false, None, None);
+                debug_log(
+                    "daemon_client_outbound_dropped",
+                    serde_json::json!({
+                        "provider": agent.info.provider.as_str(),
+                        "session_id": &agent.info.session_id,
+                        "reason": if flush_failed { "write_failed" } else { "stalled" },
+                    }),
+                );
+            } else if conn.should_resync() {
+                let snapshot = agent.screen_snapshot_bytes(false);
+                let (discarded_frames, discarded_bytes) = conn.finish_resync();
+                if conn
+                    .send_event(&AgentDaemonEvent::Snapshot { data: snapshot })
+                    .is_err()
+                {
+                    client = None;
+                    attached_client_pid = None;
+                    attached_client_instance_id = None;
+                    let _ = write_agent_meta(&meta_path, &mut agent, false, None, None);
+                    debug_log(
+                        "daemon_client_resync_failed",
+                        serde_json::json!({
+                            "provider": agent.info.provider.as_str(),
+                            "session_id": &agent.info.session_id,
+                        }),
+                    );
+                } else {
+                    debug_log(
+                        "daemon_client_output_resynced",
+                        serde_json::json!({
+                            "provider": agent.info.provider.as_str(),
+                            "session_id": &agent.info.session_id,
+                            "discarded_frames": discarded_frames,
+                            "discarded_bytes": discarded_bytes,
+                        }),
+                    );
+                }
+            }
+        }
+
         if let Some(conn) = client.as_mut() {
             match conn.read_requests() {
                 Ok(requests) => {
@@ -12171,6 +12421,13 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
 
         if output_backlog_remaining {
             thread::yield_now();
+        } else if client
+            .as_ref()
+            .is_some_and(DaemonConnection::has_pending_outbound)
+        {
+            // Queued outbound bytes are waiting on socket space; retry on a
+            // short cadence so a draining peer catches up quickly.
+            thread::sleep(Duration::from_millis(5));
         } else {
             thread::sleep(Duration::from_millis(30));
         }
@@ -12218,6 +12475,18 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
         let _ = conn.send_event(&AgentDaemonEvent::Exited {
             status: exit_status.clone(),
         });
+        // The exit notice (and any final output) may still be queued; give
+        // the peer a bounded window to drain before the runtime files go
+        // away. A peer that cannot drain learns of the exit from the EOF.
+        let flush_deadline = Instant::now() + Duration::from_millis(DAEMON_EXIT_FLUSH_TIMEOUT_MS);
+        while conn.has_pending_outbound() && Instant::now() < flush_deadline {
+            if conn.flush_outbound().is_err() {
+                break;
+            }
+            if conn.has_pending_outbound() {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
     // Drain queued disk writes and close the pty log before removing it.
     agent.shutdown_disk_writer();
@@ -12697,19 +12966,83 @@ fn new_agent_backing_session_from_meta(meta: &AgentMetaSnapshot) -> Option<NewAg
     if meta.source.as_deref() != Some(NEW_AGENT_SESSION_SOURCE_MARKER) {
         return None;
     }
-    if meta.provider.as_deref().and_then(Provider::parse) != Some(Provider::Codex) {
-        return None;
+    match meta.provider.as_deref().and_then(Provider::parse)? {
+        Provider::Codex => codex_new_agent_backing_session(meta),
+        Provider::Claude => claude_new_agent_backing_session(meta),
+        Provider::OpenCode => opencode_new_agent_backing_session(meta),
     }
+}
+
+fn codex_new_agent_backing_session(meta: &AgentMetaSnapshot) -> Option<NewAgentBackingSession> {
     let child_pid = meta.child_pid?;
     let expected_cwd = meta.cwd.as_deref().filter(|cwd| !cwd.is_empty());
-    let rollout_path = codex_rollout_path_for_process_tree(child_pid, expected_cwd)?;
-    let session_id = codex_session_id_from_rollout_path(&rollout_path)?;
+    let backing_path = codex_rollout_path_for_process_tree(child_pid, expected_cwd)?;
+    let session_id = codex_session_id_from_rollout_path(&backing_path)?;
     Some(NewAgentBackingSession {
         key: AgentKey {
             provider: Provider::Codex,
             session_id,
         },
-        rollout_path,
+        backing_path,
+    })
+}
+
+/// New claude agents launch with `--session-id <uuid>` (the uuid inside the
+/// synthetic `new-<uuid>` key), so the backing session id is known up front.
+/// The alias only becomes valid once claude has written the session file;
+/// daemons launched before this contract never produce that file under the
+/// derived id and simply stay unlinked.
+fn claude_new_agent_backing_session(meta: &AgentMetaSnapshot) -> Option<NewAgentBackingSession> {
+    let session_uuid = new_agent_session_uuid(meta.session_id.as_deref()?)?;
+    let cwd = meta.cwd.as_deref().filter(|cwd| !cwd.is_empty())?;
+    let projects_root = dirs::home_dir()?.join(".claude").join("projects");
+    claude_new_agent_backing_session_in_root(&projects_root, cwd, session_uuid)
+}
+
+fn claude_new_agent_backing_session_in_root(
+    projects_root: &Path,
+    cwd: &str,
+    session_uuid: uuid::Uuid,
+) -> Option<NewAgentBackingSession> {
+    let session_id = session_uuid.to_string();
+    let backing_path = projects_root
+        .join(cokacmux::providers::claude::path::encode_cwd(cwd))
+        .join(format!("{session_id}.jsonl"));
+    if !backing_path.is_file() {
+        return None;
+    }
+    Some(NewAgentBackingSession {
+        key: AgentKey {
+            provider: Provider::Claude,
+            session_id,
+        },
+        backing_path,
+    })
+}
+
+/// opencode assigns its own session id, so attribute by creation time: the
+/// synthetic key's uuidv7 timestamp predates the child's session row, and a
+/// row qualifies only when it is the unique session for this cwd created
+/// after that instant. Ambiguity (two new agents racing in one cwd) links
+/// nothing rather than risking a wrong alias.
+fn opencode_new_agent_backing_session(meta: &AgentMetaSnapshot) -> Option<NewAgentBackingSession> {
+    let session_uuid = new_agent_session_uuid(meta.session_id.as_deref()?)?;
+    let timestamp = session_uuid.get_timestamp()?;
+    let (secs, nanos) = timestamp.to_unix();
+    let created_after_epoch_ms =
+        (secs as i64).saturating_mul(1000) + i64::from(nanos / 1_000_000);
+    let cwd = meta.cwd.as_deref().filter(|cwd| !cwd.is_empty())?;
+    let (session_id, backing_path) =
+        cokacmux::providers::discovery::unique_opencode_session_created_after(
+            cwd,
+            created_after_epoch_ms,
+        )?;
+    Some(NewAgentBackingSession {
+        key: AgentKey {
+            provider: Provider::OpenCode,
+            session_id,
+        },
+        backing_path,
     })
 }
 
@@ -14452,8 +14785,10 @@ fn write_all_retry(writer: &mut AgentStream, mut bytes: &[u8]) -> io::Result<()>
             Ok(n) => bytes = &bytes[n..],
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 // A peer that has not drained its socket for this long is
-                // gone or wedged; retrying forever would tie this loop (and
-                // on the daemon side, the output pump) to the dead peer.
+                // gone or wedged; retrying forever would tie the client's
+                // writer thread to the dead peer. (The daemon side never
+                // uses this path — it queues into the bounded
+                // `DaemonConnection` outbound buffer instead.)
                 if started.elapsed() >= Duration::from_millis(AGENT_STREAM_WRITE_STALL_TIMEOUT_MS) {
                     return Err(io::Error::new(
                         ErrorKind::TimedOut,
@@ -16383,8 +16718,19 @@ fn shell_session_info_for_cwd(cwd: String) -> SessionInfo {
 /// provider's fresh-start command instead of a resume/session command.
 const NEW_AGENT_SESSION_SOURCE_MARKER: &str = "@cokacmux-new-agent";
 
+const NEW_AGENT_SESSION_ID_PREFIX: &str = "new-";
+
 fn is_new_agent_session_info(info: &SessionInfo) -> bool {
     info.source.as_os_str() == NEW_AGENT_SESSION_SOURCE_MARKER
+}
+
+/// The uuid embedded in a synthetic new-agent session id (`new-<uuidv7>`).
+/// Daemons launched before the prefix carried a uuid yield None and stay on
+/// the probe-based backing discovery path.
+fn new_agent_session_uuid(session_id: &str) -> Option<uuid::Uuid> {
+    session_id
+        .strip_prefix(NEW_AGENT_SESSION_ID_PREFIX)
+        .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
 }
 
 /// Marker for a cokacdir pane launched from the new session dialog. Like shell
@@ -16411,7 +16757,7 @@ fn cokacdir_session_info_for_cwd(cwd: String) -> SessionInfo {
 fn new_agent_session_info(provider: Provider, cwd: String) -> SessionInfo {
     SessionInfo {
         provider,
-        session_id: format!("new-{}", uuid::Uuid::now_v7()),
+        session_id: format!("{NEW_AGENT_SESSION_ID_PREFIX}{}", uuid::Uuid::now_v7()),
         cwd: cwd.clone(),
         source: PathBuf::from(NEW_AGENT_SESSION_SOURCE_MARKER),
         updated_at_epoch_s: chrono::Utc::now().timestamp().max(0) as u64,
@@ -17208,6 +17554,15 @@ fn new_agent_launch_spec_with_programs(
             let mut args = Vec::new();
             if launch_mode == AgentLaunchMode::SkipPermissions {
                 args.push("--dangerously-skip-permissions".to_string());
+            }
+            // Pin the session id claude will write to. claude does not keep
+            // its session file open, so unlike codex the backing session
+            // cannot be recovered from the process tree afterwards — knowing
+            // the id up front is what lets the sessions list show this
+            // agent's runtime state.
+            if let Some(session_uuid) = new_agent_session_uuid(&info.session_id) {
+                args.push("--session-id".to_string());
+                args.push(session_uuid.to_string());
             }
             AgentLaunchSpec {
                 program: agent_programs.program_for(Provider::Claude),
@@ -22419,6 +22774,269 @@ mod tests {
         info
     }
 
+    struct LimitedWriter {
+        accepted: Vec<u8>,
+        budget: usize,
+    }
+
+    impl Write for LimitedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.budget == 0 {
+                return Err(io::Error::new(ErrorKind::WouldBlock, "full"));
+            }
+            let n = buf.len().min(self.budget);
+            self.budget -= n;
+            self.accepted.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn outbound_frame(kind: OutboundFrameKind, len: usize, fill: u8) -> OutboundFrame {
+        OutboundFrame {
+            kind,
+            bytes: vec![fill; len],
+        }
+    }
+
+    #[test]
+    fn flush_outbound_frames_resumes_partial_frames_across_wouldblock() {
+        let mut frames: VecDeque<OutboundFrame> = VecDeque::from([
+            outbound_frame(OutboundFrameKind::Output, 10, b'a'),
+            outbound_frame(OutboundFrameKind::Control, 5, b'b'),
+        ]);
+        let mut front_written = 0usize;
+        let mut pending = 15usize;
+
+        let mut writer = LimitedWriter {
+            accepted: Vec::new(),
+            budget: 12,
+        };
+        let progress =
+            flush_outbound_frames(&mut writer, &mut frames, &mut front_written, &mut pending)
+                .unwrap();
+        assert!(progress);
+        assert_eq!(pending, 3);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(front_written, 2);
+
+        let mut blocked = LimitedWriter {
+            accepted: Vec::new(),
+            budget: 0,
+        };
+        let progress =
+            flush_outbound_frames(&mut blocked, &mut frames, &mut front_written, &mut pending)
+                .unwrap();
+        assert!(!progress);
+        assert_eq!(pending, 3);
+        assert_eq!(front_written, 2);
+
+        let mut writer = LimitedWriter {
+            accepted: Vec::new(),
+            budget: 64,
+        };
+        let progress =
+            flush_outbound_frames(&mut writer, &mut frames, &mut front_written, &mut pending)
+                .unwrap();
+        assert!(progress);
+        assert_eq!(pending, 0);
+        assert!(frames.is_empty());
+        assert_eq!(front_written, 0);
+        assert_eq!(writer.accepted, vec![b'b'; 3]);
+    }
+
+    #[test]
+    fn discard_keeps_partial_front_and_control_frames() {
+        let mut frames: VecDeque<OutboundFrame> = VecDeque::from([
+            outbound_frame(OutboundFrameKind::Output, 10, b'a'),
+            outbound_frame(OutboundFrameKind::Control, 5, b'b'),
+            outbound_frame(OutboundFrameKind::Output, 7, b'c'),
+            outbound_frame(OutboundFrameKind::Output, 9, b'd'),
+        ]);
+        let mut pending = 31usize;
+
+        // Front frame has bytes on the wire: it must survive the discard so
+        // line framing stays intact.
+        let (dropped_frames, dropped_bytes) =
+            discard_queued_output_frames(&mut frames, 4, &mut pending);
+        assert_eq!(dropped_frames, 2);
+        assert_eq!(dropped_bytes, 16);
+        assert_eq!(pending, 15);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].kind, OutboundFrameKind::Output);
+        assert_eq!(frames[1].kind, OutboundFrameKind::Control);
+
+        // A fully unwritten output front frame is discardable.
+        let (dropped_frames, dropped_bytes) =
+            discard_queued_output_frames(&mut frames, 0, &mut pending);
+        assert_eq!(dropped_frames, 1);
+        assert_eq!(dropped_bytes, 10);
+        assert_eq!(pending, 5);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, OutboundFrameKind::Control);
+    }
+
+    /// Flush `conn` and read from the peer until the outbound queue is
+    /// empty, then pull whatever is left in the kernel buffer.
+    #[cfg(unix)]
+    fn drain_daemon_connection_pair(
+        conn: &mut DaemonConnection,
+        right: &mut AgentStream,
+        received: &mut Vec<u8>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 64 * 1024];
+        while conn.has_pending_outbound() {
+            assert!(Instant::now() < deadline, "outbound drain timed out");
+            conn.flush_outbound().unwrap();
+            match right.read(&mut buf) {
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("peer read failed: {e}"),
+            }
+        }
+        loop {
+            match right.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => panic!("peer read failed: {e}"),
+            }
+        }
+    }
+
+    /// End-to-end backpressure cycle over a real socket pair: the peer
+    /// stops reading, output frames pile up past the budget and are
+    /// discarded, a control frame queued during the window survives, and
+    /// after the peer drains the resync snapshot closes the cycle. Every
+    /// received line must still parse — the partial-frame bookkeeping may
+    /// never corrupt framing — and ordering plus discard accounting must
+    /// hold exactly.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_connection_discard_cycle_preserves_framing_and_accounting() {
+        let (left, right) = AgentStream::pair().unwrap();
+        let mut right = right;
+        right.set_nonblocking(true).unwrap();
+        let mut conn = DaemonConnection::new(left).unwrap();
+
+        let mut sent = 0u64;
+        while !conn.needs_resync {
+            conn.send_event(&AgentDaemonEvent::Output {
+                data: vec![sent as u8; 16 * 1024],
+            })
+            .unwrap();
+            sent += 1;
+            assert!(sent < 200, "budget should trip long before 200 frames");
+        }
+        assert!(conn.out_discarded_frames > 0);
+
+        // A control event queued during the backpressure window survives.
+        conn.send_event(&AgentDaemonEvent::Exited {
+            status: "exit status: 0".into(),
+        })
+        .unwrap();
+
+        let mut received = Vec::new();
+        drain_daemon_connection_pair(&mut conn, &mut right, &mut received);
+
+        assert!(conn.should_resync());
+        let (discarded_frames, discarded_bytes) = conn.finish_resync();
+        assert!(discarded_frames > 0);
+        assert!(discarded_bytes > 0);
+        conn.send_event(&AgentDaemonEvent::Snapshot {
+            data: b"RESYNC".to_vec(),
+        })
+        .unwrap();
+        drain_daemon_connection_pair(&mut conn, &mut right, &mut received);
+
+        assert_eq!(conn.out_pending_bytes, 0);
+        assert!(conn.out_frames.is_empty());
+        assert_eq!(conn.out_front_written, 0);
+
+        let mut output_ids = Vec::new();
+        let mut saw_exited = false;
+        let mut last_event = String::new();
+        for line in received.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let event: AgentDaemonEvent = serde_json::from_slice(line)
+                .expect("every delivered line must parse after a discard");
+            match &event {
+                AgentDaemonEvent::Output { data } => {
+                    assert!(!data.is_empty());
+                    output_ids.push(data[0]);
+                    last_event = "output".into();
+                }
+                AgentDaemonEvent::Exited { .. } => {
+                    saw_exited = true;
+                    last_event = "exited".into();
+                }
+                AgentDaemonEvent::Snapshot { data } => {
+                    assert_eq!(data, b"RESYNC");
+                    last_event = "snapshot".into();
+                }
+                _ => last_event = "other".into(),
+            }
+        }
+        assert!(saw_exited);
+        assert_eq!(last_event, "snapshot");
+        // Delivered outputs keep their original order with no duplicates.
+        assert!(output_ids.windows(2).all(|pair| pair[0] < pair[1]));
+        // Exact accounting: every queued frame was either delivered or
+        // counted as discarded.
+        assert_eq!(output_ids.len() as u64 + discarded_frames, sent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_connection_drops_output_while_resync_is_pending() {
+        let (left, _right) = AgentStream::pair().unwrap();
+        let mut conn = DaemonConnection::new(left).unwrap();
+        conn.needs_resync = true;
+
+        conn.send_event(&AgentDaemonEvent::Output {
+            data: vec![1, 2, 3],
+        })
+        .unwrap();
+        assert!(conn.out_frames.is_empty());
+        assert_eq!(conn.out_discarded_frames, 1);
+        assert!(conn.should_resync());
+
+        // Control events keep flowing while the resync is pending.
+        conn.send_event(&AgentDaemonEvent::Exited {
+            status: "exit status: 0".into(),
+        })
+        .unwrap();
+
+        let (discarded_frames, _discarded_bytes) = conn.finish_resync();
+        assert_eq!(discarded_frames, 1);
+        assert!(!conn.should_resync());
+    }
+
+    /// Attach runs on a worker thread and reports back via `MainEvent`;
+    /// key tests that assert on attach outcomes must apply that result the
+    /// way the live event loop would.
+    fn pump_attach_result(app: &mut App, rx: &Receiver<MainEvent>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = rx
+                .recv_timeout(remaining)
+                .expect("attach worker should send a result");
+            if let MainEvent::AttachResult(result) = event {
+                app.on_attach_result(result);
+                return;
+            }
+        }
+    }
+
     fn default_agent_launch_spec(
         info: &SessionInfo,
         launch_mode: AgentLaunchMode,
@@ -23313,6 +23931,8 @@ mod tests {
         let cwd = dir.path().display().to_string();
         let missing_program = dir.path().join(cokacdir_local_filename());
         let mut app = app_for_key_tests();
+        let (tx, rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
         app.settings.cokacmux.cokacdir_program = Some(missing_program.display().to_string());
         app.input_mode = InputMode::NewSession {
             selected: NEW_SESSION_FIELD_KIND,
@@ -23332,6 +23952,11 @@ mod tests {
             24,
             &keybindings,
         );
+
+        // The cokacdir program check runs in the attach worker's prepare
+        // stage; the failure dialog opens when its result is applied.
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        pump_attach_result(&mut app, &rx);
 
         match &app.input_mode {
             InputMode::Notice { title, message } => {
@@ -24192,6 +24817,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("deleted-project");
         let mut app = app_for_key_tests();
+        let (tx, rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
         app.input_mode = InputMode::AgentLaunch {
             selected: 0,
             source: session_info(
@@ -24208,6 +24835,12 @@ mod tests {
             80,
             20,
         );
+
+        // Confirm closes the dialog and hands off to the attach worker; the
+        // missing-cwd precheck comes back as an attach result.
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.attach_in_flight.is_some());
+        pump_attach_result(&mut app, &rx);
 
         match &app.input_mode {
             InputMode::CreateFolderConfirm {
@@ -24271,8 +24904,14 @@ mod tests {
         let target = dir.path().join("clone-target");
         let snapshot_path = dir.path().join("snapshot-data");
         let mut app = app_for_key_tests();
+        let (tx, rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
         app.input_mode = InputMode::RestoreDataConfirm {
-            info: session_info(Provider::Codex, "clone-id", &target.display().to_string()),
+            info: session_info(
+                Provider::Codex,
+                &format!("clone-id-{}", uuid::Uuid::now_v7()),
+                &target.display().to_string(),
+            ),
             snapshot: session_data_snapshot(
                 Provider::Codex,
                 "clone-id",
@@ -24292,6 +24931,11 @@ mod tests {
             80,
             20,
         );
+
+        // Skipping the restore starts the attach; its missing-cwd precheck
+        // returns through the worker result.
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        pump_attach_result(&mut app, &rx);
 
         match &app.input_mode {
             InputMode::CreateFolderConfirm { path, selected, .. } => {
@@ -26338,6 +26982,144 @@ mod tests {
             opencode_skip.env,
             vec![("OPENCODE_PERMISSION".into(), r#"{"*":"allow"}"#.into())]
         );
+    }
+
+    #[test]
+    fn new_agent_session_uuid_requires_prefixed_uuid() {
+        let uuid = uuid::Uuid::now_v7();
+        assert_eq!(
+            new_agent_session_uuid(&format!("new-{uuid}")),
+            Some(uuid)
+        );
+        assert_eq!(new_agent_session_uuid("new-agent"), None);
+        assert_eq!(new_agent_session_uuid(&uuid.to_string()), None);
+    }
+
+    #[test]
+    fn fresh_claude_launch_spec_pins_session_id_from_synthetic_key() {
+        let info = new_agent_session_info(Provider::Claude, "/repo".to_string());
+        let session_uuid = new_agent_session_uuid(&info.session_id).unwrap();
+
+        let spec = default_agent_launch_spec(&info, AgentLaunchMode::Normal);
+        assert_eq!(
+            spec.args,
+            vec!["--session-id".to_string(), session_uuid.to_string()]
+        );
+
+        let skip = default_agent_launch_spec(&info, AgentLaunchMode::SkipPermissions);
+        assert_eq!(
+            skip.args,
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--session-id".to_string(),
+                session_uuid.to_string()
+            ]
+        );
+
+        // Synthetic ids without an embedded uuid (legacy daemons) launch bare.
+        let legacy = default_agent_launch_spec(
+            &new_agent_info(Provider::Claude, "/repo"),
+            AgentLaunchMode::Normal,
+        );
+        assert!(legacy.args.is_empty());
+    }
+
+    #[test]
+    fn claude_new_agent_backing_session_requires_written_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects_root = dir.path();
+        let session_uuid = uuid::Uuid::now_v7();
+        let cwd = "/repo";
+
+        assert!(
+            claude_new_agent_backing_session_in_root(projects_root, cwd, session_uuid).is_none()
+        );
+
+        let project_dir =
+            projects_root.join(cokacmux::providers::claude::path::encode_cwd(cwd));
+        fs::create_dir_all(&project_dir).unwrap();
+        let session_file = project_dir.join(format!("{session_uuid}.jsonl"));
+        fs::write(&session_file, "{}\n").unwrap();
+
+        let backing =
+            claude_new_agent_backing_session_in_root(projects_root, cwd, session_uuid).unwrap();
+        assert_eq!(
+            backing.key,
+            AgentKey {
+                provider: Provider::Claude,
+                session_id: session_uuid.to_string(),
+            }
+        );
+        assert_eq!(backing.backing_path, session_file);
+    }
+
+    #[test]
+    fn cached_backing_states_apply_to_all_providers() {
+        for provider in [Provider::Claude, Provider::OpenCode, Provider::Codex] {
+            let fresh = new_agent_info(provider, "/repo");
+            let synthetic_key = AgentKey::new(&fresh);
+            let backing_key = AgentKey {
+                provider,
+                session_id: "real-session".into(),
+            };
+            let mut states = HashMap::new();
+            states.insert(
+                synthetic_key.clone(),
+                AgentListState::Live {
+                    activity: AgentActivity::Busy,
+                },
+            );
+            let mut aliases = HashMap::new();
+            aliases.insert(synthetic_key, backing_key.clone());
+
+            apply_cached_new_agent_backing_states(&[fresh], &aliases, &mut states);
+
+            assert_eq!(
+                states.get(&backing_key).copied(),
+                Some(AgentListState::Live {
+                    activity: AgentActivity::Busy
+                }),
+                "provider {provider:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_backing_states_apply_cached_aliases_for_all_providers() {
+        for provider in [Provider::Claude, Provider::OpenCode, Provider::Codex] {
+            let fresh = new_agent_info(provider, "/repo");
+            let synthetic_key = AgentKey::new(&fresh);
+            let backing_key = AgentKey {
+                provider,
+                session_id: "real-session".into(),
+            };
+            let mut states = HashMap::new();
+            states.insert(
+                synthetic_key.clone(),
+                AgentListState::Live {
+                    activity: AgentActivity::Quiet,
+                },
+            );
+            let mut aliases = HashMap::new();
+            aliases.insert(synthetic_key, backing_key.clone());
+            let mut probe_after = HashMap::new();
+
+            apply_new_agent_backing_states_to_snapshot(
+                &[fresh],
+                &mut aliases,
+                &mut probe_after,
+                &mut states,
+                false,
+            );
+
+            assert_eq!(
+                states.get(&backing_key).copied(),
+                Some(AgentListState::Live {
+                    activity: AgentActivity::Quiet
+                }),
+                "provider {provider:?}"
+            );
+        }
     }
 
     #[cfg(windows)]

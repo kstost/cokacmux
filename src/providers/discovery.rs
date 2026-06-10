@@ -432,6 +432,79 @@ fn latest_opencode_by_cwd(cwd: &str) -> Result<SessionInfo> {
         .ok_or_else(|| ConvertError::Parse(format!("no opencode session matching cwd {}", cwd)))
 }
 
+/// Find the single top-level OpenCode session in `cwd` created at or after
+/// `created_after_epoch_ms`. Returns `(session_id, db_path)` only when exactly
+/// one row qualifies — zero or several candidates yield None so callers never
+/// link the wrong session.
+#[cfg(feature = "opencode")]
+pub fn unique_opencode_session_created_after(
+    cwd: &str,
+    created_after_epoch_ms: i64,
+) -> Option<(String, std::path::PathBuf)> {
+    let db = default_opencode_db_candidates()
+        .into_iter()
+        .find(|p| p.is_file())?;
+    match unique_opencode_session_created_after_in_db(&db, cwd, created_after_epoch_ms) {
+        Ok(Some(session_id)) => Some((session_id, db)),
+        Ok(None) => None,
+        Err(error) => {
+            crate::debug::log(
+                "discovery_opencode_created_after_error",
+                serde_json::json!({
+                    "db_path": db.display().to_string(),
+                    "cwd": cwd,
+                    "created_after_epoch_ms": created_after_epoch_ms,
+                    "error": error.to_string(),
+                }),
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "opencode"))]
+pub fn unique_opencode_session_created_after(
+    _cwd: &str,
+    _created_after_epoch_ms: i64,
+) -> Option<(String, std::path::PathBuf)> {
+    None
+}
+
+#[cfg(feature = "opencode")]
+fn unique_opencode_session_created_after_in_db(
+    db: &Path,
+    cwd: &str,
+    created_after_epoch_ms: i64,
+) -> Result<Option<String>> {
+    let conn = crate::providers::opencode::db::open_readonly(db)?;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM session \
+         WHERE directory = ?1 AND time_created >= ?2 AND parent_id IS NULL",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(rusqlite::params![cwd, created_after_epoch_ms], |row| {
+            row.get::<_, String>(0)
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    match ids.as_slice() {
+        [id] => Ok(Some(id.clone())),
+        [] => Ok(None),
+        many => {
+            crate::debug::log(
+                "discovery_opencode_created_after_ambiguous",
+                serde_json::json!({
+                    "db_path": db.display().to_string(),
+                    "cwd": cwd,
+                    "created_after_epoch_ms": created_after_epoch_ms,
+                    "matches": many,
+                }),
+            );
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(feature = "opencode")]
 fn default_opencode_db_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -551,6 +624,64 @@ mod tests {
         assert_eq!(
             titles.get("s1").map(String::as_str),
             Some("Codex Thread Title")
+        );
+    }
+
+    #[cfg(feature = "opencode")]
+    #[test]
+    fn unique_opencode_session_created_after_requires_single_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode.db");
+        let conn = crate::providers::opencode::db::open_readwrite(&db).unwrap();
+        conn.execute_batch(crate::providers::opencode::db::SCHEMA_MIN)
+            .unwrap();
+        let insert = "INSERT INTO session \
+             (id, project_id, parent_id, directory, time_created, time_updated) \
+             VALUES (?1, 'proj', ?2, ?3, ?4, ?4)";
+        conn.execute(
+            insert,
+            rusqlite::params!["ses_old", None::<String>, "/repo", 1_000i64],
+        )
+        .unwrap();
+
+        // Sessions created before the cutoff never match.
+        assert_eq!(
+            unique_opencode_session_created_after_in_db(&db, "/repo", 2_000).unwrap(),
+            None
+        );
+
+        conn.execute(
+            insert,
+            rusqlite::params!["ses_fresh", None::<String>, "/repo", 3_000i64],
+        )
+        .unwrap();
+        conn.execute(
+            insert,
+            rusqlite::params!["ses_child", "ses_fresh", "/repo", 3_500i64],
+        )
+        .unwrap();
+        conn.execute(
+            insert,
+            rusqlite::params!["ses_other", None::<String>, "/elsewhere", 3_000i64],
+        )
+        .unwrap();
+
+        // Child sessions and other directories are ignored.
+        assert_eq!(
+            unique_opencode_session_created_after_in_db(&db, "/repo", 2_000).unwrap(),
+            Some("ses_fresh".to_string())
+        );
+
+        conn.execute(
+            insert,
+            rusqlite::params!["ses_second", None::<String>, "/repo", 4_000i64],
+        )
+        .unwrap();
+
+        // Two qualifying sessions are ambiguous: link nothing.
+        assert_eq!(
+            unique_opencode_session_created_after_in_db(&db, "/repo", 2_000).unwrap(),
+            None
         );
     }
 }
