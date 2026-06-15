@@ -30,6 +30,30 @@ pub struct NativeValidationCheck {
     pub detail: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct NativeValidationOpts {
+    /// Codex live clone/list-resume validation must prove that
+    /// `state_5.sqlite::threads` points at the rollout. Install callers may
+    /// intentionally disable that side effect, so their validation must match
+    /// the requested write scope instead of failing after writing the file.
+    pub require_codex_state_index: bool,
+    /// Override the Codex state DB used to verify `threads`.
+    ///
+    /// Install callers may write the rollout under one `codex_home` while
+    /// updating a cloned or otherwise explicit `state_5.sqlite`. Validation
+    /// must check the same DB the writer updated.
+    pub codex_state_5_path: Option<PathBuf>,
+}
+
+impl Default for NativeValidationOpts {
+    fn default() -> Self {
+        Self {
+            require_codex_state_index: true,
+            codex_state_5_path: None,
+        }
+    }
+}
+
 impl NativeValidationReport {
     fn new(provider: Provider, session_id: impl Into<String>, artifact: impl Into<String>) -> Self {
         Self {
@@ -65,7 +89,11 @@ impl NativeValidationReport {
 pub fn validate_info(info: &SessionInfo) -> Result<NativeValidationReport> {
     match info.provider {
         Provider::Claude => validate_claude_file(&info.source, &info.session_id),
-        Provider::Codex => validate_codex_rollout(&info.source, &info.session_id),
+        Provider::Codex => validate_codex_rollout(
+            &info.source,
+            &info.session_id,
+            &NativeValidationOpts::default(),
+        ),
         Provider::OpenCode => validate_opencode_db(&info.source, &info.session_id),
     }
 }
@@ -75,9 +103,25 @@ pub fn validate_clone_artifact(
     session_id: &str,
     artifact: &ArtifactPath,
 ) -> Result<NativeValidationReport> {
+    validate_clone_artifact_with_opts(
+        provider,
+        session_id,
+        artifact,
+        NativeValidationOpts::default(),
+    )
+}
+
+pub fn validate_clone_artifact_with_opts(
+    provider: Provider,
+    session_id: &str,
+    artifact: &ArtifactPath,
+    opts: NativeValidationOpts,
+) -> Result<NativeValidationReport> {
     match (provider, artifact) {
         (Provider::Claude, ArtifactPath::File(path)) => validate_claude_file(path, session_id),
-        (Provider::Codex, ArtifactPath::File(path)) => validate_codex_rollout(path, session_id),
+        (Provider::Codex, ArtifactPath::File(path)) => {
+            validate_codex_rollout(path, session_id, &opts)
+        }
         (
             Provider::OpenCode,
             ArtifactPath::OpenCodeDb {
@@ -273,7 +317,11 @@ fn claude_api_content_type_is_known_safe(kind: &str) -> bool {
     )
 }
 
-fn validate_codex_rollout(path: &Path, session_id: &str) -> Result<NativeValidationReport> {
+fn validate_codex_rollout(
+    path: &Path,
+    session_id: &str,
+    opts: &NativeValidationOpts,
+) -> Result<NativeValidationReport> {
     let mut report =
         NativeValidationReport::new(Provider::Codex, session_id, path.display().to_string());
     report.check("file_exists", path.is_file(), path.display().to_string());
@@ -290,7 +338,20 @@ fn validate_codex_rollout(path: &Path, session_id: &str) -> Result<NativeValidat
         }
     };
     validate_codex_jsonl_text(&mut report, &content, session_id);
-    validate_codex_state_index(&mut report, path, session_id);
+    if opts.require_codex_state_index {
+        validate_codex_state_index(
+            &mut report,
+            path,
+            session_id,
+            opts.codex_state_5_path.as_deref(),
+        );
+    } else {
+        report.check(
+            "state_5_index_required",
+            true,
+            "skipped: caller disabled codex index update".to_string(),
+        );
+    }
     Ok(report)
 }
 
@@ -378,21 +439,26 @@ fn validate_codex_state_index(
     report: &mut NativeValidationReport,
     rollout_path: &Path,
     session_id: &str,
+    state_5_override: Option<&Path>,
 ) {
-    let Some(codex_home) = infer_codex_home_from_rollout(rollout_path) else {
-        report.check(
-            "state_5_home_inferred",
-            false,
-            "rollout path is not under sessions/YYYY/MM/DD".to_string(),
-        );
-        return;
+    let state_5 = if let Some(state_5) = state_5_override {
+        state_5.to_path_buf()
+    } else {
+        let Some(codex_home) = infer_codex_home_from_rollout(rollout_path) else {
+            report.check(
+                "state_5_home_inferred",
+                false,
+                "rollout path is not under sessions/YYYY/MM/DD".to_string(),
+            );
+            return;
+        };
+        codex_home.join("state_5.sqlite")
     };
-    let state_5 = codex_home.join("state_5.sqlite");
     if !state_5.is_file() {
         report.check(
             "state_5_index_present",
-            true,
-            format!("skipped: {} not found", state_5.display()),
+            false,
+            format!("{} not found", state_5.display()),
         );
         return;
     }
@@ -423,10 +489,11 @@ fn validate_codex_state_index(
     }
     #[cfg(not(feature = "opencode"))]
     {
+        let _ = session_id;
         report.check(
             "state_5_thread_row",
-            true,
-            "skipped: opencode feature disabled".to_string(),
+            false,
+            "cannot verify Codex state_5.sqlite without opencode/rusqlite feature".to_string(),
         );
     }
 }
@@ -504,14 +571,52 @@ fn validate_opencode_db_connection(
             },
         )
         .map(|(directory, slug, version, path)| {
-            !directory.is_empty() && !slug.is_empty() && !version.is_empty() && !path.is_empty()
+            // OpenCode 1.15.x native rows may leave `path` empty for global
+            // sessions. Current list/resume behavior relies on directory,
+            // slug, and version being present; `path` is optional.
+            let path_ok = path.is_empty() || !path.trim().is_empty();
+            !directory.is_empty() && !slug.is_empty() && !version.is_empty() && path_ok
         })
         .unwrap_or(false);
     report.check(
         "session_metadata_non_empty",
         metadata_ok,
-        "directory/slug/version/path".to_string(),
+        "directory/slug/version; path optional".to_string(),
     );
+    let project_link = conn
+        .query_row(
+            "SELECT s.project_id, s.directory, p.worktree
+             FROM session s
+             LEFT JOIN project p ON p.id = s.project_id
+             WHERE s.id = ?1",
+            rusqlite::params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok();
+    report.check(
+        "project_row_present",
+        project_link
+            .as_ref()
+            .and_then(|(_, _, worktree)| worktree.as_ref())
+            .is_some(),
+        format!(
+            "project_id={:?}",
+            project_link.as_ref().map(|(project_id, _, _)| project_id)
+        ),
+    );
+    if let Some((project_id, directory, Some(worktree))) = project_link {
+        report.check(
+            "non_global_project_worktree_matches_directory",
+            project_id == "global" || worktree == directory,
+            format!("project_id={project_id}, directory={directory}, worktree={worktree}"),
+        );
+    }
     let message_rows = count_query(
         conn,
         "SELECT COUNT(*) FROM message WHERE session_id = ?1",
@@ -614,6 +719,7 @@ fn count_non_native_ids(
     Some(count)
 }
 
+#[cfg(feature = "opencode")]
 fn is_opencode_native_id(id: &str, prefix: &str) -> bool {
     let Some(body) = id.strip_prefix(prefix) else {
         return false;

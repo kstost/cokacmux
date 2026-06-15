@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS project (
     time_created INTEGER NOT NULL,
     time_updated INTEGER NOT NULL,
     time_initialized INTEGER,
-    sandboxes TEXT NOT NULL DEFAULT '{}',
+    sandboxes TEXT NOT NULL DEFAULT '[]',
     commands TEXT,
     icon_url_override TEXT
 );

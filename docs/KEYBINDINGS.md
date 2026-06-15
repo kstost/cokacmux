@@ -303,8 +303,10 @@ clone 실행 전에 세션만 복제할지, 저장 가능한 폴더 데이터도
 |---|---|---|
 | `clone_options.cancel` | `esc` | clone 취소 |
 | `clone_options.confirm` | `enter` | 선택한 버튼 실행 |
-| `clone_options.next` | `right`, `down`, `l`, `j`, `tab` | 다음 버튼 선택 |
-| `clone_options.prev` | `left`, `up`, `h`, `k`, `backtab` | 이전 버튼 선택 |
+| `clone_options.next` | `right`, `down`, `l`, `j` | 다음 버튼 선택 |
+| `clone_options.prev` | `left`, `up`, `h`, `k` | 이전 버튼 선택 |
+| `clone_options.target_next` | `tab` | 다음 대상 provider 선택 |
+| `clone_options.target_prev` | `backtab` | 이전 대상 provider 선택 |
 | `clone_options.session_only` | `1` | Session only 버튼 실행 |
 | `clone_options.folder_data` | `2` | Folder data too 버튼 실행 |
 | `clone_options.cancel_choice` | `3` | Cancel 버튼 실행 |

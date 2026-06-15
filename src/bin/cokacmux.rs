@@ -48,8 +48,9 @@ unsafe extern "system" {
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
+    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -136,6 +137,10 @@ const NEW_AGENT_BACKING_PROBE_INTERVAL_MS: u64 = 5_000;
 const MAIN_EVENT_DRAIN_LIMIT: usize = 64;
 const MAIN_EVENT_DRAIN_BUDGET_MS: u64 = 8;
 const AGENT_CLIENT_OUTPUT_DRAIN_BYTES: usize = 16 * 1024;
+const BRACKETED_PASTE_INPUT_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_INPUT_END: &[u8] = b"\x1b[201~";
+const BRACKETED_PASTE_MODE_PARAM: u32 = 2004;
+const BRACKETED_PASTE_MODE_SCAN_TAIL_BYTES: usize = 128;
 const PERF_LOG_THRESHOLD_MS: u128 = 50;
 const UI_STALL_LOG_THRESHOLD_MS: u64 = 2_000;
 const UI_STALL_LOG_COOLDOWN_MS: u64 = 2_000;
@@ -599,6 +604,8 @@ enum KeyAction {
     CloneOptionsConfirm,
     CloneOptionsNext,
     CloneOptionsPrev,
+    CloneOptionsTargetNext,
+    CloneOptionsTargetPrev,
     CloneOptionsSessionOnly,
     CloneOptionsFolderData,
     CloneOptionsCancelChoice,
@@ -886,12 +893,22 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "clone_options.next",
         KeyAction::CloneOptionsNext,
-        &["right", "down", "l", "j", "tab"],
+        &["right", "down", "l", "j"],
     ),
     (
         "clone_options.prev",
         KeyAction::CloneOptionsPrev,
-        &["left", "up", "h", "k", "backtab"],
+        &["left", "up", "h", "k"],
+    ),
+    (
+        "clone_options.target_next",
+        KeyAction::CloneOptionsTargetNext,
+        &["tab"],
+    ),
+    (
+        "clone_options.target_prev",
+        KeyAction::CloneOptionsTargetPrev,
+        &["backtab"],
     ),
     (
         "clone_options.session_only",
@@ -1678,6 +1695,10 @@ fn available_agent_provider_options(agent_programs: &AgentProgramSettings) -> Ve
         .collect()
 }
 
+fn clone_target_provider_options() -> Vec<Provider> {
+    PROVIDER_OPTIONS.to_vec()
+}
+
 fn normalize_agent_provider_selection(
     provider: Provider,
     options: &[Provider],
@@ -1796,6 +1817,7 @@ enum InputMode {
     CloneOptions {
         source: SessionInfo,
         target: Provider,
+        target_options: Vec<Provider>,
         selected: usize,
         folder_data: CloneFolderDataAvailability,
     },
@@ -2479,11 +2501,16 @@ struct AgentSession {
     last_meta_activity_write_epoch_ms: u64,
     debug_drain_logs: u32,
     terminal_response_scan_tail: Vec<u8>,
+    bracketed_paste_mode: bool,
+    bracketed_paste_scan_tail: Vec<u8>,
 }
 
 enum DaemonDiskJob {
     PtyAppend(Vec<u8>),
-    WriteMeta { meta_path: PathBuf, contents: String },
+    WriteMeta {
+        meta_path: PathBuf,
+        contents: String,
+    },
 }
 
 /// Shared between the daemon loop and its disk writer thread: the writer
@@ -2554,12 +2581,7 @@ fn run_daemon_disk_writer(
                 meta_path,
                 contents,
             } => {
-                let _ = persist_agent_meta(
-                    &meta_path,
-                    provider.as_str(),
-                    &session_id,
-                    &contents,
-                );
+                let _ = persist_agent_meta(&meta_path, provider.as_str(), &session_id, &contents);
             }
         }
     }
@@ -2889,6 +2911,8 @@ impl AgentSession {
             last_meta_activity_write_epoch_ms: now_ms,
             debug_drain_logs: 0,
             terminal_response_scan_tail: Vec::new(),
+            bracketed_paste_mode: false,
+            bracketed_paste_scan_tail: Vec::new(),
         })
     }
 
@@ -2901,6 +2925,21 @@ impl AgentSession {
                     self.last_output_epoch_ms = current_epoch_ms();
                     drain.activity_changed = true;
                     self.append_pty_log(&bytes);
+                    let bracketed_changed = update_bracketed_paste_mode_from_output(
+                        &mut self.bracketed_paste_mode,
+                        &mut self.bracketed_paste_scan_tail,
+                        &bytes,
+                    );
+                    if bracketed_changed && DEBUG_ENABLED.load(Ordering::Relaxed) {
+                        debug_log(
+                            "daemon_bracketed_paste_mode_changed",
+                            serde_json::json!({
+                                "provider": self.info.provider.as_str(),
+                                "session_id": &self.info.session_id,
+                                "enabled": self.bracketed_paste_mode,
+                            }),
+                        );
+                    }
                     if process_parser_output(
                         &mut self.parser,
                         &bytes,
@@ -3773,6 +3812,8 @@ enum AgentDaemonEvent {
         last_output_epoch_ms: u64,
         #[serde(default)]
         last_input_epoch_ms: u64,
+        #[serde(default)]
+        bracketed_paste_mode: bool,
     },
     Output {
         data: Vec<u8>,
@@ -3843,6 +3884,8 @@ struct AgentClient {
     startup_spinner_started_at: Option<Instant>,
     debug_output_events: u32,
     codex_transcript_overlay_assumed_open: bool,
+    bracketed_paste_mode: bool,
+    bracketed_paste_scan_tail: Vec<u8>,
     /// Monotonic id identifying the reader/writer threads for this attach.
     /// Forwarded inside socket-thread events so the main loop can ignore
     /// events that belong to a previous attach.
@@ -4220,6 +4263,8 @@ impl AgentClient {
             startup_spinner_started_at: None,
             debug_output_events: 0,
             codex_transcript_overlay_assumed_open: false,
+            bracketed_paste_mode: false,
+            bracketed_paste_scan_tail: Vec::new(),
             reader_id,
             reader_thread: Some(reader_thread),
             writer_thread: Some(writer_thread),
@@ -4239,9 +4284,12 @@ impl AgentClient {
                 last_screen_change_epoch_ms,
                 last_output_epoch_ms,
                 last_input_epoch_ms,
+                bracketed_paste_mode,
                 ..
             } => {
                 self.command_line = command;
+                self.bracketed_paste_mode = bracketed_paste_mode;
+                self.bracketed_paste_scan_tail.clear();
                 let visible_rows = self.pty_size.rows as usize;
                 let verbose_debug = TRACE_ENABLED.load(Ordering::Relaxed);
                 let state_before = verbose_debug.then(|| {
@@ -4263,6 +4311,7 @@ impl AgentClient {
                         "last_screen_change_epoch_ms": last_screen_change_epoch_ms,
                         "last_output_epoch_ms": last_output_epoch_ms,
                         "last_input_epoch_ms": last_input_epoch_ms,
+                        "bracketed_paste_mode": bracketed_paste_mode,
                         "state_before": state_before,
                     }),
                 );
@@ -4369,6 +4418,21 @@ impl AgentClient {
     }
 
     fn process_agent_output(&mut self, data: &[u8], counts_as_activity: bool) {
+        let bracketed_changed = update_bracketed_paste_mode_from_output(
+            &mut self.bracketed_paste_mode,
+            &mut self.bracketed_paste_scan_tail,
+            data,
+        );
+        if bracketed_changed && DEBUG_ENABLED.load(Ordering::Relaxed) {
+            debug_log(
+                "agent_client_bracketed_paste_mode_changed",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "enabled": self.bracketed_paste_mode,
+                }),
+            );
+        }
         self.process_agent_output_inner(data, counts_as_activity, true);
     }
 
@@ -4631,9 +4695,8 @@ impl AgentClient {
             rows: next.rows,
         });
         if should_debug {
-            let state_after = verbose_debug.then(|| {
-                debug_agent_client_state_value(self, visible_rows, visible_rows.min(120))
-            });
+            let state_after = verbose_debug
+                .then(|| debug_agent_client_state_value(self, visible_rows, visible_rows.min(120)));
             debug_log(
                 "agent_client_resize",
                 serde_json::json!({
@@ -4760,6 +4823,60 @@ impl AgentClient {
                     }),
                 );
             }
+        }
+    }
+
+    fn send_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let data = paste_text_to_agent_bytes(text, self.bracketed_paste_mode);
+        if data.is_empty() {
+            return;
+        }
+        let scrollback_before = self.scrollback_offset();
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            let visible_rows = self.pty_size.rows as usize;
+            let state_before = TRACE_ENABLED
+                .load(Ordering::Relaxed)
+                .then(|| debug_agent_client_state_value(self, visible_rows, visible_rows.min(120)));
+            debug_log(
+                "agent_client_forward_paste",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "text_len": text.len(),
+                    "data": debug_terminal_data_summary(&data, 128),
+                    "bracketed_paste_mode": self.bracketed_paste_mode,
+                    "scrollback_before": scrollback_before,
+                    "state_before": state_before,
+                }),
+            );
+        }
+        if self.scrollback_offset() > 0 {
+            self.set_scrollback_offset(0);
+            self.history_scroll_offset = 0;
+        }
+        self.last_input_epoch_ms = current_epoch_ms();
+        self.pending_input_since_epoch_ms = Some(self.last_input_epoch_ms);
+        self.pending_input_key = Some("paste".into());
+        self.pending_input_count = self.pending_input_count.saturating_add(1);
+        let send_result = self.send_request(AgentDaemonRequest::Input { data });
+        if send_result.is_err() {
+            self.pending_input_since_epoch_ms = None;
+            self.pending_input_key = None;
+        }
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            debug_log(
+                "agent_client_forward_paste_sent",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "send_ok": send_result.is_ok(),
+                    "send_error": send_result.err().map(|e| e.to_string()),
+                    "scrollback_after": self.scrollback_offset(),
+                }),
+            );
         }
     }
 
@@ -6933,6 +7050,7 @@ impl App {
             .cloned()
             .collect::<Vec<_>>();
         self.live_shells = next_live_shells;
+        self.sync_active_plain_pty_tool_info_from_live_shells();
         self.overlay_active_agent_runtime_state();
         apply_cached_new_agent_backing_states(
             &self.live_shells,
@@ -7286,6 +7404,7 @@ impl App {
     fn apply_agent_runtime_refresh_result(&mut self, result: AgentRuntimeRefreshResult) {
         self.runtime_refresh_applied_seq = self.runtime_refresh_applied_seq.max(result.seq);
         self.live_shells = result.live_shells;
+        self.sync_active_plain_pty_tool_info_from_live_shells();
         self.agent_states = result.agent_states;
         self.new_agent_backing_aliases = result.new_agent_backing_aliases;
         self.new_agent_backing_probe_after = result.new_agent_backing_probe_after;
@@ -7376,6 +7495,42 @@ impl App {
                 }),
             );
         }
+    }
+
+    fn sync_active_plain_pty_tool_info_from_live_shells(&mut self) {
+        let Some(agent) = self.active_agent.as_mut() else {
+            return;
+        };
+        if !is_plain_pty_tool_session_info(&agent.info) {
+            return;
+        }
+        let key = AgentKey::new(&agent.info);
+        let Some(info) = self
+            .live_shells
+            .iter()
+            .find(|info| AgentKey::new(info) == key)
+            .cloned()
+        else {
+            return;
+        };
+        if agent.info.cwd == info.cwd
+            && agent.info.source == info.source
+            && agent.info.updated_at_epoch_s == info.updated_at_epoch_s
+            && agent.info.title == info.title
+        {
+            return;
+        }
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            debug_log(
+                "active_pty_tool_info_synced",
+                serde_json::json!({
+                    "key": agent_key_debug_value(&key),
+                    "before": session_info_debug_value(&agent.info),
+                    "after": session_info_debug_value(&info),
+                }),
+            );
+        }
+        agent.info = info;
     }
 
     fn mark_agent_attached_locally(&mut self, key: AgentKey) {
@@ -7611,12 +7766,13 @@ impl App {
         let agent_states = &self.agent_states;
         let live_shells = &self.live_shells;
         self.agent_sidebar_order.retain(|key| {
-            candidates.iter().any(|info| {
-                info.provider == key.provider && info.session_id == key.session_id
-            }) || agent_states.contains_key(key)
-                || live_shells.iter().any(|info| {
-                    info.provider == key.provider && info.session_id == key.session_id
-                })
+            candidates
+                .iter()
+                .any(|info| info.provider == key.provider && info.session_id == key.session_id)
+                || agent_states.contains_key(key)
+                || live_shells
+                    .iter()
+                    .any(|info| info.provider == key.provider && info.session_id == key.session_id)
         });
         candidates.sort_by_key(|info| {
             position
@@ -8942,7 +9098,11 @@ impl App {
                         short_id,
                         skip_suffix
                     ),
-                    format!("attach {} agent {} failed: ", key.provider.as_str(), short_id),
+                    format!(
+                        "attach {} agent {} failed: ",
+                        key.provider.as_str(),
+                        short_id
+                    ),
                     format!(
                         "prepare {} agent {} failed: ",
                         key.provider.as_str(),
@@ -9263,10 +9423,7 @@ impl App {
                     "killed {}; switched to live {}",
                     killed_label, next_label
                 ),
-                status_started: format!(
-                    "killed {}; switched to live {}",
-                    killed_label, next_label
-                ),
+                status_started: format!("killed {}; switched to live {}", killed_label, next_label),
                 status_err_prefix: format!(
                     "killed {}; switch to live {} failed: ",
                     killed_label, next_label
@@ -9324,10 +9481,7 @@ impl App {
                     "{} exited; switched to live {}",
                     exited_label, next_label
                 ),
-                status_started: format!(
-                    "{} exited; switched to live {}",
-                    exited_label, next_label
-                ),
+                status_started: format!("{} exited; switched to live {}", exited_label, next_label),
                 status_err_prefix: format!(
                     "{} exited; switch to live {} failed: ",
                     exited_label, next_label
@@ -9562,6 +9716,12 @@ impl App {
                     }),
                 );
             }
+        }
+    }
+
+    fn send_paste_to_active_agent(&mut self, text: &str) {
+        if let Some(agent) = self.active_agent.as_mut() {
+            agent.send_paste(text);
         }
     }
 
@@ -9873,10 +10033,13 @@ impl App {
                 CloneFolderDataAvailability::Unavailable(reason)
             }
         };
+        let target_options = clone_target_provider_options();
+        let target = normalize_agent_provider_selection(target, &target_options).unwrap_or(target);
         self.status = "choose clone option.".into();
         self.input_mode = InputMode::CloneOptions {
             source: info,
             target,
+            target_options,
             selected: CLONE_OPTION_SESSION_ONLY,
             folder_data,
         };
@@ -9897,10 +10060,23 @@ impl App {
             }),
         );
         let seq = self.next_data_task_seq();
-        let label = if copy_folder_data {
+        let same_provider = info.provider == target;
+        let label = if same_provider && copy_folder_data {
             format!("cloning {} session + folder data", info.provider.as_str())
-        } else {
+        } else if same_provider {
             format!("cloning {} session", info.provider.as_str())
+        } else if copy_folder_data {
+            format!(
+                "preparing {} context session for {} + folder data",
+                info.provider.as_str(),
+                target.as_str()
+            )
+        } else {
+            format!(
+                "preparing {} context session for {}",
+                info.provider.as_str(),
+                target.as_str()
+            )
         };
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.data_task = Some(
@@ -10673,6 +10849,14 @@ fn compute_agent_runtime_refresh(
     );
     debug_agent_runtime_refresh_step(request.seq, "merge_live_shells", step_started.elapsed());
 
+    let step_started = Instant::now();
+    let live_shells = refresh_live_shell_infos_from_meta(live_shells, live_agent_meta_snapshot);
+    debug_agent_runtime_refresh_step(
+        request.seq,
+        "refresh_live_shell_infos_from_meta",
+        step_started.elapsed(),
+    );
+
     let mut states = HashMap::new();
     let mut runtime_keys: Vec<AgentKey> = live_shells.iter().map(AgentKey::new).collect();
     runtime_keys.extend(request.previous_states.keys().cloned());
@@ -11151,7 +11335,7 @@ fn print_help() {
          v             toggle session list/tree view\n  \
          t             edit selected session title\n  \
          r             refresh from disk\n  \
-         c             clone/convert selected session\n  \
+         c             clone selected session\n  \
          e / Enter     switch to live selected agent, or choose launch mode to start it\n  \
          Ctrl+] / Ctrl+[ switch between sessions and active agent\n  \
          Ctrl+K        kill selected/current agent\n  \
@@ -11166,6 +11350,14 @@ fn setup_terminal() -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    let bracketed_paste = execute!(stdout, EnableBracketedPaste);
+    debug_log(
+        "terminal_bracketed_paste_enable",
+        serde_json::json!({
+            "ok": bracketed_paste.is_ok(),
+            "error": bracketed_paste.err().map(|e| e.to_string()),
+        }),
+    );
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -11181,6 +11373,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     terminal.show_cursor()?;
     disable_raw_mode()?;
     let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -11464,6 +11657,60 @@ fn handle_actionable_input_event(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_paste_input_event(app: &mut App, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    if app.is_agent_view() && matches!(app.input_mode, InputMode::Normal) {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let _ = app.sync_active_agent_viewport(cols, rows);
+        app.send_paste_to_active_agent(&text);
+        return;
+    }
+    if paste_text_into_input_mode(app, &text) {
+        return;
+    }
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        debug_log(
+            "input_paste_ignored",
+            serde_json::json!({
+                "len": text.len(),
+                "agent_view": app.is_agent_view(),
+                "input_mode": input_mode_label(&app.input_mode),
+            }),
+        );
+    }
+}
+
+fn paste_text_into_input_mode(app: &mut App, text: &str) -> bool {
+    let text = text_field_paste_text(text);
+    match &mut app.input_mode {
+        InputMode::Filter { draft, cursor } => {
+            if app.search_pending.is_some() {
+                return true;
+            }
+            insert_str_at_cursor(draft, cursor, &text);
+            true
+        }
+        InputMode::NewSession {
+            selected,
+            cwd,
+            cwd_cursor,
+            ..
+        } => {
+            if *selected == NEW_SESSION_FIELD_CWD {
+                insert_str_at_cursor(cwd, cwd_cursor, &text);
+            }
+            true
+        }
+        InputMode::TitleEdit { draft, cursor, .. } => {
+            insert_str_at_cursor(draft, cursor, &text);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn handle_main_event(
     app: &mut App,
     event: MainEvent,
@@ -11484,6 +11731,12 @@ fn handle_main_event(
     );
     let started = Instant::now();
     match event {
+        MainEvent::Input {
+            event: Event::Paste(text),
+            ..
+        } => {
+            handle_paste_input_event(app, text);
+        }
         MainEvent::Input {
             event: Event::Key(key),
             ..
@@ -12556,6 +12809,7 @@ fn send_daemon_attached(
         last_screen_change_epoch_ms: agent.last_screen_change_epoch_ms,
         last_output_epoch_ms: agent.last_output_epoch_ms,
         last_input_epoch_ms: agent.last_input_epoch_ms,
+        bracketed_paste_mode: agent.bracketed_paste_mode,
     })?;
     conn.send_event(&AgentDaemonEvent::Snapshot { data: snapshot })
 }
@@ -12957,6 +13211,56 @@ fn live_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
     })
 }
 
+fn session_info_from_agent_meta_snapshot(meta: &AgentMetaSnapshot) -> Option<SessionInfo> {
+    let source = meta.source.as_deref().unwrap_or("");
+    let provider = meta.provider.as_deref().and_then(Provider::parse)?;
+    let session_id = meta.session_id.clone()?;
+    let cwd = meta.cwd.clone().unwrap_or_default();
+    let title = match source {
+        SHELL_SESSION_SOURCE_MARKER => shell_pane_title(&cwd),
+        COKACDIR_SESSION_SOURCE_MARKER => cokacdir_pane_title(&cwd),
+        NEW_AGENT_SESSION_SOURCE_MARKER => new_agent_pane_title(provider, &cwd),
+        _ => String::new(),
+    };
+    Some(SessionInfo {
+        provider,
+        session_id,
+        cwd,
+        source: PathBuf::from(source),
+        updated_at_epoch_s: meta.updated_at_epoch_s,
+        title: (!title.is_empty()).then_some(title),
+    })
+}
+
+fn refresh_live_shell_infos_from_meta<F>(
+    infos: Vec<SessionInfo>,
+    mut read_meta: F,
+) -> Vec<SessionInfo>
+where
+    F: FnMut(&AgentKey) -> Option<AgentMetaSnapshot>,
+{
+    infos
+        .into_iter()
+        .map(|info| {
+            if !is_plain_pty_tool_session_info(&info) {
+                return info;
+            }
+            let key = AgentKey::new(&info);
+            let Some(meta) = read_meta(&key) else {
+                return info;
+            };
+            let Some(next) = session_info_from_agent_meta_snapshot(&meta) else {
+                return info;
+            };
+            if AgentKey::new(&next) == key && is_plain_pty_tool_session_info(&next) {
+                next
+            } else {
+                info
+            }
+        })
+        .collect()
+}
+
 fn new_agent_backing_session_for_key(key: &AgentKey) -> Option<NewAgentBackingSession> {
     let meta = live_agent_meta_snapshot(key)?;
     new_agent_backing_session_from_meta(&meta)
@@ -13029,8 +13333,7 @@ fn opencode_new_agent_backing_session(meta: &AgentMetaSnapshot) -> Option<NewAge
     let session_uuid = new_agent_session_uuid(meta.session_id.as_deref()?)?;
     let timestamp = session_uuid.get_timestamp()?;
     let (secs, nanos) = timestamp.to_unix();
-    let created_after_epoch_ms =
-        (secs as i64).saturating_mul(1000) + i64::from(nanos / 1_000_000);
+    let created_after_epoch_ms = (secs as i64).saturating_mul(1000) + i64::from(nanos / 1_000_000);
     let cwd = meta.cwd.as_deref().filter(|cwd| !cwd.is_empty())?;
     let (session_id, backing_path) =
         cokacmux::providers::discovery::unique_opencode_session_created_after(
@@ -14988,8 +15291,7 @@ fn read_agent_daemon_requests(
         })?;
         messages.push(msg);
     }
-    if (total_read > 0 || saw_eof || !messages.is_empty())
-        && DEBUG_ENABLED.load(Ordering::Relaxed)
+    if (total_read > 0 || saw_eof || !messages.is_empty()) && DEBUG_ENABLED.load(Ordering::Relaxed)
     {
         let details = serde_json::json!({
             "initial_buffer_len": initial_buffer_len,
@@ -16328,11 +16630,11 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
             }
         };
         let source = meta.source.as_deref().unwrap_or("");
-        let Some(provider) = meta.provider.as_deref().and_then(Provider::parse) else {
+        let Some(info) = session_info_from_agent_meta_snapshot(&meta) else {
             debug_log(
                 "live_shell_discover_skip",
                 serde_json::json!({
-                    "reason": "invalid_provider",
+                    "reason": "invalid_meta",
                     "path": path.display().to_string(),
                     "source": source,
                     "daemon_pid": meta.pid,
@@ -16342,39 +16644,9 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
             );
             continue;
         };
-        let Some(session_id) = meta.session_id.clone() else {
-            debug_log(
-                "live_shell_discover_skip",
-                serde_json::json!({
-                    "reason": "missing_session_id",
-                    "path": path.display().to_string(),
-                    "source": source,
-                    "daemon_pid": meta.pid,
-                    "provider": provider.as_str(),
-                }),
-            );
-            continue;
-        };
-        let cwd = meta.cwd.clone().unwrap_or_default();
-        let title = match source {
-            SHELL_SESSION_SOURCE_MARKER => shell_pane_title(&cwd),
-            COKACDIR_SESSION_SOURCE_MARKER => cokacdir_pane_title(&cwd),
-            NEW_AGENT_SESSION_SOURCE_MARKER => new_agent_pane_title(provider, &cwd),
-            _ => String::new(),
-        };
-        let debug_session_id = session_id.clone();
-        let debug_cwd = cwd.clone();
         let is_synthetic = source == SHELL_SESSION_SOURCE_MARKER
             || source == NEW_AGENT_SESSION_SOURCE_MARKER
             || source == COKACDIR_SESSION_SOURCE_MARKER;
-        out.push(SessionInfo {
-            provider,
-            session_id,
-            cwd,
-            source: PathBuf::from(source),
-            updated_at_epoch_s: meta.updated_at_epoch_s,
-            title: (!title.is_empty()).then_some(title),
-        });
         if trace_enabled {
             trace_log(
                 "live_shell_discover_add",
@@ -16384,14 +16656,15 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
                     "synthetic": is_synthetic,
                     "daemon_pid": meta.pid,
                     "daemon_alive": process_is_alive(meta.pid),
-                    "provider": provider.as_str(),
-                    "session_id": &debug_session_id,
-                    "cwd": &debug_cwd,
+                    "provider": info.provider.as_str(),
+                    "session_id": &info.session_id,
+                    "cwd": &info.cwd,
                     "attached": meta.attached,
                     "attached_client_pid": meta.attached_client_pid,
                 }),
             );
         }
+        out.push(info);
     }
     if trace_enabled {
         trace_log(
@@ -18550,6 +18823,139 @@ fn xterm_modifier_param(modifiers: KeyModifiers) -> Option<u8> {
     (param > 1).then_some(param)
 }
 
+fn paste_text_to_agent_bytes(text: &str, bracketed_paste_mode: bool) -> Vec<u8> {
+    if bracketed_paste_mode {
+        let mut bytes = Vec::with_capacity(
+            BRACKETED_PASTE_INPUT_START.len() + text.len() + BRACKETED_PASTE_INPUT_END.len(),
+        );
+        bytes.extend_from_slice(BRACKETED_PASTE_INPUT_START);
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(BRACKETED_PASTE_INPUT_END);
+        return bytes;
+    }
+
+    let mut bytes = Vec::with_capacity(text.len());
+    let raw = text.as_bytes();
+    let mut index = 0usize;
+    while index < raw.len() {
+        match raw[index] {
+            b'\r' => {
+                bytes.push(b'\r');
+                index += 1;
+                if raw.get(index) == Some(&b'\n') {
+                    index += 1;
+                }
+            }
+            b'\n' => {
+                bytes.push(b'\r');
+                index += 1;
+            }
+            byte => {
+                bytes.push(byte);
+                index += 1;
+            }
+        }
+    }
+    bytes
+}
+
+fn text_field_paste_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push(' ');
+            }
+            '\n' | '\t' => out.push(' '),
+            _ if ch.is_control() => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn insert_str_at_cursor(draft: &mut String, cursor: &mut usize, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    *cursor = clamp_to_char_boundary(draft, *cursor);
+    draft.insert_str(*cursor, text);
+    *cursor += text.len();
+}
+
+fn update_bracketed_paste_mode_from_output(
+    enabled: &mut bool,
+    scan_tail: &mut Vec<u8>,
+    data: &[u8],
+) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let before = *enabled;
+    let previous_len = scan_tail.len();
+    let mut scan = Vec::with_capacity(scan_tail.len() + data.len());
+    scan.extend_from_slice(scan_tail);
+    scan.extend_from_slice(data);
+
+    let mut index = 0usize;
+    while index < scan.len() {
+        let Some(start_offset) = scan[index..]
+            .windows(3)
+            .position(|window| window == b"\x1b[?")
+        else {
+            break;
+        };
+        let start = index + start_offset;
+        let params_start = start + 3;
+        let Some(final_offset) = scan[params_start..]
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))
+        else {
+            break;
+        };
+        let final_index = params_start + final_offset;
+        if final_index + 1 > previous_len {
+            let final_byte = scan[final_index];
+            if matches!(final_byte, b'h' | b'l')
+                && private_mode_params_include_bracketed_paste(&scan[params_start..final_index])
+            {
+                *enabled = final_byte == b'h';
+            }
+        }
+        index = final_index + 1;
+    }
+
+    let keep_start = scan
+        .len()
+        .saturating_sub(BRACKETED_PASTE_MODE_SCAN_TAIL_BYTES);
+    *scan_tail = scan[keep_start..].to_vec();
+    before != *enabled
+}
+
+fn private_mode_params_include_bracketed_paste(params: &[u8]) -> bool {
+    let mut value = 0u32;
+    let mut in_digits = false;
+    for &byte in params {
+        if byte.is_ascii_digit() {
+            value = value
+                .saturating_mul(10)
+                .saturating_add(u32::from(byte - b'0'));
+            in_digits = true;
+            continue;
+        }
+        if in_digits && value == BRACKETED_PASTE_MODE_PARAM {
+            return true;
+        }
+        value = 0;
+        in_digits = false;
+    }
+    in_digits && value == BRACKETED_PASTE_MODE_PARAM
+}
+
 fn theme_base_style() -> Style {
     Style::default().fg(THEME_FG).bg(THEME_BG)
 }
@@ -18894,6 +19300,7 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
     } else if let InputMode::CloneOptions {
         source,
         target,
+        target_options: _,
         selected,
         folder_data,
     } = &app.input_mode
@@ -19816,6 +20223,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     if let InputMode::CloneOptions {
         source,
         target,
+        target_options,
         selected,
         folder_data,
     } = &mut app.input_mode
@@ -19876,6 +20284,26 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                     "source_session_id": &source.session_id,
                     "target_provider": target.as_str(),
                     "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::CloneOptionsTargetNext, key) {
+            *target = move_provider_in_options(*target, 1, target_options);
+            debug_log(
+                "clone_options_target_move",
+                serde_json::json!({
+                    "source_provider": source.provider.as_str(),
+                    "source_session_id": &source.session_id,
+                    "target_provider": target.as_str(),
+                }),
+            );
+        } else if keybindings.matches(KeyAction::CloneOptionsTargetPrev, key) {
+            *target = move_provider_in_options(*target, -1, target_options);
+            debug_log(
+                "clone_options_target_move",
+                serde_json::json!({
+                    "source_provider": source.provider.as_str(),
+                    "source_session_id": &source.session_id,
+                    "target_provider": target.as_str(),
                 }),
             );
         } else if keybindings.matches(KeyAction::CloneOptionsNext, key) {
@@ -20884,7 +21312,12 @@ fn draw_clone_options_modal(
         source.provider.as_str(),
         truncate_width(&source.session_id, 24)
     );
-    let target_line = format!("Target: {}", target.as_str());
+    let target_kind = if target == source.provider {
+        "native copy"
+    } else {
+        "2-message context handoff"
+    };
+    let target_line = format!("Target: {} ({})", target.as_str(), target_kind);
     let data_line = clone_options_data_line(folder_data);
     let help = clone_options_help_text(keybindings);
     let lines = vec![
@@ -20898,7 +21331,7 @@ fn draw_clone_options_modal(
         )),
         clone_options_data_status_line(folder_data, data_line),
         Line::from(""),
-        clone_options_button_line(selected, folder_data),
+        clone_options_button_line(selected, folder_data, target == source.provider),
         Line::from(Span::styled(
             help,
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
@@ -20951,18 +21384,25 @@ fn clone_options_data_status_line(
 fn clone_options_button_line(
     selected: usize,
     folder_data: &CloneFolderDataAvailability,
+    same_provider: bool,
 ) -> Line<'static> {
     let folder_data_enabled = matches!(folder_data, CloneFolderDataAvailability::Available(_));
+    let session_label = if same_provider {
+        "1 Native copy"
+    } else {
+        "1 Context"
+    };
+    let data_label = if same_provider {
+        "2 Native + data"
+    } else {
+        "2 Context + data"
+    };
     Line::from(vec![
         Span::raw("  "),
-        clone_options_button_span(
-            "1 Session only",
-            selected == CLONE_OPTION_SESSION_ONLY,
-            true,
-        ),
+        clone_options_button_span(session_label, selected == CLONE_OPTION_SESSION_ONLY, true),
         Span::raw("  "),
         clone_options_button_span(
-            "2 Folder data too",
+            data_label,
             selected == CLONE_OPTION_FOLDER_DATA,
             folder_data_enabled,
         ),
@@ -21291,13 +21731,19 @@ fn restore_data_help_text(keybindings: &KeyBindings) -> String {
 
 fn clone_options_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} choose · {} select · {}/{}/{} direct · {} cancel",
+        "{} choose · {} option · {} target · {}/{}/{} direct · {} cancel",
         keybindings.help(KeyAction::CloneOptionsConfirm, "Enter"),
         keybindings.help_pair(
             KeyAction::CloneOptionsPrev,
             KeyAction::CloneOptionsNext,
             "Left",
             "Right",
+        ),
+        keybindings.help_pair(
+            KeyAction::CloneOptionsTargetPrev,
+            KeyAction::CloneOptionsTargetNext,
+            "Shift+Tab",
+            "Tab",
         ),
         keybindings.help(KeyAction::CloneOptionsSessionOnly, "1"),
         keybindings.help(KeyAction::CloneOptionsFolderData, "2"),
@@ -23498,11 +23944,14 @@ mod tests {
             InputMode::CloneOptions {
                 source,
                 target,
+                target_options,
                 selected,
                 folder_data: CloneFolderDataAvailability::Available(path),
             } => {
                 assert_eq!(source.session_id, "codex-id");
                 assert_eq!(target, Provider::Codex);
+                assert!(target_options.contains(&Provider::Claude));
+                assert!(target_options.contains(&Provider::Codex));
                 assert_eq!(selected, CLONE_OPTION_SESSION_ONLY);
                 assert_eq!(path, dir.path());
             }
@@ -23534,11 +23983,14 @@ mod tests {
             InputMode::CloneOptions {
                 source,
                 target,
+                target_options,
                 selected,
                 folder_data: CloneFolderDataAvailability::Unavailable(reason),
             } => {
                 assert_eq!(source.session_id, "codex-id");
                 assert_eq!(target, Provider::Codex);
+                assert!(target_options.contains(&Provider::Claude));
+                assert!(target_options.contains(&Provider::Codex));
                 assert_eq!(selected, CLONE_OPTION_SESSION_ONLY);
                 assert!(reason.contains("No such file") || reason.contains("not found"));
             }
@@ -23555,6 +24007,7 @@ mod tests {
         app.input_mode = InputMode::CloneOptions {
             source: session_info(Provider::Codex, "codex-id", "/missing"),
             target: Provider::Codex,
+            target_options: clone_target_provider_options(),
             selected: CLONE_OPTION_SESSION_ONLY,
             folder_data: CloneFolderDataAvailability::Unavailable("missing cwd".into()),
         };
@@ -23582,6 +24035,7 @@ mod tests {
         app.input_mode = InputMode::CloneOptions {
             source: session_info(Provider::Codex, "codex-id", "/repo"),
             target: Provider::Codex,
+            target_options: clone_target_provider_options(),
             selected: CLONE_OPTION_SESSION_ONLY,
             folder_data: CloneFolderDataAvailability::Available(PathBuf::from("/repo")),
         };
@@ -23596,6 +24050,36 @@ mod tests {
 
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert_eq!(app.status, "cancelled.");
+    }
+
+    #[test]
+    fn clone_options_tab_changes_target_provider() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::CloneOptions {
+            source: session_info(Provider::Codex, "codex-id", "/repo"),
+            target: Provider::Codex,
+            target_options: clone_target_provider_options(),
+            selected: CLONE_OPTION_SESSION_ONLY,
+            folder_data: CloneFolderDataAvailability::Available(PathBuf::from("/repo")),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match app.input_mode {
+            InputMode::CloneOptions {
+                target, selected, ..
+            } => {
+                assert_eq!(target, Provider::OpenCode);
+                assert_eq!(selected, CLONE_OPTION_SESSION_ONLY);
+            }
+            other => panic!("expected clone options to stay open, got {:?}", other),
+        }
     }
 
     #[test]
@@ -26438,6 +26922,78 @@ mod tests {
     }
 
     #[test]
+    fn live_shell_info_refresh_updates_cached_shell_cwd_from_meta() {
+        let shell = shell_session_info_for_cwd("/repo".into());
+        let key = AgentKey::new(&shell);
+
+        let refreshed = refresh_live_shell_infos_from_meta(vec![shell], |probe_key| {
+            assert_eq!(probe_key, &key);
+            Some(AgentMetaSnapshot {
+                pid: 123,
+                child_pid: None,
+                provider: Some(key.provider.as_str().into()),
+                session_id: Some(key.session_id.clone()),
+                cwd: Some("/repo/sub".into()),
+                source: Some(SHELL_SESSION_SOURCE_MARKER.into()),
+                attached: true,
+                attached_client_pid: Some(std::process::id()),
+                attached_client_instance_id: Some("test-client".into()),
+                last_screen_change_epoch_ms: 0,
+                last_output_epoch_ms: 0,
+                last_input_epoch_ms: 0,
+                updated_at_epoch_s: 456,
+            })
+        });
+
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(AgentKey::new(&refreshed[0]), key);
+        assert_eq!(refreshed[0].cwd, "/repo/sub");
+        assert_eq!(refreshed[0].title.as_deref(), Some("shell @ sub"));
+        assert_eq!(refreshed[0].updated_at_epoch_s, 456);
+    }
+
+    #[test]
+    fn live_shell_info_refresh_keeps_cached_info_on_meta_key_mismatch() {
+        let shell = shell_session_info_for_cwd("/repo".into());
+        let key = AgentKey::new(&shell);
+
+        let refreshed = refresh_live_shell_infos_from_meta(vec![shell.clone()], |_| {
+            Some(AgentMetaSnapshot {
+                pid: 123,
+                child_pid: None,
+                provider: Some(key.provider.as_str().into()),
+                session_id: Some("different-session".into()),
+                cwd: Some("/repo/sub".into()),
+                source: Some(SHELL_SESSION_SOURCE_MARKER.into()),
+                attached: true,
+                attached_client_pid: Some(std::process::id()),
+                attached_client_instance_id: Some("test-client".into()),
+                last_screen_change_epoch_ms: 0,
+                last_output_epoch_ms: 0,
+                last_input_epoch_ms: 0,
+                updated_at_epoch_s: 456,
+            })
+        });
+
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(AgentKey::new(&refreshed[0]), key);
+        assert_eq!(refreshed[0].cwd, shell.cwd);
+    }
+
+    #[test]
+    fn live_shell_info_refresh_skips_provider_sessions() {
+        let stored = session_info(Provider::Codex, "stored", "/repo");
+        let refreshed = refresh_live_shell_infos_from_meta(vec![stored.clone()], |_| {
+            panic!("provider-backed sessions should not be polled for cwd refresh")
+        });
+
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(AgentKey::new(&refreshed[0]), AgentKey::new(&stored));
+        assert_eq!(refreshed[0].cwd, stored.cwd);
+        assert_eq!(refreshed[0].source, stored.source);
+    }
+
+    #[test]
     fn runtime_refresh_request_keeps_live_discovery_off_runtime_worker() {
         let mut app = app_for_key_tests();
         let (tx, rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
@@ -26987,10 +27543,7 @@ mod tests {
     #[test]
     fn new_agent_session_uuid_requires_prefixed_uuid() {
         let uuid = uuid::Uuid::now_v7();
-        assert_eq!(
-            new_agent_session_uuid(&format!("new-{uuid}")),
-            Some(uuid)
-        );
+        assert_eq!(new_agent_session_uuid(&format!("new-{uuid}")), Some(uuid));
         assert_eq!(new_agent_session_uuid("new-agent"), None);
         assert_eq!(new_agent_session_uuid(&uuid.to_string()), None);
     }
@@ -27035,8 +27588,7 @@ mod tests {
             claude_new_agent_backing_session_in_root(projects_root, cwd, session_uuid).is_none()
         );
 
-        let project_dir =
-            projects_root.join(cokacmux::providers::claude::path::encode_cwd(cwd));
+        let project_dir = projects_root.join(cokacmux::providers::claude::path::encode_cwd(cwd));
         fs::create_dir_all(&project_dir).unwrap();
         let session_file = project_dir.join(format!("{session_uuid}.jsonl"));
         fs::write(&session_file, "{}\n").unwrap();
@@ -27400,6 +27952,7 @@ IF EXIST "%~dp0\node.exe" (
         app.input_mode = InputMode::CloneOptions {
             source: session_info(Provider::Codex, "codex-id", "/repo"),
             target: Provider::Codex,
+            target_options: clone_target_provider_options(),
             selected: CLONE_OPTION_SESSION_ONLY,
             folder_data: CloneFolderDataAvailability::Available(PathBuf::from("/repo")),
         };
@@ -27681,6 +28234,94 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
+    fn paste_text_to_agent_bytes_converts_plain_newlines_to_enter() {
+        assert_eq!(
+            paste_text_to_agent_bytes("one\ntwo\r\nthree\rfour", false),
+            b"one\rtwo\rthree\rfour".to_vec()
+        );
+    }
+
+    #[test]
+    fn paste_text_to_agent_bytes_wraps_bracketed_paste_mode() {
+        assert_eq!(
+            paste_text_to_agent_bytes("one\ntwo", true),
+            b"\x1b[200~one\ntwo\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_mode_tracker_handles_split_sequences() {
+        let mut enabled = false;
+        let mut scan_tail = Vec::new();
+
+        assert!(!update_bracketed_paste_mode_from_output(
+            &mut enabled,
+            &mut scan_tail,
+            b"\x1b[?20"
+        ));
+        assert!(!enabled);
+
+        assert!(update_bracketed_paste_mode_from_output(
+            &mut enabled,
+            &mut scan_tail,
+            b"04h"
+        ));
+        assert!(enabled);
+
+        assert!(update_bracketed_paste_mode_from_output(
+            &mut enabled,
+            &mut scan_tail,
+            b"body\x1b[?2004l"
+        ));
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn bracketed_paste_mode_tracker_handles_combined_private_modes() {
+        let mut enabled = false;
+        let mut scan_tail = Vec::new();
+
+        assert!(update_bracketed_paste_mode_from_output(
+            &mut enabled,
+            &mut scan_tail,
+            b"\x1b[?25;2004h"
+        ));
+        assert!(enabled);
+
+        assert!(update_bracketed_paste_mode_from_output(
+            &mut enabled,
+            &mut scan_tail,
+            b"\x1b[?2004;25l"
+        ));
+        assert!(!enabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_client_send_paste_queues_daemon_input_for_current_mode() {
+        let (mut client, request_rx) = buffered_output_test_client_with_requests("paste-input", 71);
+
+        client.send_paste("one\ntwo");
+        let plain = request_rx.try_recv().unwrap();
+        match plain.request {
+            AgentDaemonRequest::Input { data } => {
+                assert_eq!(data, b"one\rtwo".to_vec());
+            }
+            other => panic!("expected plain paste input request, got {other:?}"),
+        }
+
+        client.bracketed_paste_mode = true;
+        client.send_paste("three\nfour");
+        let bracketed = request_rx.try_recv().unwrap();
+        match bracketed.request {
+            AgentDaemonRequest::Input { data } => {
+                assert_eq!(data, b"\x1b[200~three\nfour\x1b[201~".to_vec());
+            }
+            other => panic!("expected bracketed paste input request, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parser_snapshot_rehydrates_scrollback_lines() {
         let mut source = vt100::Parser::new(5, 20, AGENT_SCROLLBACK_LINES);
         for line in 1..=12 {
@@ -27857,6 +28498,8 @@ IF EXIST "%~dp0\node.exe" (
             startup_spinner_started_at: None,
             debug_output_events: 0,
             codex_transcript_overlay_assumed_open: false,
+            bracketed_paste_mode: false,
+            bracketed_paste_scan_tail: Vec::new(),
             reader_id: 0,
             reader_thread: None,
             writer_thread: None,
@@ -27886,8 +28529,16 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     fn buffered_output_test_client(session_id: &str, reader_id: u64) -> AgentClient {
+        buffered_output_test_client_with_requests(session_id, reader_id).0
+    }
+
+    #[cfg(unix)]
+    fn buffered_output_test_client_with_requests(
+        session_id: &str,
+        reader_id: u64,
+    ) -> (AgentClient, Receiver<AgentWriterRequest>) {
         let (stream, _peer) = AgentStream::pair().unwrap();
-        let (request_tx, _request_rx) = mpsc::channel();
+        let (request_tx, request_rx) = mpsc::channel();
         let pty_size = agent_pty_size(80, 8);
         let mut client = AgentClient {
             info: session_info(Provider::Claude, session_id, "/repo"),
@@ -27912,12 +28563,14 @@ IF EXIST "%~dp0\node.exe" (
             startup_spinner_started_at: None,
             debug_output_events: 0,
             codex_transcript_overlay_assumed_open: false,
+            bracketed_paste_mode: false,
+            bracketed_paste_scan_tail: Vec::new(),
             reader_id,
             reader_thread: None,
             writer_thread: None,
         };
         client.screen_hash = screen_activity_hash(client.parser.screen());
-        client
+        (client, request_rx)
     }
 
     #[cfg(unix)]
@@ -28029,6 +28682,45 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
+    fn runtime_refresh_syncs_active_terminal_cwd_into_sidebar_candidate() {
+        let mut app = app_for_key_tests();
+        let mut active = buffered_output_test_client("active-shell", 41);
+        active.info = shell_session_info_for_cwd("/repo".into());
+        let key = AgentKey::new(&active.info);
+        app.set_active_agent(active);
+
+        let mut updated = shell_session_info_for_cwd("/repo/sub".into());
+        updated.session_id = key.session_id.clone();
+        app.apply_agent_runtime_refresh_result(AgentRuntimeRefreshResult {
+            seq: 3,
+            live_shells: vec![updated.clone()],
+            agent_states: HashMap::from([(
+                key.clone(),
+                AgentListState::Attached {
+                    mine: true,
+                    activity: AgentActivity::Quiet,
+                },
+            )]),
+            new_agent_backing_aliases: HashMap::new(),
+            new_agent_backing_probe_after: HashMap::new(),
+        });
+
+        assert_eq!(
+            app.active_agent.as_ref().unwrap().info.cwd,
+            "/repo/sub",
+            "active terminal info should follow the runtime meta cwd"
+        );
+        let candidates = app.live_agent_switch_candidates();
+        let candidate = candidates
+            .iter()
+            .find(|info| AgentKey::new(info) == key)
+            .expect("active terminal should remain in agents sidebar candidates");
+        assert_eq!(candidate.cwd, "/repo/sub");
+        assert_eq!(live_agent_status_label(candidate), "shell at /repo/sub");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn agent_self_exit_switches_to_next_live_agent() {
         let mut app = app_for_key_tests();
         let (tx, _rx) = mpsc::channel::<MainEvent>();
@@ -28058,7 +28750,9 @@ IF EXIST "%~dp0\node.exe" (
 
         assert!(app.active_agent.is_none());
         assert_eq!(
-            app.attach_in_flight.as_ref().map(|attach| attach.key.clone()),
+            app.attach_in_flight
+                .as_ref()
+                .map(|attach| attach.key.clone()),
             Some(other_key),
             "self-exit should auto-attach the next live agent"
         );
@@ -28132,7 +28826,10 @@ IF EXIST "%~dp0\node.exe" (
         app.live_shell_discovery_seq = prune_seq;
         app.live_shell_discovery_pending = true;
         app.on_live_shell_discovery_result(empty_scan(prune_seq));
-        assert!(app.live_shells.is_empty(), "ghost survived the strike limit");
+        assert!(
+            app.live_shells.is_empty(),
+            "ghost survived the strike limit"
+        );
         assert!(!app.agent_states.contains_key(&ghost_key));
 
         // A stale in-flight runtime result can resurrect the ghost; the
@@ -28303,6 +29000,8 @@ IF EXIST "%~dp0\node.exe" (
             startup_spinner_started_at: None,
             debug_output_events: 0,
             codex_transcript_overlay_assumed_open: false,
+            bracketed_paste_mode: false,
+            bracketed_paste_scan_tail: Vec::new(),
             reader_id: 7,
             reader_thread: None,
             writer_thread: None,
@@ -28319,6 +29018,7 @@ IF EXIST "%~dp0\node.exe" (
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
+            bracketed_paste_mode: false,
         });
 
         let (tx, _rx) = mpsc::channel::<MainEvent>();
@@ -28563,6 +29263,8 @@ IF EXIST "%~dp0\node.exe" (
             startup_spinner_started_at: None,
             debug_output_events: 0,
             codex_transcript_overlay_assumed_open: false,
+            bracketed_paste_mode: false,
+            bracketed_paste_scan_tail: Vec::new(),
             reader_id: 0,
             reader_thread: None,
             writer_thread: None,
@@ -28634,6 +29336,8 @@ IF EXIST "%~dp0\node.exe" (
             startup_spinner_started_at: None,
             debug_output_events: 0,
             codex_transcript_overlay_assumed_open: false,
+            bracketed_paste_mode: false,
+            bracketed_paste_scan_tail: Vec::new(),
             reader_id: 0,
             reader_thread: None,
             writer_thread: None,

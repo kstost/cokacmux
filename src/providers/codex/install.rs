@@ -33,9 +33,9 @@ pub struct InstallOpts {
     /// Also register the session in `state_5.sqlite::threads` so that
     /// `codex resume <sid>` and the picker see it.
     ///
-    /// Requires the `codex-index` feature (which pulls in `rusqlite` via
-    /// the `opencode` feature). If the feature is off this field is
-    /// ignored.
+    /// Requires the `opencode` feature, which provides the `rusqlite`
+    /// dependency used for the Codex index. If that feature is off, update
+    /// attempts are reported as not indexed.
     pub update_index: bool,
     /// Override the state_5.sqlite path (for tests).
     pub state_5_path: Option<PathBuf>,

@@ -15,31 +15,82 @@
 #![cfg(feature = "discovery")]
 #![cfg(feature = "opencode")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cokacmux::providers::{claude, codex, opencode};
-use cokacmux::Provider;
+use cokacmux::session;
+use cokacmux::{
+    context_user_message_text, wrap_session_for_context_convert, ContentBlock, Provider, Role,
+    UniversalSession, CONTEXT_ACK, CONTEXT_CONTINUATION_PROMPT,
+};
+
+const MAX_ACCEPTANCE_CONTEXT_BYTES: usize = 128 * 1024;
 
 fn home() -> PathBuf {
     dirs::home_dir().expect("home dir")
 }
 
-/// Find a source session we can clone from. Prefer the small "Greeting"
-/// session in /home/kst/123 because it's tiny.
-fn pick_claude_source() -> Option<PathBuf> {
-    let p = home()
-        .join(".claude")
-        .join("projects")
-        .join("-home-kst-123");
-    if !p.is_dir() {
-        return None;
+fn pick_cross_provider_source(target: Provider) -> Option<UniversalSession> {
+    pick_cross_provider_source_where(target, |_| true)
+}
+
+fn pick_cross_provider_source_where(
+    target: Provider,
+    mut accept: impl FnMut(&UniversalSession) -> bool,
+) -> Option<UniversalSession> {
+    let sessions = session::list_all().ok()?;
+    for info in sessions {
+        if info.provider == target {
+            continue;
+        }
+        match session::load(&info) {
+            Ok(session) if is_good_acceptance_source(&session) && accept(&session) => {
+                return Some(session);
+            }
+            _ => continue,
+        }
     }
-    std::fs::read_dir(&p)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.extension().map(|s| s == "jsonl").unwrap_or(false))
+    None
+}
+
+fn is_good_acceptance_source(session: &UniversalSession) -> bool {
+    if session.messages.is_empty() || is_context_wrapper_session(session) {
+        return false;
+    }
+    context_user_message_text(session).len() <= MAX_ACCEPTANCE_CONTEXT_BYTES
+}
+
+fn is_context_wrapper_session(session: &UniversalSession) -> bool {
+    if session.extras.contains_key("context_convert") {
+        return true;
+    }
+    let user_texts = visible_texts_for_role(session, Role::User);
+    let assistant_texts = visible_texts_for_role(session, Role::Assistant);
+    user_texts.len() == 1
+        && assistant_texts == vec![CONTEXT_ACK]
+        && user_texts[0].ends_with(CONTEXT_CONTINUATION_PROMPT)
+}
+
+fn visible_texts_for_role(session: &UniversalSession, role: Role) -> Vec<&str> {
+    session
+        .messages
+        .iter()
+        .filter(|message| message.role == role && !message.flags.is_meta)
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_two_message_wrapper(session: &UniversalSession) {
+    let user_texts = visible_texts_for_role(session, Role::User);
+    let assistant_texts = visible_texts_for_role(session, Role::Assistant);
+    assert_eq!(user_texts.len(), 1);
+    assert!(user_texts[0].ends_with(CONTEXT_CONTINUATION_PROMPT));
+    assert_eq!(assistant_texts, vec![CONTEXT_ACK]);
 }
 
 // =====================================================================
@@ -49,23 +100,19 @@ fn pick_claude_source() -> Option<PathBuf> {
 #[test]
 #[ignore]
 fn live_claude_install_and_resume_path() {
-    let src = match pick_claude_source() {
-        Some(p) => p,
+    let source = match pick_cross_provider_source(Provider::Claude) {
+        Some(session) => session,
         None => {
-            eprintln!("no source claude session — skip");
+            eprintln!("no non-Claude source session — skip");
             return;
         }
     };
-    eprintln!("source: {}", src.display());
 
-    // Read source.
-    let mut session = claude::from_file(&src, &Default::default()).expect("from_file");
-
-    // Mint a fresh UUID v7 so we don't collide with any existing session.
-    let new_uuid = uuid::Uuid::now_v7().to_string();
-    let original_uuid = session.session_id.clone();
-    session.session_id = new_uuid.clone();
-    eprintln!("test uuid: {} (was {})", new_uuid, original_uuid);
+    let session = wrap_session_for_context_convert(&source, Provider::Claude);
+    eprintln!(
+        "source: {:?} {} -> Claude test uuid: {}",
+        source.origin.provider, source.session_id, session.session_id
+    );
 
     // Install to live ~/.claude.
     let claude_home = home().join(".claude");
@@ -79,25 +126,30 @@ fn live_claude_install_and_resume_path() {
     .expect("install");
 
     eprintln!("installed: {}", report.jsonl_path.display());
-    assert!(report.jsonl_path.exists());
+    let file_exists = report.jsonl_path.exists();
 
     // The encoded path must match what `claude --resume <UUID>` would look for.
     let expected_encoding = claude::path::encode_cwd(&session.cwd);
     let expected_path = claude_home
         .join("projects")
         .join(&expected_encoding)
-        .join(format!("{}.jsonl", new_uuid));
-    assert_eq!(report.jsonl_path, expected_path);
+        .join(format!("{}.jsonl", session.session_id));
+    let path_matches = report.jsonl_path == expected_path;
 
     // Re-parse the installed file and check the session_id and cwd match.
-    let reparsed = claude::from_file(&report.jsonl_path, &Default::default()).expect("re-parse");
-    assert_eq!(reparsed.session_id, new_uuid);
-    assert_eq!(reparsed.cwd, session.cwd);
+    let reparsed = claude::from_file(&report.jsonl_path, &Default::default());
 
     // Cleanup. Remove the JSONL — leave the projects/<encoded-cwd>/ alone
     // if it already existed (it almost certainly did).
     std::fs::remove_file(&report.jsonl_path).expect("cleanup");
     eprintln!("cleaned up: {}", report.jsonl_path.display());
+
+    assert!(file_exists);
+    assert!(path_matches);
+    let reparsed = reparsed.expect("re-parse");
+    assert_eq!(reparsed.session_id, session.session_id);
+    assert_eq!(reparsed.cwd, session.cwd);
+    assert_two_message_wrapper(&reparsed);
 }
 
 // =====================================================================
@@ -107,21 +159,19 @@ fn live_claude_install_and_resume_path() {
 #[test]
 #[ignore]
 fn live_codex_install_with_threads_index() {
-    let src = match pick_claude_source() {
-        Some(p) => p,
+    let source = match pick_cross_provider_source(Provider::Codex) {
+        Some(session) => session,
         None => {
-            eprintln!("no source claude session — skip");
+            eprintln!("no non-Codex source session — skip");
             return;
         }
     };
-    let session_claude = claude::from_file(&src, &Default::default()).expect("from_file");
-
-    // Convert to a UniversalSession with a fresh UUID before installing.
-    let mut session = session_claude.clone();
-    session.origin.provider = Some(Provider::Codex);
-    session.session_id = uuid::Uuid::now_v7().to_string();
+    let session = wrap_session_for_context_convert(&source, Provider::Codex);
     let test_id = session.session_id.clone();
-    eprintln!("test uuid: {}", test_id);
+    eprintln!(
+        "source: {:?} {} -> Codex test uuid: {}",
+        source.origin.provider, source.session_id, test_id
+    );
 
     let codex_home = home().join(".codex");
     if !codex_home.is_dir() {
@@ -142,8 +192,9 @@ fn live_codex_install_with_threads_index() {
     .expect("install");
 
     eprintln!("installed rollout: {}", report.rollout_path.display());
-    assert!(report.rollout_path.exists());
-    assert!(report.indexed, "threads index update should succeed");
+    let rollout_exists = report.rollout_path.exists();
+    let indexed = report.indexed;
+    let reparsed = codex::from_file(&report.rollout_path);
 
     // Verify the threads row exists with our id and matches expected fields.
     let state_5 = report.index_path.as_ref().unwrap().clone();
@@ -172,21 +223,12 @@ fn live_codex_install_with_threads_index() {
             },
         )
         .expect("threads row");
-    assert_eq!(rid, test_id);
-    assert_eq!(rpath, report.rollout_path.display().to_string());
-    assert_eq!(source, "cli");
-    assert!(!mp.is_empty());
-    // sandbox_policy must be valid JSON with a "type" key.
-    let p: serde_json::Value = serde_json::from_str(&sandbox).expect("sandbox JSON");
-    assert!(p.get("type").is_some());
-    assert!(["never", "on-request", "untrusted", "on-failure"].contains(&approval.as_str()));
+    let rollout_path_matches = rpath == report.rollout_path.display().to_string();
+    let sandbox_json = serde_json::from_str::<serde_json::Value>(&sandbox);
+    let approval_valid =
+        ["never", "on-request", "untrusted", "on-failure"].contains(&approval.as_str());
 
-    eprintln!(
-        "threads row: id={}, source={}, sandbox_policy={}",
-        rid, source, sandbox
-    );
-
-    // Cleanup: drop the row and the rollout file.
+    // Cleanup: drop the row and the rollout file before asserting parsed shape.
     conn.execute(
         "DELETE FROM threads WHERE id = ?1",
         rusqlite::params![test_id],
@@ -194,10 +236,33 @@ fn live_codex_install_with_threads_index() {
     .expect("delete row");
     std::fs::remove_file(&report.rollout_path).expect("remove rollout");
     eprintln!("cleaned up.");
+
+    assert!(rollout_exists);
+    assert!(indexed, "threads index update should succeed");
+    let reparsed = reparsed.expect("re-parse");
+    assert_eq!(reparsed.session_id, test_id);
+    assert_eq!(reparsed.cwd, session.cwd);
+    assert_two_message_wrapper(&reparsed);
+    assert_eq!(rid, test_id);
+    assert!(rollout_path_matches);
+    assert!(
+        ["exec", "cli"].contains(&source.as_str()),
+        "unexpected Codex thread source: {source}"
+    );
+    assert!(!mp.is_empty());
+    // sandbox_policy must be valid JSON with a "type" key.
+    let p = sandbox_json.expect("sandbox JSON");
+    assert!(p.get("type").is_some());
+    assert!(approval_valid);
+
+    eprintln!(
+        "threads row: id={}, source={}, sandbox_policy={}",
+        rid, source, sandbox
+    );
 }
 
 // =====================================================================
-// OpenCode  (read-only verification with `opencode session list`)
+// OpenCode
 // =====================================================================
 
 #[test]
@@ -213,30 +278,22 @@ fn live_opencode_install_and_list() {
         return;
     }
 
-    // Generate a fresh `ses_` id.
-    let rand = uuid::Uuid::now_v7().simple().to_string();
-    // OpenCode session ids look like `ses_<hex>`; we use a fresh `ses_test_<hex>`
-    // namespace so cleanup can target it precisely.
-    let test_sid = format!("ses_test_{}", &rand[..16]);
-    eprintln!("test session_id: {}", test_sid);
-
-    // Read a tiny existing session as the source, then rename its id.
-    let src_sid = "ses_1bcbac7d3ffeQ6QyJn54Ri3O5E"; // the "Greeting" session
-    let mut session = match opencode::from_db_path(&db, src_sid) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("could not read source session {}: {} — skip", src_sid, e);
+    let source = match pick_cross_provider_source_where(Provider::OpenCode, |session| {
+        Path::new(&session.cwd).is_dir()
+    }) {
+        Some(session) => session,
+        None => {
+            eprintln!("no non-OpenCode source session with existing cwd — skip");
             return;
         }
     };
-    session.session_id = test_sid.clone();
-    // Re-id messages so we don't collide with the original session's primary
-    // keys (we cloned from a session that's still in the DB).
-    for m in &mut session.messages {
-        m.id = format!("{}_m{:04}", test_sid, m.index);
-    }
-    // Give it a distinctive title so we can spot it.
+    let mut session = wrap_session_for_context_convert(&source, Provider::OpenCode);
+    let test_sid = session.session_id.clone();
     session.title = Some("cokacmux-live-test".into());
+    eprintln!(
+        "source: {:?} {} -> OpenCode test session_id: {}",
+        source.origin.provider, source.session_id, test_sid
+    );
 
     // Install — must refuse if opencode is running (lock probe).
     let report = match opencode::install::install_to_default_db(
@@ -258,14 +315,33 @@ fn live_opencode_install_and_list() {
         report.messages
     );
 
-    // Run `opencode session list` and verify our id appears.
+    // Run `opencode session list` from the installed session cwd. OpenCode
+    // chooses the visible project from the current worktree.
     let out = Command::new("opencode")
-        .args(["session", "list"])
-        .output()
-        .expect("opencode session list");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let found = stdout.contains(&test_sid);
-    eprintln!("opencode session list shows our id: {}", found);
+        .current_dir(&session.cwd)
+        .args(["session", "list", "--format", "json"])
+        .output();
+    let found = out
+        .as_ref()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains(&test_sid))
+        .unwrap_or(false);
+    eprintln!(
+        "opencode session list from {} shows our id: {}",
+        session.cwd, found
+    );
+    let reparsed = opencode::from_db_path(&db, &test_sid);
+    let project_row = {
+        let conn = rusqlite::Connection::open(&db).expect("open opencode.db");
+        conn.query_row(
+            "SELECT s.project_id, p.worktree
+             FROM session s
+             JOIN project p ON p.id = s.project_id
+             WHERE s.id = ?1",
+            rusqlite::params![test_sid],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("project row")
+    };
 
     // Cleanup.
     let conn = rusqlite::Connection::open(&db).expect("open opencode.db");
@@ -280,12 +356,24 @@ fn live_opencode_install_and_list() {
     )
     .expect("rm message");
     conn.execute(
+        "DELETE FROM session_message WHERE session_id = ?1",
+        rusqlite::params![test_sid],
+    )
+    .expect("rm session_message");
+    conn.execute(
         "DELETE FROM session WHERE id = ?1",
         rusqlite::params![test_sid],
     )
     .expect("rm session");
     eprintln!("cleaned up.");
 
+    let reparsed = reparsed.expect("re-parse");
+    assert_eq!(reparsed.session_id, test_sid);
+    assert_two_message_wrapper(&reparsed);
+    out.expect("opencode session list");
+    if project_row.0 != "global" {
+        assert_eq!(project_row.1, session.cwd);
+    }
     assert!(
         found,
         "opencode CLI did not show our installed session in `session list`"

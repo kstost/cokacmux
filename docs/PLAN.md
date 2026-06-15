@@ -303,7 +303,7 @@ cokacmux/
 │   ├── time.rs                        # ISO/epoch 변환
 │   ├── jsonl.rs                       # 줄 단위 read/write, atomic write
 │   └── bin/
-│       └── cokacmux.rs          # CLI 진입점 (feature = "cli")
+│       └── cokacmux.rs          # TUI 진입점 (feature = "tui")
 ├── tests/
 │   ├── data/
 │   │   ├── claude/*.jsonl             # fixture 세션
@@ -375,44 +375,26 @@ pub enum SessionTarget {
 
 ```toml
 [features]
-default     = ["claude", "codex", "opencode", "cli"]
+default     = ["claude", "codex", "opencode", "discovery", "tui"]
 claude      = []                          # JSONL only, always lightweight
-codex       = []                          # 기본 변환만. state_5.sqlite 인덱싱은 별도
-codex-index = ["dep:rusqlite", "codex"]   # codex install 시 threads 테이블 갱신
+codex       = []                          # JSONL rollout
 opencode    = ["dep:rusqlite"]            # opencode.db read/write
-cli         = ["dep:clap", "dep:anyhow"]  # bin/cokacmux.rs 빌드
 discovery   = ["dep:dirs"]                # ~/.codex, ~/.claude 등 자동 탐색
+tui         = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:anyhow"]
 ```
 
 라이브러리 사용자가 claude/codex만 쓰고 싶다면:
 ```toml
 cokacmux = { version = "0.1", default-features = false, features = ["claude", "codex"] }
 ```
-이러면 rusqlite·clap 빌드 비용을 0으로 만든다 — "이식 수월한 모듈화"의 핵심.
+이러면 rusqlite·TUI 의존성 빌드 비용을 0으로 만든다 — "이식 수월한 모듈화"의 핵심.
 
-### 4.5 CLI 표면 (얇은 wrapper)
+### 4.5 사용자-facing 표면
 
-```
-cokacmux convert
-    --from   <codex|claude|opencode|auto>
-    --to     <codex|claude|opencode|universal>
-    --input  <PATH | OPENCODE_DB#SID>
-    --output <PATH>
-    [--cwd <DIR>]                       # provider가 cwd를 필요로 할 때
-    [--inline-tool-results]             # claude tool-results/ 사이드카 흡수 (기본 ON)
-    [--strict]                          # 미지 이벤트 발견 시 에러
-    [--dry-run]
-
-cokacmux inspect
-    --from auto --input <PATH | OPENCODE_DB#SID>     # UniversalType JSON → stdout
-
-cokacmux list --provider <codex|claude|opencode> [--cwd <DIR>]
-```
-
-`--from auto`는 파일 sniff:
-- `*.db` → opencode
-- JSONL 첫 줄에 `"timestamp"`+`"payload"` → codex
-- JSONL 첫 줄에 `"sessionId"`+`"type"` → claude
+배포되는 `cokacmux`는 TUI에서 같은 provider 안의 native clone과 다른 provider로의
+2-message context-wrapper handoff를 노출한다. 과거 계획의 `cokacmux convert`/`inspect`
+CLI는 제거 방향이며, 현재 public library `convert()`도 lossless cross-provider
+transcript 합성이 아니라 2-message context-wrapper handoff이다.
 
 `install`은 CLI 노출 X (라이브러리 API로만). 사용자가 자기 도구로 명시적으로 사용.
 
@@ -428,7 +410,7 @@ cokacmux list --provider <codex|claude|opencode> [--cwd <DIR>]
 - **`Cargo.toml` 슬림화**:
   - `name = "cokacmux"`, `version = "0.1.0"`, `description`, `repository` 갱신
   - **제거**: `ratatui`, `crossterm`, `reqwest`, `rcgen`, `tokio-rustls`, `rustls`, `rustls-pemfile`, `rustls-pki-types`, `if-addrs`, `libc`(unix), `tokio`(풀 features)
-  - **유지**: `serde`, `serde_json`, `clap`, `chrono`, `sha2`, `getrandom`
+  - **유지**: `serde`, `serde_json`, `chrono`, `sha2`, `getrandom`
   - **추가**: `uuid = { version = "1", features = ["v7", "serde"] }`, `thiserror`, optional `rusqlite = { version = "0.32", features = ["bundled"], optional = true }`, optional `anyhow = { version = "1", optional = true }`, optional `dirs = { version = "5", optional = true }`
   - `[lib]` + `[[bin]] path = "src/bin/cokacmux.rs"` 둘 다
   - `[features]` (§4.4)
@@ -443,7 +425,7 @@ cokacmux list --provider <codex|claude|opencode> [--cwd <DIR>]
 5. `src/providers/codex/`: `from_jsonl_str` — 외부/내부 type 양쪽 매핑
 6. `src/providers/opencode/`: `from_db_session` (rusqlite read-only)
 7. `src/lib.rs`: 모든 public API export
-8. CLI: `cokacmux inspect`, `cokacmux convert --to universal`
+8. Library API: `read_session` / `write_session` / context-wrapper `convert`
 9. **테스트**:
    - 각 provider 작은 fixture로 단위 테스트
    - 현 시스템 `~/.codex`, `~/.claude`, `~/.local/share/opencode`에서 실제 세션을 골라 `inspect` → 결과 JSON을 사람이 검사
@@ -453,7 +435,7 @@ cokacmux list --provider <codex|claude|opencode> [--cwd <DIR>]
 1. `to_claude::to_jsonl_string`: UniversalSession → claude JSONL 라인 시퀀스. cwd 인코딩으로 파일명 결정. 사이드카는 `--with-sidecar` 옵션.
 2. `to_codex::to_jsonl_string`: UniversalSession → 롤아웃 JSONL. `state_5.sqlite` 갱신은 `codex-index` feature.
 3. `to_opencode::to_db_session`: rusqlite INSERT. `opencode export` 실행 결과의 정확한 row 구조를 캡처해 역엔지니어링 필요 — Phase 2 시작 시 한 번 조사.
-4. CLI: `cokacmux convert --to <claude|codex|opencode>`
+4. Library writer API: `write_session` / provider `to_*`
 5. **테스트(왕복)**: 같은 세션을 `from_X → to_X` 해서 원본과 의미적 동일성 검사 (canonical 정규화 후 diff).
 6. **테스트(피벗)**: `codex → universal → claude → universal → codex` 4단계 왕복에서 텍스트 본문이 보존되는지.
 
@@ -490,8 +472,7 @@ cokacmux list --provider <codex|claude|opencode> [--cwd <DIR>]
 - `tests/lib_api.rs`: in-memory API(`from_jsonl_str`, `to_jsonl_string`)로 한 사이클
 
 ### 6.4 실데이터 스모크 테스트 (CI에서는 skip, 로컬 only)
-- `~/.codex/sessions`, `~/.claude/projects`, `~/.local/share/opencode/opencode.db`에서 무작위 N개 → `inspect` 에러 없이 통과
-- 환경변수 `COKACCONVERTER_SMOKE=1` 일 때만 실행
+- `~/.codex/sessions`, `~/.claude/projects`, `~/.local/share/opencode/opencode.db`에서 무작위 N개 → session load 에러 없이 통과
 
 ### 6.5 Strict 모드
 - `--strict`는 미지의 이벤트 타입이나 짝없는 `tool_use_id`를 발견하면 에러. 새 버전 에이전트가 추가한 필드를 빨리 발견하기 위한 안전망.

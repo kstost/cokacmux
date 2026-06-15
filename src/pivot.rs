@@ -1,8 +1,8 @@
-//! X → U → Y composition helpers (re-exports for clarity).
+//! Context-wrapper conversion helpers (re-exports for clarity).
 
 use crate::error::Result;
 use crate::universal::{Provider, UniversalSession};
-use crate::{read_session, write_session, SessionSource, SessionTarget};
+use crate::{SessionSource, SessionTarget};
 
 pub fn convert(
     from: Provider,
@@ -10,7 +10,5 @@ pub fn convert(
     src: &SessionSource,
     dst: &SessionTarget,
 ) -> Result<UniversalSession> {
-    let session = read_session(from, src)?;
-    write_session(to, &session, dst)?;
-    Ok(session)
+    crate::convert(from, to, src, dst)
 }

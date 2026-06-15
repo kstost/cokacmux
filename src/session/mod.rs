@@ -6,6 +6,7 @@
 pub mod clone;
 pub mod clone_tree;
 pub mod data;
+pub mod install;
 pub mod native_validate;
 pub mod remove;
 pub mod render;

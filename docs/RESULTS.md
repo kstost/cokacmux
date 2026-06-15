@@ -30,16 +30,17 @@ Feature gating verified: `claude,codex` alone does NOT pull in `rusqlite`
 ## Test suite (`cargo test --all-features`)
 
 ```text
-running 5 tests           (unit)                                   ok
-running 0 tests           (bin)                                    ok
-running 5 tests           (tests/install.rs)                       ok
+running 61 tests          (unit)                                   ok
+running 213 tests         (bin)                                    ok
+running 12 tests          (tests/install.rs)                       ok
 running 3 tests           (tests/live_acceptance.rs)               3 ignored
-running 3 tests           (tests/pivot.rs)                         ok
-running 5 tests           (tests/roundtrip.rs)                     ok
+running 22 tests          (tests/pivot.rs)                         ok
+running 30 tests          (tests/roundtrip.rs)                     ok
+running 7 tests           (tests/session.rs)                       4 ok / 3 ignored
 running 1 test            (doc-test for src/lib.rs)                ok
                                                               ─────
-                                                              19/19 pass + 3 ignored (live)
-                                                              22/22 pass when live tests included
+                                                              343/343 pass + 6 ignored (live)
+                                                              349/349 pass when live tests included
 ```
 
 Specific tests of interest:
@@ -55,6 +56,10 @@ Specific tests of interest:
   `threads` index with NOT NULL columns valid against the live schema.
 - `codex_install_against_live_state_5_clone` — installs into a copy of
   the user's actual `state_5.sqlite`; proves real-schema compatibility.
+- `codex_install_validates_explicit_state_5_path_outside_codex_home` —
+  validation checks the same explicit `state_5.sqlite` that install updated.
+- `codex_failed_install_removes_explicit_state_5_override_row` — failed
+  post-write validation rolls back both the rollout and explicit index row.
 
 ## Real-data smoke test
 
@@ -106,39 +111,34 @@ SRC codex    user/assistant texts: ['<environment_context>...', 'hi', 'Hi. What 
 SRC opencode user/assistant texts: ['hi', 'Hi. How can I help?']
 ```
 
-### Same-provider round-trip (bit-identical)
+### Same-provider adapter round-trip (bit-identical)
 
 ```text
-$ cokacmux convert --from claude --to claude \
-      --input  /home/kst/.claude/projects/-home-kst-123/aecdfa0d-...jsonl \
-      --output /tmp/claude.rt.jsonl
-ok: 9 messages → /tmp/claude.rt.jsonl (claude)
-$ diff /home/kst/.claude/projects/-home-kst-123/aecdfa0d-...jsonl /tmp/claude.rt.jsonl
+library adapter: claude from_jsonl -> to_jsonl
+diff /home/kst/.claude/projects/-home-kst-123/aecdfa0d-...jsonl /tmp/claude.rt.jsonl
 exit=0   # bit-identical
 
-$ cokacmux convert --from codex --to codex --input <rollout>.jsonl --output /tmp/codex.rt.jsonl
-ok: 11 messages → /tmp/codex.rt.jsonl (codex)
-$ diff <rollout>.jsonl /tmp/codex.rt.jsonl
+library adapter: codex from_jsonl -> to_jsonl
+diff <rollout>.jsonl /tmp/codex.rt.jsonl
 exit=0   # bit-identical
 ```
 
-### Cross-provider round-trip (text-preserving)
+### Cross-provider convert() contract
 
 ```text
-OK  claude->codex:    2 text body/bodies preserved
-OK  claude->opencode: 2 text body/bodies preserved
-OK  codex->claude:    3 text body/bodies preserved
-OK  codex->opencode:  3 text body/bodies preserved
-OK  opencode->claude: 2 text body/bodies preserved
-OK  opencode->codex:  2 text body/bodies preserved
-fail=0/6
+Current public convert() output is a context handoff:
+  user      = rendered source session + continuation prompt
+  assistant = ok
+
+It is intentionally not a lossless native transcript synthesis contract.
 ```
 
 ### Heavy-tool-call session
 
 The current cokacmux working session (`a651c028-…`, 707 JSONL lines,
 **212 tool_use / 212 tool_result pairs**, 32 text turns) — the most
-substantial real session available — converted in three directions:
+substantial real session available — was used to audit provider adapter
+synthesis in three directions:
 
 ```text
 SRC    tool_use=212  tool_result=212  text= 32  (claude)
@@ -202,7 +202,7 @@ test live_codex_install_with_threads_index ... ok
 
 test live_opencode_install_and_list ... ok
   installed to /home/kst/.local/share/opencode/opencode.db (2 messages)
-  `opencode session list` shows our id: true   ← agent CLI confirms
+  `opencode session list` from the installed cwd shows our id: true   ← agent CLI confirms
   cleaned up session/message/part rows.
 ```
 
@@ -216,22 +216,25 @@ satisfy every constraint and shape requirement opencode itself enforces.
    `{"id","providerID","variant"}`. A plain `"openai/gpt-5.5"` string
    makes `opencode session list` silently drop the row. Fixed in
    `providers::opencode::write::to_db_connection`.
-2. **OpenCode CLI sessions all live under `project_id='global'`** (the
-   special catch-all project). Our writer was synthesizing a per-cwd
-   project id, which kept rows out of the picker. Fixed by using
-   `'global'` and inserting the corresponding project row.
+2. **OpenCode `project_id` must match the target DB's cwd/project view.**
+   Current OpenCode DBs can contain dedicated `project` rows for git
+   worktrees, while older/global rows still use `project_id='global'`.
+   A hard-coded `global` row can be accepted by the DB but hidden from
+   `opencode session list` in a worktree with its own project row. Fixed
+   by preserving native `opencode_project_id`, otherwise reusing
+   `project.worktree == session.cwd`, and only falling back to `global`
+   when no matching project exists. Existing `global` project metadata is
+   left intact; if the row is missing, it is created with the session cwd.
 
 ## Other notes
 
 - `model` field of an OpenCode session row is a JSON-stringified object;
   the reader parses it back into a proper `ModelInfo`. (Verified on a
   live `opencode.db` v1.15.5 row.)
-- Cross-provider synthesis preserves *text bodies* of user/assistant
-  turns. Provider-specific meta (e.g. Claude's `attachment.deferred_tools_delta`,
-  Codex's `event_msg.task_complete`) round-trips perfectly when the
-  destination matches the source (replay of `provenance.raw`), and is
-  preserved as `ContentBlock::Other` / system-meta in cross-provider
-  hops.
+- Same-provider adapter round-trips preserve provider-native data where the
+  writer can replay `provenance.raw`. Public cross-provider `convert()` now
+  uses the context-wrapper handoff above, so provider-specific meta is rendered
+  as context instead of being promised as a native target transcript.
 - Phase-3 `install` is exposed as library API only (not CLI). Tempdir
   unit tests exercise schemas; live-acceptance tests run end-to-end
   against the user's real directories with cleanup.

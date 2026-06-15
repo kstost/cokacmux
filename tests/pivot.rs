@@ -1,9 +1,17 @@
-//! Cross-provider pivot tests: X → Universal → Y must preserve the user/
-//! assistant text bodies. Four-step pivots (X → Y → Z → X) likewise.
+//! Adapter pivot tests plus the public cross-provider `convert()` contract.
+//! Provider adapters still cover semantic preservation; `convert()` now writes
+//! a two-message continuation wrapper rather than a lossless target transcript.
 
+#[cfg(feature = "opencode")]
+use cokacmux::session::{
+    clone::ArtifactPath,
+    install::{install_universal_session, InstallSessionOpts},
+    native_validate,
+};
 use cokacmux::{
-    convert, providers, read_session, universal::Role, ContentBlock, ImageSource, Provider,
-    SessionSource, SessionTarget, UniversalSession,
+    convert, providers, read_session, universal::Role, wrap_session_for_context_convert,
+    ContentBlock, ImageSource, Provider, SessionSource, SessionTarget, UniversalSession,
+    CONTEXT_ACK, CONTEXT_CONTINUATION_PROMPT,
 };
 use serde_json::Value;
 
@@ -26,6 +34,20 @@ fn user_assistant_texts(session: &UniversalSession) -> Vec<&str> {
         .messages
         .iter()
         .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+        .flat_map(|m| {
+            m.content.iter().filter_map(|b| match b {
+                ContentBlock::Text { text, .. } if !text.is_empty() => Some(text.as_str()),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+fn texts_for_role(session: &UniversalSession, role: Role) -> Vec<&str> {
+    session
+        .messages
+        .iter()
+        .filter(|m| m.role == role && !m.flags.is_meta)
         .flat_map(|m| {
             m.content.iter().filter_map(|b| match b {
                 ContentBlock::Text { text, .. } if !text.is_empty() => Some(text.as_str()),
@@ -209,6 +231,47 @@ fn write_rich_opencode_fixture(db_path: &std::path::Path) {
     .unwrap();
 }
 
+#[cfg(feature = "opencode")]
+fn create_codex_threads_table(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            model_provider TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            title TEXT NOT NULL,
+            sandbox_policy TEXT NOT NULL,
+            approval_mode TEXT NOT NULL,
+            tokens_used INTEGER NOT NULL DEFAULT 0,
+            has_user_event INTEGER NOT NULL DEFAULT 0,
+            archived INTEGER NOT NULL DEFAULT 0,
+            archived_at INTEGER,
+            git_sha TEXT,
+            git_branch TEXT,
+            git_origin_url TEXT,
+            cli_version TEXT NOT NULL DEFAULT '',
+            first_user_message TEXT NOT NULL DEFAULT '',
+            agent_nickname TEXT,
+            agent_role TEXT,
+            memory_mode TEXT NOT NULL DEFAULT 'enabled',
+            model TEXT,
+            reasoning_effort TEXT,
+            agent_path TEXT,
+            created_at_ms INTEGER,
+            updated_at_ms INTEGER,
+            thread_source TEXT,
+            preview TEXT NOT NULL DEFAULT ''
+        );
+    "#,
+    )
+    .unwrap();
+}
+
 fn write_native_source(provider: Provider, dir: &std::path::Path) -> SessionSource {
     match provider {
         Provider::Claude => {
@@ -257,34 +320,6 @@ fn source_from_target(
         },
         _ => panic!("target/provider mismatch"),
     }
-}
-
-fn assert_cross_provider_profile_preserved(
-    from: Provider,
-    to: Provider,
-    expected: &SemanticProfile,
-    actual: &SemanticProfile,
-) {
-    assert_eq!(
-        actual.cwd, expected.cwd,
-        "{from:?} -> {to:?} should preserve cwd"
-    );
-    assert_eq!(
-        actual.fragments, expected.fragments,
-        "{from:?} -> {to:?} should preserve visible text/reasoning fragments"
-    );
-    assert_eq!(
-        actual.tool_uses, expected.tool_uses,
-        "{from:?} -> {to:?} should preserve tool calls"
-    );
-    assert_eq!(
-        actual.tool_results, expected.tool_results,
-        "{from:?} -> {to:?} should preserve tool results"
-    );
-    assert_eq!(
-        actual.images, expected.images,
-        "{from:?} -> {to:?} should preserve image blocks"
-    );
 }
 
 #[test]
@@ -457,30 +492,633 @@ fn codex_to_claude_emits_resume_compatible_jsonl() {
 
 #[cfg(feature = "opencode")]
 #[test]
-fn all_six_cross_provider_conversions_preserve_rich_semantics() {
+fn all_six_cross_provider_conversions_wrap_source_context() {
     let providers = [Provider::Claude, Provider::Codex, Provider::OpenCode];
     for from in providers {
         let source_dir = tempfile::tempdir().unwrap();
         let source = write_native_source(from, source_dir.path());
         let source_session = read_session(from, &source).unwrap();
-        let expected = semantic_profile(&source_session);
+        let source_profile = semantic_profile(&source_session);
 
         for to in providers.into_iter().filter(|to| *to != from) {
             let target_dir = tempfile::tempdir().unwrap();
             let target = target_for(to, &source_session.session_id, target_dir.path());
             let converted_source = convert(from, to, &source, &target).unwrap();
             assert_eq!(
-                semantic_profile(&converted_source),
-                expected,
-                "{from:?} -> {to:?} should read the same source semantics through convert()"
+                converted_source.messages.len(),
+                2,
+                "{from:?} -> {to:?} convert() should return a two-message wrapper"
             );
-            let target_source = source_from_target(to, &target, &source_session.session_id);
-            let converted = read_session(to, &target_source).unwrap();
-            let actual = semantic_profile(&converted);
+            assert_context_wrapper(
+                from,
+                to,
+                &source_session,
+                &source_profile,
+                &converted_source,
+            );
 
-            assert_cross_provider_profile_preserved(from, to, &expected, &actual);
+            if let (Provider::OpenCode, SessionTarget::OpenCodeDb { db_path }) = (to, &target) {
+                let report = native_validate::validate_clone_artifact(
+                    Provider::OpenCode,
+                    &converted_source.session_id,
+                    &ArtifactPath::OpenCodeDb {
+                        db_path: db_path.clone(),
+                        session_id: converted_source.session_id.clone(),
+                    },
+                )
+                .unwrap();
+                assert!(
+                    report.ok,
+                    "{from:?} -> {to:?} OpenCode wrapper should pass native validation: {}",
+                    report.failure_summary()
+                );
+            }
+
+            let target_source = source_from_target(to, &target, &converted_source.session_id);
+            let converted = read_session(to, &target_source).unwrap();
+            assert_context_wrapper(from, to, &source_session, &source_profile, &converted);
         }
     }
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn rich_cross_provider_wrappers_install_into_native_live_layouts() {
+    let providers = [Provider::Claude, Provider::Codex, Provider::OpenCode];
+    for from in providers.iter().copied() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = write_native_source(from, source_dir.path());
+        let source_session = read_session(from, &source).unwrap();
+        let source_profile = semantic_profile(&source_session);
+
+        for to in providers.iter().copied().filter(|to| *to != from) {
+            let converted = wrap_session_for_context_convert(&source_session, to);
+            assert_eq!(
+                converted.messages.len(),
+                2,
+                "{from:?} -> {to:?} wrapper should synthesize exactly two visible messages"
+            );
+
+            let target_dir = tempfile::tempdir().unwrap();
+            let mut opts = InstallSessionOpts::default();
+            match to {
+                Provider::Claude => {
+                    opts.claude_home = Some(target_dir.path().join(".claude"));
+                }
+                Provider::Codex => {
+                    let state_path = target_dir.path().join("state_5.sqlite");
+                    create_codex_threads_table(&state_path);
+                    opts.codex_home = Some(target_dir.path().join(".codex"));
+                    opts.codex_state_5_path = Some(state_path);
+                }
+                Provider::OpenCode => {
+                    opts.opencode_db_path = Some(target_dir.path().join("opencode.db"));
+                }
+            }
+
+            let codex_state_5_path = opts.codex_state_5_path.clone();
+            let report = install_universal_session(to, &converted, &opts).unwrap();
+            assert!(
+                report.validation.ok,
+                "{from:?} -> {to:?} installed wrapper should pass native validation: {}",
+                report.validation.failure_summary()
+            );
+            assert_installed_native_wrapper_shape(
+                to,
+                &report.artifact,
+                &report.session_id,
+                codex_state_5_path.as_deref(),
+            );
+            let back = read_installed_session(to, &report.artifact, &report.session_id);
+            assert_context_wrapper(from, to, &source_session, &source_profile, &back);
+        }
+    }
+}
+
+#[cfg(feature = "opencode")]
+fn read_installed_session(
+    provider: Provider,
+    artifact: &ArtifactPath,
+    session_id: &str,
+) -> UniversalSession {
+    match (provider, artifact) {
+        (Provider::Claude, ArtifactPath::File(path)) => {
+            providers::claude::from_file(path, &Default::default()).unwrap()
+        }
+        (Provider::Codex, ArtifactPath::File(path)) => providers::codex::from_file(path).unwrap(),
+        (Provider::OpenCode, ArtifactPath::OpenCodeDb { db_path, .. }) => {
+            providers::opencode::from_db_path(db_path, session_id).unwrap()
+        }
+        _ => panic!("provider/artifact mismatch: {provider:?} {artifact:?}"),
+    }
+}
+
+#[cfg(feature = "opencode")]
+fn assert_installed_native_wrapper_shape(
+    provider: Provider,
+    artifact: &ArtifactPath,
+    session_id: &str,
+    codex_state_5_path: Option<&std::path::Path>,
+) {
+    match (provider, artifact) {
+        (Provider::Claude, ArtifactPath::File(path)) => {
+            assert_claude_native_wrapper_shape(path, session_id);
+        }
+        (Provider::Codex, ArtifactPath::File(path)) => {
+            assert_codex_native_wrapper_shape(path, session_id, codex_state_5_path);
+        }
+        (Provider::OpenCode, ArtifactPath::OpenCodeDb { db_path, .. }) => {
+            assert_opencode_native_wrapper_shape(db_path, session_id);
+        }
+        _ => panic!("provider/artifact mismatch: {provider:?} {artifact:?}"),
+    }
+}
+
+#[cfg(feature = "opencode")]
+fn jsonl_file_values(path: &std::path::Path) -> Vec<Value> {
+    jsonl_values(&std::fs::read_to_string(path).unwrap())
+}
+
+#[cfg(feature = "opencode")]
+fn assert_claude_native_wrapper_shape(path: &std::path::Path, session_id: &str) {
+    let values = jsonl_file_values(path);
+    let conversation = claude_conversation_lines(&values);
+    assert_eq!(
+        conversation.len(),
+        2,
+        "Claude wrapper artifact should have exactly two conversation rows"
+    );
+    assert!(
+        values
+            .iter()
+            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("queue-operation")),
+        "Claude wrapper should include native queue-operation rows"
+    );
+    assert!(
+        values
+            .iter()
+            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("last-prompt")),
+        "Claude wrapper should include a native last-prompt row"
+    );
+
+    let user = conversation[0];
+    let assistant = conversation[1];
+    assert_eq!(user.get("type").and_then(|v| v.as_str()), Some("user"));
+    assert_eq!(
+        assistant.get("type").and_then(|v| v.as_str()),
+        Some("assistant")
+    );
+    assert_eq!(
+        user.get("sessionId").and_then(|v| v.as_str()),
+        Some(session_id)
+    );
+    assert_eq!(
+        assistant.get("sessionId").and_then(|v| v.as_str()),
+        Some(session_id)
+    );
+    assert!(uuid::Uuid::parse_str(user.get("uuid").unwrap().as_str().unwrap()).is_ok());
+    assert!(uuid::Uuid::parse_str(assistant.get("uuid").unwrap().as_str().unwrap()).is_ok());
+    assert!(user.get("parentUuid").unwrap().is_null());
+    assert_eq!(
+        assistant.get("parentUuid").and_then(|v| v.as_str()),
+        user.get("uuid").and_then(|v| v.as_str())
+    );
+    assert!(user.get("timestamp").and_then(|v| v.as_str()).is_some());
+    assert!(assistant
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .is_some());
+    assert_eq!(
+        user.pointer("/message/role").and_then(|v| v.as_str()),
+        Some("user")
+    );
+    assert_eq!(
+        assistant.pointer("/message/role").and_then(|v| v.as_str()),
+        Some("assistant")
+    );
+    assert!(
+        user.pointer("/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .ends_with(CONTEXT_CONTINUATION_PROMPT),
+        "Claude wrapper user content should end with the continuation prompt"
+    );
+    assert!(assistant
+        .pointer("/message/id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .starts_with("msg_"));
+    assert_eq!(
+        assistant
+            .pointer("/message/content/0/type")
+            .and_then(|v| v.as_str()),
+        Some("text")
+    );
+    assert_eq!(
+        assistant
+            .pointer("/message/content/0/text")
+            .and_then(|v| v.as_str()),
+        Some(CONTEXT_ACK)
+    );
+}
+
+#[cfg(feature = "opencode")]
+fn assert_codex_native_wrapper_shape(
+    path: &std::path::Path,
+    session_id: &str,
+    state_5_path: Option<&std::path::Path>,
+) {
+    let values = jsonl_file_values(path);
+    let session_meta = values
+        .iter()
+        .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("session_meta"))
+        .expect("Codex wrapper should include session_meta");
+    assert_eq!(
+        session_meta.pointer("/payload/id").and_then(|v| v.as_str()),
+        Some(session_id)
+    );
+    assert!(session_meta
+        .pointer("/payload/cwd")
+        .and_then(|v| v.as_str())
+        .map(|cwd| !cwd.is_empty())
+        .unwrap_or(false));
+    assert!(
+        values
+            .iter()
+            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("turn_context")),
+        "Codex wrapper should include a native turn_context row"
+    );
+    assert!(
+        !values.iter().any(|v| {
+            v.get("type").and_then(|t| t.as_str()) == Some("response_item")
+                && v.pointer("/payload/type").and_then(|t| t.as_str()) == Some("reasoning")
+                && v.pointer("/payload/summary")
+                    .and_then(|summary| summary.as_array())
+                    .map(|summary| summary.is_empty())
+                    .unwrap_or(false)
+                && v.pointer("/payload/encrypted_content").is_none()
+        }),
+        "Codex wrapper should not synthesize empty reasoning items"
+    );
+
+    let response_messages = values
+        .iter()
+        .filter(|v| {
+            v.get("type").and_then(|t| t.as_str()) == Some("response_item")
+                && v.pointer("/payload/type").and_then(|t| t.as_str()) == Some("message")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_messages.len(),
+        2,
+        "Codex wrapper artifact should have exactly two response_item.message rows"
+    );
+    assert_eq!(
+        response_messages[0]
+            .pointer("/payload/role")
+            .and_then(|v| v.as_str()),
+        Some("user")
+    );
+    assert_eq!(
+        response_messages[0]
+            .pointer("/payload/content/0/type")
+            .and_then(|v| v.as_str()),
+        Some("input_text")
+    );
+    assert!(response_messages[0]
+        .pointer("/payload/content/0/text")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .ends_with(CONTEXT_CONTINUATION_PROMPT));
+    assert_eq!(
+        response_messages[1]
+            .pointer("/payload/role")
+            .and_then(|v| v.as_str()),
+        Some("assistant")
+    );
+    assert_eq!(
+        response_messages[1]
+            .pointer("/payload/phase")
+            .and_then(|v| v.as_str()),
+        Some("final_answer")
+    );
+    assert_eq!(
+        response_messages[1]
+            .pointer("/payload/content/0/type")
+            .and_then(|v| v.as_str()),
+        Some("output_text")
+    );
+    assert_eq!(
+        response_messages[1]
+            .pointer("/payload/content/0/text")
+            .and_then(|v| v.as_str()),
+        Some(CONTEXT_ACK)
+    );
+
+    for required in [
+        "task_started",
+        "user_message",
+        "agent_message",
+        "token_count",
+        "task_complete",
+    ] {
+        assert!(
+            values.iter().any(|v| {
+                v.get("type").and_then(|t| t.as_str()) == Some("event_msg")
+                    && v.pointer("/payload/type").and_then(|t| t.as_str()) == Some(required)
+            }),
+            "Codex wrapper should include event_msg.{required}"
+        );
+    }
+
+    if let Some(state_5_path) = state_5_path {
+        let conn = rusqlite::Connection::open(state_5_path).unwrap();
+        let (
+            rollout_path,
+            source,
+            model_provider,
+            cwd,
+            title,
+            sandbox_policy,
+            approval_mode,
+            has_user_event,
+            first_user_message,
+            preview,
+            memory_mode,
+            model,
+            reasoning_effort,
+        ): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT rollout_path, source, model_provider, cwd, title,
+                        sandbox_policy, approval_mode, has_user_event,
+                        first_user_message, preview, memory_mode, model, reasoning_effort
+                 FROM threads WHERE id = ?1",
+                rusqlite::params![session_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(rollout_path, path.display().to_string());
+        assert!(!source.is_empty());
+        assert!(!model_provider.is_empty());
+        assert!(!cwd.is_empty());
+        assert!(!title.is_empty());
+        assert!(serde_json::from_str::<Value>(&sandbox_policy)
+            .unwrap()
+            .get("type")
+            .is_some());
+        assert!(!approval_mode.is_empty());
+        assert_eq!(has_user_event, 1);
+        assert!(first_user_message.ends_with(CONTEXT_CONTINUATION_PROMPT));
+        assert!(preview.contains("==="));
+        assert_eq!(memory_mode, "enabled");
+        assert!(model.map(|m| !m.is_empty()).unwrap_or(false));
+        assert!(reasoning_effort.map(|e| !e.is_empty()).unwrap_or(false));
+    }
+}
+
+#[cfg(feature = "opencode")]
+fn assert_opencode_native_wrapper_shape(db_path: &std::path::Path, session_id: &str) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let (directory, slug, version, model): (String, String, String, String) = conn
+        .query_row(
+            "SELECT directory, slug, version, model FROM session WHERE id = ?1",
+            rusqlite::params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert!(!directory.is_empty());
+    assert!(!slug.is_empty());
+    assert!(!version.is_empty());
+    let model: Value = serde_json::from_str(&model).unwrap();
+    assert!(model.get("id").and_then(|v| v.as_str()).is_some());
+    assert!(model.get("providerID").and_then(|v| v.as_str()).is_some());
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, data FROM message
+             WHERE session_id = ?1
+             ORDER BY time_created, id",
+        )
+        .unwrap();
+    let messages = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        2,
+        "OpenCode wrapper artifact should have exactly two message rows"
+    );
+    assert!(messages[0].0.starts_with("msg_"));
+    assert!(messages[1].0.starts_with("msg_"));
+    let user_data: Value = serde_json::from_str(&messages[0].1).unwrap();
+    let assistant_data: Value = serde_json::from_str(&messages[1].1).unwrap();
+    assert_eq!(user_data.get("role").and_then(|v| v.as_str()), Some("user"));
+    assert_eq!(
+        assistant_data.get("role").and_then(|v| v.as_str()),
+        Some("assistant")
+    );
+    assert_eq!(
+        assistant_data.get("parentID").and_then(|v| v.as_str()),
+        Some(messages[0].0.as_str())
+    );
+    assert_eq!(
+        assistant_data.get("finish").and_then(|v| v.as_str()),
+        Some("stop")
+    );
+    assert!(assistant_data
+        .get("tokens")
+        .and_then(|v| v.as_object())
+        .is_some());
+
+    let user_parts = opencode_part_data(&conn, session_id, &messages[0].0);
+    assert_eq!(user_parts.len(), 1);
+    assert_eq!(
+        user_parts[0].get("type").and_then(|v| v.as_str()),
+        Some("text")
+    );
+    assert!(user_parts[0]
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .ends_with(CONTEXT_CONTINUATION_PROMPT));
+
+    let assistant_parts = opencode_part_data(&conn, session_id, &messages[1].0);
+    let assistant_part_types = assistant_parts
+        .iter()
+        .filter_map(|part| part.get("type").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>();
+    assert!(assistant_part_types.contains(&"step-start"));
+    assert!(assistant_part_types.contains(&"reasoning"));
+    assert!(assistant_part_types.contains(&"text"));
+    assert!(assistant_part_types.contains(&"step-finish"));
+    assert!(
+        assistant_parts.iter().any(|part| {
+            part.get("type").and_then(|v| v.as_str()) == Some("text")
+                && part.get("text").and_then(|v| v.as_str()) == Some(CONTEXT_ACK)
+        }),
+        "OpenCode assistant text part should contain ok"
+    );
+
+    let session_message_types = conn
+        .prepare(
+            "SELECT id, type FROM session_message
+             WHERE session_id = ?1
+             ORDER BY time_created, id",
+        )
+        .unwrap()
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    if !session_message_types.is_empty() {
+        assert_eq!(session_message_types.len(), 2);
+        assert!(session_message_types
+            .iter()
+            .all(|(id, _)| id.starts_with("evt_")));
+        assert_eq!(
+            session_message_types
+                .iter()
+                .map(|(_, kind)| kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-switched", "model-switched"]
+        );
+    }
+}
+
+#[cfg(feature = "opencode")]
+fn opencode_part_data(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    message_id: &str,
+) -> Vec<Value> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT data FROM part
+             WHERE session_id = ?1 AND message_id = ?2
+             ORDER BY time_created, id",
+        )
+        .unwrap();
+    stmt.query_map(rusqlite::params![session_id, message_id], |row| {
+        let data: String = row.get(0)?;
+        Ok(serde_json::from_str(&data).unwrap())
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+#[cfg(feature = "opencode")]
+fn assert_context_wrapper(
+    from: Provider,
+    to: Provider,
+    source: &UniversalSession,
+    source_profile: &SemanticProfile,
+    converted: &UniversalSession,
+) {
+    assert_eq!(
+        converted.cwd, source.cwd,
+        "{from:?} -> {to:?} should preserve cwd on the wrapper session"
+    );
+    let user_texts = texts_for_role(converted, Role::User);
+    assert_eq!(
+        user_texts.len(),
+        1,
+        "{from:?} -> {to:?} should expose one user context message"
+    );
+    let context = user_texts[0];
+    assert!(
+        context.ends_with(CONTEXT_CONTINUATION_PROMPT),
+        "{from:?} -> {to:?} context should end with the continuation prompt"
+    );
+    assert!(
+        context.contains(&format!(
+            "=== {} ({}) ===",
+            source.session_id,
+            from.as_str()
+        )),
+        "{from:?} -> {to:?} context should include source session header"
+    );
+    for fragment in &source_profile.fragments {
+        assert!(
+            context.contains(fragment),
+            "{from:?} -> {to:?} context should contain source fragment {fragment:?}"
+        );
+    }
+    for (call_id, name, input) in &source_profile.tool_uses {
+        assert!(
+            context.contains(&format!("tool_use[{call_id}] {name}:")),
+            "{from:?} -> {to:?} context should contain source tool call {call_id:?}"
+        );
+        let input = serde_json::to_string(input).unwrap();
+        assert!(
+            context.contains(&input),
+            "{from:?} -> {to:?} context should contain source tool input {input:?}"
+        );
+    }
+    for (call_id, output, is_error) in &source_profile.tool_results {
+        let label = if *is_error {
+            format!("tool_result[{call_id}] error:")
+        } else {
+            format!("tool_result[{call_id}]:")
+        };
+        assert!(
+            context.contains(&label),
+            "{from:?} -> {to:?} context should contain source tool result {call_id:?}"
+        );
+        assert!(
+            context.contains(output),
+            "{from:?} -> {to:?} context should contain source tool output {output:?}"
+        );
+    }
+    for (mime, _) in &source_profile.images {
+        assert!(
+            context.contains(&format!("image: {mime} ")),
+            "{from:?} -> {to:?} context should contain source image marker for {mime:?}"
+        );
+    }
+
+    let assistant_texts = texts_for_role(converted, Role::Assistant);
+    assert_eq!(
+        assistant_texts,
+        vec![CONTEXT_ACK],
+        "{from:?} -> {to:?} should expose one assistant acknowledgement"
+    );
 }
 
 #[cfg(feature = "opencode")]

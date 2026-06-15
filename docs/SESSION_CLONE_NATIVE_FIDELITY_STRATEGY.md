@@ -497,7 +497,9 @@ OpenCode는 SQLite 기반이다.
 
 write 전략:
 
-- `project_id='global'` row를 보장한다.
+- OpenCode 원본에서 온 `opencode_project_id`는 보존한다.
+- cross-provider wrapper처럼 target project 정보가 없으면 target DB에서 `project.worktree == session.cwd` 행을 우선 재사용한다.
+- matching project가 없을 때만 `project_id='global'` fallback row를 사용한다. 기존 `global` row의 worktree는 보존하고, row가 없을 때만 session cwd로 생성한다.
 - `session` row에는 directory, title, agent, model, token totals, slug, version, path를 채운다.
 - `session.model`은 JSON object string 형태로 저장한다.
 - `message.data` user에는 role, time, agent, model, summary를 넣는다.
@@ -621,7 +623,6 @@ shape가 맞아도 의미가 깨질 수 있다.
 
 ```text
 COKACMUX_DEBUG=1
-COKACCONVERT_DEBUG=1
 ```
 
 로그 위치:

@@ -1,4 +1,4 @@
-//! cokacmux — bidirectional converter for coding-agent session data.
+//! cokacmux — converter and session manager for coding-agent session data.
 //!
 //! Supported coding-agent providers write their session data to disk in
 //! very different shapes. The currently implemented adapters include:
@@ -12,8 +12,14 @@
 //!
 //! This crate defines [`UniversalSession`] — a provider-agnostic data model
 //! that can hold supported provider data without loss — and provides
-//! `from_X` / `to_X` adapter pairs for each provider. Any X → Y conversion
-//! is the composition `from_X → to_Y`.
+//! `from_X` / `to_X` adapter pairs for each provider.
+//!
+//! Same-provider adapter round-trips may preserve native data, but `convert()`
+//! is deliberately a different contract: it does not try to reproduce a full
+//! native session history in another provider. Instead it wraps the source
+//! session into a two-message continuation context: one user message containing
+//! the rendered source context, followed by one assistant message containing
+//! `ok`.
 //!
 //! ## Quick start
 //!
@@ -30,6 +36,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod context_convert;
 #[doc(hidden)]
 pub mod debug;
 pub mod error;
@@ -44,6 +51,10 @@ pub mod universal;
 pub mod session;
 
 // Re-exports — these form the public surface area.
+pub use context_convert::{
+    context_user_message_text, wrap_session_for_context_convert, CONTEXT_ACK,
+    CONTEXT_CONTINUATION_PROMPT,
+};
 pub use error::{ConvertError, Result};
 pub use universal::{
     ContentBlock, GitInfo, ImageSource, MessageFlags, ModelInfo, Provenance, Provider,
@@ -191,7 +202,16 @@ pub fn write_session(
     result
 }
 
-/// `from → universal → to` in one call.
+/// Context-wrapper conversion in one call.
+///
+/// This is intentionally not a lossless cross-provider transcript converter.
+/// Keep adapter-level preservation tests separate from this public helper so
+/// future changes do not accidentally reintroduce a hidden provider-to-provider
+/// synthesis contract.
+///
+/// The written target session contains two visible messages: a user message
+/// with the rendered source context and continuation prompt, then an assistant
+/// `ok`.
 pub fn convert(
     from: Provider,
     to: Provider,
@@ -207,7 +227,7 @@ pub fn convert(
             "target": session_target_label(dst),
         }),
     );
-    let session = match read_session(from, src) {
+    let source_session = match read_session(from, src) {
         Ok(session) => session,
         Err(error) => {
             debug::log(
@@ -222,14 +242,16 @@ pub fn convert(
             return Err(error);
         }
     };
-    if let Err(error) = write_session(to, &session, dst) {
+    let converted = wrap_session_for_context_convert(&source_session, to);
+    if let Err(error) = write_session(to, &converted, dst) {
         debug::log(
             "convert_error",
             serde_json::json!({
                 "stage": "write",
                 "from": from.as_str(),
                 "to": to.as_str(),
-                "session_id": &session.session_id,
+                "source_session_id": &source_session.session_id,
+                "target_session_id": &converted.session_id,
                 "error": error.to_string(),
             }),
         );
@@ -240,11 +262,13 @@ pub fn convert(
         serde_json::json!({
             "from": from.as_str(),
             "to": to.as_str(),
-            "session_id": &session.session_id,
-            "messages": session.messages.len(),
+            "source_session_id": &source_session.session_id,
+            "target_session_id": &converted.session_id,
+            "source_messages": source_session.messages.len(),
+            "target_messages": converted.messages.len(),
         }),
     );
-    Ok(session)
+    Ok(converted)
 }
 
 fn session_source_label(src: &SessionSource) -> String {

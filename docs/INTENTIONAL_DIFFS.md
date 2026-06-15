@@ -143,7 +143,8 @@ preserving이다. 의도적 손실로 분류한다.
 - `session_meta.payload.id` 와 session_id 불일치 (Codex)
 - OpenCode `session.directory` 또는 `path` 가 비어 있음
 - OpenCode `model` 컬럼이 plain string (JSON object 가 아님)
-- OpenCode `project_id` 가 `'global'` 아님 (top-level session의 경우)
+- OpenCode `project_id` 가 실제 `project` row를 가리키지 않음
+- OpenCode non-global `project.worktree` 와 `session.directory` 불일치
 - assistant message 가 두 번 row로 들어감
 - tool_use ↔ tool_result `call_id` 페어링이 깨짐
 - `INSERT OR REPLACE` 가 원본 row를 덮어씀

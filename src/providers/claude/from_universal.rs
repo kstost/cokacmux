@@ -150,8 +150,16 @@ pub(crate) fn parse_lines_with_sidecar_root(
         }
 
         // Compose the UMessage.
-        let umessage =
-            build_umessage(&val, &line_type, idx, ts, is_sidechain, ctx, sidecar_root, lineno);
+        let umessage = build_umessage(
+            &val,
+            &line_type,
+            idx,
+            ts,
+            is_sidechain,
+            ctx,
+            sidecar_root,
+            lineno,
+        );
         if umessage.flags.is_meta {
             meta_messages = meta_messages.saturating_add(1);
         } else {

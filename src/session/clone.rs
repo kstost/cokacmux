@@ -11,16 +11,18 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use crate::context_convert::wrap_session_for_context_convert;
 use crate::error::{ConvertError, Result};
 use crate::providers;
 use crate::providers::discovery::SessionInfo;
+use crate::session::install::{install_universal_session, InstallSessionOpts};
 use crate::universal::Provider;
 
 #[derive(Debug)]
 pub struct CloneOpts {
-    /// Override the target provider. Defaults to the source provider. Clone
-    /// only supports same-provider copies; cross-provider data creation must
-    /// use conversion instead.
+    /// Override the target provider. Defaults to the source provider. Same-provider
+    /// clone copies provider-native storage; cross-provider clone installs a
+    /// two-message context wrapper in the target provider's native live store.
     pub to: Option<Provider>,
     /// Override cwd on the new session. Defaults to the source cwd.
     pub cwd: Option<String>,
@@ -64,8 +66,9 @@ enum JsonLine {
     Json(Value),
 }
 
-/// Clone the session described by `src` into the same provider's live
-/// storage with a new session id. Returns the path/id of the new artifact.
+/// Clone the session described by `src` into live storage with a new session id.
+/// Same-provider targets preserve native storage; cross-provider targets are
+/// prepared as a two-message context handoff in the target provider's format.
 pub fn clone_to_live(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport> {
     crate::debug::log(
         "clone_to_live_start",
@@ -81,19 +84,7 @@ pub fn clone_to_live(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport>
 
     let target_provider = opts.to.unwrap_or(src.provider);
     if target_provider != src.provider {
-        crate::debug::log(
-            "clone_cross_provider_rejected",
-            serde_json::json!({
-                "source_provider": src.provider.as_str(),
-                "source_session_id": &src.session_id,
-                "target_provider": target_provider.as_str(),
-            }),
-        );
-        return Err(ConvertError::Unsupported(format!(
-            "cross-provider clone is not supported because clone must preserve native provider data; use convert to create a {} session from {}",
-            target_provider.as_str(),
-            src.provider.as_str()
-        )));
+        return clone_cross_provider_context_wrapper(src, target_provider, opts);
     }
 
     match src.provider {
@@ -112,6 +103,68 @@ pub fn clone_to_live(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport>
             }
         }
     }
+}
+
+fn clone_cross_provider_context_wrapper(
+    src: &SessionInfo,
+    target_provider: Provider,
+    opts: &CloneOpts,
+) -> Result<CloneReport> {
+    clone_cross_provider_context_wrapper_with_install_opts(
+        src,
+        target_provider,
+        opts,
+        &InstallSessionOpts {
+            overwrite: opts.overwrite,
+            ..Default::default()
+        },
+    )
+}
+
+fn clone_cross_provider_context_wrapper_with_install_opts(
+    src: &SessionInfo,
+    target_provider: Provider,
+    opts: &CloneOpts,
+    install_opts: &InstallSessionOpts,
+) -> Result<CloneReport> {
+    let source_session = super::load(src)?;
+    let mut wrapped = wrap_session_for_context_convert(&source_session, target_provider);
+    let new_cwd = opts.cwd.clone().unwrap_or_else(|| src.cwd.clone());
+    if !new_cwd.is_empty() {
+        wrapped.cwd = new_cwd;
+    }
+    if let Some(new_id) = opts.new_id.clone() {
+        ensure_native_session_id_for(target_provider, &new_id)?;
+        wrapped.session_id = new_id.clone();
+        if let Some(context) = wrapped
+            .extras
+            .get_mut("context_convert")
+            .and_then(Value::as_object_mut)
+        {
+            context.insert("target_session_id".into(), Value::String(new_id));
+        }
+    }
+
+    let install = install_universal_session(target_provider, &wrapped, install_opts)?;
+    crate::debug::log(
+        "clone_cross_provider_context_wrapper_ok",
+        serde_json::json!({
+            "source_provider": src.provider.as_str(),
+            "source_session_id": &src.session_id,
+            "target_provider": target_provider.as_str(),
+            "new_session_id": &install.session_id,
+            "artifact": format!("{:?}", &install.artifact),
+            "messages": wrapped.messages.len(),
+            "native_validation_checks": install.validation.checks.len(),
+        }),
+    );
+    Ok(CloneReport {
+        source_provider: src.provider,
+        source_session_id: src.session_id.clone(),
+        new_session_id: install.session_id,
+        target_provider,
+        artifact: install.artifact,
+    })
 }
 
 fn clone_claude_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport> {
@@ -981,6 +1034,31 @@ fn mint_id_for(target: Provider) -> String {
     }
 }
 
+fn ensure_native_session_id_for(target: Provider, session_id: &str) -> Result<()> {
+    let ok = match target {
+        Provider::Claude | Provider::Codex => uuid::Uuid::parse_str(session_id).is_ok(),
+        Provider::OpenCode => is_opencode_session_id(session_id),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(ConvertError::Other(format!(
+            "new session id `{session_id}` is not a native {} session id",
+            target.as_str()
+        )))
+    }
+}
+
+fn is_opencode_session_id(session_id: &str) -> bool {
+    let Some(body) = session_id.strip_prefix("ses_") else {
+        return false;
+    };
+    body.len() == 26
+        && body.is_ascii()
+        && body[..12].chars().all(|c| c.is_ascii_hexdigit())
+        && body[12..].chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf};
@@ -1015,23 +1093,97 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cross_provider_clone_before_reading_source() {
-        let missing = PathBuf::from("/tmp/cokacmux-missing-source.jsonl");
-        let src = session_info(Provider::Claude, "source-id", "/repo", missing);
-
-        let error = clone_to_live(
+    fn cross_provider_clone_installs_two_message_context_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.jsonl");
+        fs::write(
+            &source_path,
+            r#"{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{"id":"source-codex","cwd":"/repo"}}
+{"timestamp":"2026-05-20T01:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"continue this work"}]}}
+"#,
+        )
+        .unwrap();
+        let src = session_info(Provider::Codex, "source-codex", "/repo", source_path);
+        let report = clone_cross_provider_context_wrapper_with_install_opts(
             &src,
-            &CloneOpts {
-                to: Some(Provider::Codex),
+            Provider::Claude,
+            &CloneOpts::default(),
+            &InstallSessionOpts {
+                claude_home: Some(dir.path().join(".claude")),
                 ..Default::default()
             },
         )
-        .expect_err("cross-provider clone must be rejected");
+        .unwrap();
 
+        assert_eq!(report.source_provider, Provider::Codex);
+        assert_eq!(report.source_session_id, "source-codex");
+        assert_eq!(report.target_provider, Provider::Claude);
+        let ArtifactPath::File(path) = &report.artifact else {
+            panic!("expected Claude file artifact, got {:?}", report.artifact);
+        };
+        assert!(path.is_file());
+
+        let back = providers::claude::from_file(path, &Default::default()).unwrap();
+        let user_texts = text_messages_for_role(&back, crate::universal::Role::User);
+        let assistant_texts = text_messages_for_role(&back, crate::universal::Role::Assistant);
+        assert_eq!(user_texts.len(), 1);
+        assert_eq!(assistant_texts.len(), 1);
+        let user_text = user_texts[0];
+        assert!(user_text.contains("=== source-codex (codex) ==="));
+        assert!(user_text.contains("continue this work"));
+        assert!(user_text.ends_with(crate::CONTEXT_CONTINUATION_PROMPT));
+        assert_eq!(assistant_texts[0], crate::CONTEXT_ACK);
+    }
+
+    #[cfg(feature = "opencode")]
+    #[test]
+    fn cross_provider_clone_rejects_non_native_target_session_id_before_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.jsonl");
+        fs::write(
+            &source_path,
+            r#"{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{"id":"source-codex","cwd":"/repo"}}
+{"timestamp":"2026-05-20T01:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"continue this work"}]}}
+"#,
+        )
+        .unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let src = session_info(Provider::Codex, "source-codex", "/repo", source_path);
+        let err = clone_cross_provider_context_wrapper_with_install_opts(
+            &src,
+            Provider::OpenCode,
+            &CloneOpts {
+                new_id: Some("not-native".into()),
+                ..Default::default()
+            },
+            &InstallSessionOpts {
+                opencode_db_path: Some(db_path.clone()),
+                ..Default::default()
+            },
+        )
+        .expect_err("invalid target-native session id should be rejected before install");
+
+        assert!(err.to_string().contains("not a native opencode session id"));
         assert!(
-            error.to_string().contains("cross-provider clone"),
-            "{error}"
+            !db_path.exists(),
+            "invalid id should fail before creating the OpenCode DB"
         );
+    }
+
+    fn text_messages_for_role(
+        session: &crate::universal::UniversalSession,
+        role: crate::universal::Role,
+    ) -> Vec<&str> {
+        session
+            .messages
+            .iter()
+            .filter(|message| message.role == role && !message.flags.is_meta)
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                crate::universal::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]

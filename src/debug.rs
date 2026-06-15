@@ -78,10 +78,10 @@ fn enabled() -> bool {
 }
 
 fn init_enabled() -> bool {
-    let convert_env_enabled = std::env::var("COKACCONVERT_DEBUG")
+    let env_enabled = std::env::var("COKACMUX_DEBUG")
         .map(|value| value == "1")
         .unwrap_or(false);
-    let enabled = convert_env_enabled;
+    let enabled = env_enabled;
     DEBUG_STATE.store(
         if enabled { DEBUG_ON } else { DEBUG_OFF },
         Ordering::Relaxed,
@@ -89,7 +89,7 @@ fn init_enabled() -> bool {
     if enabled {
         write_log_to(
             DEBUG_LOG_FILE,
-            "library_debug_enabled {\"source\":\"COKACCONVERT_DEBUG\"}",
+            "library_debug_enabled {\"source\":\"COKACMUX_DEBUG\"}",
         );
     }
     enabled
@@ -254,7 +254,11 @@ fn open_log_file(filename: &str) -> Option<File> {
     #[cfg(unix)]
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     let path = dir.join(filename);
-    let file = OpenOptions::new().create(true).append(true).open(&path).ok()?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
     #[cfg(unix)]
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     Some(file)

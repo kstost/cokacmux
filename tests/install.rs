@@ -4,11 +4,20 @@
 
 #![cfg(feature = "discovery")]
 
+use std::path::{Path, PathBuf};
+
 #[cfg(feature = "opencode")]
 use cokacmux::providers::opencode;
 use cokacmux::providers::{claude, codex};
-use cokacmux::session::{clone::ArtifactPath, native_validate};
-use cokacmux::Provider;
+use cokacmux::session::{
+    clone::ArtifactPath,
+    install::{install_universal_session, InstallSessionOpts},
+    native_validate,
+};
+use cokacmux::{
+    wrap_session_for_context_convert, ContentBlock, Provider, Role, CONTEXT_ACK,
+    CONTEXT_CONTINUATION_PROMPT,
+};
 
 fn claude_fixture() -> &'static str {
     r#"{"type":"user","sessionId":"installtest-1","cwd":"/tmp/abc","timestamp":"2026-05-20T01:00:00.000Z","uuid":"019e0000-0000-7000-8000-000000000001","parentUuid":null,"message":{"role":"user","content":"hi"}}
@@ -20,6 +29,80 @@ fn codex_fixture() -> &'static str {
     r#"{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{"id":"installtest-codex","cwd":"/tmp/abc"}}
 {"timestamp":"2026-05-20T01:00:00.500Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}
 "#
+}
+
+#[cfg(feature = "opencode")]
+fn create_codex_threads_table(path: &Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            model_provider TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            title TEXT NOT NULL,
+            sandbox_policy TEXT NOT NULL,
+            approval_mode TEXT NOT NULL,
+            tokens_used INTEGER NOT NULL DEFAULT 0,
+            has_user_event INTEGER NOT NULL DEFAULT 0,
+            archived INTEGER NOT NULL DEFAULT 0,
+            archived_at INTEGER,
+            git_sha TEXT,
+            git_branch TEXT,
+            git_origin_url TEXT,
+            cli_version TEXT NOT NULL DEFAULT '',
+            first_user_message TEXT NOT NULL DEFAULT '',
+            agent_nickname TEXT,
+            agent_role TEXT,
+            memory_mode TEXT NOT NULL DEFAULT 'enabled',
+            model TEXT,
+            reasoning_effort TEXT,
+            agent_path TEXT,
+            created_at_ms INTEGER,
+            updated_at_ms INTEGER,
+            thread_source TEXT,
+            preview TEXT NOT NULL DEFAULT ''
+        );
+    "#,
+    )
+    .unwrap();
+}
+
+fn text_messages_for_role<'a>(session: &'a cokacmux::UniversalSession, role: Role) -> Vec<&'a str> {
+    session
+        .messages
+        .iter()
+        .filter(|message| message.role == role)
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn jsonl_files_under(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_jsonl_files(root, &mut files);
+    files
+}
+
+fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) {
+    if !root.exists() {
+        return;
+    }
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_jsonl_files(&path, files);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
 }
 
 #[test]
@@ -71,6 +154,42 @@ fn claude_install_into_tempdir() {
 }
 
 #[test]
+fn context_wrapper_install_into_claude_tempdir_validates_native_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = codex::from_jsonl_str(codex_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::Claude);
+
+    let report = install_universal_session(
+        Provider::Claude,
+        &converted,
+        &InstallSessionOpts {
+            claude_home: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.provider, Provider::Claude);
+    assert_eq!(report.session_id, converted.session_id);
+    assert!(report.validation.ok, "{:?}", report.validation);
+    let ArtifactPath::File(path) = &report.artifact else {
+        panic!("expected Claude file artifact: {:?}", report.artifact);
+    };
+    assert_eq!(
+        path.file_stem().and_then(|stem| stem.to_str()),
+        Some(converted.session_id.as_str())
+    );
+
+    let back = claude::from_file(path, &Default::default()).unwrap();
+    let user_texts = text_messages_for_role(&back, Role::User);
+    assert_eq!(user_texts.len(), 1);
+    assert!(user_texts[0].ends_with(CONTEXT_CONTINUATION_PROMPT));
+    assert!(user_texts[0].contains("installtest-codex"));
+    let assistant_texts = text_messages_for_role(&back, Role::Assistant);
+    assert_eq!(assistant_texts, vec![CONTEXT_ACK]);
+}
+
+#[test]
 fn codex_install_into_tempdir() {
     let tmp = tempfile::tempdir().unwrap();
     let session = codex::from_jsonl_str(codex_fixture(), &Default::default()).unwrap();
@@ -93,6 +212,215 @@ fn codex_install_into_tempdir() {
     let parent = p.parent().unwrap();
     assert!(parent.starts_with(tmp.path().join("sessions")));
     assert!(!report.indexed); // we asked it not to
+}
+
+#[test]
+fn codex_install_validation_failure_removes_rollout_when_required_index_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = claude::from_jsonl_str(claude_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::Codex);
+
+    let err = install_universal_session(
+        Provider::Codex,
+        &converted,
+        &InstallSessionOpts {
+            codex_home: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        },
+    )
+    .expect_err("missing required state_5.sqlite index should fail validation");
+
+    let message = err.to_string();
+    assert!(message.contains("state_5_index_present"), "{message}");
+    let jsonls = jsonl_files_under(&tmp.path().join("sessions"));
+    assert!(
+        jsonls.is_empty(),
+        "failed install should remove rollout files: {jsonls:?}"
+    );
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn context_wrapper_install_into_codex_tempdir_indexes_and_validates_native_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_path = tmp.path().join("state_5.sqlite");
+    create_codex_threads_table(&state_path);
+
+    let source = claude::from_jsonl_str(claude_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::Codex);
+    let report = install_universal_session(
+        Provider::Codex,
+        &converted,
+        &InstallSessionOpts {
+            codex_home: Some(tmp.path().to_path_buf()),
+            codex_state_5_path: Some(state_path.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.provider, Provider::Codex);
+    assert_eq!(report.session_id, converted.session_id);
+    assert!(report.validation.ok, "{:?}", report.validation);
+    let ArtifactPath::File(path) = &report.artifact else {
+        panic!("expected Codex file artifact: {:?}", report.artifact);
+    };
+    assert!(path.starts_with(tmp.path().join("sessions")));
+    assert!(path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(&format!("{}.jsonl", converted.session_id))));
+    assert!(report
+        .validation
+        .checks
+        .iter()
+        .any(|check| { check.name == "state_5_rollout_path_matches" && check.ok }));
+
+    let conn = rusqlite::Connection::open(&state_path).unwrap();
+    let indexed_path: String = conn
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            rusqlite::params![converted.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed_path, path.display().to_string());
+
+    let back = codex::from_file(path).unwrap();
+    let user_texts = text_messages_for_role(&back, Role::User);
+    assert_eq!(user_texts.len(), 1);
+    assert!(user_texts[0].ends_with(CONTEXT_CONTINUATION_PROMPT));
+    assert!(user_texts[0].contains("installtest-1"));
+    let assistant_texts = text_messages_for_role(&back, Role::Assistant);
+    assert_eq!(assistant_texts, vec![CONTEXT_ACK]);
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn codex_install_validates_explicit_state_5_path_outside_codex_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let codex_home = tmp.path().join("codex-home");
+    let state_dir = tmp.path().join("state-clone");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let state_path = state_dir.join("state_5.sqlite");
+    create_codex_threads_table(&state_path);
+
+    let source = claude::from_jsonl_str(claude_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::Codex);
+    let report = install_universal_session(
+        Provider::Codex,
+        &converted,
+        &InstallSessionOpts {
+            codex_home: Some(codex_home.clone()),
+            codex_state_5_path: Some(state_path.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(report.validation.ok, "{:?}", report.validation);
+    assert!(!codex_home.join("state_5.sqlite").exists());
+    assert!(report
+        .validation
+        .checks
+        .iter()
+        .any(|check| check.name == "state_5_rollout_path_matches" && check.ok));
+
+    let ArtifactPath::File(path) = &report.artifact else {
+        panic!("expected Codex file artifact: {:?}", report.artifact);
+    };
+    let conn = rusqlite::Connection::open(&state_path).unwrap();
+    let indexed_path: String = conn
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            rusqlite::params![converted.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed_path, path.display().to_string());
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn codex_failed_install_removes_explicit_state_5_override_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let codex_home = tmp.path().join("codex-home");
+    let state_dir = tmp.path().join("state-clone");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let state_path = state_dir.join("state_5.sqlite");
+    create_codex_threads_table(&state_path);
+
+    let source = claude::from_jsonl_str(claude_fixture(), &Default::default()).unwrap();
+    let mut converted = wrap_session_for_context_convert(&source, Provider::Codex);
+    converted.cwd.clear();
+
+    let err = install_universal_session(
+        Provider::Codex,
+        &converted,
+        &InstallSessionOpts {
+            codex_home: Some(codex_home.clone()),
+            codex_state_5_path: Some(state_path.clone()),
+            ..Default::default()
+        },
+    )
+    .expect_err("empty cwd should fail native validation after writing");
+
+    let message = err.to_string();
+    assert!(message.contains("session_meta_cwd_present"), "{message}");
+    let jsonls = jsonl_files_under(&codex_home.join("sessions"));
+    assert!(
+        jsonls.is_empty(),
+        "failed install should remove rollout files: {jsonls:?}"
+    );
+
+    let conn = rusqlite::Connection::open(&state_path).unwrap();
+    let indexed_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?1",
+            rusqlite::params![converted.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed_rows, 0);
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn codex_context_wrapper_install_can_skip_index_validation_when_index_update_is_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_path = tmp.path().join("state_5.sqlite");
+    create_codex_threads_table(&state_path);
+
+    let source = claude::from_jsonl_str(claude_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::Codex);
+    let report = install_universal_session(
+        Provider::Codex,
+        &converted,
+        &InstallSessionOpts {
+            codex_home: Some(tmp.path().to_path_buf()),
+            codex_state_5_path: Some(state_path.clone()),
+            codex_update_index: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(report.validation.ok, "{:?}", report.validation);
+    assert!(report.validation.checks.iter().any(|check| {
+        check.name == "state_5_index_required"
+            && check.ok
+            && check.detail.contains("disabled codex index update")
+    }));
+
+    let conn = rusqlite::Connection::open(&state_path).unwrap();
+    let indexed_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?1",
+            rusqlite::params![converted.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed_rows, 0);
 }
 
 /// Build a state_5.sqlite with the same schema columns codex uses, then
@@ -335,4 +663,160 @@ fn opencode_install_into_tempdir() {
         },
     )
     .unwrap();
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn context_wrapper_install_into_opencode_tempdir_uses_native_ids_and_validates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    let source = codex::from_jsonl_str(codex_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::OpenCode);
+
+    let report = install_universal_session(
+        Provider::OpenCode,
+        &converted,
+        &InstallSessionOpts {
+            opencode_db_path: Some(db.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.provider, Provider::OpenCode);
+    assert_eq!(report.session_id, converted.session_id);
+    assert!(report.session_id.starts_with("ses_"));
+    assert!(report.validation.ok, "{:?}", report.validation);
+    assert!(report
+        .validation
+        .checks
+        .iter()
+        .any(|check| { check.name == "session_id_shape_native" && check.ok }));
+    assert!(report
+        .validation
+        .checks
+        .iter()
+        .any(|check| { check.name == "message_id_shape_native" && check.ok }));
+
+    let back = opencode::from_db_path(&db, &report.session_id).unwrap();
+    let user_texts = text_messages_for_role(&back, Role::User);
+    assert_eq!(user_texts.len(), 1);
+    assert!(user_texts[0].ends_with(CONTEXT_CONTINUATION_PROMPT));
+    assert!(user_texts[0].contains("installtest-codex"));
+    let assistant_texts = text_messages_for_role(&back, Role::Assistant);
+    assert_eq!(assistant_texts, vec![CONTEXT_ACK]);
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn opencode_install_uses_existing_project_for_session_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        opencode::db::ensure_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO project (id, worktree, vcs, time_created, time_updated, sandboxes)
+             VALUES ('project-current', '/tmp/abc', 'git', 1, 1, '[]')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let source = codex::from_jsonl_str(codex_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::OpenCode);
+    opencode::install::install_to_default_db(
+        &converted,
+        &opencode::install::InstallOpts {
+            db_path: Some(db.clone()),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let project_id: String = conn
+        .query_row(
+            "SELECT project_id FROM session WHERE id = ?1",
+            rusqlite::params![converted.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(project_id, "project-current");
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn opencode_install_global_fallback_tracks_session_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    let source = codex::from_jsonl_str(codex_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::OpenCode);
+
+    opencode::install::install_to_default_db(
+        &converted,
+        &opencode::install::InstallOpts {
+            db_path: Some(db.clone()),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let row: (String, String, String) = conn
+        .query_row(
+            "SELECT s.project_id, p.worktree, p.sandboxes
+             FROM session s
+             JOIN project p ON p.id = s.project_id
+             WHERE s.id = ?1",
+            rusqlite::params![converted.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, "global");
+    assert_eq!(row.1, "/tmp/abc");
+    assert_eq!(row.2, "[]");
+}
+
+#[cfg(feature = "opencode")]
+#[test]
+fn opencode_install_does_not_rewrite_existing_global_project_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        opencode::db::ensure_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('global', '/', 1, 1, '[]')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let source = codex::from_jsonl_str(codex_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::OpenCode);
+
+    opencode::install::install_to_default_db(
+        &converted,
+        &opencode::install::InstallOpts {
+            db_path: Some(db.clone()),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let row: (String, String) = conn
+        .query_row(
+            "SELECT s.project_id, p.worktree
+             FROM session s
+             JOIN project p ON p.id = s.project_id
+             WHERE s.id = ?1",
+            rusqlite::params![converted.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, "global");
+    assert_eq!(row.1, "/");
 }

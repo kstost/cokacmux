@@ -346,30 +346,6 @@ fn synthesize_lines(session: &UniversalSession, m: &UMessage) -> Vec<Value> {
         let mut images: Vec<String> = Vec::new();
         let mut local_images: Vec<String> = Vec::new();
         let mut lines = Vec::new();
-        if matches!(m.role, Role::Assistant)
-            && !m
-                .content
-                .iter()
-                .any(|block| matches!(block, ContentBlock::Thinking { .. }))
-            && m.content.iter().any(|block| {
-                matches!(
-                    block,
-                    ContentBlock::Text { .. }
-                        | ContentBlock::ToolUse { .. }
-                        | ContentBlock::Image { .. }
-                )
-            })
-        {
-            lines.push(json!({
-                "timestamp": ts,
-                "type": "response_item",
-                "payload": {
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": null,
-                },
-            }));
-        }
         for b in &m.content {
             match b {
                 ContentBlock::Text { text, .. } => {

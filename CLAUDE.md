@@ -45,8 +45,9 @@ When changes conflict, the lower number wins.
    reads, cleanup, and attach all depend on this contract. Never add a code
    path that assumes liveness without the files or death despite them.
 5. **The UI always responds** (see Core Goal).
-6. **Conversion is lossless.** Cross-provider session conversion preserves
-   information; `tests/roundtrip.rs` is the contract.
+6. **Conversion contracts are explicit.** Same-provider adapter round-trips
+   preserve native data; cross-provider `convert()` creates a continuation
+   context wrapper, not a lossless native transcript.
 
 Example of applying the order: never sacrifice display truth (3) for
 responsiveness (5); never risk a live agent (1) to clean up the display (3).

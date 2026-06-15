@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
 use crate::debug;
@@ -120,17 +121,7 @@ pub fn to_db_connection_with_opts(
         }
     }
 
-    // OpenCode puts CLI-driven sessions under the special `global` project.
-    // (Verified against a live opencode.db v1.15.5: every session listed by
-    // `opencode session list` has project_id='global'.) Sessions tied to a
-    // tracked worktree-project use a separate project_id but those rows are
-    // managed by opencode's own startup; we don't try to replicate them.
-    let project_id = "global";
-    tx.execute(
-        "INSERT OR IGNORE INTO project (id, worktree, time_created, time_updated, sandboxes)
-         VALUES (?1, '/', ?2, ?2, '{}')",
-        rusqlite::params![project_id, now_ms],
-    )?;
+    let project_id = select_project_id(&tx, session, now_ms)?;
 
     let time_created = session
         .created_at
@@ -514,6 +505,92 @@ fn extra_string(session: &UniversalSession, key: &str) -> Option<String> {
 
 fn extra_i64(session: &UniversalSession, key: &str) -> Option<i64> {
     session.extras.get(key).and_then(|value| value.as_i64())
+}
+
+fn select_project_id(
+    tx: &rusqlite::Transaction<'_>,
+    session: &UniversalSession,
+    now_ms: i64,
+) -> Result<String> {
+    if let Some(project_id) = extra_string(session, "opencode_project_id") {
+        ensure_project_row(tx, &project_id, session, now_ms)?;
+        return Ok(project_id);
+    }
+
+    if let Some(project_id) = project_id_for_worktree(tx, &session.cwd)? {
+        touch_project(tx, &project_id, now_ms)?;
+        return Ok(project_id);
+    }
+
+    let project_id = "global";
+    ensure_project_row(tx, project_id, session, now_ms)?;
+    Ok(project_id.to_string())
+}
+
+fn project_id_for_worktree(
+    tx: &rusqlite::Transaction<'_>,
+    worktree: &str,
+) -> Result<Option<String>> {
+    Ok(tx
+        .query_row(
+            "SELECT id
+             FROM project
+             WHERE worktree = ?1
+             ORDER BY CASE WHEN id = 'global' THEN 1 ELSE 0 END,
+                      time_updated DESC,
+                      id ASC
+             LIMIT 1",
+            rusqlite::params![worktree],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn ensure_project_row(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    session: &UniversalSession,
+    now_ms: i64,
+) -> Result<()> {
+    let existing_worktree = tx
+        .query_row(
+            "SELECT worktree FROM project WHERE id = ?1",
+            rusqlite::params![project_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let vcs = session.git.as_ref().map(|_| "git");
+
+    if existing_worktree.is_some() {
+        touch_project(tx, project_id, now_ms)?;
+        tx.execute(
+            "UPDATE project
+             SET sandboxes = CASE WHEN sandboxes = '' THEN '[]' ELSE sandboxes END
+             WHERE id = ?1",
+            rusqlite::params![project_id],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO project (id, worktree, vcs, time_created, time_updated, sandboxes)
+             VALUES (?1, ?2, ?3, ?4, ?4, '[]')",
+            rusqlite::params![project_id, session.cwd, vcs, now_ms],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn touch_project(tx: &rusqlite::Transaction<'_>, project_id: &str, now_ms: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE project
+         SET time_updated = CASE
+             WHEN time_updated < ?2 THEN ?2
+             ELSE time_updated
+         END
+         WHERE id = ?1",
+        rusqlite::params![project_id, now_ms],
+    )?;
+    Ok(())
 }
 
 fn synthesized_slug(session: &UniversalSession) -> String {

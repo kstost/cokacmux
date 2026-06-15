@@ -1,6 +1,6 @@
 [package]
 name = "cokacmux"
-version = "0.2.32"
+version = "0.2.33"
 edition = "2021"
 authors = ["cokac <monogatree@gmail.com>"]
 description = "TUI multiplexer for local coding agent sessions."
@@ -21,7 +21,7 @@ default = ["claude", "codex", "opencode", "cli", "discovery", "tui"]
 claude = []
 codex = []
 opencode = ["dep:rusqlite"]
-cli = ["dep:clap", "dep:anyhow", "discovery"]
+cli = ["discovery"]
 discovery = ["dep:dirs"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:anyhow", "dep:portable-pty", "dep:vt100", "discovery", "claude", "codex"]
 
@@ -33,7 +33,6 @@ uuid = { version = "1", features = ["v7", "serde"] }
 sha2 = "0.10"
 thiserror = "1"
 
-clap = { version = "4", features = ["derive"], optional = true }
 anyhow = { version = "1", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 dirs = { version = "5", optional = true }
