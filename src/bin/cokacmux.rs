@@ -7602,6 +7602,7 @@ impl App {
         if !is_coding_agent_session_info(info) || info.cwd.trim().is_empty() {
             return false;
         }
+        let _ = cleanup_stale_coding_agent_cwd_locks("agent_launch_cwd_lock_sweep");
         if let Some(conflict) = self.live_coding_agent_cwd_conflict(info) {
             self.status = coding_agent_cwd_conflict_message(info, &conflict);
             debug_log(
@@ -11410,16 +11411,22 @@ fn cokacmux_main() -> Result<()> {
                 "skipped_self": report.skipped_self,
                 "errors": report.errors,
                 "pty_logs_deleted": report.pty_logs_deleted,
+                "cwd_locks_removed": report.cwd_locks_removed,
             }),
         );
         println!(
-            "killed {} agent daemon(s); stale={} skipped_self={} errors={}{}",
+            "killed {} agent daemon(s); stale={} skipped_self={} errors={}{}{}",
             report.killed,
             report.stale,
             report.skipped_self,
             report.errors,
             if report.pty_logs_deleted > 0 {
                 format!(" pty_logs_deleted={}", report.pty_logs_deleted)
+            } else {
+                String::new()
+            },
+            if report.cwd_locks_removed > 0 {
+                format!(" cwd_locks_removed={}", report.cwd_locks_removed)
             } else {
                 String::new()
             }
@@ -13385,6 +13392,8 @@ struct CodingAgentCwdLock {
     #[serde(default = "coding_agent_cwd_lock_default_owner")]
     owner_kind: String,
     pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid_start_ticks: Option<u64>,
     provider: String,
     session_id: String,
     cwd: String,
@@ -13425,6 +13434,7 @@ fn coding_agent_cwd_lock_for_info(
         version: CODING_AGENT_CWD_LOCK_VERSION,
         owner_kind: owner_kind.to_string(),
         pid,
+        pid_start_ticks: process_start_ticks(pid),
         provider: info.provider.as_str().to_string(),
         session_id: info.session_id.clone(),
         cwd: info.cwd.clone(),
@@ -13444,6 +13454,7 @@ fn coding_agent_cwd_lock_debug_value(lock: &CodingAgentCwdLock) -> serde_json::V
         "version": lock.version,
         "owner_kind": &lock.owner_kind,
         "pid": lock.pid,
+        "pid_start_ticks": lock.pid_start_ticks,
         "provider": &lock.provider,
         "session_id": &lock.session_id,
         "cwd": &lock.cwd,
@@ -13621,8 +13632,79 @@ fn read_coding_agent_cwd_lock(path: &Path) -> Option<CodingAgentCwdLock> {
         .and_then(|content| serde_json::from_str::<CodingAgentCwdLock>(&content).ok())
 }
 
+fn remove_coding_agent_cwd_lock_for_info(
+    info: &SessionInfo,
+    reason: &str,
+    expected_owner_kind: &str,
+) -> bool {
+    let key = AgentKey::new(info);
+    let Ok(Some(path)) = coding_agent_cwd_lock_path(info) else {
+        return false;
+    };
+    if let Some(lock) = read_coding_agent_cwd_lock(&path) {
+        let lock_key = coding_agent_cwd_lock_key(&lock);
+        if lock_key.as_ref() != Some(&key) || lock.owner_kind != expected_owner_kind {
+            debug_log(
+                "coding_agent_cwd_lock_cleanup_skipped",
+                serde_json::json!({
+                    "reason": reason,
+                    "key": agent_key_debug_value(&key),
+                    "path": path.display().to_string(),
+                    "expected_owner_kind": expected_owner_kind,
+                    "lock": coding_agent_cwd_lock_debug_value(&lock),
+                    "lock_key": lock_key.as_ref().map(agent_key_debug_value),
+                }),
+            );
+            return false;
+        }
+    }
+    remove_agent_runtime_file_logged(reason, Some(&key), None, "cwd_lock", &path)
+}
+
+fn cleanup_stale_coding_agent_cwd_locks(reason: &str) -> usize {
+    let Ok(runtime_dir) = agent_runtime_dir() else {
+        return 0;
+    };
+    cleanup_stale_coding_agent_cwd_locks_at(&runtime_dir, reason)
+}
+
+fn cleanup_stale_coding_agent_cwd_locks_at(runtime_dir: &Path, reason: &str) -> usize {
+    let Ok(read_dir) = fs::read_dir(runtime_dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !file_name.starts_with("cwd-")
+            || path.extension().and_then(|ext| ext.to_str()) != Some("lock")
+        {
+            continue;
+        }
+        let Some(lock) = read_coding_agent_cwd_lock(&path) else {
+            if remove_agent_runtime_file_logged(reason, None, None, "cwd_lock", &path) {
+                removed = removed.saturating_add(1);
+            }
+            continue;
+        };
+        if coding_agent_cwd_lock_is_live(&lock) {
+            continue;
+        }
+        let key = coding_agent_cwd_lock_key(&lock);
+        if remove_agent_runtime_file_logged(reason, key.as_ref(), None, "cwd_lock", &path) {
+            removed = removed.saturating_add(1);
+        }
+    }
+    removed
+}
+
 fn coding_agent_cwd_lock_is_live(lock: &CodingAgentCwdLock) -> bool {
     if lock.pid == 0 || !process_is_alive(lock.pid) {
+        return false;
+    }
+    if !coding_agent_cwd_lock_pid_matches(lock) {
         return false;
     }
     if lock.owner_kind == CODING_AGENT_CWD_LOCK_OWNER_RESTORE {
@@ -13632,6 +13714,16 @@ fn coding_agent_cwd_lock_is_live(lock: &CodingAgentCwdLock) -> bool {
         return true;
     };
     agent_daemon_process_identity(lock.pid, &key) != AgentDaemonProcessIdentity::Other
+}
+
+fn coding_agent_cwd_lock_pid_matches(lock: &CodingAgentCwdLock) -> bool {
+    if let Some(expected) = lock.pid_start_ticks {
+        return process_start_ticks(lock.pid) == Some(expected);
+    }
+    if let Some(started_at_epoch_s) = process_start_epoch_s(lock.pid) {
+        return started_at_epoch_s <= lock.created_at_epoch_s.saturating_add(1);
+    }
+    true
 }
 
 fn coding_agent_cwd_lock_path(info: &SessionInfo) -> Result<Option<PathBuf>> {
@@ -14108,6 +14200,13 @@ fn read_agent_runtime_state_at_for_key(
             "socket",
             socket_path,
         );
+        let cwd_lock_removed = session_info_from_agent_meta_snapshot(&meta).is_some_and(|info| {
+            remove_coding_agent_cwd_lock_for_info(
+                &info,
+                "agent_runtime_stale_cleanup",
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            )
+        });
         if debug_enabled {
             debug_log(
                 "agent_meta_stale_removed",
@@ -14120,6 +14219,7 @@ fn read_agent_runtime_state_at_for_key(
                     "socket_path": socket_path.display().to_string(),
                     "meta_removed": meta_removed,
                     "socket_removed": socket_removed,
+                    "cwd_lock_removed": cwd_lock_removed,
                     "meta_child_pid": meta.child_pid,
                     "meta_child_alive": meta.child_pid.map(process_is_alive),
                     "meta_phase": meta_json.as_ref().and_then(|value| value.get("phase")).and_then(serde_json::Value::as_str),
@@ -14159,6 +14259,14 @@ fn read_agent_runtime_state_at_for_key(
                 "socket",
                 socket_path,
             );
+            let cwd_lock_removed =
+                session_info_from_agent_meta_snapshot(&meta).is_some_and(|info| {
+                    remove_coding_agent_cwd_lock_for_info(
+                        &info,
+                        "agent_runtime_identity_mismatch_cleanup",
+                        CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+                    )
+                });
             if debug_enabled {
                 debug_log(
                     "agent_meta_identity_mismatch_removed",
@@ -14172,6 +14280,7 @@ fn read_agent_runtime_state_at_for_key(
                         "socket_path": socket_path.display().to_string(),
                         "meta_removed": meta_removed,
                         "socket_removed": socket_removed,
+                        "cwd_lock_removed": cwd_lock_removed,
                         "meta_child_pid": meta.child_pid,
                         "meta_child_alive": meta.child_pid.map(process_is_alive),
                         "meta_attached": meta.attached,
@@ -14222,7 +14331,71 @@ fn read_agent_runtime_state_at_for_key(
     state
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    if linux_process_is_zombie(pid) {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_zombie(pid: u32) -> bool {
+    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status
+        .lines()
+        .find(|line| line.starts_with("State:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        == Some("Z")
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_epoch_s(pid: u32) -> Option<u64> {
+    let ticks = process_start_ticks(pid)?;
+    let boot_time_epoch_s = linux_boot_time_epoch_s()?;
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    Some(boot_time_epoch_s.saturating_add(ticks / ticks_per_second as u64))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_epoch_s(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_time_epoch_s() -> Option<u64> {
+    fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|raw| raw.trim().parse().ok())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn process_is_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
@@ -16271,6 +16444,7 @@ struct KillAllAgentsReport {
     skipped_self: usize,
     errors: usize,
     pty_logs_deleted: usize,
+    cwd_locks_removed: usize,
 }
 
 fn kill_all_agent_daemons() -> Result<KillAllAgentsReport> {
@@ -16330,6 +16504,13 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             {
                 report.pty_logs_deleted = report.pty_logs_deleted.saturating_add(1);
             }
+            if let Some(info) = session_info_from_agent_meta_snapshot(&meta) {
+                let _ = remove_coding_agent_cwd_lock_for_info(
+                    &info,
+                    "killall_stale_daemon_cleanup",
+                    CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+                );
+            }
             continue;
         }
         let Some(key) = agent_key_from_meta(&meta) else {
@@ -16356,6 +16537,13 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
                 stem,
                 "killall_identity_failed_cleanup",
             );
+            if let Some(info) = session_info_from_agent_meta_snapshot(&meta) {
+                let _ = remove_coding_agent_cwd_lock_for_info(
+                    &info,
+                    "killall_identity_failed_cleanup",
+                    CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+                );
+            }
             debug_log(
                 "killall_agent_unverified",
                 serde_json::json!({
@@ -16386,6 +16574,13 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
         if remove_agent_runtime_files_by_stem(runtime_dir, stem, "killall_killed_cleanup") {
             report.pty_logs_deleted = report.pty_logs_deleted.saturating_add(1);
         }
+        if let Some(info) = session_info_from_agent_meta_snapshot(&meta) {
+            let _ = remove_coding_agent_cwd_lock_for_info(
+                &info,
+                "killall_killed_cleanup",
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            );
+        }
         debug_log(
             "killall_agent_killed",
             serde_json::json!({
@@ -16397,6 +16592,8 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             }),
         );
     }
+    report.cwd_locks_removed =
+        cleanup_stale_coding_agent_cwd_locks_at(runtime_dir, "killall_stale_cwd_lock_sweep");
     report
 }
 
@@ -16481,6 +16678,16 @@ fn terminate_agent_daemon(key: &AgentKey) -> Result<AgentTermination> {
         "socket",
         &socket_path,
     );
+    if let Some(info) = meta
+        .as_ref()
+        .and_then(session_info_from_agent_meta_snapshot)
+    {
+        let _ = remove_coding_agent_cwd_lock_for_info(
+            &info,
+            "terminate_agent_cleanup",
+            CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+        );
+    }
     let pty_log_deleted = remove_agent_pty_log(key);
     Ok(AgentTermination {
         pid: terminated_pid,
@@ -25830,6 +26037,7 @@ mod tests {
             version: CODING_AGENT_CWD_LOCK_VERSION,
             owner_kind: CODING_AGENT_CWD_LOCK_OWNER_RESTORE.to_string(),
             pid: child.id(),
+            pid_start_ticks: process_start_ticks(child.id()),
             provider: Provider::Codex.as_str().to_string(),
             session_id: "restore-lock-stale-pid".to_string(),
             cwd: "/tmp".to_string(),
@@ -25849,6 +26057,111 @@ mod tests {
 
         assert_eq!(identity, AgentClientProcessIdentity::Other);
         assert!(!is_live);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_lock_treats_zombie_daemon_pid_as_dead() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn short-lived child");
+        let started = Instant::now();
+        while !linux_process_is_zombie(child.id()) && started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            linux_process_is_zombie(child.id()),
+            "child should become zombie before it is reaped"
+        );
+        let lock = CodingAgentCwdLock {
+            version: CODING_AGENT_CWD_LOCK_VERSION,
+            owner_kind: CODING_AGENT_CWD_LOCK_OWNER_AGENT.to_string(),
+            pid: child.id(),
+            pid_start_ticks: process_start_ticks(child.id()),
+            provider: Provider::Codex.as_str().to_string(),
+            session_id: "zombie-daemon-lock".to_string(),
+            cwd: "/tmp".to_string(),
+            created_at_epoch_s: current_epoch_s(),
+        };
+
+        let is_alive = process_is_alive(child.id());
+        let is_live = coding_agent_cwd_lock_is_live(&lock);
+        let _ = child.wait();
+
+        assert!(!is_alive);
+        assert!(!is_live);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_lock_rejects_pid_start_tick_mismatch() {
+        let current_pid = std::process::id();
+        let info = session_info(Provider::Codex, "pid-start-token", "/tmp");
+        let lock =
+            coding_agent_cwd_lock_for_info(&info, current_pid, CODING_AGENT_CWD_LOCK_OWNER_RESTORE);
+        let actual_start_ticks = lock
+            .pid_start_ticks
+            .expect("linux lock should include process start ticks");
+        assert!(coding_agent_cwd_lock_pid_matches(&lock));
+
+        let mut mismatched = lock.clone();
+        mismatched.pid_start_ticks = Some(actual_start_ticks.saturating_add(1));
+
+        assert!(!coding_agent_cwd_lock_pid_matches(&mismatched));
+        assert!(!coding_agent_cwd_lock_is_live(&mismatched));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_restore_cwd_lock_rejects_pid_started_after_lock() {
+        let current_pid = std::process::id();
+        let started_at_epoch_s =
+            process_start_epoch_s(current_pid).expect("linux process start epoch");
+        let stale_created_at = started_at_epoch_s.saturating_sub(2);
+        let lock = CodingAgentCwdLock {
+            version: CODING_AGENT_CWD_LOCK_VERSION,
+            owner_kind: CODING_AGENT_CWD_LOCK_OWNER_RESTORE.to_string(),
+            pid: current_pid,
+            pid_start_ticks: None,
+            provider: Provider::Codex.as_str().to_string(),
+            session_id: "legacy-reused-pid-lock".to_string(),
+            cwd: "/tmp".to_string(),
+            created_at_epoch_s: stale_created_at,
+        };
+
+        assert!(!coding_agent_cwd_lock_pid_matches(&lock));
+        assert!(!coding_agent_cwd_lock_is_live(&lock));
+    }
+
+    #[test]
+    fn stale_cwd_lock_sweep_removes_dead_and_invalid_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let dead = session_info(Provider::Codex, "dead-lock", "/tmp/dead-lock");
+        let dead_path = dir.path().join("cwd-dead.lock");
+        let invalid_path = dir.path().join("cwd-invalid.lock");
+        let other_path = dir.path().join("session.lock");
+        fs::write(
+            &dead_path,
+            serde_json::to_string_pretty(&coding_agent_cwd_lock_for_info(
+                &dead,
+                0,
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(&invalid_path, "{not json").unwrap();
+        fs::write(&other_path, "{not json").unwrap();
+
+        let removed =
+            cleanup_stale_coding_agent_cwd_locks_at(dir.path(), "test_stale_cwd_lock_sweep");
+
+        assert_eq!(removed, 2);
+        assert!(!dead_path.exists());
+        assert!(!invalid_path.exists());
+        assert!(other_path.exists());
     }
 
     #[test]
@@ -30471,6 +30784,100 @@ IF EXIST "%~dp0\node.exe" (
         assert!(!remove_agent_pty_log_file(&key, &path));
     }
 
+    #[test]
+    fn terminate_agent_daemon_removes_matching_cwd_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(
+            Provider::Codex,
+            &format!("lock-cleanup-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+        let key = AgentKey::new(&info);
+        let meta_path = agent_meta_path(&key).unwrap();
+        let lock_path = coding_agent_cwd_lock_path(&info).unwrap().unwrap();
+        fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "pid": 0,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            &lock_path,
+            serde_json::to_string_pretty(&coding_agent_cwd_lock_for_info(
+                &info,
+                0,
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = terminate_agent_daemon(&key).unwrap();
+
+        assert_eq!(outcome.pid, None);
+        assert!(!meta_path.exists());
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn terminate_agent_daemon_keeps_mismatched_cwd_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(
+            Provider::Codex,
+            &format!("lock-cleanup-target-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+        let other = session_info(
+            Provider::Codex,
+            &format!("lock-cleanup-other-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+        let key = AgentKey::new(&info);
+        let meta_path = agent_meta_path(&key).unwrap();
+        let lock_path = coding_agent_cwd_lock_path(&info).unwrap().unwrap();
+        fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "pid": 0,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            &lock_path,
+            serde_json::to_string_pretty(&coding_agent_cwd_lock_for_info(
+                &other,
+                0,
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = terminate_agent_daemon(&key).unwrap();
+
+        assert_eq!(outcome.pid, None);
+        assert!(!meta_path.exists());
+        assert!(lock_path.exists());
+        let _ = fs::remove_file(&lock_path);
+    }
+
     #[cfg(unix)]
     #[test]
     fn terminate_agent_child_process_kills_separate_process_group() {
@@ -30527,6 +30934,8 @@ IF EXIST "%~dp0\node.exe" (
         let scrollback = dir.path().join("scrollback");
         fs::create_dir_all(&scrollback).unwrap();
         let stem = "codex-stale";
+        let info = session_info(Provider::Codex, "stale", "/tmp/killall-stale-lock");
+        let cwd_lock = dir.path().join("cwd-stale.lock");
         fs::write(
             dir.path().join(format!("{}.json", stem)),
             r#"{"pid":3000000000,"provider":"codex","session_id":"stale"}"#,
@@ -30534,6 +30943,16 @@ IF EXIST "%~dp0\node.exe" (
         .unwrap();
         fs::write(dir.path().join(format!("{}.sock", stem)), "").unwrap();
         fs::write(scrollback.join(format!("{}.ptylog", stem)), b"OLD\n").unwrap();
+        fs::write(
+            &cwd_lock,
+            serde_json::to_string_pretty(&coding_agent_cwd_lock_for_info(
+                &info,
+                0,
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
 
         let report = kill_all_agent_daemons_at(dir.path(), std::process::id());
 
@@ -30541,9 +30960,11 @@ IF EXIST "%~dp0\node.exe" (
         assert_eq!(report.stale, 1);
         assert_eq!(report.killed, 0);
         assert_eq!(report.pty_logs_deleted, 1);
+        assert_eq!(report.cwd_locks_removed, 1);
         assert!(!dir.path().join(format!("{}.json", stem)).exists());
         assert!(!dir.path().join(format!("{}.sock", stem)).exists());
         assert!(!scrollback.join(format!("{}.ptylog", stem)).exists());
+        assert!(!cwd_lock.exists());
     }
 
     #[test]
