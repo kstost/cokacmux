@@ -7653,27 +7653,74 @@ impl App {
         }
     }
 
-    fn live_coding_agent_cwd_conflict(&self, target: &SessionInfo) -> Option<SessionInfo> {
+    fn live_coding_agent_cwd_conflict(&mut self, target: &SessionInfo) -> Option<SessionInfo> {
+        let current_pid = std::process::id();
+        self.live_coding_agent_cwd_conflict_with_runtime(target, |key| {
+            read_agent_runtime_state(key, current_pid)
+        })
+    }
+
+    fn live_coding_agent_cwd_conflict_with_runtime<F>(
+        &mut self,
+        target: &SessionInfo,
+        mut runtime_state: F,
+    ) -> Option<SessionInfo>
+    where
+        F: FnMut(&AgentKey) -> AgentListState,
+    {
         let target_key = AgentKey::new(target);
-        if let Some(agent) = self.active_agent.as_ref() {
-            if live_coding_agent_info_conflicts(target, &target_key, &agent.info) {
-                return Some(agent.info.clone());
+        if let Some(active_info) = self
+            .active_agent
+            .as_ref()
+            .filter(|agent| agent.exited.is_none())
+            .map(|agent| agent.info.clone())
+        {
+            if live_coding_agent_info_conflicts(target, &target_key, &active_info) {
+                return Some(active_info);
             }
         }
-        self.sessions
+
+        let candidates = self
+            .sessions
             .iter()
             .chain(self.live_shells.iter())
-            .find(|candidate| {
-                let candidate_key = AgentKey::new(candidate);
-                candidate_key != target_key
-                    && self
-                        .agent_states
-                        .get(&candidate_key)
-                        .copied()
-                        .is_some_and(|state| state != AgentListState::Idle)
-                    && live_coding_agent_info_conflicts(target, &target_key, candidate)
-            })
             .cloned()
+            .collect::<Vec<_>>();
+        for candidate in candidates {
+            let candidate_key = AgentKey::new(&candidate);
+            if candidate_key == target_key
+                || !live_coding_agent_info_conflicts(target, &target_key, &candidate)
+            {
+                continue;
+            }
+            let Some(cached_state) = self
+                .agent_states
+                .get(&candidate_key)
+                .copied()
+                .filter(|state| *state != AgentListState::Idle)
+            else {
+                continue;
+            };
+
+            let observed_state = runtime_state(&candidate_key);
+            if observed_state == AgentListState::Idle {
+                self.remove_dead_live_shell(&candidate_key);
+                debug_log(
+                    "agent_launch_ignored_stale_cwd_conflict",
+                    serde_json::json!({
+                        "target": session_info_debug_value(target),
+                        "candidate": session_info_debug_value(&candidate),
+                        "cached_state": agent_list_state_debug_value(cached_state),
+                    }),
+                );
+                continue;
+            }
+
+            self.agent_states
+                .insert(candidate_key.clone(), observed_state);
+            return Some(candidate);
+        }
+        None
     }
 
     fn set_active_agent(&mut self, agent: AgentClient) {
@@ -25553,7 +25600,7 @@ mod tests {
     }
 
     #[test]
-    fn e_on_same_cwd_live_coding_agent_blocks_launch_selector() {
+    fn cached_same_cwd_live_coding_agent_blocks_when_runtime_confirms_live() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap().display().to_string();
         let alias = dir.path().join(".").display().to_string();
@@ -25561,14 +25608,94 @@ mod tests {
 
         let mut app = app_for_key_tests();
         let live = session_info(Provider::Claude, "live-claude", &canonical);
+        let live_key = AgentKey::new(&live);
         let target = session_info(Provider::Codex, "target-codex", &alias);
         app.agent_states.insert(
-            AgentKey::new(&live),
+            live_key.clone(),
             AgentListState::Live {
                 activity: AgentActivity::Quiet,
             },
         );
         app.sessions.push(live);
+        app.sessions.push(target);
+
+        let target = app.sessions[1].clone();
+        let conflict = app
+            .live_coding_agent_cwd_conflict_with_runtime(&target, |key| {
+                assert_eq!(key, &live_key);
+                AgentListState::Live {
+                    activity: AgentActivity::Quiet,
+                }
+            })
+            .expect("runtime-confirmed live coding agent should block");
+
+        assert_eq!(conflict.provider, Provider::Claude);
+        assert_eq!(conflict.session_id, "live-claude");
+        assert_eq!(
+            app.agent_states.get(&live_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            })
+        );
+    }
+
+    #[test]
+    fn e_on_stale_same_cwd_new_agent_does_not_block_launch_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap().display().to_string();
+        let alias = dir.path().join(".").display().to_string();
+        assert!(session_cwd_same_folder(&canonical, &alias));
+
+        let mut app = app_for_key_tests();
+        let stale = new_agent_info(Provider::Codex, &canonical);
+        let stale_key = AgentKey::new(&stale);
+        let target = session_info(Provider::Codex, "target-codex", &alias);
+        app.agent_states.insert(
+            stale_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.live_shells.push(stale);
+        app.sessions.push(target);
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::AgentLaunch { .. }));
+        assert!(app.active_agent.is_none());
+        assert_eq!(app.status, "choose launch mode.");
+        assert!(!app.agent_states.contains_key(&stale_key));
+        assert!(app
+            .live_shells
+            .iter()
+            .all(|info| AgentKey::new(info) != stale_key));
+    }
+
+    #[test]
+    fn e_on_stale_same_cwd_provider_session_does_not_block_launch_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap().display().to_string();
+        let alias = dir.path().join(".").display().to_string();
+        assert!(session_cwd_same_folder(&canonical, &alias));
+
+        let mut app = app_for_key_tests();
+        let stale = session_info(Provider::Claude, "live-claude", &canonical);
+        let stale_key = AgentKey::new(&stale);
+        let target = session_info(Provider::Codex, "target-codex", &alias);
+        app.agent_states.insert(
+            stale_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.sessions.push(stale);
         app.sessions.push(target);
         app.list_state.select(Some(1));
 
@@ -25580,10 +25707,46 @@ mod tests {
             20,
         );
 
-        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(matches!(app.input_mode, InputMode::AgentLaunch { .. }));
         assert!(app.active_agent.is_none());
-        assert!(app.status.starts_with("blocked: claude agent live-claude"));
-        assert!(app.status.contains("separate folder/worktree"));
+        assert_eq!(app.status, "choose launch mode.");
+        assert!(!app.agent_states.contains_key(&stale_key));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_same_cwd_coding_agent_blocks_without_runtime_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap().display().to_string();
+        let alias = dir.path().join(".").display().to_string();
+        assert!(session_cwd_same_folder(&canonical, &alias));
+
+        let mut app = app_for_key_tests();
+        let mut active = buffered_output_test_client("active-codex", 1);
+        active.info = session_info(Provider::Codex, "active-codex", &canonical);
+        app.set_active_agent(active);
+        let target = session_info(Provider::Codex, "target-codex", &alias);
+
+        assert!(app.block_live_coding_agent_cwd_conflict(&target));
+        assert!(app.status.starts_with("blocked: codex agent active-codex"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_active_same_cwd_coding_agent_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap().display().to_string();
+        let alias = dir.path().join(".").display().to_string();
+        assert!(session_cwd_same_folder(&canonical, &alias));
+
+        let mut app = app_for_key_tests();
+        let mut active = buffered_output_test_client("active-codex", 1);
+        active.info = session_info(Provider::Codex, "active-codex", &canonical);
+        active.exited = Some("exit status: 0".into());
+        app.set_active_agent(active);
+        let target = session_info(Provider::Codex, "target-codex", &alias);
+
+        assert!(!app.block_live_coding_agent_cwd_conflict(&target));
     }
 
     #[test]
@@ -26087,21 +26250,17 @@ mod tests {
     }
 
     #[test]
-    fn restore_data_confirm_restore_blocks_if_same_cwd_coding_agent_became_live() {
+    fn restore_data_confirm_restore_blocks_if_same_cwd_lock_became_live() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap().display().to_string();
         let alias = dir.path().join(".").display().to_string();
         let snapshot_path = dir.path().join("snapshot-data");
         let live = session_info(Provider::Claude, "live-claude", &canonical);
         let target = session_info(Provider::Codex, "clone-codex", &alias);
+        let _guard = acquire_coding_agent_cwd_restore_lock(&live)
+            .unwrap()
+            .expect("same-cwd restore lock should be acquired");
         let mut app = app_for_key_tests();
-        app.agent_states.insert(
-            AgentKey::new(&live),
-            AgentListState::Live {
-                activity: AgentActivity::Quiet,
-            },
-        );
-        app.sessions.push(live);
         app.input_mode = InputMode::RestoreDataConfirm {
             info: target,
             snapshot: session_data_snapshot(
@@ -26127,7 +26286,9 @@ mod tests {
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert!(app.data_task.is_none());
         assert!(app.active_agent.is_none());
-        assert!(app.status.starts_with("blocked: claude agent live-claude"));
+        assert!(app
+            .status
+            .starts_with("blocked: restore for claude agent live-claude"));
         assert!(app.status.contains("separate folder/worktree"));
         assert!(!snapshot_path.exists());
     }
