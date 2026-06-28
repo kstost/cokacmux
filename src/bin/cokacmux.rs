@@ -65,6 +65,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use cokacmux::providers::discovery::SessionInfo;
@@ -2165,14 +2166,6 @@ enum CloneWorkerOutcome {
         data_stats: Option<session::data::CopyStats>,
         data_snapshot_error: Option<String>,
         clone_tree_error: Option<String>,
-    },
-    Aborted {
-        source: SessionInfo,
-        target_provider: Provider,
-        target_session_id: String,
-        data_error: String,
-        deleted_file: Option<PathBuf>,
-        deleted_rows: u64,
     },
     Cancelled {
         source: SessionInfo,
@@ -7605,6 +7598,84 @@ impl App {
         }
     }
 
+    fn block_live_coding_agent_cwd_conflict(&mut self, info: &SessionInfo) -> bool {
+        if !is_coding_agent_session_info(info) || info.cwd.trim().is_empty() {
+            return false;
+        }
+        if let Some(conflict) = self.live_coding_agent_cwd_conflict(info) {
+            self.status = coding_agent_cwd_conflict_message(info, &conflict);
+            debug_log(
+                "agent_launch_blocked_cwd_conflict",
+                serde_json::json!({
+                    "source": "app_state",
+                    "target": session_info_debug_value(info),
+                    "conflict": session_info_debug_value(&conflict),
+                }),
+            );
+            return true;
+        }
+        if let Some(conflict) = live_coding_agent_cwd_meta_conflict(info) {
+            self.status = coding_agent_cwd_conflict_message(info, &conflict);
+            debug_log(
+                "agent_launch_blocked_cwd_conflict",
+                serde_json::json!({
+                    "source": "runtime_meta",
+                    "target": session_info_debug_value(info),
+                    "conflict": session_info_debug_value(&conflict),
+                }),
+            );
+            return true;
+        }
+        match live_coding_agent_cwd_lock_conflict(info) {
+            Ok(Some(conflict)) => {
+                self.status = coding_agent_cwd_lock_conflict_message(info, &conflict);
+                debug_log(
+                    "agent_launch_blocked_cwd_conflict",
+                    serde_json::json!({
+                        "source": "cwd_lock",
+                        "target": session_info_debug_value(info),
+                        "conflict": coding_agent_cwd_lock_debug_value(&conflict),
+                    }),
+                );
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                debug_log(
+                    "agent_launch_cwd_conflict_check_failed",
+                    serde_json::json!({
+                        "target": session_info_debug_value(info),
+                        "error": error.to_string(),
+                    }),
+                );
+                false
+            }
+        }
+    }
+
+    fn live_coding_agent_cwd_conflict(&self, target: &SessionInfo) -> Option<SessionInfo> {
+        let target_key = AgentKey::new(target);
+        if let Some(agent) = self.active_agent.as_ref() {
+            if live_coding_agent_info_conflicts(target, &target_key, &agent.info) {
+                return Some(agent.info.clone());
+            }
+        }
+        self.sessions
+            .iter()
+            .chain(self.live_shells.iter())
+            .find(|candidate| {
+                let candidate_key = AgentKey::new(candidate);
+                candidate_key != target_key
+                    && self
+                        .agent_states
+                        .get(&candidate_key)
+                        .copied()
+                        .is_some_and(|state| state != AgentListState::Idle)
+                    && live_coding_agent_info_conflicts(target, &target_key, candidate)
+            })
+            .cloned()
+    }
+
     fn set_active_agent(&mut self, agent: AgentClient) {
         if let Some(old_agent) = self.active_agent.take() {
             let old_info = old_agent.info.clone();
@@ -8712,6 +8783,9 @@ impl App {
             );
             return;
         }
+        if self.block_live_coding_agent_cwd_conflict(&runtime_info) {
+            return;
+        }
         let key = AgentKey::new(&info);
         debug_log(
             "agent_launch_mode_open",
@@ -8898,6 +8972,9 @@ impl App {
         if self.reject_while_data_task_running("restoring folder data") {
             return;
         }
+        if self.block_live_coding_agent_cwd_conflict(&info) {
+            return;
+        }
         let seq = self.next_data_task_seq();
         let label = format!(
             "restoring folder data for {} {}",
@@ -9063,6 +9140,9 @@ impl App {
         launch_mode: AgentLaunchMode,
         prompt_for_saved_data: bool,
     ) {
+        if self.block_live_coding_agent_cwd_conflict(&info) {
+            return;
+        }
         let key = AgentKey::new(&info);
         debug_log(
             "attach_selected",
@@ -10165,8 +10245,10 @@ impl App {
                 );
                 if let Some(stats) = data_stats.as_ref() {
                     status.push_str(&format!(
-                        " + folder data ({} files, {} bytes)",
-                        stats.files, stats.bytes
+                        " + folder data at {} ({} files, {} bytes)",
+                        truncate_width(&report.new_cwd, 48),
+                        stats.files,
+                        stats.bytes
                     ));
                 } else if !copy_folder_data {
                     status.push_str(" (session only)");
@@ -10202,44 +10284,12 @@ impl App {
                         "source_session_id": &source.session_id,
                         "target_provider": report.target_provider.as_str(),
                         "new_session_id": &report.new_session_id,
+                        "new_cwd": &report.new_cwd,
                         "artifact": format!("{:?}", report.artifact),
                         "clone_tree_error": clone_tree_error,
                         "copy_folder_data": copy_folder_data,
                         "data_snapshot_error": data_snapshot_error,
                         "focused_index": focused_index,
-                    }),
-                );
-            }
-            CloneWorkerOutcome::Aborted {
-                source,
-                target_provider,
-                target_session_id,
-                data_error,
-                deleted_file,
-                deleted_rows,
-            } => {
-                let status = format!(
-                    "clone {} -> {} aborted: folder data copy failed; cloned session removed ({})",
-                    source.provider.as_str(),
-                    target_provider.as_str(),
-                    truncate_width(&data_error, 56)
-                );
-                self.status = status.clone();
-                self.request_session_refresh_with_context(
-                    None,
-                    Some(AgentKey::new(&source)),
-                    Some(status),
-                );
-                debug_log(
-                    "clone_data_snapshot_failed_rolled_back",
-                    serde_json::json!({
-                        "source_provider": source.provider.as_str(),
-                        "source_session_id": &source.session_id,
-                        "target_provider": target_provider.as_str(),
-                        "target_session_id": target_session_id,
-                        "error": data_error,
-                        "deleted_file": deleted_file,
-                        "deleted_rows": deleted_rows,
                     }),
                 );
             }
@@ -10333,11 +10383,117 @@ fn run_clone_worker(
             },
         };
     }
-    progress.send_now("creating cloned session", None, None, None);
+    let mut data_stats = None;
+    let mut cloned_working_dir: Option<PathBuf> = None;
+    let planned_folder_clone = if copy_folder_data {
+        let new_session_id = session::clone::mint_session_id_for(target);
+        let target_cwd =
+            match session::data::clone_target_cwd_for_session(&source, target, &new_session_id) {
+                Ok(path) => path,
+                Err(e) => {
+                    return CloneWorkerResult {
+                        seq,
+                        outcome: CloneWorkerOutcome::Failed {
+                            source,
+                            target,
+                            error: e.to_string(),
+                        },
+                    };
+                }
+            };
+        progress.send_now(
+            "copying folder data",
+            Some(target_cwd.display().to_string()),
+            None,
+            None,
+        );
+        match session::data::clone_working_dir_for_session_with_progress(
+            &source,
+            &target_cwd,
+            &cancel_token,
+            |copy_progress| {
+                progress.send_copy_progress("copying folder data", copy_progress);
+            },
+        ) {
+            Ok(data_report) => {
+                progress.send_now(
+                    "folder data copied",
+                    Some(data_report.target_path.display().to_string()),
+                    Some(data_report.stats.clone()),
+                    progress.last_total(),
+                );
+                data_stats = Some(data_report.stats);
+                cloned_working_dir = Some(data_report.target_path.clone());
+                Some((new_session_id, data_report.target_path))
+            }
+            Err(e) if is_cancelled_error(&e) => {
+                let cleanup_error = session::data::remove_cloned_working_dir(&target_cwd)
+                    .err()
+                    .map(|error| error.to_string());
+                return CloneWorkerResult {
+                    seq,
+                    outcome: CloneWorkerOutcome::Cancelled {
+                        source,
+                        target,
+                        target_session_id: None,
+                        deleted_file: None,
+                        deleted_rows: 0,
+                        cleanup_error,
+                    },
+                };
+            }
+            Err(e) => {
+                let mut error = e.to_string();
+                if let Err(cleanup_error) = session::data::remove_cloned_working_dir(&target_cwd) {
+                    error.push_str(&format!("; clone folder cleanup failed: {}", cleanup_error));
+                }
+                return CloneWorkerResult {
+                    seq,
+                    outcome: CloneWorkerOutcome::Failed {
+                        source,
+                        target,
+                        error,
+                    },
+                };
+            }
+        }
+    } else {
+        None
+    };
+    if clone_cancelled(&cancel_token) {
+        let cleanup_error = cloned_working_dir.as_ref().and_then(|path| {
+            session::data::remove_cloned_working_dir(path)
+                .err()
+                .map(|error| error.to_string())
+        });
+        return CloneWorkerResult {
+            seq,
+            outcome: CloneWorkerOutcome::Cancelled {
+                source,
+                target,
+                target_session_id: None,
+                deleted_file: None,
+                deleted_rows: 0,
+                cleanup_error,
+            },
+        };
+    }
+    progress.send_now(
+        "creating cloned session",
+        None,
+        data_stats.clone(),
+        progress.last_total(),
+    );
     let outcome = match session::clone::clone_to_live(
         &source,
         &session::clone::CloneOpts {
             to: Some(target),
+            new_id: planned_folder_clone
+                .as_ref()
+                .map(|(new_session_id, _)| new_session_id.clone()),
+            cwd: planned_folder_clone
+                .as_ref()
+                .map(|(_, target_cwd)| target_cwd.display().to_string()),
             ..Default::default()
         },
     ) {
@@ -10345,83 +10501,10 @@ fn run_clone_worker(
             if clone_cancelled(&cancel_token) {
                 return CloneWorkerResult {
                     seq,
-                    outcome: cancel_clone_after_report(source, report),
+                    outcome: cancel_clone_after_report(source, report, cloned_working_dir),
                 };
             }
-            let mut data_stats = None;
-            let mut data_snapshot_error = None;
-            if copy_folder_data {
-                progress.send_now("scanning folder data", None, None, None);
-                match session::data::create_snapshot_for_clone_with_progress(
-                    &source,
-                    &report,
-                    &cancel_token,
-                    |copy_progress| {
-                        progress.send_copy_progress("copying folder data", copy_progress);
-                    },
-                ) {
-                    Ok(data_report) => {
-                        progress.send_now(
-                            "folder data copied",
-                            None,
-                            Some(data_report.stats.clone()),
-                            progress.last_total(),
-                        );
-                        data_stats = Some(data_report.stats);
-                    }
-                    Err(e) => {
-                        if is_cancelled_error(&e) {
-                            return CloneWorkerResult {
-                                seq,
-                                outcome: cancel_clone_after_report(source, report),
-                            };
-                        }
-                        let data_error = e.to_string();
-                        let cloned_info = session_info_from_clone_report(&source, &report);
-                        match session::remove::remove(&cloned_info) {
-                            Ok(remove_report) => {
-                                return CloneWorkerResult {
-                                    seq,
-                                    outcome: CloneWorkerOutcome::Aborted {
-                                        source,
-                                        target_provider: report.target_provider,
-                                        target_session_id: report.new_session_id,
-                                        data_error,
-                                        deleted_file: remove_report.deleted_file,
-                                        deleted_rows: remove_report.deleted_rows,
-                                    },
-                                };
-                            }
-                            Err(rollback_error) => {
-                                let rollback_error = rollback_error.to_string();
-                                debug_log(
-                                    "clone_data_snapshot_rollback_failed",
-                                    serde_json::json!({
-                                        "source_provider": source.provider.as_str(),
-                                        "source_session_id": &source.session_id,
-                                        "target_provider": report.target_provider.as_str(),
-                                        "target_session_id": &report.new_session_id,
-                                        "data_error": data_error,
-                                        "rollback_error": rollback_error,
-                                    }),
-                                );
-                                data_snapshot_error = Some(format!(
-                                    "{}; rollback failed: {}",
-                                    data_error, rollback_error
-                                ));
-                            }
-                        }
-                    }
-                }
-                if clone_cancelled(&cancel_token) {
-                    let cloned_info = session_info_from_clone_report(&source, &report);
-                    let _ = session::data::remove_snapshot_for_session(&cloned_info);
-                    return CloneWorkerResult {
-                        seq,
-                        outcome: cancel_clone_after_report(source, report),
-                    };
-                }
-            }
+            let data_snapshot_error = None;
             progress.send_now(
                 "recording clone tree",
                 None,
@@ -10429,22 +10512,18 @@ fn run_clone_worker(
                 progress.last_total(),
             );
             if clone_cancelled(&cancel_token) {
-                let cloned_info = session_info_from_clone_report(&source, &report);
-                let _ = session::data::remove_snapshot_for_session(&cloned_info);
                 return CloneWorkerResult {
                     seq,
-                    outcome: cancel_clone_after_report(source, report),
+                    outcome: cancel_clone_after_report(source, report, cloned_working_dir),
                 };
             }
             let clone_tree_error = session::clone_tree::record_clone_report(&report)
                 .err()
                 .map(|e| e.to_string());
             if clone_cancelled(&cancel_token) {
-                let cloned_info = session_info_from_clone_report(&source, &report);
-                let _ = session::data::remove_snapshot_for_session(&cloned_info);
                 return CloneWorkerResult {
                     seq,
-                    outcome: cancel_clone_after_report(source, report),
+                    outcome: cancel_clone_after_report(source, report, cloned_working_dir),
                 };
             }
             progress.send_now(
@@ -10463,6 +10542,12 @@ fn run_clone_worker(
             }
         }
         Err(e) => {
+            let mut error = e.to_string();
+            if let Some(path) = cloned_working_dir.as_ref() {
+                if let Err(cleanup_error) = session::data::remove_cloned_working_dir(path) {
+                    error.push_str(&format!("; clone folder cleanup failed: {}", cleanup_error));
+                }
+            }
             if clone_cancelled(&cancel_token) {
                 CloneWorkerOutcome::Cancelled {
                     source,
@@ -10470,13 +10555,13 @@ fn run_clone_worker(
                     target_session_id: None,
                     deleted_file: None,
                     deleted_rows: 0,
-                    cleanup_error: None,
+                    cleanup_error: if error.is_empty() { None } else { Some(error) },
                 }
             } else {
                 CloneWorkerOutcome::Failed {
                     source,
                     target,
-                    error: e.to_string(),
+                    error,
                 }
             }
         }
@@ -10572,6 +10657,7 @@ fn copy_progress_is_complete(progress: &session::data::CopyProgress) -> bool {
 fn cancel_clone_after_report(
     source: SessionInfo,
     report: session::clone::CloneReport,
+    cloned_working_dir: Option<PathBuf>,
 ) -> CloneWorkerOutcome {
     let cloned_info = session_info_from_clone_report(&source, &report);
     let clone_tree_cleanup_error = session::clone_tree::remove_clone_child(
@@ -10582,6 +10668,11 @@ fn cancel_clone_after_report(
     let snapshot_cleanup_error = session::data::remove_snapshot_for_session(&cloned_info)
         .err()
         .map(|error| error.to_string());
+    let folder_cleanup_error = cloned_working_dir.as_ref().and_then(|path| {
+        session::data::remove_cloned_working_dir(path)
+            .err()
+            .map(|error| error.to_string())
+    });
     match session::remove::remove(&cloned_info) {
         Ok(remove_report) => CloneWorkerOutcome::Cancelled {
             source,
@@ -10589,12 +10680,17 @@ fn cancel_clone_after_report(
             target_session_id: Some(report.new_session_id),
             deleted_file: remove_report.deleted_file,
             deleted_rows: remove_report.deleted_rows,
-            cleanup_error: join_cleanup_errors([clone_tree_cleanup_error, snapshot_cleanup_error]),
+            cleanup_error: join_cleanup_errors([
+                clone_tree_cleanup_error,
+                snapshot_cleanup_error,
+                folder_cleanup_error,
+            ]),
         },
         Err(remove_error) => {
             let cleanup_error = join_cleanup_errors([
                 clone_tree_cleanup_error,
                 snapshot_cleanup_error,
+                folder_cleanup_error,
                 Some(format!("clone cleanup failed: {remove_error}")),
             ]);
             CloneWorkerOutcome::Cancelled {
@@ -10625,7 +10721,19 @@ fn run_restore_worker(
     rows: u16,
     launch_mode: AgentLaunchMode,
 ) -> RestoreWorkerResult {
-    let outcome = session::data::restore_snapshot_for_session(&info).map_err(|e| e.to_string());
+    let outcome = (|| {
+        if let Some(conflict) = live_coding_agent_cwd_meta_conflict_including_target_key(&info) {
+            anyhow::bail!(
+                "{} already uses {}; refusing to restore folder data while a coding agent is live",
+                live_agent_status_label(&conflict),
+                truncate_width(&info.cwd, 72)
+            );
+        }
+        let _cwd_lock = acquire_coding_agent_cwd_restore_lock(&info)?;
+        session::data::restore_snapshot_for_session(&info)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    })()
+    .map_err(|e: anyhow::Error| e.to_string());
     RestoreWorkerResult {
         seq,
         info,
@@ -10647,7 +10755,7 @@ fn session_info_from_clone_report(
     SessionInfo {
         provider: report.target_provider,
         session_id: report.new_session_id.clone(),
-        cwd: source.cwd.clone(),
+        cwd: report.new_cwd.clone(),
         source: source_path,
         updated_at_epoch_s: 0,
         title: source.title.clone(),
@@ -12179,6 +12287,14 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     let settings = Settings::load();
     let startup_spec = agent_launch_spec_with_settings(&info, launch_mode, &settings);
     validate_session_launch_cwd(&info)?;
+    if let Some(conflict) = live_coding_agent_cwd_meta_conflict(&info) {
+        anyhow::bail!(
+            "{} already uses {}; refusing to start another coding agent in the same folder",
+            live_agent_status_label(&conflict),
+            truncate_width(&info.cwd, 72)
+        );
+    }
+    let _cwd_lock = acquire_coding_agent_cwd_lock(&info)?;
     debug_log(
         "daemon_start",
         serde_json::json!({
@@ -13209,6 +13325,291 @@ fn live_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
             && agent_key_from_meta(meta).as_ref() == Some(key)
             && agent_daemon_process_identity(meta.pid, key) != AgentDaemonProcessIdentity::Other
     })
+}
+
+const CODING_AGENT_CWD_LOCK_VERSION: u32 = 1;
+const CODING_AGENT_CWD_LOCK_OWNER_AGENT: &str = "agent_daemon";
+const CODING_AGENT_CWD_LOCK_OWNER_RESTORE: &str = "restore";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodingAgentCwdLock {
+    #[serde(default = "coding_agent_cwd_lock_version")]
+    version: u32,
+    #[serde(default = "coding_agent_cwd_lock_default_owner")]
+    owner_kind: String,
+    pid: u32,
+    provider: String,
+    session_id: String,
+    cwd: String,
+    created_at_epoch_s: u64,
+}
+
+struct CodingAgentCwdLockGuard {
+    key: AgentKey,
+    path: PathBuf,
+}
+
+impl Drop for CodingAgentCwdLockGuard {
+    fn drop(&mut self) {
+        let _ = remove_agent_runtime_file_logged(
+            "coding_agent_cwd_lock_release",
+            Some(&self.key),
+            None,
+            "cwd_lock",
+            &self.path,
+        );
+    }
+}
+
+fn coding_agent_cwd_lock_version() -> u32 {
+    CODING_AGENT_CWD_LOCK_VERSION
+}
+
+fn coding_agent_cwd_lock_default_owner() -> String {
+    CODING_AGENT_CWD_LOCK_OWNER_AGENT.to_string()
+}
+
+fn coding_agent_cwd_lock_for_info(
+    info: &SessionInfo,
+    pid: u32,
+    owner_kind: &'static str,
+) -> CodingAgentCwdLock {
+    CodingAgentCwdLock {
+        version: CODING_AGENT_CWD_LOCK_VERSION,
+        owner_kind: owner_kind.to_string(),
+        pid,
+        provider: info.provider.as_str().to_string(),
+        session_id: info.session_id.clone(),
+        cwd: info.cwd.clone(),
+        created_at_epoch_s: current_epoch_s(),
+    }
+}
+
+fn coding_agent_cwd_lock_key(lock: &CodingAgentCwdLock) -> Option<AgentKey> {
+    Some(AgentKey {
+        provider: Provider::parse(&lock.provider)?,
+        session_id: lock.session_id.clone(),
+    })
+}
+
+fn coding_agent_cwd_lock_debug_value(lock: &CodingAgentCwdLock) -> serde_json::Value {
+    serde_json::json!({
+        "version": lock.version,
+        "owner_kind": &lock.owner_kind,
+        "pid": lock.pid,
+        "provider": &lock.provider,
+        "session_id": &lock.session_id,
+        "cwd": &lock.cwd,
+        "created_at_epoch_s": lock.created_at_epoch_s,
+    })
+}
+
+fn live_coding_agent_cwd_meta_conflict(target: &SessionInfo) -> Option<SessionInfo> {
+    live_coding_agent_cwd_meta_conflict_inner(target, false)
+}
+
+fn live_coding_agent_cwd_meta_conflict_including_target_key(
+    target: &SessionInfo,
+) -> Option<SessionInfo> {
+    live_coding_agent_cwd_meta_conflict_inner(target, true)
+}
+
+fn live_coding_agent_cwd_meta_conflict_inner(
+    target: &SessionInfo,
+    include_target_key: bool,
+) -> Option<SessionInfo> {
+    if !is_coding_agent_session_info(target) || target.cwd.trim().is_empty() {
+        return None;
+    }
+    let target_key = AgentKey::new(target);
+    let dir = agent_runtime_dir().ok()?;
+    let read_dir = fs::read_dir(dir).ok()?;
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(meta) = read_agent_meta_snapshot_at(&path) else {
+            continue;
+        };
+        if meta.pid == 0 || !process_is_alive(meta.pid) {
+            continue;
+        }
+        let Some(key) = agent_key_from_meta(&meta) else {
+            continue;
+        };
+        if agent_daemon_process_identity(meta.pid, &key) == AgentDaemonProcessIdentity::Other {
+            continue;
+        }
+        let Some(candidate) = session_info_from_agent_meta_snapshot(&meta) else {
+            continue;
+        };
+        if is_coding_agent_session_info(&candidate)
+            && session_cwd_same_folder(&target.cwd, &candidate.cwd)
+            && (include_target_key || AgentKey::new(&candidate) != target_key)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn live_coding_agent_cwd_lock_conflict(target: &SessionInfo) -> Result<Option<CodingAgentCwdLock>> {
+    let Some(path) = coding_agent_cwd_lock_path(target)? else {
+        return Ok(None);
+    };
+    let Some(lock) = read_coding_agent_cwd_lock(&path) else {
+        return Ok(None);
+    };
+    if !coding_agent_cwd_lock_is_live(&lock) {
+        let _ = remove_agent_runtime_file_logged(
+            "coding_agent_cwd_lock_stale_cleanup",
+            coding_agent_cwd_lock_key(&lock).as_ref(),
+            None,
+            "cwd_lock",
+            &path,
+        );
+        return Ok(None);
+    }
+    Ok(Some(lock))
+}
+
+fn acquire_coding_agent_cwd_lock(info: &SessionInfo) -> Result<Option<CodingAgentCwdLockGuard>> {
+    acquire_coding_agent_cwd_lock_for_owner(info, CODING_AGENT_CWD_LOCK_OWNER_AGENT)
+}
+
+fn acquire_coding_agent_cwd_restore_lock(
+    info: &SessionInfo,
+) -> Result<Option<CodingAgentCwdLockGuard>> {
+    acquire_coding_agent_cwd_lock_for_owner(info, CODING_AGENT_CWD_LOCK_OWNER_RESTORE)
+}
+
+fn acquire_coding_agent_cwd_lock_for_owner(
+    info: &SessionInfo,
+    owner_kind: &'static str,
+) -> Result<Option<CodingAgentCwdLockGuard>> {
+    let Some(path) = coding_agent_cwd_lock_path(info)? else {
+        return Ok(None);
+    };
+    let key = AgentKey::new(info);
+    let lock = coding_agent_cwd_lock_for_info(info, std::process::id(), owner_kind);
+    let content = serde_json::to_vec_pretty(&lock)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    for _ in 0..2 {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file
+                    .write_all(&content)
+                    .and_then(|_| file.write_all(b"\n"))
+                    .and_then(|_| file.flush())
+                {
+                    let _ = remove_agent_runtime_file_logged(
+                        "coding_agent_cwd_lock_write_failed_cleanup",
+                        Some(&key),
+                        None,
+                        "cwd_lock",
+                        &path,
+                    );
+                    return Err(error.into());
+                }
+                debug_log(
+                    "coding_agent_cwd_lock_acquired",
+                    serde_json::json!({
+                        "key": agent_key_debug_value(&key),
+                        "path": path.display().to_string(),
+                        "lock": coding_agent_cwd_lock_debug_value(&lock),
+                    }),
+                );
+                return Ok(Some(CodingAgentCwdLockGuard { key, path }));
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let Some(existing) = read_coding_agent_cwd_lock(&path) else {
+                    let _ = remove_agent_runtime_file_logged(
+                        "coding_agent_cwd_lock_unreadable_cleanup",
+                        Some(&key),
+                        None,
+                        "cwd_lock",
+                        &path,
+                    );
+                    continue;
+                };
+                if coding_agent_cwd_lock_is_live(&existing) {
+                    return Err(anyhow::anyhow!(
+                        "{} {} already uses {}",
+                        coding_agent_cwd_lock_owner_label(&existing),
+                        truncate_width(&existing.session_id, 14),
+                        truncate_width(&info.cwd, 72)
+                    ));
+                }
+                let _ = remove_agent_runtime_file_logged(
+                    "coding_agent_cwd_lock_stale_cleanup",
+                    coding_agent_cwd_lock_key(&existing).as_ref(),
+                    None,
+                    "cwd_lock",
+                    &path,
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "cannot acquire coding-agent cwd lock for {}",
+        truncate_width(&info.cwd, 72)
+    ))
+}
+
+fn coding_agent_cwd_lock_owner_label(lock: &CodingAgentCwdLock) -> String {
+    if lock.owner_kind == CODING_AGENT_CWD_LOCK_OWNER_RESTORE {
+        format!("restore for {} agent", lock.provider)
+    } else {
+        format!("{} agent", lock.provider)
+    }
+}
+
+fn read_coding_agent_cwd_lock(path: &Path) -> Option<CodingAgentCwdLock> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<CodingAgentCwdLock>(&content).ok())
+}
+
+fn coding_agent_cwd_lock_is_live(lock: &CodingAgentCwdLock) -> bool {
+    if lock.pid == 0 || !process_is_alive(lock.pid) {
+        return false;
+    }
+    if lock.owner_kind == CODING_AGENT_CWD_LOCK_OWNER_RESTORE {
+        return agent_client_process_identity(lock.pid) != AgentClientProcessIdentity::Other;
+    }
+    let Some(key) = coding_agent_cwd_lock_key(lock) else {
+        return true;
+    };
+    agent_daemon_process_identity(lock.pid, &key) != AgentDaemonProcessIdentity::Other
+}
+
+fn coding_agent_cwd_lock_path(info: &SessionInfo) -> Result<Option<PathBuf>> {
+    if !is_coding_agent_session_info(info) {
+        return Ok(None);
+    }
+    let Some(cwd_key) = canonical_session_cwd_key(&info.cwd) else {
+        return Ok(None);
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(cwd_key.as_bytes());
+    let digest = hasher.finalize();
+    Ok(Some(
+        agent_runtime_dir()?.join(format!("cwd-{}.lock", bytes_to_lower_hex(&digest))),
+    ))
+}
+
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn session_info_from_agent_meta_snapshot(meta: &AgentMetaSnapshot) -> Option<SessionInfo> {
@@ -15634,6 +16035,21 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
         ));
     }
     validate_session_launch_cwd(info)?;
+    if let Some(conflict) = live_coding_agent_cwd_meta_conflict(info) {
+        return Err(anyhow::anyhow!(
+            "{} already uses {}; refusing to start another coding agent in the same folder",
+            live_agent_status_label(&conflict),
+            truncate_width(&info.cwd, 72)
+        ));
+    }
+    if let Some(conflict) = live_coding_agent_cwd_lock_conflict(info)? {
+        return Err(anyhow::anyhow!(
+            "{} {} already uses {}; refusing to start another coding agent in the same folder",
+            coding_agent_cwd_lock_owner_label(&conflict),
+            truncate_width(&conflict.session_id, 14),
+            truncate_width(&info.cwd, 72)
+        ));
+    }
     let meta_path = agent_meta_path(&key)?;
     if meta_path.exists() {
         let _ = remove_agent_runtime_file_logged(
@@ -16972,6 +17388,10 @@ fn is_plain_pty_tool_session_info(info: &SessionInfo) -> bool {
     is_shell_session_info(info) || is_cokacdir_session_info(info)
 }
 
+fn is_coding_agent_session_info(info: &SessionInfo) -> bool {
+    !is_plain_pty_tool_session_info(info)
+}
+
 fn shell_session_info_for_cwd(cwd: String) -> SessionInfo {
     let title = shell_pane_title(&cwd);
     SessionInfo {
@@ -17073,6 +17493,45 @@ fn session_cwd_eq(left: &str, right: &str) -> bool {
         return false;
     };
     left_key == right_key
+}
+
+fn session_cwd_same_folder(left: &str, right: &str) -> bool {
+    if session_cwd_eq(left, right) {
+        return true;
+    }
+    let Some(left_key) = canonical_session_cwd_key(left) else {
+        return false;
+    };
+    let Some(right_key) = canonical_session_cwd_key(right) else {
+        return false;
+    };
+    left_key == right_key
+}
+
+fn canonical_session_cwd_key(cwd: &str) -> Option<String> {
+    if cwd.trim().is_empty() {
+        return None;
+    }
+    Path::new(cwd).canonicalize().ok().map(cwd_path_key)
+}
+
+#[cfg(windows)]
+fn cwd_path_key(path: PathBuf) -> String {
+    strip_redundant_windows_cwd_key_separators(strip_windows_namespace_prefix(
+        path.display().to_string().replace('/', "\\"),
+    ))
+    .to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn cwd_path_key(path: PathBuf) -> String {
+    path.display().to_string()
+}
+
+#[cfg(windows)]
+fn strip_redundant_windows_cwd_key_separators(mut path: String) -> String {
+    strip_redundant_windows_trailing_separators(&mut path);
+    path
 }
 
 fn windows_session_cwd_key(cwd: &str) -> Option<String> {
@@ -17266,6 +17725,36 @@ fn live_agent_status_label(info: &SessionInfo) -> String {
             truncate_width(&info.session_id, 14)
         )
     }
+}
+
+fn live_coding_agent_info_conflicts(
+    target: &SessionInfo,
+    target_key: &AgentKey,
+    candidate: &SessionInfo,
+) -> bool {
+    AgentKey::new(candidate) != *target_key
+        && is_coding_agent_session_info(candidate)
+        && session_cwd_same_folder(&target.cwd, &candidate.cwd)
+}
+
+fn coding_agent_cwd_conflict_message(target: &SessionInfo, conflict: &SessionInfo) -> String {
+    format!(
+        "blocked: {} already uses {}; use a separate folder/worktree",
+        live_agent_status_label(conflict),
+        truncate_width(&target.cwd, 48)
+    )
+}
+
+fn coding_agent_cwd_lock_conflict_message(
+    target: &SessionInfo,
+    conflict: &CodingAgentCwdLock,
+) -> String {
+    format!(
+        "blocked: {} {} already uses {}; use a separate folder/worktree",
+        coding_agent_cwd_lock_owner_label(conflict),
+        truncate_width(&conflict.session_id, 14),
+        truncate_width(&target.cwd, 48)
+    )
 }
 
 fn should_select_visible_session_for_live_info(info: &SessionInfo) -> bool {
@@ -24092,6 +24581,7 @@ mod tests {
             source_session_id: "source-id".to_string(),
             new_session_id: "clone-id".to_string(),
             target_provider: Provider::Codex,
+            new_cwd: "/repo-clone".to_string(),
             artifact: session::clone::ArtifactPath::File(artifact.clone()),
         };
 
@@ -24099,9 +24589,37 @@ mod tests {
 
         assert_eq!(clone_info.provider, Provider::Codex);
         assert_eq!(clone_info.session_id, "clone-id");
-        assert_eq!(clone_info.cwd, "/repo");
+        assert_eq!(clone_info.cwd, "/repo-clone");
         assert_eq!(clone_info.source, artifact);
         assert_eq!(clone_info.title.as_deref(), Some("Source title"));
+    }
+
+    #[test]
+    fn clone_cancelled_before_session_creation_reports_no_cloned_session_removed() {
+        let mut app = app_for_key_tests();
+        app.data_task = Some(DataTaskPending::new(
+            7,
+            DataTaskKind::Clone,
+            "cloning codex session + folder data".to_string(),
+        ));
+        let source = session_info(Provider::Codex, "source-id", "/repo");
+
+        app.on_clone_worker_result(CloneWorkerResult {
+            seq: 7,
+            outcome: CloneWorkerOutcome::Cancelled {
+                source,
+                target: Provider::Claude,
+                target_session_id: None,
+                deleted_file: None,
+                deleted_rows: 0,
+                cleanup_error: None,
+            },
+        });
+
+        assert!(app
+            .status
+            .contains("cancelled before cloned session was created"));
+        assert!(!app.status.contains("cloned session removed"));
     }
 
     #[test]
@@ -25035,6 +25553,142 @@ mod tests {
     }
 
     #[test]
+    fn e_on_same_cwd_live_coding_agent_blocks_launch_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap().display().to_string();
+        let alias = dir.path().join(".").display().to_string();
+        assert!(session_cwd_same_folder(&canonical, &alias));
+
+        let mut app = app_for_key_tests();
+        let live = session_info(Provider::Claude, "live-claude", &canonical);
+        let target = session_info(Provider::Codex, "target-codex", &alias);
+        app.agent_states.insert(
+            AgentKey::new(&live),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.sessions.push(live);
+        app.sessions.push(target);
+        app.list_state.select(Some(1));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.active_agent.is_none());
+        assert!(app.status.starts_with("blocked: claude agent live-claude"));
+        assert!(app.status.contains("separate folder/worktree"));
+    }
+
+    #[test]
+    fn e_on_same_cwd_live_shell_does_not_block_coding_agent_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let mut app = app_for_key_tests();
+        let shell = shell_session_info_for_cwd(cwd.clone());
+        let target = session_info(Provider::Codex, "target-codex", &cwd);
+        app.agent_states.insert(
+            AgentKey::new(&shell),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.live_shells.push(shell);
+        app.sessions.push(target);
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::AgentLaunch { .. }));
+        assert_eq!(app.status, "choose launch mode.");
+    }
+
+    #[test]
+    fn cwd_restore_lock_blocks_same_folder_coding_agent_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(Provider::Codex, "restore-lock-target", &cwd);
+
+        let _guard = acquire_coding_agent_cwd_restore_lock(&info)
+            .unwrap()
+            .expect("coding-agent cwd restore lock should be acquired");
+        let conflict = live_coding_agent_cwd_lock_conflict(&info)
+            .unwrap()
+            .expect("restore lock should be reported as a live cwd conflict");
+
+        assert_eq!(conflict.owner_kind, CODING_AGENT_CWD_LOCK_OWNER_RESTORE);
+        assert_eq!(conflict.provider, Provider::Codex.as_str());
+        assert_eq!(conflict.session_id, "restore-lock-target");
+        assert!(coding_agent_cwd_lock_conflict_message(&info, &conflict)
+            .starts_with("blocked: restore for codex agent restore-lock"));
+    }
+
+    #[test]
+    fn cwd_restore_lock_blocks_agent_daemon_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(
+            Provider::Codex,
+            &format!("restore-lock-daemon-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+
+        let _guard = acquire_coding_agent_cwd_restore_lock(&info)
+            .unwrap()
+            .expect("coding-agent cwd restore lock should be acquired");
+        let error = start_agent_daemon(&info, AgentLaunchMode::Normal)
+            .expect_err("restore lock should block agent daemon start");
+
+        let message = error.to_string();
+        assert!(message.contains("restore for codex agent"));
+        assert!(message.contains("refusing to start another coding agent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_cwd_lock_ignores_live_non_cokacmux_pid() {
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn non-cokacmux process");
+        let lock = CodingAgentCwdLock {
+            version: CODING_AGENT_CWD_LOCK_VERSION,
+            owner_kind: CODING_AGENT_CWD_LOCK_OWNER_RESTORE.to_string(),
+            pid: child.id(),
+            provider: Provider::Codex.as_str().to_string(),
+            session_id: "restore-lock-stale-pid".to_string(),
+            cwd: "/tmp".to_string(),
+            created_at_epoch_s: current_epoch_s(),
+        };
+
+        let started = Instant::now();
+        while agent_client_process_identity(child.id()) == AgentClientProcessIdentity::Unknown
+            && started.elapsed() < Duration::from_secs(2)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let identity = agent_client_process_identity(child.id());
+        let is_live = coding_agent_cwd_lock_is_live(&lock);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(identity, AgentClientProcessIdentity::Other);
+        assert!(!is_live);
+    }
+
+    #[test]
     fn e_on_live_selected_missing_cwd_does_not_prompt_create_folder() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("deleted-project");
@@ -25429,6 +26083,52 @@ mod tests {
             other => panic!("expected create-folder confirm after restore skip, got {other:?}"),
         }
         assert!(!target.exists());
+        assert!(!snapshot_path.exists());
+    }
+
+    #[test]
+    fn restore_data_confirm_restore_blocks_if_same_cwd_coding_agent_became_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap().display().to_string();
+        let alias = dir.path().join(".").display().to_string();
+        let snapshot_path = dir.path().join("snapshot-data");
+        let live = session_info(Provider::Claude, "live-claude", &canonical);
+        let target = session_info(Provider::Codex, "clone-codex", &alias);
+        let mut app = app_for_key_tests();
+        app.agent_states.insert(
+            AgentKey::new(&live),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.sessions.push(live);
+        app.input_mode = InputMode::RestoreDataConfirm {
+            info: target,
+            snapshot: session_data_snapshot(
+                Provider::Codex,
+                "clone-codex",
+                "/source-project",
+                snapshot_path.clone(),
+            ),
+            cols: 80,
+            rows: 20,
+            launch_mode: AgentLaunchMode::Normal,
+            selected: RESTORE_DATA_OPTION_RESTORE,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.data_task.is_none());
+        assert!(app.active_agent.is_none());
+        assert!(app.status.starts_with("blocked: claude agent live-claude"));
+        assert!(app.status.contains("separate folder/worktree"));
         assert!(!snapshot_path.exists());
     }
 

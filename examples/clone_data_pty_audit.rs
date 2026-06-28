@@ -1,8 +1,8 @@
-//! PTY-driven audit for cloned session folder snapshots.
+//! PTY-driven audit for cloned session working-folder copies.
 //!
 //! This launches the real cokacmux TUI in a real PTY with an isolated HOME,
-//! drives `c`, confirm, `e`, launch-confirm, restore-confirm, and verifies the
-//! resulting files on disk.
+//! drives `c`, chooses the data-copy clone option, and verifies that
+//! folder-data clones get their own cwd instead of sharing the source cwd.
 
 use std::env;
 use std::error::Error;
@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 const CTRL_Q: u8 = 0x11;
-const ENTER: u8 = b'\r';
 const COLS: u16 = 120;
 const ROWS: u16 = 34;
 
@@ -33,22 +32,22 @@ fn main() -> AuditResult<()> {
     }
 
     let total_started = Instant::now();
-    let restore = audit_clone_restore_success(&exe)?;
-    let delete = audit_clone_delete_snapshot(&exe)?;
+    let workspace = audit_clone_workspace_success(&exe)?;
+    let delete = audit_clone_delete_session_keeps_workspace(&exe)?;
     #[cfg(unix)]
     let rollback = audit_clone_data_failure_rolls_back(&exe)?;
 
     println!("[ok] real PTY clone-data audit passed");
     println!("  binary: {}", exe.display());
-    println!("  restore success: {}", restore);
-    println!("  delete cleanup: {}", delete);
+    println!("  workspace success: {}", workspace);
+    println!("  delete session: {}", delete);
     #[cfg(unix)]
     println!("  snapshot failure rollback: {}", rollback);
     println!("  total={}ms", total_started.elapsed().as_millis());
     Ok(())
 }
 
-fn audit_clone_restore_success(exe: &Path) -> AuditResult<String> {
+fn audit_clone_workspace_success(exe: &Path) -> AuditResult<String> {
     let audit_started = Instant::now();
     let sandbox = tempfile::tempdir()?;
     let home = sandbox.path().join("home");
@@ -64,57 +63,39 @@ fn audit_clone_restore_success(exe: &Path) -> AuditResult<String> {
 
     let boot_ms = audit.wait_screen_contains("pty-source", Duration::from_secs(6))?;
     audit.send(b"c")?;
-    let clone_prompt_ms =
-        audit.wait_screen_contains("Copy working folder data", Duration::from_secs(4))?;
-    audit.send(b"y")?;
-    let (snapshot_json, snapshot_dir, clone_session_id, snapshot_wait_ms) =
-        wait_for_snapshot(&home, "pty-source", Duration::from_secs(6))?;
-    assert_file_eq(&snapshot_dir.join("marker.txt"), "snapshot-original\n")?;
-    assert_file_eq(&snapshot_dir.join("src.txt"), "source-file\n")?;
+    let clone_prompt_ms = audit.wait_screen_contains("Native + data", Duration::from_secs(4))?;
+    audit.send(b"2")?;
+    let (clone_dir, clone_file, clone_session_id, clone_wait_ms) =
+        wait_for_cloned_workspace(&home, &project, "pty-source", Duration::from_secs(6))?;
+    assert_file_eq(&clone_dir.join("marker.txt"), "snapshot-original\n")?;
+    assert_file_eq(&clone_dir.join("src.txt"), "source-file\n")?;
+    assert_file_contains(&clone_file, &clone_dir.display().to_string())?;
 
-    fs::write(project.join("marker.txt"), "mutated-before-restore\n")?;
-    fs::write(project.join("current-only.txt"), "backup-only\n")?;
-
-    thread::sleep(Duration::from_millis(250));
-    audit.send(b"e")?;
-    let launch_prompt_ms =
-        audit.wait_screen_contains("choose launch mode", Duration::from_secs(4))?;
-    audit.send(&[ENTER])?;
-    let restore_prompt_ms =
-        audit.wait_screen_contains("Saved folder data exists", Duration::from_secs(4))?;
-    audit.send(b"y")?;
-    let (backup_path, restore_wait_ms) = wait_for_restore(&project, Duration::from_secs(6))?;
-    if snapshot_json.exists() || snapshot_dir.exists() {
-        return Err(format!(
-            "restore left consumed snapshot behind: json={} dir={}",
-            snapshot_json.display(),
-            snapshot_dir.display()
-        )
-        .into());
+    fs::write(project.join("marker.txt"), "mutated-source-after-clone\n")?;
+    fs::write(project.join("source-only.txt"), "source-only\n")?;
+    assert_file_eq(&clone_dir.join("marker.txt"), "snapshot-original\n")?;
+    if clone_dir.join("source-only.txt").exists() {
+        return Err("clone workspace picked up source mutation after clone".into());
     }
 
     audit.quit_cleanly()?;
     let bytes = audit.captured_len();
 
     Ok(format!(
-        "home={} source=pty-source clone={} snapshot_json={} snapshot_dir={} backup={} boot={}ms clone_prompt={}ms snapshot={}ms launch_prompt={}ms restore_prompt={}ms restore={}ms total={}ms bytes={}",
+        "home={} source=pty-source clone={} clone_dir={} clone_file={} boot={}ms clone_prompt={}ms clone={}ms total={}ms bytes={}",
         home.display(),
         clone_session_id,
-        snapshot_json.display(),
-        snapshot_dir.display(),
-        backup_path.display(),
+        clone_dir.display(),
+        clone_file.display(),
         boot_ms,
         clone_prompt_ms,
-        snapshot_wait_ms,
-        launch_prompt_ms,
-        restore_prompt_ms,
-        restore_wait_ms,
+        clone_wait_ms,
         audit_started.elapsed().as_millis(),
         bytes
     ))
 }
 
-fn audit_clone_delete_snapshot(exe: &Path) -> AuditResult<String> {
+fn audit_clone_delete_session_keeps_workspace(exe: &Path) -> AuditResult<String> {
     let audit_started = Instant::now();
     let sandbox = tempfile::tempdir()?;
     let home = sandbox.path().join("home");
@@ -128,22 +109,20 @@ fn audit_clone_delete_snapshot(exe: &Path) -> AuditResult<String> {
     let mut audit = PtyAudit::spawn(exe, &home)?;
     let boot_ms = audit.wait_screen_contains("pty-delete-source", Duration::from_secs(6))?;
     audit.send(b"c")?;
-    let clone_prompt_ms =
-        audit.wait_screen_contains("Copy working folder data", Duration::from_secs(4))?;
-    audit.send(b"y")?;
-    let (snapshot_json, snapshot_dir, clone_session_id, snapshot_wait_ms) =
-        wait_for_snapshot(&home, "pty-delete-source", Duration::from_secs(6))?;
-    let clone_file = claude_session_file(&home, &project, &clone_session_id);
-    if !clone_file.is_file() {
-        return Err(format!("expected cloned session file {}", clone_file.display()).into());
-    }
+    let clone_prompt_ms = audit.wait_screen_contains("Native + data", Duration::from_secs(4))?;
+    audit.send(b"2")?;
+    let (clone_dir, clone_file, clone_session_id, clone_wait_ms) =
+        wait_for_cloned_workspace(&home, &project, "pty-delete-source", Duration::from_secs(6))?;
 
     audit.send(b"d")?;
     let delete_prompt_ms = audit.wait_screen_contains(&clone_session_id, Duration::from_secs(4))?;
     audit.send(b"y")?;
-    let delete_wait_ms = wait_until(Duration::from_secs(6), || {
-        !clone_file.exists() && !snapshot_json.exists() && !snapshot_dir.exists()
-    })?;
+    let delete_wait_ms = wait_until(Duration::from_secs(6), || !clone_file.exists())?;
+    if !clone_dir.is_dir() {
+        return Err(
+            "delete removed cloned workspace; session delete must not delete user files".into(),
+        );
+    }
     let source_file = claude_session_file(&home, &project, "pty-delete-source");
     if !source_file.is_file() {
         return Err("delete cleanup removed the source session".into());
@@ -153,12 +132,13 @@ fn audit_clone_delete_snapshot(exe: &Path) -> AuditResult<String> {
     let bytes = audit.captured_len();
 
     Ok(format!(
-        "home={} source=pty-delete-source clone={} boot={}ms clone_prompt={}ms snapshot={}ms delete_prompt={}ms delete={}ms total={}ms bytes={}",
+        "home={} source=pty-delete-source clone={} clone_dir={} boot={}ms clone_prompt={}ms clone={}ms delete_prompt={}ms delete={}ms total={}ms bytes={}",
         home.display(),
         clone_session_id,
+        clone_dir.display(),
         boot_ms,
         clone_prompt_ms,
-        snapshot_wait_ms,
+        clone_wait_ms,
         delete_prompt_ms,
         delete_wait_ms,
         audit_started.elapsed().as_millis(),
@@ -182,13 +162,12 @@ fn audit_clone_data_failure_rolls_back(exe: &Path) -> AuditResult<String> {
     let mut audit = PtyAudit::spawn(exe, &home)?;
     let boot_ms = audit.wait_screen_contains("pty-rollback-source", Duration::from_secs(6))?;
     audit.send(b"c")?;
-    let clone_prompt_ms =
-        audit.wait_screen_contains("Copy working folder data", Duration::from_secs(4))?;
-    audit.send(b"y")?;
+    let clone_prompt_ms = audit.wait_screen_contains("Native + data", Duration::from_secs(4))?;
+    audit.send(b"2")?;
     let rollback_wait_ms =
-        audit.wait_screen_contains("aborted: folder data copy failed", Duration::from_secs(6))?;
+        audit.wait_screen_contains("unsupported filesystem entry", Duration::from_secs(6))?;
 
-    let files = claude_session_files(&home, &project)?;
+    let files = all_claude_session_files(&home)?;
     if files.len() != 1 || files[0] != claude_session_file(&home, &project, "pty-rollback-source") {
         return Err(format!("rollback left unexpected session files: {files:?}").into());
     }
@@ -198,8 +177,11 @@ fn audit_clone_data_failure_rolls_back(exe: &Path) -> AuditResult<String> {
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<_, _>>()?;
         if !leftovers.is_empty() {
-            return Err(format!("rollback left snapshot data behind: {leftovers:?}").into());
+            return Err(format!("rollback left data-store entries behind: {leftovers:?}").into());
         }
+    }
+    if !clone_workspace_dirs(&project)?.is_empty() {
+        return Err("rollback left cloned workspace behind".into());
     }
 
     audit.quit_cleanly()?;
@@ -491,11 +473,11 @@ fn claude_session_file(home: &Path, project: &Path, session_id: &str) -> PathBuf
         .join(format!("{session_id}.jsonl"))
 }
 
-fn claude_session_files(home: &Path, project: &Path) -> AuditResult<Vec<PathBuf>> {
+fn claude_session_files_for_cwd(home: &Path, cwd: &Path) -> AuditResult<Vec<PathBuf>> {
     let dir = home
         .join(".claude")
         .join("projects")
-        .join(encode_claude_cwd(&project.display().to_string()));
+        .join(encode_claude_cwd(&cwd.display().to_string()));
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
@@ -504,6 +486,28 @@ fn claude_session_files(home: &Path, project: &Path) -> AuditResult<Vec<PathBuf>
         let path = entry?.path();
         if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
             files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn all_claude_session_files(home: &Path) -> AuditResult<Vec<PathBuf>> {
+    let projects = home.join(".claude").join("projects");
+    if !projects.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for project_entry in fs::read_dir(projects)? {
+        let project_dir = project_entry?.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(project_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                files.push(path);
+            }
         }
     }
     files.sort();
@@ -526,41 +530,32 @@ where
     }
 }
 
-fn wait_for_snapshot(
+fn wait_for_cloned_workspace(
     home: &Path,
+    project: &Path,
     source_session_id: &str,
     timeout: Duration,
 ) -> AuditResult<(PathBuf, PathBuf, String, u128)> {
-    let data_root = home.join(".cokacmux").join("data");
     let start = Instant::now();
     loop {
-        if data_root.is_dir() {
-            let mut json_files = Vec::new();
-            for entry in fs::read_dir(&data_root)? {
-                let path = entry?.path();
-                if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                    json_files.push(path);
-                }
+        for clone_dir in clone_workspace_dirs(project)? {
+            if !clone_dir.join("marker.txt").is_file()
+                && !clone_dir.join("delete-marker.txt").is_file()
+            {
+                continue;
             }
-            if let Some(json_path) = json_files.into_iter().next() {
-                let value: serde_json::Value = serde_json::from_slice(&fs::read(&json_path)?)?;
-                let session_id = value
-                    .get("session_id")
-                    .and_then(|value| value.as_str())
-                    .ok_or("snapshot metadata missing session_id")?
-                    .to_string();
-                if session_id == source_session_id {
-                    return Err("snapshot was written for source session instead of clone".into());
-                }
-                let snapshot_path = value
-                    .get("snapshot_path")
-                    .and_then(|value| value.as_str())
-                    .map(PathBuf::from)
-                    .ok_or("snapshot metadata missing snapshot_path")?;
-                if snapshot_path.is_dir() {
+            for clone_file in claude_session_files_for_cwd(home, &clone_dir)? {
+                let Some(session_id) = clone_file
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                if session_id != source_session_id {
                     return Ok((
-                        json_path,
-                        snapshot_path,
+                        clone_dir,
+                        clone_file,
                         session_id,
                         start.elapsed().as_millis(),
                     ));
@@ -569,32 +564,7 @@ fn wait_for_snapshot(
         }
         if start.elapsed() >= timeout {
             return Err(format!(
-                "timed out waiting for clone snapshot under {}",
-                data_root.display()
-            )
-            .into());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn wait_for_restore(project: &Path, timeout: Duration) -> AuditResult<(PathBuf, u128)> {
-    let start = Instant::now();
-    loop {
-        if fs::read_to_string(project.join("marker.txt"))
-            .ok()
-            .as_deref()
-            == Some("snapshot-original\n")
-            && !project.join("current-only.txt").exists()
-        {
-            let backup = find_backup(project)?;
-            assert_file_eq(&backup.join("marker.txt"), "mutated-before-restore\n")?;
-            assert_file_eq(&backup.join("current-only.txt"), "backup-only\n")?;
-            return Ok((backup, start.elapsed().as_millis()));
-        }
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "timed out waiting for restored project at {}",
+                "timed out waiting for cloned workspace next to {}",
                 project.display()
             )
             .into());
@@ -603,26 +573,29 @@ fn wait_for_restore(project: &Path, timeout: Duration) -> AuditResult<(PathBuf, 
     }
 }
 
-fn find_backup(project: &Path) -> AuditResult<PathBuf> {
+fn clone_workspace_dirs(project: &Path) -> AuditResult<Vec<PathBuf>> {
     let parent = project.parent().ok_or("project path has no parent")?;
     let prefix = format!(
-        "{}.cokacmux-backup-",
+        "{}.cokacmux-claude-",
         project
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or("project path has no file name")?
     );
+    let mut dirs = Vec::new();
     for entry in fs::read_dir(parent)? {
         let path = entry?.path();
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(&prefix))
+        if path.is_dir()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
         {
-            return Ok(path);
+            dirs.push(path);
         }
     }
-    Err(format!("backup directory with prefix {prefix:?} not found").into())
+    dirs.sort();
+    Ok(dirs)
 }
 
 fn assert_file_eq(path: &Path, expected: &str) -> AuditResult<()> {
@@ -630,6 +603,20 @@ fn assert_file_eq(path: &Path, expected: &str) -> AuditResult<()> {
     if actual != expected {
         return Err(format!(
             "unexpected content in {}: expected {:?}, got {:?}",
+            path.display(),
+            expected,
+            actual
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn assert_file_contains(path: &Path, expected: &str) -> AuditResult<()> {
+    let actual = fs::read_to_string(path)?;
+    if !actual.contains(expected) {
+        return Err(format!(
+            "expected {} to contain {:?}, got {:?}",
             path.display(),
             expected,
             actual

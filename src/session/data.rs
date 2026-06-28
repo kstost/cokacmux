@@ -1,5 +1,6 @@
 //! Per-session working-directory snapshots managed by cokacmux.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{ConvertError, Result};
 use crate::providers::discovery::{home_dir, SessionInfo};
@@ -50,6 +52,12 @@ pub struct CopyProgress {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDataSnapshotReport {
     pub snapshot: SessionDataSnapshot,
+    pub stats: CopyStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDataCloneReport {
+    pub target_path: PathBuf,
     pub stats: CopyStats,
 }
 
@@ -98,6 +106,71 @@ where
         Some(cancel),
         &mut on_progress,
     )
+}
+
+pub fn clone_target_cwd_for_session(
+    source: &SessionInfo,
+    target_provider: Provider,
+    new_session_id: &str,
+) -> Result<PathBuf> {
+    let source_dir = snapshot_source_dir(source)?;
+    let parent = source_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            home_dir()
+                .map(|home| home.join(APP_DIR_NAME).join("workspaces"))
+                .unwrap_or_else(|_| PathBuf::from(".cokacmux-workspaces"))
+        });
+    let name = source_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace");
+    let safe_id = safe_path_component(new_session_id);
+    let base = format!("{}.cokacmux-{}-{}", name, target_provider.as_str(), safe_id);
+    for index in 0..1000 {
+        let candidate = if index == 0 {
+            parent.join(&base)
+        } else {
+            parent.join(format!("{base}-{index}"))
+        };
+        if path_entry_exists(&candidate) || paths_overlap(&source_dir, &candidate) {
+            continue;
+        }
+        return Ok(candidate);
+    }
+    Err(ConvertError::Other(format!(
+        "cannot allocate clone folder for {} {}",
+        target_provider.as_str(),
+        new_session_id
+    )))
+}
+
+pub fn clone_working_dir_for_session_with_progress<F>(
+    source: &SessionInfo,
+    target_path: &Path,
+    cancel: &AtomicBool,
+    mut on_progress: F,
+) -> Result<SessionDataCloneReport>
+where
+    F: FnMut(CopyProgress),
+{
+    clone_working_dir_for_session_at_with_progress(
+        source,
+        target_path,
+        Some(cancel),
+        &mut on_progress,
+    )
+}
+
+pub fn remove_cloned_working_dir(path: &Path) -> Result<bool> {
+    if path_entry_exists(path) {
+        remove_path_if_exists(path)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 pub fn restore_snapshot_for_session(info: &SessionInfo) -> Result<SessionDataRestoreReport> {
@@ -216,6 +289,117 @@ fn create_snapshot_for_clone_at_with_progress(
     Ok(SessionDataSnapshotReport { snapshot, stats })
 }
 
+fn clone_working_dir_for_session_at_with_progress(
+    source: &SessionInfo,
+    target_path: &Path,
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut dyn FnMut(CopyProgress),
+) -> Result<SessionDataCloneReport> {
+    check_cancelled(cancel)?;
+    let source_dir = snapshot_source_dir(source)?;
+    if target_path.as_os_str().is_empty() {
+        return Err(ConvertError::MissingField("target_path"));
+    }
+    if paths_overlap(&source_dir, target_path) {
+        return Err(ConvertError::Other(format!(
+            "refusing to clone folder data into overlapping path: {} -> {}",
+            source_dir.display(),
+            target_path.display()
+        )));
+    }
+    if path_entry_exists(target_path) {
+        return Err(ConvertError::Other(format!(
+            "clone folder already exists: {}",
+            target_path.display()
+        )));
+    }
+    let parent = target_path.parent().ok_or_else(|| {
+        ConvertError::Other(format!(
+            "clone folder has no parent: {}",
+            target_path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    fs::create_dir(target_path)?;
+
+    let mut exclude_roots = vec![canonical_or_self(target_path)];
+    if let Ok(root) = data_root() {
+        exclude_roots.push(canonical_or_self(&root));
+    }
+    let before = match scan_source_manifest(&source_dir, &exclude_roots, cancel) {
+        Ok(before) => before,
+        Err(error) => {
+            let _ = remove_path_if_exists(target_path);
+            return Err(error);
+        }
+    };
+    let total = copy_stats_from_manifest(&before);
+    let mut stats = CopyStats::default();
+    if let Err(error) = copy_dir_contents_with_progress(
+        &source_dir,
+        target_path,
+        &exclude_roots,
+        &mut stats,
+        Some(&total),
+        cancel,
+        on_progress,
+    ) {
+        let _ = remove_path_if_exists(target_path);
+        return Err(error);
+    }
+    let copied = match scan_source_manifest(target_path, &[], cancel) {
+        Ok(copied) => copied,
+        Err(error) => {
+            let _ = remove_path_if_exists(target_path);
+            return Err(error);
+        }
+    };
+    let after = match scan_source_manifest(&source_dir, &exclude_roots, cancel) {
+        Ok(after) => after,
+        Err(error) => {
+            let _ = remove_path_if_exists(target_path);
+            return Err(error);
+        }
+    };
+    if before != after {
+        let _ = remove_path_if_exists(target_path);
+        return Err(ConvertError::Other(format!(
+            "source folder changed while copying: {}; retry when the session is idle",
+            source_dir.display()
+        )));
+    }
+    if content_manifest_from_source(&before) != content_manifest_from_source(&copied) {
+        let _ = remove_path_if_exists(target_path);
+        return Err(ConvertError::Other(format!(
+            "cloned folder content mismatch after copying: {}; retry when the session is idle",
+            source_dir.display()
+        )));
+    }
+    if let Err(error) = check_cancelled(cancel) {
+        let _ = remove_path_if_exists(target_path);
+        return Err(error);
+    }
+
+    crate::debug::log(
+        "session_data_folder_cloned",
+        serde_json::json!({
+            "source_provider": source.provider.as_str(),
+            "source_session_id": &source.session_id,
+            "source_dir": source_dir.display().to_string(),
+            "target_path": target_path.display().to_string(),
+            "files": stats.files,
+            "dirs": stats.dirs,
+            "symlinks": stats.symlinks,
+            "bytes": stats.bytes,
+        }),
+    );
+
+    Ok(SessionDataCloneReport {
+        target_path: target_path.to_path_buf(),
+        stats,
+    })
+}
+
 pub fn snapshot_for_session_at(
     data_root: &Path,
     info: &SessionInfo,
@@ -246,6 +430,17 @@ pub fn restore_snapshot_for_session_at(
     data_root: &Path,
     info: &SessionInfo,
 ) -> Result<SessionDataRestoreReport> {
+    restore_snapshot_for_session_at_with_hook(data_root, info, |_| Ok(()))
+}
+
+fn restore_snapshot_for_session_at_with_hook<F>(
+    data_root: &Path,
+    info: &SessionInfo,
+    mut on_target_reserved: F,
+) -> Result<SessionDataRestoreReport>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
     let Some(snapshot) = snapshot_for_session_at(data_root, info)? else {
         return Err(ConvertError::Other(format!(
             "no saved folder snapshot for {} {}",
@@ -266,6 +461,7 @@ pub fn restore_snapshot_for_session_at(
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let snapshot_before = scan_source_manifest(&snapshot.snapshot_path, &[], None)?;
 
     let mut backup_path = None;
     if path_entry_exists(&target_path) {
@@ -275,18 +471,47 @@ pub fn restore_snapshot_for_session_at(
     }
 
     let mut stats = CopyStats::default();
-    let restore_result = copy_dir_contents(&snapshot.snapshot_path, &target_path, &[], &mut stats);
+    let mut target_reserved = false;
+    let restore_result = (|| -> Result<()> {
+        fs::create_dir(&target_path)?;
+        target_reserved = true;
+        on_target_reserved(&target_path)?;
+        copy_dir_contents(&snapshot.snapshot_path, &target_path, &[], &mut stats)?;
+        let snapshot_after = scan_source_manifest(&snapshot.snapshot_path, &[], None)?;
+        if snapshot_before != snapshot_after {
+            return Err(ConvertError::Other(format!(
+                "snapshot folder changed while restoring: {}; retry when the session is idle",
+                snapshot.snapshot_path.display()
+            )));
+        }
+        let restored = scan_source_manifest(&target_path, &[], None)?;
+        if content_manifest_from_source(&snapshot_before) != content_manifest_from_source(&restored)
+        {
+            return Err(ConvertError::Other(format!(
+                "restored folder content mismatch after copying: {}; retry when the session is idle",
+                target_path.display()
+            )));
+        }
+        Ok(())
+    })();
     if let Err(error) = restore_result {
         let mut message = error.to_string();
-        if let Err(cleanup_error) = remove_path_if_exists(&target_path) {
-            message.push_str(&format!(
-                "; failed to remove partial restore at {}: {}",
-                target_path.display(),
-                cleanup_error
-            ));
+        if target_reserved {
+            if let Err(cleanup_error) = remove_path_if_exists(&target_path) {
+                message.push_str(&format!(
+                    "; failed to remove partial restore at {}: {}",
+                    target_path.display(),
+                    cleanup_error
+                ));
+            }
         }
         if let Some(backup) = backup_path.as_ref() {
-            if let Err(restore_error) = fs::rename(backup, &target_path) {
+            if path_entry_exists(&target_path) {
+                message.push_str(&format!(
+                    "; backup left at {} because target path is occupied",
+                    backup.display()
+                ));
+            } else if let Err(restore_error) = fs::rename(backup, &target_path) {
                 message.push_str(&format!(
                     "; failed to restore backup {} to {}: {}",
                     backup.display(),
@@ -294,6 +519,11 @@ pub fn restore_snapshot_for_session_at(
                     restore_error
                 ));
             }
+        } else if target_reserved && path_entry_exists(&target_path) {
+            message.push_str(&format!(
+                "; partial restore may remain at {}",
+                target_path.display()
+            ));
         }
         return Err(ConvertError::Other(message));
     }
@@ -371,7 +601,7 @@ pub fn snapshot_source_dir(info: &SessionInfo) -> Result<PathBuf> {
             path.display()
         )));
     }
-    Ok(path)
+    path.canonicalize().map_err(Into::into)
 }
 
 fn ensure_data_root(data_root: &Path) -> Result<()> {
@@ -552,6 +782,154 @@ fn scan_copy_totals(
     Err(unsupported_entry_error(source))
 }
 
+type SourceManifest = BTreeMap<PathBuf, SourceEntryFingerprint>;
+type ContentManifest = BTreeMap<PathBuf, ContentEntryFingerprint>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceEntryFingerprint {
+    kind: SourceEntryKind,
+    len: u64,
+    modified: Option<SystemTime>,
+    digest: Option<[u8; 32]>,
+    link_target: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContentEntryFingerprint {
+    kind: SourceEntryKind,
+    len: u64,
+    digest: Option<[u8; 32]>,
+    link_target: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceEntryKind {
+    Dir,
+    File,
+    Symlink,
+}
+
+fn scan_source_manifest(
+    source: &Path,
+    exclude_roots: &[PathBuf],
+    cancel: Option<&AtomicBool>,
+) -> Result<SourceManifest> {
+    let mut manifest = BTreeMap::new();
+    scan_source_manifest_at(source, source, true, exclude_roots, cancel, &mut manifest)?;
+    Ok(manifest)
+}
+
+fn scan_source_manifest_at(
+    root: &Path,
+    path: &Path,
+    is_root: bool,
+    exclude_roots: &[PathBuf],
+    cancel: Option<&AtomicBool>,
+    manifest: &mut SourceManifest,
+) -> Result<()> {
+    check_cancelled(cancel)?;
+    if !is_root && should_skip_path(path, exclude_roots) {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    let file_type = metadata.file_type();
+    if !file_type.is_symlink() && unsupported_reparse_point(&metadata) {
+        return Err(unsupported_entry_error(path));
+    }
+    let kind = if file_type.is_symlink() {
+        SourceEntryKind::Symlink
+    } else if file_type.is_dir() {
+        SourceEntryKind::Dir
+    } else if file_type.is_file() {
+        SourceEntryKind::File
+    } else {
+        return Err(unsupported_entry_error(path));
+    };
+    let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+    let link_target = if file_type.is_symlink() {
+        fs::read_link(path).ok()
+    } else {
+        None
+    };
+    let digest = if file_type.is_file() {
+        Some(file_digest(path, cancel)?)
+    } else {
+        None
+    };
+    manifest.insert(
+        rel,
+        SourceEntryFingerprint {
+            kind,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            digest,
+            link_target,
+        },
+    );
+    if file_type.is_dir() && !file_type.is_symlink() {
+        for entry in fs::read_dir(path)? {
+            check_cancelled(cancel)?;
+            let entry = entry?;
+            scan_source_manifest_at(root, &entry.path(), false, exclude_roots, cancel, manifest)?;
+        }
+    }
+    Ok(())
+}
+
+fn content_manifest_from_source(manifest: &SourceManifest) -> ContentManifest {
+    manifest
+        .iter()
+        .map(|(path, entry)| {
+            (
+                path.clone(),
+                ContentEntryFingerprint {
+                    kind: entry.kind.clone(),
+                    len: if entry.kind == SourceEntryKind::File {
+                        entry.len
+                    } else {
+                        0
+                    },
+                    digest: entry.digest,
+                    link_target: entry.link_target.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn file_digest(path: &Path, cancel: Option<&AtomicBool>) -> Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; COPY_CHUNK_SIZE];
+    loop {
+        check_cancelled(cancel)?;
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(&digest);
+    Ok(bytes)
+}
+
+fn copy_stats_from_manifest(manifest: &SourceManifest) -> CopyStats {
+    let mut stats = CopyStats::default();
+    for entry in manifest.values() {
+        match entry.kind {
+            SourceEntryKind::Dir => stats.dirs = stats.dirs.saturating_add(1),
+            SourceEntryKind::File => {
+                stats.files = stats.files.saturating_add(1);
+                stats.bytes = stats.bytes.saturating_add(entry.len);
+            }
+            SourceEntryKind::Symlink => stats.symlinks = stats.symlinks.saturating_add(1),
+        }
+    }
+    stats
+}
+
 fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<()> {
     if cancel.is_some_and(|token| token.load(Ordering::Relaxed)) {
         Err(ConvertError::Cancelled("operation cancelled".into()))
@@ -623,10 +1001,33 @@ fn copy_symlink(source: &Path, dest: &Path) -> Result<()> {
 }
 
 fn should_skip_path(path: &Path, exclude_roots: &[PathBuf]) -> bool {
-    let candidate = canonical_or_self(path);
+    let candidate = if fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        canonical_parent_joined(path)
+    } else {
+        canonical_or_self(path)
+    };
     exclude_roots
         .iter()
         .any(|root| candidate == *root || candidate.starts_with(root))
+}
+
+fn canonical_parent_joined(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    match parent.canonicalize() {
+        Ok(mut canonical_parent) => {
+            canonical_parent.push(name);
+            canonical_parent
+        }
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
@@ -904,6 +1305,7 @@ mod tests {
             source_session_id: "source".into(),
             new_session_id: "clone-1".into(),
             target_provider: Provider::Codex,
+            new_cwd: project.display().to_string(),
             artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
         };
 
@@ -992,6 +1394,125 @@ mod tests {
     }
 
     #[test]
+    fn failed_restore_rolls_back_when_reserved_target_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let project = dir.path().join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("README.md"), "snapshot").unwrap();
+
+        let source = info(Provider::Codex, "source", &project);
+        let report = CloneReport {
+            source_provider: Provider::Codex,
+            source_session_id: "source".into(),
+            new_session_id: "clone-target-race".into(),
+            target_provider: Provider::Codex,
+            new_cwd: project.display().to_string(),
+            artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
+        };
+        create_snapshot_for_clone_at(&data_root, &source, &report).unwrap();
+
+        fs::write(project.join("README.md"), "current").unwrap();
+        fs::write(project.join("current-only.txt"), "current-only").unwrap();
+
+        let clone = info(Provider::Codex, "clone-target-race", &project);
+        let error = restore_snapshot_for_session_at_with_hook(&data_root, &clone, |target| {
+            fs::write(target.join("external-race.txt"), "external")?;
+            Ok(())
+        })
+        .expect_err("target mutation during restore should fail");
+
+        assert!(error
+            .to_string()
+            .contains("restored folder content mismatch"));
+        assert_eq!(
+            fs::read_to_string(project.join("README.md")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            fs::read_to_string(project.join("current-only.txt")).unwrap(),
+            "current-only"
+        );
+        assert!(!project.join("external-race.txt").exists());
+        assert!(data_root.join("codex-clone-target-race").exists());
+        assert!(data_root.join("codex-clone-target-race.json").exists());
+    }
+
+    #[test]
+    fn failed_restore_removes_new_target_when_reserved_target_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let source_project = dir.path().join("source-project");
+        let target = dir.path().join("target-project");
+        fs::create_dir_all(&source_project).unwrap();
+        fs::write(source_project.join("README.md"), "snapshot").unwrap();
+
+        let source = info(Provider::Claude, "source", &source_project);
+        let report = CloneReport {
+            source_provider: Provider::Claude,
+            source_session_id: "source".into(),
+            new_session_id: "clone-new-target-race".into(),
+            target_provider: Provider::Claude,
+            new_cwd: target.display().to_string(),
+            artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
+        };
+        create_snapshot_for_clone_at(&data_root, &source, &report).unwrap();
+
+        let clone = info(Provider::Claude, "clone-new-target-race", &target);
+        let error = restore_snapshot_for_session_at_with_hook(&data_root, &clone, |target| {
+            fs::write(target.join("external-race.txt"), "external")?;
+            Ok(())
+        })
+        .expect_err("target mutation during restore should fail");
+
+        assert!(error
+            .to_string()
+            .contains("restored folder content mismatch"));
+        assert!(!target.exists());
+        assert!(data_root.join("claude-clone-new-target-race").exists());
+        assert!(data_root.join("claude-clone-new-target-race.json").exists());
+    }
+
+    #[test]
+    fn failed_restore_rolls_back_when_snapshot_changes_during_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "snapshot").unwrap();
+
+        let source = info(Provider::Codex, "source", &project);
+        let report = CloneReport {
+            source_provider: Provider::Codex,
+            source_session_id: "source".into(),
+            new_session_id: "clone-snapshot-race".into(),
+            target_provider: Provider::Codex,
+            new_cwd: project.display().to_string(),
+            artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
+        };
+        let snapshot = create_snapshot_for_clone_at(&data_root, &source, &report).unwrap();
+
+        fs::write(project.join("README.md"), "current").unwrap();
+        let clone = info(Provider::Codex, "clone-snapshot-race", &project);
+        let error = restore_snapshot_for_session_at_with_hook(&data_root, &clone, |_target| {
+            fs::write(snapshot.snapshot.snapshot_path.join("late.txt"), "late")?;
+            Ok(())
+        })
+        .expect_err("snapshot mutation during restore should fail");
+
+        assert!(error
+            .to_string()
+            .contains("snapshot folder changed while restoring"));
+        assert_eq!(
+            fs::read_to_string(project.join("README.md")).unwrap(),
+            "current"
+        );
+        assert!(!project.join("late.txt").exists());
+        assert!(snapshot.snapshot.snapshot_path.exists());
+        assert!(data_root.join("codex-clone-snapshot-race.json").exists());
+    }
+
+    #[test]
     fn snapshot_copy_skips_data_root_when_source_contains_it() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("home");
@@ -1006,6 +1527,7 @@ mod tests {
             source_session_id: "source".into(),
             new_session_id: "clone-2".into(),
             target_provider: Provider::Claude,
+            new_cwd: source.display().to_string(),
             artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
         };
 
@@ -1016,6 +1538,223 @@ mod tests {
             .snapshot_path
             .join(".cokacmux/data")
             .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_copy_follows_symlink_session_cwd_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let project = dir.path().join("real-project");
+        let linked = dir.path().join("linked-project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "snapshot").unwrap();
+        unix_fs::symlink(&project, &linked).unwrap();
+
+        let source = info(Provider::Codex, "source", &linked);
+        let report = CloneReport {
+            source_provider: Provider::Codex,
+            source_session_id: "source".into(),
+            new_session_id: "clone-symlink-root".into(),
+            target_provider: Provider::Codex,
+            new_cwd: linked.display().to_string(),
+            artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
+        };
+
+        let snapshot = create_snapshot_for_clone_at(&data_root, &source, &report).unwrap();
+
+        assert_eq!(snapshot.stats.files, 1);
+        assert_eq!(
+            fs::read_to_string(snapshot.snapshot.snapshot_path.join("README.md")).unwrap(),
+            "snapshot"
+        );
+    }
+
+    #[test]
+    fn clone_working_dir_copies_to_dedicated_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let target = dir.path().join("project.cokacmux-codex-clone");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("README.md"), "source").unwrap();
+        fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let source = info(Provider::Codex, "source", &project);
+        let cancel = AtomicBool::new(false);
+        let copied =
+            clone_working_dir_for_session_with_progress(&source, &target, &cancel, |_progress| {})
+                .unwrap();
+
+        assert_eq!(copied.target_path, target);
+        assert_eq!(copied.stats.files, 2);
+        assert_eq!(
+            fs::read_to_string(project.join("README.md")).unwrap(),
+            "source"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("README.md")).unwrap(),
+            "source"
+        );
+        assert!(target.join("src/main.rs").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_working_dir_follows_symlink_session_cwd_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("real-project");
+        let linked = dir.path().join("linked-project");
+        let target = dir.path().join("project.cokacmux-codex-clone");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "source").unwrap();
+        unix_fs::symlink(&project, &linked).unwrap();
+
+        let source = info(Provider::Codex, "source", &linked);
+        let cancel = AtomicBool::new(false);
+        let copied =
+            clone_working_dir_for_session_with_progress(&source, &target, &cancel, |_progress| {})
+                .unwrap();
+
+        assert_eq!(copied.stats.files, 1);
+        assert_eq!(
+            fs::read_to_string(target.join("README.md")).unwrap(),
+            "source"
+        );
+    }
+
+    #[test]
+    fn clone_working_dir_reserves_target_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let target = dir.path().join("project.cokacmux-codex-clone");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "source").unwrap();
+
+        let source = info(Provider::Codex, "source", &project);
+        let cancel = AtomicBool::new(false);
+        let saw_reserved_target = AtomicBool::new(false);
+        clone_working_dir_for_session_with_progress(&source, &target, &cancel, |_progress| {
+            if target.is_dir() {
+                saw_reserved_target.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap();
+
+        assert!(saw_reserved_target.load(Ordering::Relaxed));
+        assert_eq!(
+            fs::read_to_string(target.join("README.md")).unwrap(),
+            "source"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_working_dir_preserves_symlink_to_reserved_target_path() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let target = dir.path().join("project.cokacmux-codex-clone");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "source").unwrap();
+        unix_fs::symlink(&target, project.join("future-target-link")).unwrap();
+
+        let source = info(Provider::Codex, "source", &project);
+        let cancel = AtomicBool::new(false);
+        clone_working_dir_for_session_with_progress(&source, &target, &cancel, |_progress| {})
+            .unwrap();
+
+        assert_eq!(
+            fs::read_link(target.join("future-target-link")).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn cancelled_clone_working_dir_removes_reserved_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let target = dir.path().join("project.cokacmux-codex-clone");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "source").unwrap();
+
+        let source = info(Provider::Codex, "source", &project);
+        let cancel = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let error =
+            clone_working_dir_for_session_with_progress(&source, &target, &cancel, |_progress| {
+                if !cancelled.swap(true, Ordering::Relaxed) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            })
+            .expect_err("cancelled clone folder copy should fail");
+
+        assert!(matches!(error, ConvertError::Cancelled(_)));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn clone_working_dir_rejects_existing_empty_target_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let target = dir.path().join("project.cokacmux-codex-clone");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "source").unwrap();
+        fs::create_dir(&target).unwrap();
+
+        let source = info(Provider::Codex, "source", &project);
+        let cancel = AtomicBool::new(false);
+        let error =
+            clone_working_dir_for_session_with_progress(&source, &target, &cancel, |_progress| {})
+                .expect_err("existing target must not be overwritten");
+
+        assert!(error.to_string().contains("clone folder already exists"));
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn clone_working_dir_rejects_source_changes_during_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let target = dir.path().join("project.cokacmux-codex-clone");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "before").unwrap();
+
+        let source = info(Provider::Codex, "source", &project);
+        let cancel = AtomicBool::new(false);
+        let changed = AtomicBool::new(false);
+        let error =
+            clone_working_dir_for_session_with_progress(&source, &target, &cancel, |_progress| {
+                if !changed.swap(true, Ordering::Relaxed) {
+                    fs::write(project.join("README.md"), "after").unwrap();
+                }
+            })
+            .expect_err("source mutation during copy should fail");
+
+        assert!(error.to_string().contains("source folder changed"));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn clone_target_cwd_allocates_non_overlapping_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let source = info(Provider::Claude, "source", &project);
+
+        let target = clone_target_cwd_for_session(&source, Provider::Codex, "clone/id").unwrap();
+
+        assert_eq!(target.parent(), project.parent());
+        assert!(target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .starts_with("project.cokacmux-codex-clone%2Fid"));
+        assert!(!paths_overlap(&project, &target));
     }
 
     #[test]
@@ -1032,6 +1771,7 @@ mod tests {
             source_session_id: "source".into(),
             new_session_id: "clone-cancelled".into(),
             target_provider: Provider::Codex,
+            new_cwd: project.display().to_string(),
             artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
         };
         let cancel = AtomicBool::new(true);
@@ -1075,6 +1815,7 @@ mod tests {
             source_session_id: "source".into(),
             new_session_id: "clone-cancelled-chunk".into(),
             target_provider: Provider::Codex,
+            new_cwd: project.display().to_string(),
             artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
         };
         let cancel = AtomicBool::new(false);
@@ -1113,6 +1854,7 @@ mod tests {
             source_session_id: "source".into(),
             new_session_id: "clone-missing-data".into(),
             target_provider: Provider::Codex,
+            new_cwd: dir.path().display().to_string(),
             artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
         };
 
@@ -1155,6 +1897,7 @@ mod tests {
             source_session_id: "source".into(),
             new_session_id: "clone-partial-failure".into(),
             target_provider: Provider::Codex,
+            new_cwd: project.display().to_string(),
             artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
         };
 
@@ -1191,6 +1934,7 @@ mod tests {
             source_session_id: "source".into(),
             new_session_id: "clone-readonly".into(),
             target_provider: Provider::Claude,
+            new_cwd: project.display().to_string(),
             artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
         };
 
@@ -1219,6 +1963,7 @@ mod tests {
             source_session_id: "source".into(),
             new_session_id: "clone-readonly-file".into(),
             target_provider: Provider::Codex,
+            new_cwd: project.display().to_string(),
             artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
         };
 
@@ -1248,6 +1993,7 @@ mod tests {
             source_session_id: "source".into(),
             new_session_id: "clone-broken-link".into(),
             target_provider: Provider::Codex,
+            new_cwd: project.display().to_string(),
             artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
         };
         create_snapshot_for_clone_at(&data_root, &source, &report).unwrap();
@@ -1287,6 +2033,7 @@ mod tests {
             source_session_id: "source".into(),
             new_session_id: "clone-symlink-overlap".into(),
             target_provider: Provider::Codex,
+            new_cwd: project.display().to_string(),
             artifact: ArtifactPath::File(dir.path().join("clone.jsonl")),
         };
         let snapshot = create_snapshot_for_clone_at(&data_root, &source, &report).unwrap();

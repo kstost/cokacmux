@@ -49,6 +49,7 @@ pub struct CloneReport {
     pub source_session_id: String,
     pub new_session_id: String,
     pub target_provider: Provider,
+    pub new_cwd: String,
     pub artifact: ArtifactPath,
 }
 
@@ -105,6 +106,10 @@ pub fn clone_to_live(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport>
     }
 }
 
+pub fn mint_session_id_for(target: Provider) -> String {
+    mint_id_for(target)
+}
+
 fn clone_cross_provider_context_wrapper(
     src: &SessionInfo,
     target_provider: Provider,
@@ -131,7 +136,7 @@ fn clone_cross_provider_context_wrapper_with_install_opts(
     let mut wrapped = wrap_session_for_context_convert(&source_session, target_provider);
     let new_cwd = opts.cwd.clone().unwrap_or_else(|| src.cwd.clone());
     if !new_cwd.is_empty() {
-        wrapped.cwd = new_cwd;
+        wrapped.cwd = new_cwd.clone();
     }
     if let Some(new_id) = opts.new_id.clone() {
         ensure_native_session_id_for(target_provider, &new_id)?;
@@ -163,6 +168,7 @@ fn clone_cross_provider_context_wrapper_with_install_opts(
         source_session_id: src.session_id.clone(),
         new_session_id: install.session_id,
         target_provider,
+        new_cwd,
         artifact: install.artifact,
     })
 }
@@ -241,6 +247,7 @@ fn clone_claude_same_provider_at_home(
         source_session_id: src.session_id.clone(),
         new_session_id: new_id,
         target_provider: Provider::Claude,
+        new_cwd,
         artifact,
     })
 }
@@ -314,6 +321,7 @@ fn clone_codex_same_provider_at_home(
         source_session_id: src.session_id.clone(),
         new_session_id: new_id,
         target_provider: Provider::Codex,
+        new_cwd,
         artifact,
     })
 }
@@ -366,6 +374,7 @@ fn clone_opencode_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<C
         source_session_id: src.session_id.clone(),
         new_session_id: new_id,
         target_provider: Provider::OpenCode,
+        new_cwd,
         artifact,
     })
 }
