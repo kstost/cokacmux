@@ -2759,6 +2759,7 @@ impl AgentSession {
         );
         let child = pair.slave.spawn_command(command)?;
         let child_pid = child.process_id();
+        let child_pid_start_ticks = child_pid.and_then(process_start_ticks);
         debug_log(
             "agent_spawn_command_started",
             serde_json::json!({
@@ -2766,6 +2767,7 @@ impl AgentSession {
                 "session_id": &info.session_id,
                 "command": spec.command_line(),
                 "child_pid": child_pid,
+                "child_pid_start_ticks": child_pid_start_ticks,
             }),
         );
         drop(pair.slave);
@@ -5681,7 +5683,7 @@ impl App {
         let (keybindings, keybindings_mtime) =
             KeyBindings::load_with_mtime(keybindings_path.as_deref());
         let session_view = settings.cokacmux.session_view;
-        let orphan_pty_logs_removed = cleanup_orphan_agent_pty_logs();
+        let startup_runtime_sweep = cleanup_stale_agent_runtime_files("app_start_runtime_sweep");
         let mut app = Self {
             settings,
             keybindings,
@@ -5754,7 +5756,10 @@ impl App {
                 "session_view": app.session_view.label(),
                 "provider_filter": app.provider_filter.label(),
                 "text_filter": &app.text_filter,
-                "orphan_pty_logs_removed": orphan_pty_logs_removed,
+                "orphan_pty_logs_removed": startup_runtime_sweep.pty_logs_deleted,
+                "child_processes_terminated": startup_runtime_sweep.child_processes_terminated,
+                "cwd_locks_removed": startup_runtime_sweep.cwd_locks_removed,
+                "runtime_files_removed": startup_runtime_sweep.runtime_files_removed,
             }),
         );
         app
@@ -9409,6 +9414,7 @@ impl App {
         let key = AgentKey::new(&active_agent.info);
         let provider = active_agent.info.provider;
         let session_id = active_agent.info.session_id.clone();
+        let active_info = active_agent.info.clone();
         let killed_label = live_agent_status_label(&active_agent.info);
         let cols = active_agent.pty_size.cols;
         let rows = active_agent.pty_size.rows;
@@ -9420,7 +9426,7 @@ impl App {
         drop(agent);
         self.cancel_pending_attach("kill_active_agent");
 
-        let result = terminate_agent_daemon(&key);
+        let result = terminate_agent_daemon_for_info(&key, &active_info);
         self.agent_states.remove(&key);
         self.discard_pending_agent_runtime_refresh();
         self.refresh_agent_runtime_states();
@@ -9434,6 +9440,7 @@ impl App {
                         "provider": provider.as_str(),
                         "session_id": &session_id,
                         "daemon_pid": outcome.pid,
+                        "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
                         "has_next": next_info.is_some(),
                     }),
@@ -9636,7 +9643,7 @@ impl App {
         let selected_key = AgentKey::new(&info);
         let runtime_info = self.runtime_info_for_selected_agent(&info);
         let runtime_key = AgentKey::new(&runtime_info);
-        let result = terminate_agent_daemon(&runtime_key);
+        let result = terminate_agent_daemon_for_info(&runtime_key, &runtime_info);
         self.agent_states.remove(&selected_key);
         self.agent_states.remove(&runtime_key);
         self.discard_pending_agent_runtime_refresh();
@@ -9672,6 +9679,7 @@ impl App {
                         "runtime_provider": runtime_key.provider.as_str(),
                         "runtime_session_id": &runtime_key.session_id,
                         "daemon_pid": outcome.pid,
+                        "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
                     }),
                 );
@@ -11410,16 +11418,31 @@ fn cokacmux_main() -> Result<()> {
                 "stale": report.stale,
                 "skipped_self": report.skipped_self,
                 "errors": report.errors,
+                "child_processes_terminated": report.child_processes_terminated,
+                "runtime_files_removed": report.runtime_files_removed,
                 "pty_logs_deleted": report.pty_logs_deleted,
                 "cwd_locks_removed": report.cwd_locks_removed,
             }),
         );
         println!(
-            "killed {} agent daemon(s); stale={} skipped_self={} errors={}{}{}",
+            "killed {} agent daemon(s); stale={} skipped_self={} errors={}{}{}{}{}",
             report.killed,
             report.stale,
             report.skipped_self,
             report.errors,
+            if report.child_processes_terminated > 0 {
+                format!(
+                    " child_processes_terminated={}",
+                    report.child_processes_terminated
+                )
+            } else {
+                String::new()
+            },
+            if report.runtime_files_removed > 0 {
+                format!(" runtime_files_removed={}", report.runtime_files_removed)
+            } else {
+                String::new()
+            },
             if report.pty_logs_deleted > 0 {
                 format!(" pty_logs_deleted={}", report.pty_logs_deleted)
             } else {
@@ -12936,6 +12959,18 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
         "meta",
         &meta_path,
     );
+    let sweep = cleanup_stale_agent_runtime_files("daemon_child_exit_runtime_sweep");
+    debug_log(
+        "daemon_child_exit_runtime_sweep",
+        serde_json::json!({
+            "provider": key.provider.as_str(),
+            "session_id": &key.session_id,
+            "runtime_files_removed": sweep.runtime_files_removed,
+            "child_processes_terminated": sweep.child_processes_terminated,
+            "pty_logs_deleted": sweep.pty_logs_deleted,
+            "cwd_locks_removed": sweep.cwd_locks_removed,
+        }),
+    );
     Ok(())
 }
 
@@ -13072,10 +13107,11 @@ fn render_agent_meta_parts(
     child_pid: Option<u32>,
 ) -> io::Result<String> {
     let value = serde_json::json!({
-        "pid": std::process::id(),
-        "child_pid": child_pid,
-        "provider": info.provider.as_str(),
-        "session_id": &info.session_id,
+            "pid": std::process::id(),
+            "child_pid": child_pid,
+            "child_pid_start_ticks": child_pid.and_then(process_start_ticks),
+            "provider": info.provider.as_str(),
+            "session_id": &info.session_id,
         "cwd": &info.cwd,
         "source": info.source.display().to_string(),
         "command": spec.command_line(),
@@ -13340,6 +13376,8 @@ struct AgentMetaSnapshot {
     pid: u32,
     #[serde(default)]
     child_pid: Option<u32>,
+    #[serde(default)]
+    child_pid_start_ticks: Option<u64>,
     provider: Option<String>,
     session_id: Option<String>,
     #[serde(default)]
@@ -13381,11 +13419,78 @@ fn live_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
     })
 }
 
+fn agent_runtime_meta_has_live_daemon_for_stem(meta: &AgentMetaSnapshot, stem: &str) -> bool {
+    if meta.pid == 0 || !process_is_alive(meta.pid) {
+        return false;
+    }
+    let Some(key) = agent_key_from_meta(meta) else {
+        return false;
+    };
+    if agent_file_stem(&key) != stem {
+        return false;
+    }
+    agent_daemon_process_identity(meta.pid, &key) != AgentDaemonProcessIdentity::Other
+}
+
+fn agent_meta_child_pid_matches(meta: &AgentMetaSnapshot) -> bool {
+    let Some(child_pid) = meta.child_pid else {
+        return false;
+    };
+    if child_pid == 0 || !process_is_alive(child_pid) {
+        return false;
+    }
+    if let Some(expected) = meta.child_pid_start_ticks {
+        return process_start_ticks(child_pid) == Some(expected);
+    }
+    if let Some(started_at_epoch_s) = process_start_epoch_s(child_pid) {
+        return meta.updated_at_epoch_s == 0
+            || started_at_epoch_s <= meta.updated_at_epoch_s.saturating_add(1);
+    }
+    true
+}
+
+fn terminate_agent_meta_child_process(
+    meta: &AgentMetaSnapshot,
+    key: &AgentKey,
+    reason: &str,
+) -> Option<u32> {
+    let child_pid = meta.child_pid?;
+    if !agent_meta_child_pid_matches(meta) {
+        debug_log(
+            "kill_agent_child_process_skipped",
+            serde_json::json!({
+                "reason": reason,
+                "key": agent_key_debug_value(key),
+                "daemon_pid": meta.pid,
+                "child_pid": child_pid,
+                "child_pid_start_ticks": meta.child_pid_start_ticks,
+                "child_alive": process_is_alive(child_pid),
+                "child_pid_matches": false,
+            }),
+        );
+        return None;
+    }
+    let terminated = terminate_agent_child_process(Some(child_pid), meta.pid, key);
+    if let Some(pid) = terminated {
+        debug_log(
+            "kill_agent_meta_child_process",
+            serde_json::json!({
+                "reason": reason,
+                "key": agent_key_debug_value(key),
+                "daemon_pid": meta.pid,
+                "child_pid": pid,
+                "child_pid_start_ticks": meta.child_pid_start_ticks,
+            }),
+        );
+    }
+    terminated
+}
+
 const CODING_AGENT_CWD_LOCK_VERSION: u32 = 1;
 const CODING_AGENT_CWD_LOCK_OWNER_AGENT: &str = "agent_daemon";
 const CODING_AGENT_CWD_LOCK_OWNER_RESTORE: &str = "restore";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CodingAgentCwdLock {
     #[serde(default = "coding_agent_cwd_lock_version")]
     version: u32,
@@ -13403,17 +13508,12 @@ struct CodingAgentCwdLock {
 struct CodingAgentCwdLockGuard {
     key: AgentKey,
     path: PathBuf,
+    lock: CodingAgentCwdLock,
 }
 
 impl Drop for CodingAgentCwdLockGuard {
     fn drop(&mut self) {
-        let _ = remove_agent_runtime_file_logged(
-            "coding_agent_cwd_lock_release",
-            Some(&self.key),
-            None,
-            "cwd_lock",
-            &self.path,
-        );
+        let _ = remove_coding_agent_cwd_lock_for_guard(&self.key, &self.path, &self.lock);
     }
 }
 
@@ -13580,7 +13680,7 @@ fn acquire_coding_agent_cwd_lock_for_owner(
                         "lock": coding_agent_cwd_lock_debug_value(&lock),
                     }),
                 );
-                return Ok(Some(CodingAgentCwdLockGuard { key, path }));
+                return Ok(Some(CodingAgentCwdLockGuard { key, path, lock }));
             }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 let Some(existing) = read_coding_agent_cwd_lock(&path) else {
@@ -13630,6 +13730,45 @@ fn read_coding_agent_cwd_lock(path: &Path) -> Option<CodingAgentCwdLock> {
     fs::read_to_string(path)
         .ok()
         .and_then(|content| serde_json::from_str::<CodingAgentCwdLock>(&content).ok())
+}
+
+fn remove_coding_agent_cwd_lock_for_guard(
+    key: &AgentKey,
+    path: &Path,
+    expected: &CodingAgentCwdLock,
+) -> bool {
+    let Some(lock) = read_coding_agent_cwd_lock(path) else {
+        debug_log(
+            "coding_agent_cwd_lock_release_skipped",
+            serde_json::json!({
+                "reason": "unreadable_or_missing",
+                "key": agent_key_debug_value(key),
+                "path": path.display().to_string(),
+                "expected_lock": coding_agent_cwd_lock_debug_value(expected),
+            }),
+        );
+        return false;
+    };
+    if &lock != expected {
+        debug_log(
+            "coding_agent_cwd_lock_release_skipped",
+            serde_json::json!({
+                "reason": "lock_replaced",
+                "key": agent_key_debug_value(key),
+                "path": path.display().to_string(),
+                "expected_lock": coding_agent_cwd_lock_debug_value(expected),
+                "actual_lock": coding_agent_cwd_lock_debug_value(&lock),
+            }),
+        );
+        return false;
+    }
+    remove_agent_runtime_file_logged(
+        "coding_agent_cwd_lock_release",
+        Some(key),
+        None,
+        "cwd_lock",
+        path,
+    )
 }
 
 fn remove_coding_agent_cwd_lock_for_info(
@@ -13700,6 +13839,118 @@ fn cleanup_stale_coding_agent_cwd_locks_at(runtime_dir: &Path, reason: &str) -> 
     removed
 }
 
+#[derive(Debug, Default)]
+struct AgentRuntimeSweepReport {
+    runtime_files_removed: usize,
+    child_processes_terminated: usize,
+    pty_logs_deleted: usize,
+    cwd_locks_removed: usize,
+}
+
+fn cleanup_stale_agent_runtime_files(reason: &str) -> AgentRuntimeSweepReport {
+    let Ok(runtime_dir) = agent_runtime_dir() else {
+        return AgentRuntimeSweepReport::default();
+    };
+    cleanup_stale_agent_runtime_files_at(&runtime_dir, reason)
+}
+
+fn cleanup_stale_agent_runtime_files_at(
+    runtime_dir: &Path,
+    reason: &str,
+) -> AgentRuntimeSweepReport {
+    let Ok(read_dir) = fs::read_dir(runtime_dir) else {
+        return AgentRuntimeSweepReport::default();
+    };
+    let mut report = AgentRuntimeSweepReport::default();
+    let mut live_stems = HashSet::new();
+    let entries = read_dir
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+
+    for path in &entries {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(meta) = read_agent_meta_snapshot_at(path) else {
+            if remove_agent_runtime_files_by_stem(runtime_dir, stem, reason) {
+                report.pty_logs_deleted = report.pty_logs_deleted.saturating_add(1);
+            }
+            continue;
+        };
+        if agent_runtime_meta_has_live_daemon_for_stem(&meta, stem) {
+            live_stems.insert(stem.to_string());
+            continue;
+        }
+        if let Some(key) = agent_key_from_meta(&meta).filter(|key| agent_file_stem(key) == stem) {
+            if terminate_agent_meta_child_process(&meta, &key, reason).is_some() {
+                report.child_processes_terminated =
+                    report.child_processes_terminated.saturating_add(1);
+            }
+        }
+        if remove_agent_runtime_files_by_stem(runtime_dir, stem, reason) {
+            report.pty_logs_deleted = report.pty_logs_deleted.saturating_add(1);
+        }
+    }
+
+    report.cwd_locks_removed = cleanup_stale_coding_agent_cwd_locks_at(runtime_dir, reason);
+    report.pty_logs_deleted = report
+        .pty_logs_deleted
+        .saturating_add(cleanup_orphan_agent_pty_logs_at(runtime_dir));
+
+    let Ok(read_dir) = fs::read_dir(runtime_dir) else {
+        return report;
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Some(stem) = orphan_agent_runtime_file_stem(&path) else {
+            continue;
+        };
+        if live_stems.contains(&stem) || agent_runtime_stem_has_reachable_daemon(runtime_dir, &stem)
+        {
+            continue;
+        }
+        if remove_agent_runtime_file_logged(reason, None, Some(&stem), "orphan_runtime", &path) {
+            report.runtime_files_removed = report.runtime_files_removed.saturating_add(1);
+        }
+    }
+
+    report
+}
+
+fn orphan_agent_runtime_file_stem(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    if let Some(stem) = file_name.strip_suffix(".json.tmp") {
+        return Some(stem.to_string());
+    }
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("sock" | "tcp") => path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn agent_runtime_stem_has_reachable_daemon(runtime_dir: &Path, stem: &str) -> bool {
+    AgentStream::connect(runtime_dir.join(format!("{stem}.sock"))).is_ok()
+}
+
+#[cfg(windows)]
+fn agent_runtime_stem_has_reachable_daemon(runtime_dir: &Path, stem: &str) -> bool {
+    let marker_path = runtime_dir.join(format!("{stem}.tcp"));
+    read_agent_tcp_addr(&marker_path)
+        .and_then(|addr| AgentStream::connect(addr))
+        .is_ok()
+}
+
 fn coding_agent_cwd_lock_is_live(lock: &CodingAgentCwdLock) -> bool {
     if lock.pid == 0 || !process_is_alive(lock.pid) {
         return false;
@@ -13707,12 +13958,15 @@ fn coding_agent_cwd_lock_is_live(lock: &CodingAgentCwdLock) -> bool {
     if !coding_agent_cwd_lock_pid_matches(lock) {
         return false;
     }
+    let Some(key) = coding_agent_cwd_lock_key(lock) else {
+        return false;
+    };
     if lock.owner_kind == CODING_AGENT_CWD_LOCK_OWNER_RESTORE {
+        if lock.pid == std::process::id() {
+            return true;
+        }
         return agent_client_process_identity(lock.pid) != AgentClientProcessIdentity::Other;
     }
-    let Some(key) = coding_agent_cwd_lock_key(lock) else {
-        return true;
-    };
     agent_daemon_process_identity(lock.pid, &key) != AgentDaemonProcessIdentity::Other
 }
 
@@ -14095,6 +14349,7 @@ fn agent_runtime_probe_debug_value(key: &AgentKey, current_pid: u32) -> serde_js
         "daemon_alive": daemon_alive,
         "daemon_identity": daemon_identity,
         "child_pid": meta.child_pid,
+        "child_pid_start_ticks": meta.child_pid_start_ticks,
         "child_alive": meta.child_pid.map(process_is_alive),
         "provider": meta.provider.as_deref(),
         "session_id": meta.session_id.as_deref(),
@@ -14207,6 +14462,17 @@ fn read_agent_runtime_state_at_for_key(
                 CODING_AGENT_CWD_LOCK_OWNER_AGENT,
             )
         });
+        let child_process_terminated = expected_key.and_then(|key| {
+            (agent_key_from_meta(&meta).as_ref() == Some(key))
+                .then(|| {
+                    terminate_agent_meta_child_process(&meta, key, "agent_runtime_stale_cleanup")
+                })
+                .flatten()
+        });
+        let pty_log_deleted = remove_agent_runtime_extra_files_for_meta_path(
+            meta_path,
+            "agent_runtime_stale_cleanup",
+        );
         if debug_enabled {
             debug_log(
                 "agent_meta_stale_removed",
@@ -14220,6 +14486,8 @@ fn read_agent_runtime_state_at_for_key(
                     "meta_removed": meta_removed,
                     "socket_removed": socket_removed,
                     "cwd_lock_removed": cwd_lock_removed,
+                    "child_process_terminated": child_process_terminated,
+                    "pty_log_deleted": pty_log_deleted,
                     "meta_child_pid": meta.child_pid,
                     "meta_child_alive": meta.child_pid.map(process_is_alive),
                     "meta_phase": meta_json.as_ref().and_then(|value| value.get("phase")).and_then(serde_json::Value::as_str),
@@ -14245,6 +14513,15 @@ fn read_agent_runtime_state_at_for_key(
         let identity_mismatch = meta_key.as_ref() != Some(expected_key)
             || daemon_identity == AgentDaemonProcessIdentity::Other;
         if identity_mismatch {
+            let child_process_terminated = (meta_key.as_ref() == Some(expected_key))
+                .then(|| {
+                    terminate_agent_meta_child_process(
+                        &meta,
+                        expected_key,
+                        "agent_runtime_identity_mismatch_cleanup",
+                    )
+                })
+                .flatten();
             let meta_removed = remove_agent_runtime_file_logged(
                 "agent_runtime_identity_mismatch_cleanup",
                 Some(expected_key),
@@ -14267,6 +14544,10 @@ fn read_agent_runtime_state_at_for_key(
                         CODING_AGENT_CWD_LOCK_OWNER_AGENT,
                     )
                 });
+            let pty_log_deleted = remove_agent_runtime_extra_files_for_meta_path(
+                meta_path,
+                "agent_runtime_identity_mismatch_cleanup",
+            );
             if debug_enabled {
                 debug_log(
                     "agent_meta_identity_mismatch_removed",
@@ -14281,6 +14562,8 @@ fn read_agent_runtime_state_at_for_key(
                         "meta_removed": meta_removed,
                         "socket_removed": socket_removed,
                         "cwd_lock_removed": cwd_lock_removed,
+                        "child_process_terminated": child_process_terminated,
+                        "pty_log_deleted": pty_log_deleted,
                         "meta_child_pid": meta.child_pid,
                         "meta_child_alive": meta.child_pid.map(process_is_alive),
                         "meta_attached": meta.attached,
@@ -16271,6 +16554,15 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
         ));
     }
     let meta_path = agent_meta_path(&key)?;
+    let stem = agent_file_stem(&key);
+    if let Some(meta) = read_agent_meta_snapshot_at(&meta_path) {
+        if !agent_runtime_meta_has_live_daemon_for_stem(&meta, &stem)
+            && agent_key_from_meta(&meta).as_ref() == Some(&key)
+        {
+            let _ =
+                terminate_agent_meta_child_process(&meta, &key, "daemon_start_stale_child_cleanup");
+        }
+    }
     if meta_path.exists() {
         let _ = remove_agent_runtime_file_logged(
             "daemon_start_cleanup_before_spawn",
@@ -16433,6 +16725,7 @@ fn configure_daemon_command(command: &mut Command, breakaway: bool) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AgentTermination {
     pid: Option<u32>,
+    child_pid: Option<u32>,
     pty_log_deleted: bool,
 }
 
@@ -16443,6 +16736,8 @@ struct KillAllAgentsReport {
     stale: usize,
     skipped_self: usize,
     errors: usize,
+    child_processes_terminated: usize,
+    runtime_files_removed: usize,
     pty_logs_deleted: usize,
     cwd_locks_removed: usize,
 }
@@ -16494,12 +16789,18 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
                 continue;
             }
         };
-        if meta.pid == current_pid {
-            report.skipped_self = report.skipped_self.saturating_add(1);
-            continue;
-        }
+        let is_current_process_meta = meta.pid == current_pid;
         if !process_is_alive(meta.pid) {
             report.stale = report.stale.saturating_add(1);
+            if let Some(key) = agent_key_from_meta(&meta).filter(|key| agent_file_stem(key) == stem)
+            {
+                if terminate_agent_meta_child_process(&meta, &key, "killall_stale_daemon_cleanup")
+                    .is_some()
+                {
+                    report.child_processes_terminated =
+                        report.child_processes_terminated.saturating_add(1);
+                }
+            }
             if remove_agent_runtime_files_by_stem(runtime_dir, stem, "killall_stale_daemon_cleanup")
             {
                 report.pty_logs_deleted = report.pty_logs_deleted.saturating_add(1);
@@ -16530,8 +16831,18 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             );
             continue;
         };
-        if agent_file_stem(&key) != stem || !verify_agent_daemon_identity(&key, meta.pid) {
+        let stem_matches_key = agent_file_stem(&key) == stem;
+        if !stem_matches_key || !verify_agent_daemon_identity(&key, meta.pid) {
             report.stale = report.stale.saturating_add(1);
+            let child_process_terminated = if stem_matches_key {
+                terminate_agent_meta_child_process(&meta, &key, "killall_identity_failed_cleanup")
+            } else {
+                None
+            };
+            if child_process_terminated.is_some() {
+                report.child_processes_terminated =
+                    report.child_processes_terminated.saturating_add(1);
+            }
             let _ = remove_agent_runtime_files_by_stem(
                 runtime_dir,
                 stem,
@@ -16551,13 +16862,22 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
                     "daemon_pid": meta.pid,
                     "provider": meta.provider.as_deref(),
                     "session_id": meta.session_id.as_deref(),
+                    "child_pid": child_process_terminated,
                     "reason": "identity_check_failed",
                 }),
             );
             continue;
         }
+        if is_current_process_meta {
+            report.skipped_self = report.skipped_self.saturating_add(1);
+            continue;
+        }
 
-        let terminated_child_pid = terminate_agent_child_process(meta.child_pid, meta.pid, &key);
+        let terminated_child_pid =
+            terminate_agent_meta_child_process(&meta, &key, "killall_killed_cleanup");
+        if terminated_child_pid.is_some() {
+            report.child_processes_terminated = report.child_processes_terminated.saturating_add(1);
+        }
         terminate_process_group(meta.pid);
         if process_is_alive(meta.pid) {
             report.errors = report.errors.saturating_add(1);
@@ -16592,8 +16912,19 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             }),
         );
     }
-    report.cwd_locks_removed =
-        cleanup_stale_coding_agent_cwd_locks_at(runtime_dir, "killall_stale_cwd_lock_sweep");
+    let sweep = cleanup_stale_agent_runtime_files_at(runtime_dir, "killall_stale_runtime_sweep");
+    report.runtime_files_removed = report
+        .runtime_files_removed
+        .saturating_add(sweep.runtime_files_removed);
+    report.child_processes_terminated = report
+        .child_processes_terminated
+        .saturating_add(sweep.child_processes_terminated);
+    report.pty_logs_deleted = report
+        .pty_logs_deleted
+        .saturating_add(sweep.pty_logs_deleted);
+    report.cwd_locks_removed = report
+        .cwd_locks_removed
+        .saturating_add(sweep.cwd_locks_removed);
     report
 }
 
@@ -16612,6 +16943,20 @@ fn remove_agent_runtime_files_by_stem(runtime_dir: &Path, stem: &str, reason: &s
         "socket",
         &runtime_dir.join(format!("{}.sock", stem)),
     );
+    remove_agent_runtime_extra_files_by_stem(runtime_dir, stem, reason)
+}
+
+fn remove_agent_runtime_extra_files_for_meta_path(meta_path: &Path, reason: &str) -> bool {
+    let Some(runtime_dir) = meta_path.parent() else {
+        return false;
+    };
+    let Some(stem) = meta_path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    remove_agent_runtime_extra_files_by_stem(runtime_dir, stem, reason)
+}
+
+fn remove_agent_runtime_extra_files_by_stem(runtime_dir: &Path, stem: &str, reason: &str) -> bool {
     let _ = remove_agent_runtime_file_logged(
         reason,
         None,
@@ -16630,7 +16975,19 @@ fn remove_agent_runtime_files_by_stem(runtime_dir: &Path, stem: &str, reason: &s
     )
 }
 
+#[cfg(test)]
 fn terminate_agent_daemon(key: &AgentKey) -> Result<AgentTermination> {
+    terminate_agent_daemon_with_info(key, None)
+}
+
+fn terminate_agent_daemon_for_info(key: &AgentKey, info: &SessionInfo) -> Result<AgentTermination> {
+    terminate_agent_daemon_with_info(key, Some(info))
+}
+
+fn terminate_agent_daemon_with_info(
+    key: &AgentKey,
+    expected_info: Option<&SessionInfo>,
+) -> Result<AgentTermination> {
     let meta_path = agent_meta_path(key)?;
     let socket_path = agent_socket_path(key)?;
     let meta = fs::read_to_string(&meta_path)
@@ -16638,10 +16995,12 @@ fn terminate_agent_daemon(key: &AgentKey) -> Result<AgentTermination> {
         .and_then(|content| serde_json::from_str::<AgentMetaSnapshot>(&content).ok());
 
     let mut terminated_pid = None;
+    let mut terminated_child_pid = None;
     if let Some(meta) = meta.as_ref() {
         if process_is_alive(meta.pid) && verify_agent_daemon_identity(key, meta.pid) {
             let pid = meta.pid;
-            let terminated_child_pid = terminate_agent_child_process(meta.child_pid, pid, key);
+            terminated_child_pid =
+                terminate_agent_meta_child_process(meta, key, "terminate_agent_cleanup");
             terminate_process_group(pid);
             debug_log(
                 "kill_agent_processes",
@@ -16653,6 +17012,12 @@ fn terminate_agent_daemon(key: &AgentKey) -> Result<AgentTermination> {
                 }),
             );
             terminated_pid = Some(pid);
+        } else if agent_key_from_meta(meta).as_ref() == Some(key) {
+            terminated_child_pid = terminate_agent_meta_child_process(
+                meta,
+                key,
+                "terminate_agent_stale_child_cleanup",
+            );
         } else if meta.pid > 0 {
             debug_log(
                 "kill_agent_unverified",
@@ -16678,19 +17043,37 @@ fn terminate_agent_daemon(key: &AgentKey) -> Result<AgentTermination> {
         "socket",
         &socket_path,
     );
+    let mut cwd_lock_removed = false;
     if let Some(info) = meta
         .as_ref()
         .and_then(session_info_from_agent_meta_snapshot)
     {
-        let _ = remove_coding_agent_cwd_lock_for_info(
+        cwd_lock_removed |= remove_coding_agent_cwd_lock_for_info(
             &info,
             "terminate_agent_cleanup",
             CODING_AGENT_CWD_LOCK_OWNER_AGENT,
         );
     }
+    if let Some(info) = expected_info {
+        cwd_lock_removed |= remove_coding_agent_cwd_lock_for_info(
+            info,
+            "terminate_agent_cleanup_expected_info",
+            CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+        );
+    }
     let pty_log_deleted = remove_agent_pty_log(key);
+    if cwd_lock_removed {
+        debug_log(
+            "kill_agent_cwd_lock_removed",
+            serde_json::json!({
+                "provider": key.provider.as_str(),
+                "session_id": &key.session_id,
+            }),
+        );
+    }
     Ok(AgentTermination {
         pid: terminated_pid,
+        child_pid: terminated_child_pid,
         pty_log_deleted,
     })
 }
@@ -17105,13 +17488,6 @@ fn remove_agent_pty_log_file(key: &AgentKey, path: &Path) -> bool {
     }
 }
 
-fn cleanup_orphan_agent_pty_logs() -> usize {
-    let Ok(runtime_dir) = agent_runtime_dir() else {
-        return 0;
-    };
-    cleanup_orphan_agent_pty_logs_at(&runtime_dir)
-}
-
 fn cleanup_orphan_agent_pty_logs_at(runtime_dir: &Path) -> usize {
     let scrollback_dir = runtime_dir.join("scrollback");
     let Ok(read_dir) = fs::read_dir(&scrollback_dir) else {
@@ -17130,7 +17506,7 @@ fn cleanup_orphan_agent_pty_logs_at(runtime_dir: &Path) -> usize {
         let has_live_meta = fs::read_to_string(&meta_path)
             .ok()
             .and_then(|content| serde_json::from_str::<AgentMetaSnapshot>(&content).ok())
-            .map(|meta| process_is_alive(meta.pid))
+            .map(|meta| agent_runtime_meta_has_live_daemon_for_stem(&meta, stem))
             .unwrap_or(false);
         if has_live_meta {
             continue;
@@ -17176,14 +17552,17 @@ fn terminate_process_group(pid: u32) {
     if pid == 0 || pid > i32::MAX as u32 {
         return;
     }
-    let pgid = -(pid as i32);
+    let pid = pid as i32;
+    let pgid = -pid;
     unsafe {
         let _ = libc::kill(pgid, libc::SIGTERM);
+        let _ = libc::kill(pid, libc::SIGTERM);
     }
     thread::sleep(Duration::from_millis(150));
-    if process_is_alive(pid) {
+    if process_is_alive(pid as u32) {
         unsafe {
             let _ = libc::kill(pgid, libc::SIGKILL);
+            let _ = libc::kill(pid, libc::SIGKILL);
         }
     }
 }
@@ -23938,6 +24317,36 @@ mod tests {
         }
     }
 
+    fn write_test_cwd_lock_for_info(info: &SessionInfo, owner_kind: &'static str) -> PathBuf {
+        let lock_path = coding_agent_cwd_lock_path(info).unwrap().unwrap();
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(
+            &lock_path,
+            serde_json::to_string_pretty(&coding_agent_cwd_lock_for_info(info, 0, owner_kind))
+                .unwrap(),
+        )
+        .unwrap();
+        lock_path
+    }
+
+    #[cfg(unix)]
+    fn assert_process_exits(child: &mut std::process::Child, message: &str) {
+        let start = Instant::now();
+        let mut exited = false;
+        while start.elapsed() < Duration::from_secs(2) {
+            if child.try_wait().unwrap().is_some() {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !exited {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        assert!(exited, "{message}");
+    }
+
     fn session_data_snapshot(
         provider: Provider,
         session_id: &str,
@@ -26006,6 +26415,61 @@ mod tests {
     }
 
     #[test]
+    fn cwd_lock_guard_drop_removes_own_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(
+            Provider::Codex,
+            &format!("guard-own-lock-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+        let lock_path = coding_agent_cwd_lock_path(&info).unwrap().unwrap();
+        let guard = acquire_coding_agent_cwd_restore_lock(&info)
+            .unwrap()
+            .expect("restore cwd lock should be acquired");
+
+        assert!(lock_path.exists());
+        drop(guard);
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn cwd_lock_guard_drop_keeps_replaced_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(
+            Provider::Codex,
+            &format!("guard-replaced-lock-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+        let other = session_info(
+            Provider::Codex,
+            &format!("guard-replacement-lock-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+        let lock_path = coding_agent_cwd_lock_path(&info).unwrap().unwrap();
+        let guard = acquire_coding_agent_cwd_restore_lock(&info)
+            .unwrap()
+            .expect("restore cwd lock should be acquired");
+        fs::write(
+            &lock_path,
+            serde_json::to_string_pretty(&coding_agent_cwd_lock_for_info(
+                &other,
+                0,
+                CODING_AGENT_CWD_LOCK_OWNER_RESTORE,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        drop(guard);
+
+        let lock = read_coding_agent_cwd_lock(&lock_path).expect("replacement lock should remain");
+        assert_eq!(lock.session_id, other.session_id);
+        let _ = fs::remove_file(&lock_path);
+    }
+
+    #[test]
     fn cwd_restore_lock_blocks_agent_daemon_start() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap().display().to_string();
@@ -26111,6 +26575,28 @@ mod tests {
 
         assert!(!coding_agent_cwd_lock_pid_matches(&mismatched));
         assert!(!coding_agent_cwd_lock_is_live(&mismatched));
+    }
+
+    #[test]
+    fn cwd_lock_rejects_invalid_provider_even_when_pid_is_live() {
+        let current_pid = std::process::id();
+        for owner_kind in [
+            CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            CODING_AGENT_CWD_LOCK_OWNER_RESTORE,
+        ] {
+            let lock = CodingAgentCwdLock {
+                version: CODING_AGENT_CWD_LOCK_VERSION,
+                owner_kind: owner_kind.to_string(),
+                pid: current_pid,
+                pid_start_ticks: process_start_ticks(current_pid),
+                provider: "not-a-provider".to_string(),
+                session_id: "invalid-provider-lock".to_string(),
+                cwd: "/tmp".to_string(),
+                created_at_epoch_s: current_epoch_s(),
+            };
+
+            assert!(!coding_agent_cwd_lock_is_live(&lock));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -27868,6 +28354,7 @@ mod tests {
         let meta = AgentMetaSnapshot {
             pid: current_pid,
             child_pid: None,
+            child_pid_start_ticks: None,
             provider: Some("claude".into()),
             session_id: Some("s1".into()),
             cwd: Some("/repo".into()),
@@ -27895,6 +28382,7 @@ mod tests {
         let mut meta = AgentMetaSnapshot {
             pid: current_pid,
             child_pid: None,
+            child_pid_start_ticks: None,
             provider: Some("claude".into()),
             session_id: Some("s1".into()),
             cwd: Some("/repo".into()),
@@ -27958,6 +28446,7 @@ mod tests {
         let meta = AgentMetaSnapshot {
             pid: current_pid,
             child_pid: None,
+            child_pid_start_ticks: None,
             provider: Some("claude".into()),
             session_id: Some("s1".into()),
             cwd: Some("/repo".into()),
@@ -28105,6 +28594,7 @@ mod tests {
             Some(AgentMetaSnapshot {
                 pid: 123,
                 child_pid: None,
+                child_pid_start_ticks: None,
                 provider: Some(key.provider.as_str().into()),
                 session_id: Some(key.session_id.clone()),
                 cwd: Some("/repo/sub".into()),
@@ -28135,6 +28625,7 @@ mod tests {
             Some(AgentMetaSnapshot {
                 pid: 123,
                 child_pid: None,
+                child_pid_start_ticks: None,
                 provider: Some(key.provider.as_str().into()),
                 session_id: Some("different-session".into()),
                 cwd: Some("/repo/sub".into()),
@@ -28513,6 +29004,52 @@ mod tests {
         );
         assert!(!meta.exists());
         assert!(!socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_pid_agent_meta_terminates_matching_child() {
+        let mut child = match Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("agent.json");
+        let socket = dir.path().join("agent.sock");
+        let key = AgentKey {
+            provider: Provider::Codex,
+            session_id: "reused-pid-child-session".into(),
+        };
+
+        fs::write(
+            &meta,
+            serde_json::json!({
+                "pid": std::process::id(),
+                "child_pid": child_pid,
+                "child_pid_start_ticks": process_start_ticks(child_pid),
+                "provider": key.provider.as_str(),
+                "session_id": &key.session_id,
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(&socket, "").unwrap();
+
+        assert_eq!(
+            read_agent_runtime_state_at_for_key(Some(&key), &meta, &socket, std::process::id()),
+            AgentListState::Idle
+        );
+        assert!(!meta.exists());
+        assert!(!socket.exists());
+        assert_process_exits(&mut child, "reused-pid meta child survived cleanup");
     }
 
     #[test]
@@ -30752,23 +31289,26 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn cleanup_orphan_agent_pty_logs_removes_only_non_live_logs() {
+    fn cleanup_orphan_agent_pty_logs_requires_live_agent_daemon_meta() {
         let dir = tempfile::tempdir().unwrap();
         let scrollback_dir = dir.path().join("scrollback");
         fs::create_dir_all(&scrollback_dir).unwrap();
         let orphan = scrollback_dir.join("orphan.ptylog");
-        let live = scrollback_dir.join("live.ptylog");
+        let reused_pid = scrollback_dir.join("codex-reused-pid.ptylog");
         fs::write(&orphan, b"ORPHAN\n").unwrap();
-        fs::write(&live, b"LIVE\n").unwrap();
+        fs::write(&reused_pid, b"REUSED\n").unwrap();
         fs::write(
-            dir.path().join("live.json"),
-            format!(r#"{{"pid":{}}}"#, std::process::id()),
+            dir.path().join("codex-reused-pid.json"),
+            format!(
+                r#"{{"pid":{},"provider":"codex","session_id":"reused-pid"}}"#,
+                std::process::id()
+            ),
         )
         .unwrap();
 
-        assert_eq!(cleanup_orphan_agent_pty_logs_at(dir.path()), 1);
+        assert_eq!(cleanup_orphan_agent_pty_logs_at(dir.path()), 2);
         assert!(!orphan.exists());
-        assert!(live.exists());
+        assert!(!reused_pid.exists());
     }
 
     #[test]
@@ -30826,6 +31366,147 @@ IF EXIST "%~dp0\node.exe" (
         assert_eq!(outcome.pid, None);
         assert!(!meta_path.exists());
         assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn terminate_agent_daemon_for_info_removes_cwd_lock_without_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(
+            Provider::Codex,
+            &format!("lock-cleanup-no-meta-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+        let key = AgentKey::new(&info);
+        let meta_path = agent_meta_path(&key).unwrap();
+        let lock_path = coding_agent_cwd_lock_path(&info).unwrap().unwrap();
+        fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        fs::write(
+            &lock_path,
+            serde_json::to_string_pretty(&coding_agent_cwd_lock_for_info(
+                &info,
+                0,
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = terminate_agent_daemon_for_info(&key, &info).unwrap();
+
+        assert_eq!(outcome.pid, None);
+        assert!(!meta_path.exists());
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn session_ctrl_k_removes_cwd_lock_without_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(
+            Provider::Codex,
+            &format!("session-ctrl-k-lock-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+        let key = AgentKey::new(&info);
+        let meta_path = agent_meta_path(&key).unwrap();
+        let lock_path = write_test_cwd_lock_for_info(&info, CODING_AGENT_CWD_LOCK_OWNER_AGENT);
+        assert!(!meta_path.exists());
+
+        let mut app = app_for_key_tests();
+        app.sessions.push(info);
+        app.list_state.select(Some(0));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        assert!(!meta_path.exists());
+        assert!(!lock_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_ctrl_k_removes_cwd_lock_without_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(
+            Provider::Codex,
+            &format!("active-ctrl-k-lock-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+        let key = AgentKey::new(&info);
+        let meta_path = agent_meta_path(&key).unwrap();
+        let lock_path = write_test_cwd_lock_for_info(&info, CODING_AGENT_CWD_LOCK_OWNER_AGENT);
+        assert!(!meta_path.exists());
+
+        let mut app = app_for_key_tests();
+        let mut active = buffered_output_test_client(&info.session_id, 1);
+        active.info = info;
+        app.set_active_agent(active);
+        app.show_sessions_view = false;
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            100,
+            24,
+        );
+
+        assert!(app.active_agent.is_none());
+        assert!(!meta_path.exists());
+        assert!(!lock_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_agent_daemon_kills_child_from_stale_meta() {
+        let mut child = match Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let info = session_info(
+            Provider::Codex,
+            &format!("stale-child-cleanup-{}", uuid::Uuid::now_v7()),
+            "/tmp/stale-child-cleanup",
+        );
+        let key = AgentKey::new(&info);
+        let meta_path = agent_meta_path(&key).unwrap();
+        fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "pid": 0,
+                "child_pid": child_pid,
+                "child_pid_start_ticks": process_start_ticks(child_pid),
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = terminate_agent_daemon(&key).unwrap();
+
+        assert_eq!(outcome.pid, None);
+        assert_eq!(outcome.child_pid, Some(child_pid));
+        assert!(!meta_path.exists());
+        assert_process_exits(
+            &mut child,
+            "stale meta child survived terminate_agent_daemon",
+        );
     }
 
     #[test]
@@ -30911,6 +31592,26 @@ IF EXIST "%~dp0\node.exe" (
             Some(child_pid)
         );
 
+        assert_process_exits(&mut child, "PTY child process group survived termination");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_process_group_falls_back_to_direct_pid_kill() {
+        let mut child = match Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+
+        terminate_process_group(child_pid);
+
         let start = Instant::now();
         let mut exited = false;
         while start.elapsed() < Duration::from_secs(2) {
@@ -30921,11 +31622,13 @@ IF EXIST "%~dp0\node.exe" (
             thread::sleep(Duration::from_millis(20));
         }
         if !exited {
-            terminate_process_group(child_pid);
             let _ = child.kill();
-            let _ = child.wait();
         }
-        assert!(exited, "PTY child process group survived termination");
+        let _ = child.wait();
+        assert!(
+            exited,
+            "direct-pid fallback failed to terminate a non-group-leader process"
+        );
     }
 
     #[test]
@@ -30965,6 +31668,196 @@ IF EXIST "%~dp0\node.exe" (
         assert!(!dir.path().join(format!("{}.sock", stem)).exists());
         assert!(!scrollback.join(format!("{}.ptylog", stem)).exists());
         assert!(!cwd_lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killall_terminates_child_from_stale_daemon_meta() {
+        let mut child = match Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(Provider::Codex, "stale-child", "/tmp/stale-child");
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        fs::write(
+            dir.path().join(format!("{stem}.json")),
+            serde_json::json!({
+                "pid": 3000000000u32,
+                "child_pid": child_pid,
+                "child_pid_start_ticks": process_start_ticks(child_pid),
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let report = kill_all_agent_daemons_at(dir.path(), std::process::id());
+
+        assert_eq!(report.stale, 1);
+        assert_eq!(report.child_processes_terminated, 1);
+        assert_process_exits(&mut child, "stale daemon child survived killall");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killall_terminates_child_from_reused_daemon_pid_meta() {
+        let mut child = match Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(
+            Provider::Codex,
+            "stale-child-reused-daemon-pid",
+            "/tmp/stale-child-reused-daemon-pid",
+        );
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let meta = dir.path().join(format!("{stem}.json"));
+        fs::write(
+            &meta,
+            serde_json::json!({
+                "pid": std::process::id(),
+                "child_pid": child_pid,
+                "child_pid_start_ticks": process_start_ticks(child_pid),
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let report = kill_all_agent_daemons_at(dir.path(), std::process::id());
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.stale, 1);
+        assert_eq!(report.skipped_self, 0);
+        assert_eq!(report.child_processes_terminated, 1);
+        assert!(!meta.exists());
+        assert_process_exits(&mut child, "reused daemon pid child survived killall");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killall_keeps_stale_meta_child_when_start_tick_mismatches() {
+        let mut child = match Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let mismatched_start_ticks = process_start_ticks(child_pid)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(
+            Provider::Codex,
+            "stale-child-reused-pid",
+            "/tmp/stale-child-reused-pid",
+        );
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        fs::write(
+            dir.path().join(format!("{stem}.json")),
+            serde_json::json!({
+                "pid": 3000000000u32,
+                "child_pid": child_pid,
+                "child_pid_start_ticks": mismatched_start_ticks,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let report = kill_all_agent_daemons_at(dir.path(), std::process::id());
+
+        assert_eq!(report.stale, 1);
+        assert_eq!(report.child_processes_terminated, 0);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "mismatched child pid should be preserved"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn stale_agent_runtime_sweep_removes_generated_files_when_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let scrollback = dir.path().join("scrollback");
+        fs::create_dir_all(&scrollback).unwrap();
+        fs::write(dir.path().join("codex-invalid.json"), b"not json").unwrap();
+        fs::write(dir.path().join("codex-invalid.sock"), b"").unwrap();
+        fs::write(scrollback.join("codex-invalid.ptylog"), b"OLD\n").unwrap();
+        fs::write(dir.path().join("codex-orphan.sock"), b"").unwrap();
+        fs::write(dir.path().join("codex-orphan.tcp"), b"tcp 127.0.0.1:1\n").unwrap();
+        fs::write(scrollback.join("codex-orphan.ptylog"), b"OLD\n").unwrap();
+        fs::write(dir.path().join("codex-temp.json.tmp"), b"partial").unwrap();
+        fs::write(dir.path().join("cwd-invalid.lock"), b"not json").unwrap();
+
+        let report = cleanup_stale_agent_runtime_files_at(dir.path(), "test_idle_runtime_sweep");
+
+        assert_eq!(report.cwd_locks_removed, 1);
+        assert_eq!(report.pty_logs_deleted, 2);
+        assert_eq!(report.runtime_files_removed, 3);
+        let top_level_files = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_file())
+            .count();
+        let scrollback_files = fs::read_dir(&scrollback).unwrap().flatten().count();
+        assert_eq!(top_level_files, 0);
+        assert_eq!(scrollback_files, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_agent_runtime_sweep_keeps_reachable_orphan_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "codex-starting";
+        let socket = dir.path().join(format!("{stem}.sock"));
+        let tmp_meta = dir.path().join(format!("{stem}.json.tmp"));
+        let _listener = AgentListener::bind(&socket).unwrap();
+        fs::write(&tmp_meta, b"partial").unwrap();
+
+        let report =
+            cleanup_stale_agent_runtime_files_at(dir.path(), "test_reachable_orphan_socket");
+
+        assert_eq!(report.runtime_files_removed, 0);
+        assert!(socket.exists());
+        assert!(tmp_meta.exists());
     }
 
     #[test]
@@ -31093,7 +31986,7 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn killall_skips_current_process_meta() {
+    fn killall_removes_unverified_current_process_meta() {
         let dir = tempfile::tempdir().unwrap();
         let stem = "codex-self";
         let meta = dir.path().join(format!("{}.json", stem));
@@ -31109,9 +32002,10 @@ IF EXIST "%~dp0\node.exe" (
         let report = kill_all_agent_daemons_at(dir.path(), std::process::id());
 
         assert_eq!(report.scanned, 1);
-        assert_eq!(report.skipped_self, 1);
+        assert_eq!(report.skipped_self, 0);
+        assert_eq!(report.stale, 1);
         assert_eq!(report.killed, 0);
-        assert!(meta.exists());
+        assert!(!meta.exists());
     }
 
     #[test]

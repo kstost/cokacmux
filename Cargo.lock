@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "cokacmux"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "anyhow",
  "chrono",
