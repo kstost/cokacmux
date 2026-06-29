@@ -262,9 +262,11 @@ const THEME_PREVIEW_ATTACHMENT: Color = Color::Indexed(181);
 const THEME_PREVIEW_OTHER: Color = Color::Indexed(246);
 const THEME_PREVIEW_PATCH_HEADER: Color = Color::Indexed(111);
 const AGENT_DEFAULT_BG: Color = THEME_BG;
-const STARTUP_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+const STARTUP_SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 const STARTUP_SPINNER_TICK_MS: u128 = 180;
 const DATA_TASK_PROGRESS_THROTTLE_MS: u64 = 100;
+const UI_SELECTED_MARKER: &str = "› ";
+const UI_UNSELECTED_MARKER: &str = "  ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Settings {
@@ -344,7 +346,7 @@ struct CokacmuxSettings {
     sessions_pane_width: Option<u16>,
     #[serde(default = "default_agent_sidebar_width")]
     agent_sidebar_width: u16,
-    /// Whether the left "agents [N]" sidebar is currently visible in the
+    /// Whether the left "agents N" sidebar is currently visible in the
     /// agents view. Toggled by Ctrl+B. The configured width is preserved
     /// regardless; hiding/showing just collapses the column to 0.
     #[serde(default = "default_agent_sidebar_visible")]
@@ -6453,29 +6455,24 @@ impl App {
             .as_deref()
             .or(task.progress_message.as_deref())
             .unwrap_or(&task.label);
-        let stats = task
-            .progress_stats
-            .as_ref()
-            .map(|stats| format!(" · {}", copy_stats_summary(stats)))
-            .unwrap_or_default();
-        let percent =
-            copy_percent_summary(task.progress_stats.as_ref(), task.progress_total.as_ref())
-                .map(|percent| format!(" · {percent}"))
-                .unwrap_or_default();
-        let cancel = if task.cancel_requested {
-            " · cancelling"
-        } else {
-            ""
-        };
-        Some(format!(
-            "{} {} ({}s){}{}{}",
+        let mut parts = vec![format!(
+            "{} {} ({}s)",
             startup_spinner_frame(elapsed),
             label,
-            elapsed.as_secs(),
-            stats,
-            percent,
-            cancel
-        ))
+            elapsed.as_secs()
+        )];
+        if let Some(stats) = task.progress_stats.as_ref() {
+            parts.push(copy_stats_summary(stats));
+        }
+        if let Some(percent) =
+            copy_percent_summary(task.progress_stats.as_ref(), task.progress_total.as_ref())
+        {
+            parts.push(percent);
+        }
+        if task.cancel_requested {
+            parts.push("cancelling".to_string());
+        }
+        Some(parts.join("  "))
     }
 
     fn display_status(&self) -> String {
@@ -20097,6 +20094,14 @@ fn theme_selected_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+fn selection_marker(selected: bool) -> &'static str {
+    if selected {
+        UI_SELECTED_MARKER
+    } else {
+        UI_UNSELECTED_MARKER
+    }
+}
+
 fn startup_spinner_frame(elapsed: Duration) -> &'static str {
     let index =
         ((elapsed.as_millis() / STARTUP_SPINNER_TICK_MS) as usize) % STARTUP_SPINNER_FRAMES.len();
@@ -20320,16 +20325,6 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
 
     let buf = f.buffer_mut();
     fill_area(buf, status_area, theme_status_style());
-    let status_hint = if app_status.is_empty() {
-        String::new()
-    } else {
-        format!(" · {}", app_status)
-    };
-    let scrollback_hint = if scrollback_offset > 0 {
-        format!(" · scrollback {} up", scrollback_offset)
-    } else {
-        String::new()
-    };
     let agent_help = agent_help_text(&app.keybindings);
     let agent_status_subject = if is_plain_pty_tool_session_info(&agent.info) {
         live_agent_status_label(&agent.info)
@@ -20340,10 +20335,16 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             truncate_width(&agent.info.session_id, 18)
         )
     };
-    let status = format!(
-        " {}{}{} · {} · {}",
-        agent_status_subject, status_hint, scrollback_hint, agent_help, &agent.command_line
-    );
+    let mut status_parts = vec![agent_status_subject];
+    if !app_status.is_empty() {
+        status_parts.push(app_status);
+    }
+    if scrollback_offset > 0 {
+        status_parts.push(format!("scrollback {} up", scrollback_offset));
+    }
+    status_parts.push(agent_help);
+    status_parts.push(agent.command_line.clone());
+    let status = format!(" {}", status_parts.join("  "));
     buf.set_stringn(
         status_area.x,
         status_area.y,
@@ -20511,25 +20512,25 @@ fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPendi
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled(
             format!(
-                "  {} {}",
+                "{} {}",
                 startup_spinner_frame(elapsed),
                 truncate_width(&task.label, 58)
             ),
             Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
         )),
         Line::from(Span::styled(
-            format!("  Status: {}", truncate_width(status, 60)),
+            format!("Status: {}", truncate_width(status, 60)),
             Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
         )),
         Line::from(Span::styled(
-            format!("  Elapsed: {}s", elapsed.as_secs()),
+            format!("Elapsed: {}s", elapsed.as_secs()),
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
         )),
     ];
 
     if let Some(stats) = task.progress_stats.as_ref() {
         lines.push(Line::from(Span::styled(
-            format!("  Copied: {}", copy_stats_summary(stats)),
+            format!("Copied: {}", copy_stats_summary(stats)),
             Style::default().fg(THEME_FG).bg(THEME_BG_ALT),
         )));
     }
@@ -20544,7 +20545,7 @@ fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPendi
         let total = copy_stats_summary(total);
         lines.push(Line::from(Span::styled(
             format!(
-                "  Progress: {}",
+                "Progress: {}",
                 truncate_width(&format!("{copied} of {total} ({percent})"), 58)
             ),
             Style::default().fg(THEME_FG).bg(THEME_BG_ALT),
@@ -20552,16 +20553,16 @@ fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPendi
     }
     if let Some(path) = task.progress_path.as_deref() {
         lines.push(Line::from(Span::styled(
-            format!("  Current: {}", truncate_width(path, 58)),
+            format!("Current: {}", truncate_width(path, 58)),
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
         )));
     }
 
     lines.push(Line::from(""));
     let help = if task.cancel_requested {
-        "  Esc pressed · cancelling and rolling back when safe"
+        "Esc pressed  cancelling and rolling back when safe"
     } else {
-        "  Esc cancel · all other actions are locked until clone completes"
+        "Esc cancel  all other actions are locked until clone completes"
     };
     lines.push(Line::from(Span::styled(
         help,
@@ -20824,7 +20825,7 @@ fn draw_agent_sidebar(
     candidates: &[SessionInfo],
     active_key: &AgentKey,
 ) {
-    let title = format!(" agents [{}] ", candidates.len());
+    let title = format!(" agents {} ", candidates.len());
     fill_area(f.buffer_mut(), area, theme_base_style());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -20890,7 +20891,7 @@ fn draw_agent_sidebar(
     let list = List::new(items)
         .style(theme_base_style())
         .highlight_style(theme_selected_style())
-        .highlight_symbol("▶ ");
+        .highlight_symbol(UI_SELECTED_MARKER);
     f.render_stateful_widget(list, inner, &mut state);
 }
 
@@ -21994,7 +21995,6 @@ fn delete_confirm_lines(
 
 fn delete_confirm_button_line(selected: usize) -> Line<'static> {
     Line::from(vec![
-        Span::raw("  "),
         delete_confirm_button_span("1 Delete session", selected == DELETE_OPTION_DELETE),
         Span::raw("  "),
         delete_confirm_button_span("2 Cancel", selected == DELETE_OPTION_CANCEL),
@@ -22002,7 +22002,7 @@ fn delete_confirm_button_line(selected: usize) -> Line<'static> {
 }
 
 fn delete_confirm_button_span(label: &str, selected: bool) -> Span<'static> {
-    let text = format!(" {} ", label);
+    let text = format!("{}{}", selection_marker(selected), label);
     let style = if selected {
         theme_selected_style()
     } else {
@@ -22068,7 +22068,6 @@ fn create_folder_confirm_lines(
 
 fn create_folder_button_line(selected: usize) -> Line<'static> {
     Line::from(vec![
-        Span::raw("  "),
         modal_button_span(
             "1 Create/start",
             selected == CREATE_FOLDER_OPTION_CREATE,
@@ -22149,7 +22148,6 @@ fn restore_data_confirm_lines(
 
 fn restore_data_button_line(selected: usize) -> Line<'static> {
     Line::from(vec![
-        Span::raw("  "),
         modal_button_span(
             "1 Restore/start",
             selected == RESTORE_DATA_OPTION_RESTORE,
@@ -22165,7 +22163,7 @@ fn restore_data_button_line(selected: usize) -> Line<'static> {
 }
 
 fn modal_button_span(label: &str, selected: bool, enabled: bool) -> Span<'static> {
-    let text = format!(" {} ", label);
+    let text = format!("{}{}", selection_marker(selected), label);
     let style = if selected && enabled {
         theme_selected_style()
     } else if selected {
@@ -22258,7 +22256,6 @@ fn draw_filter_modal(
             Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
         )),
         Line::from(vec![
-            Span::raw("  "),
             modal_button_span(&search_label, true, pending.is_none()),
             Span::raw("  "),
             modal_button_span(&cancel_label, false, true),
@@ -22389,8 +22386,8 @@ fn draw_agent_launch_modal(
             agent_launch_spec_with_programs(source, launch_mode, agent_programs).command_line();
         lines.push(Line::from(Span::styled(
             format!(
-                "{} {}. {}  {}",
-                if is_selected { ">" } else { " " },
+                "{}{}. {}  {}",
+                selection_marker(is_selected),
                 idx + 1,
                 fit_width(label, label_width, Align::Left),
                 truncate_width(&command, command_width)
@@ -22520,7 +22517,6 @@ fn clone_options_button_line(
         "2 Context + data"
     };
     Line::from(vec![
-        Span::raw("  "),
         clone_options_button_span(session_label, selected == CLONE_OPTION_SESSION_ONLY, true),
         Span::raw("  "),
         clone_options_button_span(
@@ -22534,7 +22530,7 @@ fn clone_options_button_line(
 }
 
 fn clone_options_button_span(label: &str, selected: bool, enabled: bool) -> Span<'static> {
-    let text = format!(" {} ", label);
+    let text = format!("{}{}", selection_marker(selected), label);
     let style = if selected && enabled {
         theme_selected_style()
     } else if selected {
@@ -22637,10 +22633,7 @@ fn draw_new_session_modal(
     }
 
     lines.push(Line::from(Span::styled(
-        format!(
-            "  {}",
-            truncate_width(&preview_command, inner_width.saturating_sub(2))
-        ),
+        truncate_width(&preview_command, inner_width),
         Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
     )));
     lines.push(Line::from(""));
@@ -22679,8 +22672,8 @@ fn new_session_field_line(
     };
     Line::from(Span::styled(
         format!(
-            "{} {} {}",
-            if selected { ">" } else { " " },
+            "{}{} {}",
+            selection_marker(selected),
             fit_width(label, label_width, Align::Left),
             fit_width(&value, value_width, Align::Left)
         ),
@@ -22747,7 +22740,7 @@ fn new_session_preview_command(
 
 fn title_edit_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} move · {} · {} · {} save · {} cancel",
+        "{} move  {}  {}  {} save  {} cancel",
         keybindings.help_pair(
             KeyAction::TitleMoveLeft,
             KeyAction::TitleMoveRight,
@@ -22768,7 +22761,7 @@ fn title_edit_help_text(keybindings: &KeyBindings) -> String {
 
 fn filter_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} move · {} · {} · {} search · {} cancel",
+        "{} move  {}  {}  {} search  {} cancel",
         keybindings.help_pair(
             KeyAction::FilterMoveLeft,
             KeyAction::FilterMoveRight,
@@ -22789,7 +22782,7 @@ fn filter_help_text(keybindings: &KeyBindings) -> String {
 
 fn agent_launch_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} start/attach · {} choose · {}/{} select · {} cancel",
+        "{} start/attach  {} choose  {}/{} select  {} cancel",
         keybindings.help(KeyAction::AgentLaunchConfirm, "Enter"),
         keybindings.help_pair(
             KeyAction::AgentLaunchPrev,
@@ -22805,7 +22798,7 @@ fn agent_launch_help_text(keybindings: &KeyBindings) -> String {
 
 fn delete_confirm_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} choose · {} select · {} delete · {}/{} cancel",
+        "{} choose  {} select  {} delete  {}/{} cancel",
         keybindings.help(KeyAction::DeleteConfirmConfirm, "Enter"),
         keybindings.help_pair(
             KeyAction::DeleteConfirmPrev,
@@ -22821,7 +22814,7 @@ fn delete_confirm_help_text(keybindings: &KeyBindings) -> String {
 
 fn create_folder_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} choose · {} select · {} create · {}/{} cancel",
+        "{} choose  {} select  {} create  {}/{} cancel",
         keybindings.help(KeyAction::CreateFolderConfirm, "Enter"),
         keybindings.help_pair(
             KeyAction::CreateFolderPrev,
@@ -22837,7 +22830,7 @@ fn create_folder_help_text(keybindings: &KeyBindings) -> String {
 
 fn restore_data_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} choose · {} select · {} restore · {}/{} skip",
+        "{} choose  {} select  {} restore  {}/{} skip",
         keybindings.help(KeyAction::RestoreDataConfirm, "Enter"),
         keybindings.help_pair(
             KeyAction::RestoreDataPrev,
@@ -22853,7 +22846,7 @@ fn restore_data_help_text(keybindings: &KeyBindings) -> String {
 
 fn clone_options_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} choose · {} option · {} target · {}/{}/{} direct · {} cancel",
+        "{} choose  {} option  {} target  {}/{}/{} direct  {} cancel",
         keybindings.help(KeyAction::CloneOptionsConfirm, "Enter"),
         keybindings.help_pair(
             KeyAction::CloneOptionsPrev,
@@ -22876,7 +22869,7 @@ fn clone_options_help_text(keybindings: &KeyBindings) -> String {
 
 fn new_session_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} start · {} field · {} change · {} cursor · {} cancel",
+        "{} start  {} field  {} change  {} cursor  {} cancel",
         keybindings.help(KeyAction::NewSessionConfirm, "Enter"),
         keybindings.help_pair(
             KeyAction::NewSessionPrev,
@@ -22916,7 +22909,7 @@ fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             let prov = prov_span(s.provider);
             let title = s.title.as_deref().unwrap_or("");
             let age = age_label(s.updated_at_epoch_s);
-            let marker = if selected == Some(idx) { "▶ " } else { "  " };
+            let marker = selection_marker(selected == Some(idx));
             let session_label = if app.session_view == SessionViewMode::Tree {
                 tree_session_label(row.depth, &s.session_id)
             } else {
@@ -22965,14 +22958,14 @@ fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .collect();
 
     let title = format!(
-        " sessions [{}] {} {} {} ",
+        " sessions {} {} {}{} ",
         rows.len(),
         app.provider_filter.label(),
         app.session_view.label(),
         if app.text_filter.is_empty() {
             String::new()
         } else {
-            format!("search={}", app.text_filter)
+            format!(" search {}", app.text_filter)
         },
     );
     let block = Block::default()
@@ -23059,7 +23052,7 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             truncate_width(&info.session_id, 14),
             app.preview_scroll,
             max_scroll,
-            if loading { " *" } else { "" }
+            if loading { " loading" } else { "" }
         )
     } else {
         app.preview_scroll = 0;
@@ -23212,7 +23205,11 @@ fn preview_summary_label_matches(line: &str, label: &str) -> bool {
     let Some(rest) = line.strip_prefix(label) else {
         return false;
     };
-    rest.is_empty() || rest.starts_with(':') || rest.starts_with(" · ") || rest.starts_with(" [")
+    rest.is_empty()
+        || rest.starts_with(':')
+        || rest.starts_with(" · ")
+        || rest.starts_with(" #")
+        || rest.starts_with(" [")
 }
 
 fn preview_summary_tool_result_is_error(line: &str) -> bool {
@@ -23403,19 +23400,40 @@ fn preview_value_spans(text: &str, default_color: Color) -> Vec<Span<'static>> {
 
 fn push_preview_segment_spans(spans: &mut Vec<Span<'static>>, segment: &str, default_color: Color) {
     let mut rest = segment;
-    while let Some(open) = rest.find('[') {
-        let (before, after_open) = rest.split_at(open);
+    while let Some(marker) = rest.find(['[', '#']) {
+        let (before, after_marker) = rest.split_at(marker);
         push_preview_plain_span(spans, before, default_color);
-        if let Some(close) = after_open.find(']') {
-            let (id, after_id) = after_open.split_at(close + 1);
-            spans.push(preview_span(id, THEME_FG_DIM));
-            rest = after_id;
-        } else {
-            push_preview_plain_span(spans, after_open, default_color);
+        if let Some(after_open) = after_marker.strip_prefix('[') {
+            if let Some(close) = after_open.find(']') {
+                let (id_body, after_id) = after_open.split_at(close);
+                spans.push(preview_span(format!("[{}]", id_body), THEME_FG_DIM));
+                rest = &after_id[1..];
+                continue;
+            }
+            push_preview_plain_span(spans, after_marker, default_color);
             return;
         }
+        if let Some((id, after_id)) = preview_hash_id_segment(after_marker) {
+            spans.push(preview_span(id, THEME_FG_DIM));
+            rest = after_id;
+            continue;
+        }
+        push_preview_plain_span(spans, after_marker, default_color);
+        return;
     }
     push_preview_plain_span(spans, rest, default_color);
+}
+
+fn preview_hash_id_segment(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix('#')?;
+    let mut end = 1;
+    for ch in rest.chars() {
+        if ch.is_whitespace() {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    (end > 1).then(|| value.split_at(end))
 }
 
 fn push_preview_plain_span(spans: &mut Vec<Span<'static>>, text: &str, default_color: Color) {
@@ -23473,7 +23491,7 @@ fn draw_status(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let width = area.width as usize;
     let help = truncate_width(&help_text(app.focus, width, &app.keybindings), width);
     let mode = format!(
-        "{} focus · {} preview",
+        "{} focus  {} preview",
         match app.focus {
             FocusPane::Sessions => "sessions",
             FocusPane::Preview => "preview",
@@ -23509,7 +23527,7 @@ fn draw_status(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> String {
     match focus {
         FocusPane::Sessions if width >= 92 => format!(
-            "{} preview · {} select · {} new · {} tree · {} title · {} delete · {} launch · {}/{} quit",
+            "{} preview  {} select  {} new  {} tree  {} title  {} delete  {} launch  {}/{} quit",
             keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
             keybindings.help_pair(
                 KeyAction::SessionMovePrev,
@@ -23526,7 +23544,7 @@ fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Strin
             keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
         ),
         FocusPane::Sessions if width >= 68 => format!(
-            "{} preview · {} select · {} new · {} title · {} launch · {}/{} quit",
+            "{} preview  {} select  {} new  {} title  {} launch  {}/{} quit",
             keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
             keybindings.help_pair(
                 KeyAction::SessionMovePrev,
@@ -23541,7 +23559,7 @@ fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Strin
             keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
         ),
         FocusPane::Sessions => format!(
-            "{} preview · {} select · {} title · {} launch · {}/{} quit",
+            "{} preview  {} select  {} title  {} launch  {}/{} quit",
             keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
             keybindings.help_pair(
                 KeyAction::SessionMovePrev,
@@ -23555,7 +23573,7 @@ fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Strin
             keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
         ),
         FocusPane::Preview if width >= 92 => format!(
-            "{} sessions · {} scroll · {} select · {} resize · {} page · {} top/bottom · {}/{} quit",
+            "{} sessions  {} scroll  {} select  {} resize  {} page  {} top/bottom  {}/{} quit",
             keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
             keybindings.help_pair(
                 KeyAction::SessionMovePrev,
@@ -23591,7 +23609,7 @@ fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Strin
             keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
         ),
         FocusPane::Preview if width >= 68 => format!(
-            "{} sessions · {} scroll · {} resize · {} page · {}/{} quit",
+            "{} sessions  {} scroll  {} resize  {} page  {}/{} quit",
             keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
             keybindings.help_pair(
                 KeyAction::SessionMovePrev,
@@ -23615,7 +23633,7 @@ fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Strin
             keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
         ),
         FocusPane::Preview => format!(
-            "{} sessions · {} scroll · {} resize · {}/{} quit",
+            "{} sessions  {} scroll  {} resize  {}/{} quit",
             keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
             keybindings.help_pair(
                 KeyAction::SessionMovePrev,
@@ -23637,7 +23655,7 @@ fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Strin
 
 fn agent_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} sessions · {} new · {} kill · {} quit · {} scroll · {} switch · {} select · {} resize",
+        "{} sessions  {} new  {} kill  {} quit  {} scroll  {} switch  {} select  {} resize",
         keybindings.help(KeyAction::AgentToggleSessions, "Ctrl+]"),
         keybindings.help(KeyAction::AgentNewShell, "Ctrl+N"),
         keybindings.help(KeyAction::AgentKill, "Ctrl+K"),
@@ -27237,30 +27255,24 @@ mod tests {
 
     #[test]
     fn preview_summary_styles_detail_statuses_and_ids() {
-        let result = preview_summary_line("  tool result: Bash [abc123] · error");
+        let result = preview_summary_line("  tool result: Bash #abc123 · error");
         assert_eq!(result.spans[0].style.fg, Some(THEME_PREVIEW_ERROR));
-        assert!(
-            result
-                .spans
-                .iter()
-                .any(|span| span.content.as_ref() == "[abc123]"
-                    && span.style.fg == Some(THEME_FG_DIM))
-        );
+        assert!(result
+            .spans
+            .iter()
+            .any(|span| span.content.as_ref() == "#abc123" && span.style.fg == Some(THEME_FG_DIM)));
         assert!(result
             .spans
             .iter()
             .any(|span| span.content.as_ref().trim() == "error"
                 && span.style.fg == Some(THEME_PREVIEW_ERROR)));
 
-        let unnamed_result = preview_summary_line("  tool result [def456] · ok");
+        let unnamed_result = preview_summary_line("  tool result #def456 · ok");
         assert_eq!(unnamed_result.spans[0].style.fg, Some(THEME_POSITIVE));
-        assert!(
-            unnamed_result
-                .spans
-                .iter()
-                .any(|span| span.content.as_ref() == "[def456]"
-                    && span.style.fg == Some(THEME_FG_DIM))
-        );
+        assert!(unnamed_result
+            .spans
+            .iter()
+            .any(|span| span.content.as_ref() == "#def456" && span.style.fg == Some(THEME_FG_DIM)));
     }
 
     #[test]
@@ -27303,7 +27315,7 @@ mod tests {
     fn preview_summary_styles_patch_lines_only_in_patch_context() {
         let mut state = PreviewSummaryStyleState::default();
         let tool_use =
-            preview_line_with_state("  tool use: Bash [abc123]", Mode::Summary, &mut state);
+            preview_line_with_state("  tool use: Bash #abc123", Mode::Summary, &mut state);
         assert_eq!(tool_use.spans[0].style.fg, Some(THEME_PREVIEW_TOOL));
         let command = preview_line_with_state("    cmd: ls -la", Mode::Summary, &mut state);
         assert_eq!(command.spans[0].style.fg, Some(THEME_PREVIEW_KEY));
@@ -27316,8 +27328,7 @@ mod tests {
             preview_line_with_state("      path: /tmp/error.rs", Mode::Summary, &mut state);
         assert_eq!(nested_value.spans[0].style.fg, Some(THEME_FG));
 
-        let tool =
-            preview_line_with_state("  tool result [abc123] · ok", Mode::Summary, &mut state);
+        let tool = preview_line_with_state("  tool result #abc123 · ok", Mode::Summary, &mut state);
         assert_eq!(tool.spans[0].style.fg, Some(THEME_POSITIVE));
         let chunk = preview_line_with_state("    Chunk ID: 5fea74", Mode::Summary, &mut state);
         assert_eq!(chunk.spans[0].style.fg, Some(THEME_FG));
@@ -27348,7 +27359,7 @@ mod tests {
     #[test]
     fn preview_summary_style_state_cache_tracks_context_before_each_line() {
         let lines = vec![
-            "  tool use: Bash [abc123]".to_string(),
+            "  tool use: Bash #abc123".to_string(),
             "    cmd: ls -la".to_string(),
             "USER #1".to_string(),
             "plain".to_string(),
@@ -27370,10 +27381,10 @@ mod tests {
 
     #[test]
     fn preview_summary_tool_result_error_status_must_be_terminal_detail() {
-        let ok_with_error_name = preview_summary_line("  tool result: error checker [abc123] · ok");
+        let ok_with_error_name = preview_summary_line("  tool result: error checker #abc123 · ok");
         assert_eq!(ok_with_error_name.spans[0].style.fg, Some(THEME_POSITIVE));
 
-        let error_status = preview_summary_line("  tool result: Bash [abc123] · error");
+        let error_status = preview_summary_line("  tool result: Bash #abc123 · error");
         assert_eq!(error_status.spans[0].style.fg, Some(THEME_PREVIEW_ERROR));
     }
 
@@ -27796,11 +27807,11 @@ mod tests {
 
     #[test]
     fn startup_spinner_frame_rotates_by_tick() {
-        assert_eq!(startup_spinner_frame(Duration::from_millis(0)), "|");
-        assert_eq!(startup_spinner_frame(Duration::from_millis(180)), "/");
-        assert_eq!(startup_spinner_frame(Duration::from_millis(360)), "-");
-        assert_eq!(startup_spinner_frame(Duration::from_millis(540)), "\\");
-        assert_eq!(startup_spinner_frame(Duration::from_millis(720)), "|");
+        assert_eq!(startup_spinner_frame(Duration::from_millis(0)), "⠋");
+        assert_eq!(startup_spinner_frame(Duration::from_millis(180)), "⠙");
+        assert_eq!(startup_spinner_frame(Duration::from_millis(360)), "⠹");
+        assert_eq!(startup_spinner_frame(Duration::from_millis(540)), "⠸");
+        assert_eq!(startup_spinner_frame(Duration::from_millis(1440)), "⠋");
     }
 
     #[test]
@@ -27815,7 +27826,7 @@ mod tests {
         let status = app.display_status();
 
         assert!(status.contains("cloning session + folder data"));
-        assert!(status.starts_with('|'));
+        assert!(status.starts_with('⠋'));
     }
 
     #[test]

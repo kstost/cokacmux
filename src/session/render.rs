@@ -239,7 +239,7 @@ fn render_summary_block(out: &mut String, block: &ContentBlock) {
         } => {
             let mut label = format!("  tool use: {}", display_tool_name(name));
             if !call_id.is_empty() {
-                label.push_str(&format!(" [{}]", short_id(call_id)));
+                label.push_str(&format!(" #{}", short_id(call_id)));
             }
             if let Some(status) = extras.get("status").and_then(Value::as_str) {
                 label.push_str(&format!(" · {}", status));
@@ -259,7 +259,7 @@ fn render_summary_block(out: &mut String, block: &ContentBlock) {
                 label.push_str(&format!(": {}", display_tool_name(name)));
             }
             if !call_id.is_empty() {
-                label.push_str(&format!(" [{}]", short_id(call_id)));
+                label.push_str(&format!(" #{}", short_id(call_id)));
             }
             label.push_str(if *is_error { " · error" } else { " · ok" });
             out.push_str(&label);
@@ -865,9 +865,9 @@ mod tests {
         let out = render(&s, Mode::Summary);
         assert!(out.contains("ASSISTANT #0"));
         assert!(out.contains("thinking:"));
-        assert!(out.contains("tool use: Bash [call-1234567…]"));
+        assert!(out.contains("tool use: Bash #call-1234567…"));
         assert!(out.contains("cmd: echo hi"));
-        assert!(out.contains("tool result [call-1234567…] · ok"));
+        assert!(out.contains("tool result #call-1234567… · ok"));
         assert!(out.contains("image: image/png (path=/tmp/a.png)"));
         assert!(out.contains("attachment: name=log.txt · path=/tmp/log.txt · mime=text/plain"));
         assert!(out.contains("patch: +1 -1"));
