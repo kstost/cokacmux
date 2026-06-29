@@ -2,7 +2,7 @@
 
 cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다. 파일이 없으면 기본 단축키가 모두 들어간 파일을 자동으로 만듭니다.
 
-앱을 재시작하지 않아도 됩니다. 키 입력이 들어올 때마다 파일의 수정 시각만 확인하고, 파일이 바뀐 경우에만 다시 읽어 파싱합니다. 실행 중 파일이 삭제되어도 다음 키 입력 때 기본 파일을 다시 만듭니다. 파싱에 실패하면 기존 단축키를 유지하고 status/debug log에 실패 이유를 남깁니다.
+앱을 재시작하지 않아도 됩니다. 백그라운드 감시 스레드가 약 2초마다 파일의 수정 시각만 확인하고, 파일이 바뀐 경우에만 다시 읽어 파싱합니다. 실행 중 파일이 삭제되어도 다음 감시 스레드 확인 때 기본 파일을 다시 만듭니다. 파싱에 실패하면 기존 단축키를 유지하고 status/debug log에 실패 이유를 남깁니다.
 
 ## 설정 방식
 
@@ -38,7 +38,11 @@ cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다
 
 액션을 설정하면 기본값에 추가되는 것이 아니라 그 액션의 기본 단축키 전체를 대체합니다. 예를 들어 `"sessions.quit": ["ctrl+q"]`만 쓰면 `q` 종료는 꺼지고 `ctrl+q`만 남습니다.
 
-구버전에서 자동 생성된 `agent.scroll_page_up` / `agent.scroll_page_down` 값은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`이고, `sessions.toggle_preview`는 빈 배열입니다.
+
+구버전에서 자동 생성된 `sessions.launch_agent: ["e"]` + `sessions.toggle_preview: ["enter"]` 조합은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+
+구버전에서 자동 생성된 `agent.scroll_page_up` / `agent.scroll_page_down` 값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 
 점 표기(flat)도 사용할 수 있습니다.
 
@@ -146,10 +150,10 @@ G
 | `sessions.quit` | `q` | 종료 |
 | `sessions.force_quit` | `ctrl+c` | 종료 |
 | `sessions.toggle_agent` | `ctrl+]`, `ctrl+[`, `ctrl+3`, `ctrl+5` | 세션 화면과 agent 화면 전환 |
-| `sessions.kill_agent` | `ctrl+k` | 선택한 실행 중 agent 종료 |
+| `sessions.kill_agent` | `ctrl+k` | 선택한 실행 중 대상 종료 |
 | `sessions.new_shell` | `ctrl+n` | 새 세션 모달 열기 |
 | `sessions.toggle_focus` | `tab`, `esc` | 세션 목록과 미리보기 포커스 전환 |
-| `sessions.toggle_preview` | `enter` | 미리보기 summary/full 전환 |
+| `sessions.toggle_preview` | 없음 | 미리보기를 summary 모드로 되돌림. 기본값에서는 비활성화 |
 | `sessions.move_next` | `down`, `j` | 다음 행 선택 또는 미리보기 아래로 스크롤 |
 | `sessions.move_prev` | `up`, `k` | 이전 행 선택 또는 미리보기 위로 스크롤 |
 | `sessions.page_next` | `pagedown` | 10행 아래 또는 미리보기 한 페이지 아래 |
@@ -162,7 +166,7 @@ G
 | `sessions.delete` | `delete`, `d` | 선택 세션 삭제 확인 열기 |
 | `sessions.clone` | `c` | 선택 세션 복제 |
 | `sessions.edit_title` | `t` | 선택 세션 제목 편집 |
-| `sessions.launch_agent` | `e` | agent launch 모드 선택 열기 |
+| `sessions.launch_agent` | `e`, `enter` | agent launch 모드 선택 열기 또는 live agent 연결 |
 | `sessions.refresh_preview` | `space` | 미리보기 캐시 무시하고 다시 그리기 |
 | `sessions.resize_left` | `alt+left`, `ctrl+shift+left` | 세션 패널 좁히기 |
 | `sessions.resize_right` | `alt+right`, `ctrl+shift+right` | 세션 패널 넓히기 |
@@ -171,20 +175,20 @@ G
 
 ### agent
 
-실행 중인 agent 화면에서 쓰는 액션입니다. 여기에 잡히지 않은 키는 active agent PTY로 전달됩니다.
+실행 중인 agent 화면에서 쓰는 액션입니다. 여기에 잡히지 않은 키는 active agent PTY로 전달됩니다. Codex는 line/page/top/bottom 스크롤을 transcript/pager 입력으로 보냅니다. Claude Code는 page/top/bottom을 fullscreen scroll 키로 바꾸고, 한 줄 스크롤은 원래 키를 자식 CLI에 전달합니다. OpenCode는 page up/down만 전용 키로 바꾸고, line/top/bottom은 원래 키를 자식 CLI에 전달합니다. 일반 터미널은 cokacmux PTY scrollback을 움직입니다. `cokacdir`에서는 Shift가 포함된 단축키를 자식 앱에 우선 전달하므로 기본 `Shift+...` 스크롤 키는 `cokacdir`로 들어가고, Shift가 없는 `Alt+Home` / `Alt+End`는 parent PTY scrollback을 움직입니다.
 
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
 | `agent.toggle_sessions` | `ctrl+]`, `ctrl+[`, `ctrl+3`, `ctrl+5` | 세션 화면으로 전환 |
-| `agent.kill` | `ctrl+k` | 현재 agent 종료 |
+| `agent.kill` | `ctrl+k` | 현재 코딩 agent/일반 터미널 종료. `cokacdir` 화면에서는 자식 앱에 전달 |
 | `agent.new_shell` | `ctrl+n` | 현재 agent cwd를 기본값으로 새 세션 모달 열기 |
 | `agent.toggle_sidebar` | `ctrl+b` | agents 사이드바 표시/숨김 |
-| `agent.scroll_line_up` | `shift+up` | PTY scrollback 한 줄 위 |
-| `agent.scroll_line_down` | `shift+down` | PTY scrollback 한 줄 아래 |
-| `agent.scroll_page_up` | `shift+alt+up`, `shift+alt+pageup` | PTY scrollback 한 페이지 위 |
-| `agent.scroll_page_down` | `shift+alt+down`, `shift+alt+pagedown` | PTY scrollback 한 페이지 아래 |
-| `agent.scroll_top` | `shift+home`, `alt+home` | PTY scrollback 맨 위 |
-| `agent.scroll_bottom` | `shift+end`, `alt+end` | PTY scrollback 맨 아래 |
+| `agent.scroll_line_up` | `shift+up` | transcript/scrollback 한 줄 위 |
+| `agent.scroll_line_down` | `shift+down` | transcript/scrollback 한 줄 아래 |
+| `agent.scroll_page_up` | `shift+alt+up`, `shift+alt+pageup` | transcript/scrollback 한 페이지 위 |
+| `agent.scroll_page_down` | `shift+alt+down`, `shift+alt+pagedown` | transcript/scrollback 한 페이지 아래 |
+| `agent.scroll_top` | `shift+home`, `alt+home` | transcript/scrollback 맨 위 |
+| `agent.scroll_bottom` | `shift+end`, `alt+end` | transcript/scrollback 맨 아래 |
 | `agent.resize_left` | `alt+left`, `ctrl+shift+left` | agents 사이드바 좁히기 |
 | `agent.resize_right` | `alt+right`, `ctrl+shift+right` | agents 사이드바 넓히기 |
 | `agent.sidebar_prev` | `alt+up`, `ctrl+shift+up` | agents 사이드바 선택 위로 이동 |
