@@ -625,6 +625,14 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 
 저장 위치는 `~/.cokacmux/titles.json`입니다. 원본 에이전트의 대화 파일을 직접 수정하지 않고, cokacmux가 보여줄 표시 이름만 저장합니다.
 
+AI 제목 생성과 AI 검색에 사용할 agent는 세션 목록에서 `Ctrl+T` 설정창으로 고릅니다. 기본값은 설정 없음입니다. 제목 편집창에서 `Ctrl+T`를 누르면 선택한 agent가 현재 세션 전체 내용을 읽고 한 문장 제목을 draft에 채웁니다. 처리 중에는 제목 편집창 안에 진행 상태가 표시되고 입력이 잠시 잠깁니다. 설정이 없으면 먼저 agent 설정창이 열립니다.
+
+세션 원문이 너무 크면 agent CLI의 입력 한계를 피하기 위해 전체 세션 summary 렌더러를 사용합니다.
+
+Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 `title` 필드를 받습니다. OpenCode는 `opencode run --format json`의 JSON 이벤트에서 최종 답변을 꺼낸 뒤, 그 답변 안의 `title` JSON 필드를 제목으로 사용합니다. 긴 세션에서 OS argv 길이 제한에 걸리지 않도록 agent prompt는 stdin으로 전달합니다. AI 제목 생성을 위해 별도로 실행한 agent 세션은 남기지 않습니다. Codex는 ephemeral 실행, Claude는 session persistence 비활성화 실행을 사용하고, OpenCode는 생성된 helper session id를 확인해 완료 후 삭제합니다.
+
+세션 목록에서 `Ctrl+S`를 누르면 AI 검색 프롬프트가 열립니다. 검색을 시작하면 모든 세션의 summary preview를 `~/.cokacmux/searchdata`에 최신 파일로 준비한 뒤, 선택한 agent에게 그 폴더를 직접 탐색하라고 요청합니다. 검색 중에는 중앙 오버레이에 스피너, preview 인덱싱 진행률, 현재 단계가 표시되고 `Esc` 취소 외 입력은 잠깁니다. 결과 목록은 AI 점수 순서로 표시되고 title 칼럼에는 짧은 match label이 함께 나옵니다.
+
 ### 6-11. 세션 삭제하기
 
 세션을 선택하고 `Delete` 또는 `d`를 누르면 확인창이 열립니다. 기본 선택은 Cancel입니다. `1` 또는 `y`로 바로 삭제하고, `2`, `n`, `Esc`로 취소합니다. `←`/`→`, `↑`/`↓`, `h`/`j`/`k`/`l`, `Tab`/`BackTab`으로 버튼을 고른 뒤 `Enter`로 실행할 수도 있습니다.
@@ -667,8 +675,10 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 | `Tab` / `Esc` | 세션 목록과 미리보기 포커스 전환 |
 | `Space` | 미리보기 강제 새로고침 |
 | `/` | 검색창 열기 |
+| `Ctrl+S` | AI 검색 프롬프트 열기 |
 | `v` | 트리 보기 / 목록 보기 전환 |
 | `t` | 제목 편집 |
+| `Ctrl+T` | AI 기능에 사용할 agent 설정 |
 | `r` | 세션 목록 새로고침 |
 | `c` | 복제 옵션 열기. 같은 provider는 native clone, 다른 provider는 2-message context handoff. 폴더 데이터 포함 시 전용 cwd 생성 |
 | `Delete` / `d` | 세션 삭제 확인창 열기 |
@@ -752,6 +762,7 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 | `←` / `→` | 커서 이동 |
 | `Home` / `End` | 처음 / 끝 |
 | `Backspace` / `Delete` | 글자 삭제 |
+| `Ctrl+T` | 선택한 AI agent로 세션 제목 자동 생성 |
 
 ### 복제 옵션 선택 모달
 
@@ -855,6 +866,9 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
       "claude": "",
       "opencode": ""
     },
+    "ai": {
+      "provider": null
+    },
     "cokacdir_program": ""
   }
 }
@@ -870,9 +884,12 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 | `agent_sidebar_visible` | 에이전트 사이드바를 처음에 보일지 정합니다. |
 | `session_view` | `"tree"` 또는 `"list"`입니다. `v` 키로도 바뀝니다. |
 | `agent_programs` | 현재 지원 provider의 실행 파일 경로를 직접 지정하는 곳입니다. |
+| `ai.provider` | AI 제목 생성과 AI 검색에 사용할 agent입니다. 기본값은 `null`이며, 세션 목록의 `Ctrl+T` 설정창으로 직접 선택해야 합니다. |
 | `cokacdir_program` | `cokacdir` 실행 파일 경로를 직접 지정하는 곳입니다. |
 
 `agent_programs`와 `cokacdir_program`의 빈 문자열은 placeholder입니다. 비워 두면 기존처럼 PATH에서 기본 명령 이름을 찾습니다. `cokacdir`은 PATH에서 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용하고, 그 파일도 없을 때 자동 다운로드합니다.
+
+`ai.provider`는 `null`, `"claude"`, `"codex"`, `"opencode"` 중 하나입니다. `null`이면 AI 기능용 agent가 설정되지 않은 상태입니다.
 
 ### `agent_programs` 자세히
 

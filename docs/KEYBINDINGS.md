@@ -161,11 +161,13 @@ G
 | `sessions.top` | `home`, `g` | 처음으로 이동 |
 | `sessions.bottom` | `end`, `G` | 끝으로 이동 |
 | `sessions.filter` | `/` | 검색창 열기 |
+| `sessions.ai_search` | `ctrl+s` | AI 검색 프롬프트 열기 |
 | `sessions.toggle_view` | `v` | tree/list 보기 전환 |
 | `sessions.refresh` | `r` | 세션 다시 읽기 |
 | `sessions.delete` | `delete`, `d` | 선택 세션 삭제 확인 열기 |
 | `sessions.clone` | `c` | 선택 세션 복제 |
 | `sessions.edit_title` | `t` | 선택 세션 제목 편집 |
+| `sessions.ai_title_settings` | `ctrl+t` | AI 기능용 agent 설정 열기 |
 | `sessions.launch_agent` | `e`, `enter` | agent launch 모드 선택 열기 또는 live agent 연결 |
 | `sessions.refresh_preview` | `space` | 미리보기 캐시 무시하고 다시 그리기 |
 | `sessions.resize_left` | `alt+left`, `ctrl+shift+left` | 세션 패널 좁히기 |
@@ -264,6 +266,22 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 | `title.end` | `end` | 커서 끝으로 |
 | `title.backspace` | `backspace` | 커서 앞 글자 삭제 |
 | `title.delete` | `delete` | 커서 위치 글자 삭제 |
+| `title.ai_generate` | `ctrl+t` | 선택한 AI agent로 세션 제목 자동 생성 |
+
+### ai_title_settings
+
+AI 제목 생성과 AI 검색에 사용할 agent를 고르는 설정 모달에서 쓰는 액션입니다. 기본 설정은 없음입니다.
+
+| 액션 | 기본 키 | 설명 |
+|---|---|---|
+| `ai_title_settings.cancel` | `esc` | 변경하지 않고 닫기 |
+| `ai_title_settings.save` | `enter` | 선택한 agent 저장 |
+| `ai_title_settings.next` | `down`, `j`, `tab` | 다음 선택지 |
+| `ai_title_settings.prev` | `up`, `k`, `backtab` | 이전 선택지 |
+| `ai_title_settings.none` | `1` | 설정 없음 선택 |
+| `ai_title_settings.claude` | `2` | Claude 선택 |
+| `ai_title_settings.codex` | `3` | Codex 선택 |
+| `ai_title_settings.opencode` | `4` | OpenCode 선택 |
 
 ### agent_launch
 

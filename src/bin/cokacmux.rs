@@ -14,7 +14,7 @@ use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, ErrorKind, Read, Stdout, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 #[cfg(windows)]
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -71,11 +71,68 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use cokacmux::providers::discovery::SessionInfo;
 use cokacmux::session;
 use cokacmux::session::render::Mode;
-use cokacmux::universal::Provider;
+use cokacmux::universal::{Provider, UniversalSession};
 use cokacmux::ConvertError;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 const PREVIEW_CACHE_LIMIT: usize = 16;
+const AI_TITLE_TIMEOUT_SECS: u64 = 180;
+const AI_TITLE_MAX_CHARS: usize = 120;
+const AI_TITLE_FULL_TRANSCRIPT_MAX_CHARS: usize = 120_000;
+const AI_TITLE_PROMPT_TRANSCRIPT_MAX_CHARS: usize = 160_000;
+const AI_SEARCH_TIMEOUT_SECS: u64 = 180;
+const AI_SEARCH_DATA_DIR_NAME: &str = "searchdata";
+const AI_SEARCH_PREVIEW_FORMAT_VERSION: &str = "2";
+const AI_SEARCH_CANCELLED_ERROR: &str = "cancelled";
+const AI_SEARCH_PENDING_OVERLAY_MAX_WIDTH: u16 = 160;
+const OPENCODE_AI_SEARCH_PERMISSION: &str = r#"{"read":"allow","glob":"allow","grep":"allow","list":"allow","edit":"deny","bash":"deny","task":"deny"}"#;
+const AI_TITLE_OUTPUT_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    }
+  },
+  "required": ["title"],
+  "additionalProperties": false
+}"#;
+const AI_SEARCH_OUTPUT_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": ["codex", "claude", "opencode"]
+          },
+          "session_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\r\\n]+$"
+          }
+        },
+        "required": ["provider", "session_id", "score", "reason"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["results"],
+  "additionalProperties": false
+}"#;
 const DEFAULT_SESSIONS_PANE_PERCENT: u16 = 45;
 const PANE_RESIZE_STEP_COLUMNS: u16 = 2;
 const AGENT_SCROLLBACK_LINES: usize = 10_000;
@@ -295,8 +352,11 @@ impl Settings {
         if let Some(path) = settings_path() {
             match fs::read_to_string(&path) {
                 Ok(content) => {
-                    if let Ok(settings) = serde_json::from_str::<Self>(&content) {
-                        return settings.normalized();
+                    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) {
+                        migrate_legacy_ai_settings_json(&mut value);
+                        if let Ok(settings) = serde_json::from_value::<Self>(value) {
+                            return settings.normalized();
+                        }
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -338,6 +398,39 @@ impl Settings {
     }
 }
 
+fn migrate_legacy_ai_settings_json(value: &mut serde_json::Value) {
+    let Some(cokacmux) = value
+        .get_mut("cokacmux")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if cokacmux.contains_key("ai") {
+        cokacmux.remove("ai_title");
+        if let Some(ai) = cokacmux.get_mut("ai") {
+            normalize_ai_settings_json(ai);
+        }
+    } else if let Some(legacy) = cokacmux.remove("ai_title") {
+        let mut legacy = legacy;
+        normalize_ai_settings_json(&mut legacy);
+        cokacmux.insert("ai".to_string(), legacy);
+    }
+}
+
+fn normalize_ai_settings_json(value: &mut serde_json::Value) {
+    let Some(settings) = value.as_object_mut() else {
+        *value = serde_json::json!({});
+        return;
+    };
+    match settings.get("provider") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(provider)) if Provider::parse(provider).is_some() => {}
+        _ => {
+            settings.insert("provider".to_string(), serde_json::Value::Null);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CokacmuxSettings {
     #[serde(default = "default_sessions_pane_percent")]
@@ -356,6 +449,8 @@ struct CokacmuxSettings {
     #[serde(default)]
     agent_programs: AgentProgramSettings,
     #[serde(default)]
+    ai: AiSettings,
+    #[serde(default)]
     cokacdir_program: Option<String>,
     #[serde(default, rename = "debug", skip_serializing)]
     _debug: bool,
@@ -372,8 +467,26 @@ impl Default for CokacmuxSettings {
             agent_sidebar_visible: default_agent_sidebar_visible(),
             session_view: default_session_view(),
             agent_programs: AgentProgramSettings::default(),
+            ai: AiSettings::default(),
             cokacdir_program: Some(String::new()),
             _debug: false,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AiSettings {
+    #[serde(default)]
+    provider: Option<Provider>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            provider: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -536,11 +649,13 @@ enum KeyAction {
     SessionTop,
     SessionBottom,
     SessionFilter,
+    SessionAiSearch,
     SessionToggleView,
     SessionRefresh,
     SessionDelete,
     SessionClone,
     SessionEditTitle,
+    SessionAiTitleSettings,
     SessionLaunchAgent,
     SessionRefreshPreview,
     SessionsPaneResizeLeft,
@@ -597,6 +712,15 @@ enum KeyAction {
     TitleEnd,
     TitleBackspace,
     TitleDelete,
+    TitleAiGenerate,
+    AiTitleSettingsCancel,
+    AiTitleSettingsSave,
+    AiTitleSettingsNext,
+    AiTitleSettingsPrev,
+    AiTitleSettingsNone,
+    AiTitleSettingsClaude,
+    AiTitleSettingsCodex,
+    AiTitleSettingsOpenCode,
     AgentLaunchCancel,
     AgentLaunchConfirm,
     AgentLaunchNext,
@@ -682,6 +806,11 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     ("sessions.top", KeyAction::SessionTop, &["home", "g"]),
     ("sessions.bottom", KeyAction::SessionBottom, &["end", "G"]),
     ("sessions.filter", KeyAction::SessionFilter, &["/"]),
+    (
+        "sessions.ai_search",
+        KeyAction::SessionAiSearch,
+        &["ctrl+s"],
+    ),
     ("sessions.toggle_view", KeyAction::SessionToggleView, &["v"]),
     ("sessions.refresh", KeyAction::SessionRefresh, &["r"]),
     (
@@ -691,6 +820,11 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     ),
     ("sessions.clone", KeyAction::SessionClone, &["c"]),
     ("sessions.edit_title", KeyAction::SessionEditTitle, &["t"]),
+    (
+        "sessions.ai_title_settings",
+        KeyAction::SessionAiTitleSettings,
+        &["ctrl+t"],
+    ),
     (
         "sessions.launch_agent",
         KeyAction::SessionLaunchAgent,
@@ -948,6 +1082,47 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     ("title.end", KeyAction::TitleEnd, &["end"]),
     ("title.backspace", KeyAction::TitleBackspace, &["backspace"]),
     ("title.delete", KeyAction::TitleDelete, &["delete"]),
+    ("title.ai_generate", KeyAction::TitleAiGenerate, &["ctrl+t"]),
+    (
+        "ai_title_settings.cancel",
+        KeyAction::AiTitleSettingsCancel,
+        &["esc"],
+    ),
+    (
+        "ai_title_settings.save",
+        KeyAction::AiTitleSettingsSave,
+        &["enter"],
+    ),
+    (
+        "ai_title_settings.next",
+        KeyAction::AiTitleSettingsNext,
+        &["down", "j", "tab"],
+    ),
+    (
+        "ai_title_settings.prev",
+        KeyAction::AiTitleSettingsPrev,
+        &["up", "k", "backtab"],
+    ),
+    (
+        "ai_title_settings.none",
+        KeyAction::AiTitleSettingsNone,
+        &["1"],
+    ),
+    (
+        "ai_title_settings.claude",
+        KeyAction::AiTitleSettingsClaude,
+        &["2"],
+    ),
+    (
+        "ai_title_settings.codex",
+        KeyAction::AiTitleSettingsCodex,
+        &["3"],
+    ),
+    (
+        "ai_title_settings.opencode",
+        KeyAction::AiTitleSettingsOpenCode,
+        &["4"],
+    ),
     (
         "agent_launch.cancel",
         KeyAction::AgentLaunchCancel,
@@ -1744,6 +1919,33 @@ fn selection_index_after_removed_row(
     Some(removed_index.unwrap_or(0).min(len_after.saturating_sub(1)))
 }
 
+const AI_TITLE_PROVIDER_OPTIONS: [Option<Provider>; 4] = [
+    None,
+    Some(Provider::Claude),
+    Some(Provider::Codex),
+    Some(Provider::OpenCode),
+];
+
+fn ai_title_provider_at(index: usize) -> Option<Provider> {
+    AI_TITLE_PROVIDER_OPTIONS[index % AI_TITLE_PROVIDER_OPTIONS.len()]
+}
+
+fn ai_title_provider_index(provider: Option<Provider>) -> usize {
+    AI_TITLE_PROVIDER_OPTIONS
+        .iter()
+        .position(|candidate| *candidate == provider)
+        .unwrap_or(0)
+}
+
+fn move_ai_title_provider_index(current: usize, delta: i32) -> usize {
+    let len = AI_TITLE_PROVIDER_OPTIONS.len() as i32;
+    (current as i32 + delta).rem_euclid(len) as usize
+}
+
+fn ai_title_provider_label(provider: Option<Provider>) -> &'static str {
+    provider.map(Provider::as_str).unwrap_or("not configured")
+}
+
 fn next_agent_candidate_index(len: usize, current: usize, delta: i32, wrap: bool) -> usize {
     if len == 0 {
         return 0;
@@ -1786,9 +1988,48 @@ impl SessionViewMode {
 }
 
 #[derive(Debug, Clone)]
+enum AiTitleSettingsReturn {
+    Normal,
+    TitleEdit {
+        source: SessionInfo,
+        draft: String,
+        cursor: usize,
+    },
+    AiSearch {
+        draft: String,
+        cursor: usize,
+    },
+}
+
+impl AiTitleSettingsReturn {
+    fn into_input_mode(self) -> InputMode {
+        match self {
+            AiTitleSettingsReturn::Normal => InputMode::Normal,
+            AiTitleSettingsReturn::TitleEdit {
+                source,
+                draft,
+                cursor,
+            } => InputMode::TitleEdit {
+                source,
+                draft,
+                cursor,
+            },
+            AiTitleSettingsReturn::AiSearch { draft, cursor } => InputMode::AiSearch {
+                draft,
+                cursor,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum InputMode {
     Normal,
     Filter {
+        draft: String,
+        cursor: usize,
+    },
+    AiSearch {
         draft: String,
         cursor: usize,
     },
@@ -1837,6 +2078,10 @@ enum InputMode {
         source: SessionInfo,
         draft: String,
         cursor: usize,
+    },
+    AiTitleSettings {
+        selected: usize,
+        return_to: AiTitleSettingsReturn,
     },
     Notice {
         title: String,
@@ -2082,6 +2327,84 @@ struct SearchWorkerResult {
     queued_at_epoch_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiSearchPhase {
+    Preparing,
+    Indexing,
+    AskingAgent,
+    Cancelling,
+}
+
+impl AiSearchPhase {
+    fn label(self) -> &'static str {
+        match self {
+            AiSearchPhase::Preparing => "preparing preview index",
+            AiSearchPhase::Indexing => "indexing previews",
+            AiSearchPhase::AskingAgent => "asking AI agent",
+            AiSearchPhase::Cancelling => "cancelling",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AiSearchPending {
+    seq: u64,
+    query: String,
+    provider: Provider,
+    phase: AiSearchPhase,
+    indexed: usize,
+    total: usize,
+    reused: usize,
+    written: usize,
+    cancel_requested: bool,
+    cancel: Arc<AtomicBool>,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct AiSearchHit {
+    key: AgentKey,
+    score: f64,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct AiSearchResults {
+    query: String,
+    hits: Vec<AiSearchHit>,
+}
+
+#[derive(Debug)]
+struct AiSearchOutcome {
+    hits: Vec<AiSearchHit>,
+    indexed: usize,
+    reused: usize,
+    written: usize,
+}
+
+#[derive(Debug)]
+struct AiSearchWorkerResult {
+    seq: u64,
+    query: String,
+    provider: Provider,
+    outcome: std::result::Result<AiSearchOutcome, String>,
+    elapsed_ms: u128,
+    queued_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AiSearchProgressEvent {
+    seq: u64,
+    query: String,
+    provider: Provider,
+    phase: AiSearchPhase,
+    indexed: usize,
+    total: usize,
+    reused: usize,
+    written: usize,
+    queued_at_epoch_ms: u64,
+}
+
 struct SessionRefreshResult {
     seq: u64,
     sessions: std::result::Result<Vec<SessionInfo>, String>,
@@ -2192,6 +2515,24 @@ struct RestoreWorkerResult {
     rows: u16,
     launch_mode: AgentLaunchMode,
     outcome: std::result::Result<session::data::SessionDataRestoreReport, String>,
+}
+
+#[derive(Debug, Clone)]
+struct AiTitlePending {
+    seq: u64,
+    key: AgentKey,
+    provider: Provider,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct AiTitleWorkerResult {
+    seq: u64,
+    source: SessionInfo,
+    provider: Provider,
+    outcome: std::result::Result<String, String>,
+    elapsed_ms: u128,
+    queued_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -5328,12 +5669,18 @@ enum MainEvent {
     SessionRefreshResult(SessionRefreshResult),
     /// Full-session search completed in the background.
     SearchResult(SearchWorkerResult),
+    /// AI-assisted session search progress update.
+    AiSearchProgress(AiSearchProgressEvent),
+    /// AI-assisted session search completed in the background.
+    AiSearchResult(AiSearchWorkerResult),
     /// Data-task worker progress update.
     DataTaskProgress(DataTaskProgressEvent),
     /// Clone/session-data copy completed in the background.
     CloneResult(CloneWorkerResult),
     /// Saved folder-data restore completed in the background.
     RestoreResult(RestoreWorkerResult),
+    /// AI title generation completed in the background.
+    AiTitleResult(AiTitleWorkerResult),
     /// An attach job (pre-checks + daemon connect/spawn) finished off the
     /// UI thread.
     AttachResult(Box<AttachWorkerResult>),
@@ -5605,6 +5952,11 @@ struct App {
     text_filter_matches: HashSet<AgentKey>,
     search_seq: u64,
     search_pending: Option<SearchPending>,
+    ai_search_seq: u64,
+    ai_search_pending: Option<AiSearchPending>,
+    ai_search_results: Option<AiSearchResults>,
+    ai_title_seq: u64,
+    ai_title_pending: Option<AiTitlePending>,
     data_task_seq: u64,
     data_task: Option<DataTaskPending>,
     input_mode: InputMode,
@@ -5707,6 +6059,11 @@ impl App {
             text_filter_matches: HashSet::new(),
             search_seq: 0,
             search_pending: None,
+            ai_search_seq: 0,
+            ai_search_pending: None,
+            ai_search_results: None,
+            ai_title_seq: 0,
+            ai_title_pending: None,
             data_task_seq: 0,
             data_task: None,
             input_mode: InputMode::Normal,
@@ -5808,6 +6165,249 @@ impl App {
         }
         self.status = reload.status;
     }
+
+    fn begin_ai_title_settings(&mut self, return_to: AiTitleSettingsReturn) {
+        let selected = ai_title_provider_index(self.settings.cokacmux.ai.provider);
+        self.input_mode = InputMode::AiTitleSettings {
+            selected,
+            return_to,
+        };
+        self.status = "choose AI agent.".into();
+        debug_log(
+            "ai_title_settings_open",
+            serde_json::json!({
+                "provider": ai_title_provider_label(self.settings.cokacmux.ai.provider),
+            }),
+        );
+    }
+
+    fn save_ai_title_provider(&mut self, provider: Option<Provider>) {
+        self.settings.cokacmux.ai.provider = provider;
+        match self.settings.save() {
+            Ok(()) => {
+                self.status = format!("AI agent saved: {}", ai_title_provider_label(provider));
+                debug_log(
+                    "ai_title_settings_saved",
+                    serde_json::json!({
+                        "provider": ai_title_provider_label(provider),
+                    }),
+                );
+            }
+            Err(e) => {
+                self.status = format!("AI title settings save failed: {}", e);
+                debug_log(
+                    "ai_title_settings_save_failed",
+                    serde_json::json!({
+                        "provider": ai_title_provider_label(provider),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn start_ai_title_generation(&mut self, source: SessionInfo) {
+        if self.reject_while_data_task_running("generating an AI title") {
+            return;
+        }
+        if let Some(pending) = self.ai_search_pending.as_ref() {
+            self.status = format!(
+                "AI search is running with {}; wait before generating a title.",
+                pending.provider.as_str()
+            );
+            debug_log(
+                "ai_title_request_ignored",
+                serde_json::json!({
+                    "reason": "ai_search_pending",
+                    "search_seq": pending.seq,
+                    "provider": pending.provider.as_str(),
+                }),
+            );
+            return;
+        }
+        if let Some(pending) = self.ai_title_pending.as_ref() {
+            self.status = format!(
+                "AI title already running with {} for {}",
+                pending.provider.as_str(),
+                truncate_width(&pending.key.session_id, 14)
+            );
+            debug_log(
+                "ai_title_request_ignored",
+                serde_json::json!({
+                    "reason": "pending",
+                    "seq": pending.seq,
+                    "provider": pending.provider.as_str(),
+                    "session_id": &pending.key.session_id,
+                }),
+            );
+            return;
+        }
+        let Some(provider) = self.settings.cokacmux.ai.provider else {
+            self.status = "choose an AI title agent first.".into();
+            debug_log(
+                "ai_title_request_ignored",
+                serde_json::json!({
+                    "reason": "provider_unconfigured",
+                    "source_provider": source.provider.as_str(),
+                    "session_id": &source.session_id,
+                }),
+            );
+            return;
+        };
+        let Some(tx) = self.main_tx.clone() else {
+            self.status = "AI title generation unavailable before UI event loop.".into();
+            debug_log(
+                "ai_title_request_ignored",
+                serde_json::json!({
+                    "reason": "missing_main_tx",
+                    "provider": provider.as_str(),
+                    "session_id": &source.session_id,
+                }),
+            );
+            return;
+        };
+
+        self.ai_title_seq = self.ai_title_seq.saturating_add(1);
+        let seq = self.ai_title_seq;
+        let key = AgentKey::new(&source);
+        let pending = AiTitlePending {
+            seq,
+            key: key.clone(),
+            provider,
+            started_at: Instant::now(),
+        };
+        let agent_programs = self.settings.cokacmux.agent_programs.clone();
+        self.ai_title_pending = Some(pending);
+        self.status = format!(
+            "generating AI title with {}...",
+            ai_title_provider_label(Some(provider))
+        );
+        debug_log(
+            "ai_title_request",
+            serde_json::json!({
+                "seq": seq,
+                "provider": provider.as_str(),
+                "source_provider": source.provider.as_str(),
+                "session_id": &source.session_id,
+                "cwd": &source.cwd,
+            }),
+        );
+
+        match thread::Builder::new()
+            .name("cokacmux-ai-title".to_string())
+            .spawn(move || {
+                let result = generate_ai_title_worker(seq, source, provider, agent_programs);
+                let _ = tx.send(MainEvent::AiTitleResult(result));
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                self.ai_title_pending = None;
+                self.status = format!(
+                    "AI title worker failed: {}",
+                    truncate_width(&e.to_string(), 80)
+                );
+                debug_log(
+                    "ai_title_spawn_failed",
+                    serde_json::json!({
+                        "seq": seq,
+                        "provider": provider.as_str(),
+                        "session_id": &key.session_id,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn on_ai_title_worker_result(&mut self, result: AiTitleWorkerResult) {
+        let Some(pending) = self.ai_title_pending.as_ref() else {
+            debug_log(
+                "ai_title_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "reason": "none_pending",
+                    "provider": result.provider.as_str(),
+                    "session_id": &result.source.session_id,
+                }),
+            );
+            return;
+        };
+        let result_key = AgentKey::new(&result.source);
+        if pending.seq != result.seq
+            || pending.key != result_key
+            || pending.provider != result.provider
+        {
+            debug_log(
+                "ai_title_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "pending_seq": pending.seq,
+                    "reason": "stale",
+                    "provider": result.provider.as_str(),
+                    "session_id": &result.source.session_id,
+                }),
+            );
+            return;
+        }
+        self.ai_title_pending = None;
+
+        match result.outcome {
+            Ok(title) => {
+                let mut applied = false;
+                if let InputMode::TitleEdit {
+                    source,
+                    draft,
+                    cursor,
+                } = &mut self.input_mode
+                {
+                    if AgentKey::new(source) == result_key {
+                        *draft = title.clone();
+                        *cursor = draft.len();
+                        applied = true;
+                    }
+                }
+                self.status = if applied {
+                    format!(
+                        "AI title ready with {}: {}",
+                        result.provider.as_str(),
+                        truncate_width(&title, 48)
+                    )
+                } else {
+                    format!(
+                        "AI title ready for {}; reopen title edit to regenerate",
+                        truncate_width(&result.source.session_id, 14)
+                    )
+                };
+                debug_log(
+                    "ai_title_result_ok",
+                    serde_json::json!({
+                        "seq": result.seq,
+                        "provider": result.provider.as_str(),
+                        "source_provider": result.source.provider.as_str(),
+                        "session_id": &result.source.session_id,
+                        "title_len": title.chars().count(),
+                        "applied": applied,
+                        "elapsed_ms": result.elapsed_ms,
+                    }),
+                );
+            }
+            Err(error) => {
+                self.status = format!("AI title failed: {}", truncate_width(&error, 100));
+                debug_log(
+                    "ai_title_result_failed",
+                    serde_json::json!({
+                        "seq": result.seq,
+                        "provider": result.provider.as_str(),
+                        "source_provider": result.source.provider.as_str(),
+                        "session_id": &result.source.session_id,
+                        "error": error,
+                        "elapsed_ms": result.elapsed_ms,
+                    }),
+                );
+            }
+        }
+    }
+
     /// Flip the agents sidebar's visibility and persist the change so
     /// the choice survives restarts. The configured width is left alone
     /// so the user's manual resize comes back when they toggle on again.
@@ -6235,6 +6835,20 @@ impl App {
     }
 
     fn visible_rows(&self) -> Vec<VisibleSessionRow<'_>> {
+        if let Some(results) = &self.ai_search_results {
+            let by_key: HashMap<AgentKey, &SessionInfo> = self
+                .sessions
+                .iter()
+                .map(|info| (AgentKey::new(info), info))
+                .collect();
+            return results
+                .hits
+                .iter()
+                .filter_map(|hit| by_key.get(&hit.key).copied())
+                .filter(|info| self.provider_filter.matches(info.provider))
+                .map(|info| VisibleSessionRow { info, depth: 0 })
+                .collect();
+        }
         let text_filter = (!self.text_filter.is_empty()).then(|| self.text_filter.to_lowercase());
         let text_filter = text_filter.as_deref();
         match self.session_view {
@@ -6271,6 +6885,35 @@ impl App {
             || self.text_filter_matches.contains(&AgentKey::new(s))
     }
 
+    fn has_active_session_search(&self) -> bool {
+        !self.text_filter.is_empty() || self.ai_search_results.is_some()
+    }
+
+    fn clear_session_search_results(&mut self, reason: &'static str) -> bool {
+        if !self.has_active_session_search() {
+            return false;
+        }
+        let had_text_filter = !self.text_filter.is_empty();
+        let had_ai_results = self.ai_search_results.is_some();
+        self.text_filter.clear();
+        self.text_filter_matches.clear();
+        self.ai_search_results = None;
+        self.focus = FocusPane::Sessions;
+        self.select_first();
+        let visible = self.visible().len();
+        self.status = format!("search cleared: {} sessions", visible);
+        debug_log(
+            "session_search_clear",
+            serde_json::json!({
+                "reason": reason,
+                "had_text_filter": had_text_filter,
+                "had_ai_results": had_ai_results,
+                "visible": visible,
+            }),
+        );
+        true
+    }
+
     fn begin_filter(&mut self) {
         let draft = self.text_filter.clone();
         let cursor = draft.len();
@@ -6281,6 +6924,28 @@ impl App {
             "filter_begin",
             serde_json::json!({
                 "existing_query_len": self.text_filter.chars().count(),
+            }),
+        );
+    }
+
+    fn begin_ai_search(&mut self) {
+        if self.ai_search_pending.is_some() {
+            self.status = "AI search already running.".into();
+            return;
+        }
+        let draft = self
+            .ai_search_results
+            .as_ref()
+            .map(|results| results.query.clone())
+            .unwrap_or_default();
+        let cursor = draft.len();
+        self.input_mode = InputMode::AiSearch { draft, cursor };
+        self.focus = FocusPane::Sessions;
+        self.status = "AI search sessions".into();
+        debug_log(
+            "ai_search_begin",
+            serde_json::json!({
+                "existing_query_len": self.ai_search_results.as_ref().map(|results| results.query.chars().count()).unwrap_or(0),
             }),
         );
     }
@@ -6301,11 +6966,45 @@ impl App {
         true
     }
 
+    fn cancel_pending_ai_search(&mut self, reason: &'static str) -> bool {
+        let Some(pending) = self.ai_search_pending.as_mut() else {
+            return false;
+        };
+        pending.cancel.store(true, Ordering::Relaxed);
+        pending.phase = AiSearchPhase::Cancelling;
+        if pending.cancel_requested {
+            self.status = "AI search is cancelling; waiting for worker.".into();
+            debug_log(
+                "ai_search_cancel_repeated",
+                serde_json::json!({
+                    "seq": pending.seq,
+                    "provider": pending.provider.as_str(),
+                    "query_len": pending.query.chars().count(),
+                    "reason": reason,
+                }),
+            );
+        } else {
+            pending.cancel_requested = true;
+            self.status = "AI search cancellation requested.".into();
+            debug_log(
+                "ai_search_cancel_requested",
+                serde_json::json!({
+                    "seq": pending.seq,
+                    "provider": pending.provider.as_str(),
+                    "query_len": pending.query.chars().count(),
+                    "reason": reason,
+                }),
+            );
+        }
+        true
+    }
+
     fn start_text_search(&mut self, query: String) {
         let query = query.trim().to_string();
         if query.is_empty() {
             self.text_filter.clear();
             self.text_filter_matches.clear();
+            self.ai_search_results = None;
             self.cancel_pending_search("clear");
             self.input_mode = InputMode::Normal;
             self.focus = FocusPane::Sessions;
@@ -6316,6 +7015,7 @@ impl App {
         }
 
         self.search_seq = self.search_seq.saturating_add(1);
+        self.ai_search_results = None;
         let seq = self.search_seq;
         let cancel = Arc::new(AtomicBool::new(false));
         self.search_pending = Some(SearchPending {
@@ -6442,6 +7142,290 @@ impl App {
         );
     }
 
+    fn start_ai_search(&mut self, query: String) {
+        if self.reject_while_data_task_running("running AI search") {
+            return;
+        }
+        if let Some(pending) = self.ai_title_pending.as_ref() {
+            self.status = format!(
+                "AI title is running with {}; wait before searching.",
+                pending.provider.as_str()
+            );
+            debug_log(
+                "ai_search_request_ignored",
+                serde_json::json!({
+                    "reason": "ai_title_pending",
+                    "title_seq": pending.seq,
+                    "provider": pending.provider.as_str(),
+                    "session_id": &pending.key.session_id,
+                }),
+            );
+            return;
+        }
+        if let Some(pending) = self.ai_search_pending.as_ref() {
+            self.status = format!(
+                "AI search already running with {} ({}s)",
+                pending.provider.as_str(),
+                pending.started_at.elapsed().as_secs()
+            );
+            debug_log(
+                "ai_search_request_ignored",
+                serde_json::json!({
+                    "reason": "pending",
+                    "seq": pending.seq,
+                    "provider": pending.provider.as_str(),
+                }),
+            );
+            return;
+        }
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            self.ai_search_results = None;
+            self.input_mode = InputMode::Normal;
+            self.focus = FocusPane::Sessions;
+            self.select_first();
+            self.status = format!("AI search cleared: {} sessions", self.visible().len());
+            debug_log("ai_search_clear", serde_json::json!({}));
+            return;
+        }
+        let Some(provider) = self.settings.cokacmux.ai.provider else {
+            self.status = "choose an AI agent first with Ctrl+T.".into();
+            debug_log(
+                "ai_search_request_ignored",
+                serde_json::json!({
+                    "reason": "provider_unconfigured",
+                    "query_len": query.chars().count(),
+                }),
+            );
+            return;
+        };
+        let Some(tx) = self.main_tx.clone() else {
+            self.status = "AI search unavailable before UI event loop.".into();
+            debug_log(
+                "ai_search_request_ignored",
+                serde_json::json!({
+                    "reason": "missing_main_tx",
+                    "provider": provider.as_str(),
+                }),
+            );
+            return;
+        };
+
+        self.text_filter.clear();
+        self.text_filter_matches.clear();
+        self.ai_search_results = None;
+        self.select_first();
+        self.ai_search_seq = self.ai_search_seq.saturating_add(1);
+        let seq = self.ai_search_seq;
+        let sessions = self.sessions.clone();
+        let total = sessions.len();
+        let agent_programs = self.settings.cokacmux.agent_programs.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.ai_search_pending = Some(AiSearchPending {
+            seq,
+            query: query.clone(),
+            provider,
+            phase: AiSearchPhase::Preparing,
+            indexed: 0,
+            total,
+            reused: 0,
+            written: 0,
+            cancel_requested: false,
+            cancel: cancel.clone(),
+            started_at: Instant::now(),
+        });
+        self.input_mode = InputMode::Normal;
+        self.focus = FocusPane::Sessions;
+        self.status = format!(
+            "AI searching sessions with {}...",
+            ai_title_provider_label(Some(provider))
+        );
+        debug_log(
+            "ai_search_request",
+            serde_json::json!({
+                "seq": seq,
+                "provider": provider.as_str(),
+                "query_len": query.chars().count(),
+                "sessions": sessions.len(),
+            }),
+        );
+
+        match thread::Builder::new()
+            .name("cokacmux-ai-search".to_string())
+            .spawn(move || {
+                let progress_tx = tx.clone();
+                let result = generate_ai_search_worker(
+                    seq,
+                    query,
+                    sessions,
+                    provider,
+                    agent_programs,
+                    Some(progress_tx),
+                    cancel,
+                );
+                let _ = tx.send(MainEvent::AiSearchResult(result));
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                self.ai_search_pending = None;
+                self.status = format!(
+                    "AI search worker failed: {}",
+                    truncate_width(&e.to_string(), 80)
+                );
+                debug_log(
+                    "ai_search_spawn_failed",
+                    serde_json::json!({
+                        "seq": seq,
+                        "provider": provider.as_str(),
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn on_ai_search_progress(&mut self, event: AiSearchProgressEvent) {
+        let Some(pending) = self.ai_search_pending.as_mut() else {
+            debug_log(
+                "ai_search_progress_ignored",
+                serde_json::json!({
+                    "seq": event.seq,
+                    "reason": "none_pending",
+                    "provider": event.provider.as_str(),
+                }),
+            );
+            return;
+        };
+        if pending.seq != event.seq
+            || pending.query != event.query
+            || pending.provider != event.provider
+        {
+            debug_log(
+                "ai_search_progress_ignored",
+                serde_json::json!({
+                    "seq": event.seq,
+                    "pending_seq": pending.seq,
+                    "reason": "stale",
+                    "provider": event.provider.as_str(),
+                }),
+            );
+            return;
+        }
+        pending.indexed = event.indexed.min(event.total);
+        pending.total = event.total;
+        pending.reused = event.reused;
+        pending.written = event.written;
+        if !pending.cancel_requested {
+            pending.phase = event.phase;
+        }
+    }
+
+    fn on_ai_search_worker_result(&mut self, result: AiSearchWorkerResult) {
+        let Some(pending) = self.ai_search_pending.as_ref() else {
+            debug_log(
+                "ai_search_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "reason": "none_pending",
+                    "provider": result.provider.as_str(),
+                }),
+            );
+            return;
+        };
+        if pending.seq != result.seq
+            || pending.query != result.query
+            || pending.provider != result.provider
+        {
+            debug_log(
+                "ai_search_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "pending_seq": pending.seq,
+                    "reason": "stale",
+                    "provider": result.provider.as_str(),
+                }),
+            );
+            return;
+        }
+        self.ai_search_pending = None;
+
+        match result.outcome {
+            Ok(outcome) => {
+                let known_keys: HashSet<AgentKey> =
+                    self.sessions.iter().map(AgentKey::new).collect();
+                let mut seen = HashSet::new();
+                let hits: Vec<AiSearchHit> = outcome
+                    .hits
+                    .into_iter()
+                    .filter(|hit| known_keys.contains(&hit.key))
+                    .filter(|hit| seen.insert(hit.key.clone()))
+                    .collect();
+                self.text_filter.clear();
+                self.text_filter_matches.clear();
+                self.ai_search_results = Some(AiSearchResults {
+                    query: result.query.clone(),
+                    hits,
+                });
+                self.input_mode = InputMode::Normal;
+                self.focus = FocusPane::Sessions;
+                self.select_first();
+                let visible = self.visible().len();
+                self.status = format!(
+                    "AI search \"{}\": {} sessions (usable {}, reused {}, wrote {})",
+                    truncate_width(&result.query, 24),
+                    visible,
+                    outcome.indexed,
+                    outcome.reused,
+                    outcome.written
+                );
+                debug_log(
+                    "ai_search_result_ok",
+                    serde_json::json!({
+                        "seq": result.seq,
+                        "provider": result.provider.as_str(),
+                        "query_len": result.query.chars().count(),
+                        "visible": visible,
+                        "indexed": outcome.indexed,
+                        "reused": outcome.reused,
+                        "written": outcome.written,
+                        "elapsed_ms": result.elapsed_ms,
+                    }),
+                );
+            }
+            Err(error) => {
+                if ai_search_error_is_cancelled(&error) {
+                    self.status = if error == AI_SEARCH_CANCELLED_ERROR {
+                        "AI search cancelled.".into()
+                    } else {
+                        let detail = error.strip_prefix("cancelled. ").unwrap_or(error.as_str());
+                        format!("AI search cancelled: {}", truncate_width(detail, 100))
+                    };
+                    debug_log(
+                        "ai_search_result_cancelled",
+                        serde_json::json!({
+                            "seq": result.seq,
+                            "provider": result.provider.as_str(),
+                            "query_len": result.query.chars().count(),
+                            "elapsed_ms": result.elapsed_ms,
+                        }),
+                    );
+                } else {
+                    self.status = format!("AI search failed: {}", truncate_width(&error, 100));
+                    debug_log(
+                        "ai_search_result_failed",
+                        serde_json::json!({
+                            "seq": result.seq,
+                            "provider": result.provider.as_str(),
+                            "query_len": result.query.chars().count(),
+                            "error": error,
+                            "elapsed_ms": result.elapsed_ms,
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
     fn next_data_task_seq(&mut self) -> u64 {
         self.data_task_seq = self.data_task_seq.saturating_add(1);
         self.data_task_seq
@@ -6475,8 +7459,39 @@ impl App {
         Some(parts.join("  "))
     }
 
+    fn ai_title_status(&self) -> Option<String> {
+        let pending = self.ai_title_pending.as_ref()?;
+        let elapsed = pending.started_at.elapsed();
+        Some(format!(
+            "{} AI title with {} for {} ({}s)",
+            startup_spinner_frame(elapsed),
+            pending.provider.as_str(),
+            truncate_width(&pending.key.session_id, 14),
+            elapsed.as_secs()
+        ))
+    }
+
+    fn ai_search_status(&self) -> Option<String> {
+        let pending = self.ai_search_pending.as_ref()?;
+        let elapsed = pending.started_at.elapsed();
+        let progress = ai_search_progress_summary(pending)
+            .map(|summary| format!("  {}", summary))
+            .unwrap_or_default();
+        Some(format!(
+            "{} AI search {} with {} for \"{}\"{} ({}s)",
+            startup_spinner_frame(elapsed),
+            pending.phase.label(),
+            pending.provider.as_str(),
+            truncate_width(&pending.query, 24),
+            progress,
+            elapsed.as_secs()
+        ))
+    }
+
     fn display_status(&self) -> String {
         self.data_task_status()
+            .or_else(|| self.ai_search_status())
+            .or_else(|| self.ai_title_status())
             .unwrap_or_else(|| self.status.clone())
     }
 
@@ -10797,6 +11812,1599 @@ fn run_restore_worker(
     }
 }
 
+fn generate_ai_title_worker(
+    seq: u64,
+    source: SessionInfo,
+    provider: Provider,
+    agent_programs: AgentProgramSettings,
+) -> AiTitleWorkerResult {
+    let started = Instant::now();
+    let outcome = generate_ai_title_for_session(&source, provider, &agent_programs, seq);
+    AiTitleWorkerResult {
+        seq,
+        source,
+        provider,
+        outcome,
+        elapsed_ms: started.elapsed().as_millis(),
+        queued_at_epoch_ms: current_epoch_ms(),
+    }
+}
+
+fn generate_ai_title_for_session(
+    source: &SessionInfo,
+    provider: Provider,
+    agent_programs: &AgentProgramSettings,
+    seq: u64,
+) -> std::result::Result<String, String> {
+    let session = session::load(source).map_err(|e| format!("load session failed: {}", e))?;
+    let transcript = ai_title_transcript_for_prompt(&session);
+    if transcript.text.trim().is_empty() {
+        return Err("session transcript is empty".to_string());
+    }
+    let prompt = build_ai_title_prompt(source, &transcript, provider);
+    let raw = run_ai_title_agent(source, provider, agent_programs, seq, &prompt)?;
+    extract_ai_title_response(&raw)
+        .ok_or_else(|| "AI title agent returned an empty title".to_string())
+}
+
+fn generate_ai_search_worker(
+    seq: u64,
+    query: String,
+    sessions: Vec<SessionInfo>,
+    provider: Provider,
+    agent_programs: AgentProgramSettings,
+    progress_tx: Option<Sender<MainEvent>>,
+    cancel: Arc<AtomicBool>,
+) -> AiSearchWorkerResult {
+    let started = Instant::now();
+    let outcome = generate_ai_search_for_sessions(
+        &query,
+        &sessions,
+        provider,
+        &agent_programs,
+        seq,
+        progress_tx.as_ref(),
+        &cancel,
+    );
+    AiSearchWorkerResult {
+        seq,
+        query,
+        provider,
+        outcome,
+        elapsed_ms: started.elapsed().as_millis(),
+        queued_at_epoch_ms: current_epoch_ms(),
+    }
+}
+
+fn generate_ai_search_for_sessions(
+    query: &str,
+    sessions: &[SessionInfo],
+    provider: Provider,
+    agent_programs: &AgentProgramSettings,
+    seq: u64,
+    progress_tx: Option<&Sender<MainEvent>>,
+    cancel: &AtomicBool,
+) -> std::result::Result<AiSearchOutcome, String> {
+    let progress = AiSearchProgressReporter {
+        tx: progress_tx,
+        seq,
+        query,
+        provider,
+    };
+    progress.send(AiSearchPhase::Preparing, 0, sessions.len(), 0, 0);
+    let index = build_ai_search_index(sessions, &progress, cancel)?;
+    if index.items.is_empty() {
+        return Ok(AiSearchOutcome {
+            hits: Vec::new(),
+            indexed: 0,
+            reused: index.reused,
+            written: index.written,
+        });
+    }
+    let prompt = build_ai_search_prompt(query, &index.dir, index.items.len(), provider);
+    progress.send(
+        AiSearchPhase::AskingAgent,
+        sessions.len(),
+        sessions.len(),
+        index.reused,
+        index.written,
+    );
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AI_SEARCH_CANCELLED_ERROR.to_string());
+    }
+    let raw = run_ai_search_agent(
+        provider,
+        agent_programs,
+        seq,
+        &index.dir,
+        &prompt,
+        Some(cancel),
+    )?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AI_SEARCH_CANCELLED_ERROR.to_string());
+    }
+    let hits = validate_ai_search_hits(extract_ai_search_response(&raw)?, &index.items)?;
+    Ok(AiSearchOutcome {
+        hits,
+        indexed: index.items.len(),
+        reused: index.reused,
+        written: index.written,
+    })
+}
+
+struct AiSearchProgressReporter<'a> {
+    tx: Option<&'a Sender<MainEvent>>,
+    seq: u64,
+    query: &'a str,
+    provider: Provider,
+}
+
+impl AiSearchProgressReporter<'_> {
+    fn send(
+        &self,
+        phase: AiSearchPhase,
+        indexed: usize,
+        total: usize,
+        reused: usize,
+        written: usize,
+    ) {
+        if let Some(tx) = self.tx {
+            let _ = tx.send(MainEvent::AiSearchProgress(AiSearchProgressEvent {
+                seq: self.seq,
+                query: self.query.to_string(),
+                provider: self.provider,
+                phase,
+                indexed,
+                total,
+                reused,
+                written,
+                queued_at_epoch_ms: current_epoch_ms(),
+            }));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AiSearchIndexBuild {
+    dir: PathBuf,
+    items: Vec<AiSearchIndexItem>,
+    reused: usize,
+    written: usize,
+}
+
+#[derive(Debug)]
+struct AiSearchIndexItem {
+    info: SessionInfo,
+}
+
+fn build_ai_search_index(
+    sessions: &[SessionInfo],
+    progress: &AiSearchProgressReporter<'_>,
+    cancel: &AtomicBool,
+) -> std::result::Result<AiSearchIndexBuild, String> {
+    let dir = ai_search_data_dir()?;
+    ensure_ai_search_data_dir(&dir)?;
+    let stale_removed =
+        cleanup_orphan_ai_search_preview_files(&dir, sessions).unwrap_or_else(|e| {
+            debug_log(
+                "ai_search_orphan_cleanup_failed",
+                serde_json::json!({
+                    "dir": dir.display().to_string(),
+                    "error": e.to_string(),
+                }),
+            );
+            0
+        });
+    if stale_removed > 0 {
+        debug_log(
+            "ai_search_orphan_cleanup",
+            serde_json::json!({
+                "dir": dir.display().to_string(),
+                "removed": stale_removed,
+            }),
+        );
+    }
+    let mut items = Vec::with_capacity(sessions.len());
+    let mut reused = 0usize;
+    let mut written = 0usize;
+    let mut processed = 0usize;
+    progress.send(AiSearchPhase::Indexing, 0, sessions.len(), reused, written);
+    for info in sessions {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(AI_SEARCH_CANCELLED_ERROR.to_string());
+        }
+        let path = ai_search_preview_path(&dir, info);
+        let _ = cleanup_stale_ai_search_preview_files(&dir, info, &path);
+        let (text, was_reused) = load_or_render_ai_search_preview(&path, info)?;
+        if was_reused {
+            reused += 1;
+        } else {
+            written += 1;
+        }
+        processed += 1;
+        if ai_search_preview_load_status_ok(&text) {
+            items.push(AiSearchIndexItem { info: info.clone() });
+        }
+        progress.send(
+            AiSearchPhase::Indexing,
+            processed,
+            sessions.len(),
+            reused,
+            written,
+        );
+    }
+    Ok(AiSearchIndexBuild {
+        dir,
+        items,
+        reused,
+        written,
+    })
+}
+
+fn load_or_render_ai_search_preview(
+    path: &Path,
+    info: &SessionInfo,
+) -> std::result::Result<(String, bool), String> {
+    ensure_ai_search_preview_path_is_regular_file(path)?;
+    match fs::read_to_string(path) {
+        Ok(text) if ai_search_preview_is_current(&text, info) => Ok((text, true)),
+        Ok(_) | Err(_) => {
+            let text = render_ai_search_preview(info);
+            fs::write(path, &text).map_err(|write_error| {
+                format!(
+                    "write AI search preview {} failed: {}",
+                    path.display(),
+                    write_error
+                )
+            })?;
+            Ok((text, false))
+        }
+    }
+}
+
+fn ensure_ai_search_preview_path_is_regular_file(
+    path: &Path,
+) -> std::result::Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "AI search preview path is not a regular file: {}",
+            path.display()
+        )),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "inspect AI search preview {} failed: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
+fn ensure_ai_search_data_dir(dir: &Path) -> std::result::Result<(), String> {
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(format!(
+            "AI searchdata path is not a directory: {}",
+            dir.display()
+        )),
+        Err(e) if e.kind() == ErrorKind::NotFound => fs::create_dir_all(dir)
+            .map_err(|e| format!("create AI searchdata dir {} failed: {}", dir.display(), e)),
+        Err(e) => Err(format!(
+            "inspect AI searchdata dir {} failed: {}",
+            dir.display(),
+            e
+        )),
+    }
+}
+
+fn remove_regular_ai_search_preview_file(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_file() {
+        fs::remove_file(path)
+    } else {
+        Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "AI search preview path is not a regular file: {}",
+                path.display()
+            ),
+        ))
+    }
+}
+
+fn ai_search_preview_is_current(text: &str, info: &SessionInfo) -> bool {
+    let expected_key = ai_search_preview_cache_key(info);
+    let mut has_version = false;
+    let mut has_key = false;
+    for line in text.lines().take(16) {
+        if line == format!("cache_version: {}", AI_SEARCH_PREVIEW_FORMAT_VERSION) {
+            has_version = true;
+        } else if line == format!("cache_key: {}", expected_key) {
+            has_key = true;
+        }
+    }
+    has_version && has_key && ai_search_preview_load_status_ok(text)
+}
+
+fn ai_search_preview_load_status_ok(text: &str) -> bool {
+    text.lines()
+        .take(16)
+        .any(|line| line == "load_status: ok")
+}
+
+fn ai_search_preview_cache_key(info: &SessionInfo) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        AI_SEARCH_PREVIEW_FORMAT_VERSION,
+        info.provider.as_str(),
+        &info.session_id,
+        &info.updated_at_epoch_s.to_string(),
+        &info.cwd,
+        info.title.as_deref().unwrap_or(""),
+        &info.source.display().to_string(),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(12)
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
+fn ai_search_data_dir() -> std::result::Result<PathBuf, String> {
+    app_config_dir()
+        .map(|dir| dir.join(AI_SEARCH_DATA_DIR_NAME))
+        .ok_or_else(|| "cannot resolve home directory for AI searchdata".to_string())
+}
+
+fn ai_search_preview_path(dir: &Path, info: &SessionInfo) -> PathBuf {
+    dir.join(ai_search_preview_filename(info))
+}
+
+fn ai_search_preview_filename(info: &SessionInfo) -> String {
+    let display_name = info
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&info.session_id);
+    format!(
+        "{}__{}__{}__{}.preview.md",
+        info.provider.as_str(),
+        ai_search_epoch_label(info.updated_at_epoch_s),
+        ai_search_session_hash(&info.session_id),
+        sanitize_filename_component(display_name, 56)
+    )
+}
+
+fn ai_search_epoch_label(epoch_s: u64) -> String {
+    let secs = i64::try_from(epoch_s).unwrap_or(i64::MAX);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|dt| dt.format("%Y%m%dT%H%M%SZ").to_string())
+        .unwrap_or_else(|| format!("epoch{}", epoch_s))
+}
+
+fn ai_search_session_hash(session_id: &str) -> String {
+    let digest = Sha256::digest(session_id.as_bytes());
+    digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
+fn sanitize_filename_component(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        "session".to_string()
+    } else {
+        out
+    }
+}
+
+fn cleanup_stale_ai_search_preview_files(
+    dir: &Path,
+    info: &SessionInfo,
+    current_path: &Path,
+) -> io::Result<()> {
+    let current_provider = info.provider.as_str();
+    let current_hash = ai_search_session_hash(&info.session_id);
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == current_path {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((provider, hash)) = ai_search_preview_identity_from_filename(name) else {
+            continue;
+        };
+        if provider == current_provider && hash == current_hash {
+            let _ = remove_regular_ai_search_preview_file(&path);
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_orphan_ai_search_preview_files(
+    dir: &Path,
+    sessions: &[SessionInfo],
+) -> io::Result<usize> {
+    let valid: HashSet<(String, String)> = sessions
+        .iter()
+        .map(|info| {
+            (
+                info.provider.as_str().to_string(),
+                ai_search_session_hash(&info.session_id),
+            )
+        })
+        .collect();
+    let mut removed = 0usize;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((provider, hash)) = ai_search_preview_identity_from_filename(name) else {
+            continue;
+        };
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        if !valid.contains(&(provider.to_string(), hash.to_string())) {
+            remove_regular_ai_search_preview_file(&path)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn ai_search_preview_identity_from_filename(name: &str) -> Option<(&str, &str)> {
+    if !name.ends_with(".preview.md") {
+        return None;
+    }
+    let mut parts = name.splitn(4, "__");
+    let provider = parts.next()?;
+    let _updated = parts.next()?;
+    let hash = parts.next()?;
+    let _display = parts.next()?;
+    if Provider::parse(provider).is_none() || hash.is_empty() {
+        return None;
+    }
+    Some((provider, hash))
+}
+
+fn render_ai_search_preview(info: &SessionInfo) -> String {
+    let (load_status, preview) = match session::load(info) {
+        Ok(session) => ("ok", session::render::render(&session, Mode::Summary)),
+        Err(e) => ("error", format!("error loading session: {}", e)),
+    };
+    format!(
+        "# cokacmux session preview\n\ncache_version: {}\ncache_key: {}\nload_status: {}\nprovider: {}\nsession_id: {}\nupdated_at_epoch_s: {}\ncwd: {}\ntitle: {}\nsource: {}\n\n---\n\n{}",
+        AI_SEARCH_PREVIEW_FORMAT_VERSION,
+        ai_search_preview_cache_key(info),
+        load_status,
+        info.provider.as_str(),
+        sanitize_for_single_line(&info.session_id),
+        info.updated_at_epoch_s,
+        sanitize_for_single_line(&info.cwd),
+        sanitize_for_single_line(info.title.as_deref().unwrap_or("")),
+        sanitize_for_single_line(&info.source.display().to_string()),
+        preview
+    )
+}
+
+fn build_ai_search_prompt(
+    query: &str,
+    search_dir: &Path,
+    indexed_sessions: usize,
+    provider: Provider,
+) -> String {
+    let query_json = serde_json::to_string(query).unwrap_or_else(|_| "\"\"".to_string());
+    let output_requirement = match provider {
+        Provider::Codex | Provider::Claude => "Return a JSON object matching the provided schema.",
+        Provider::OpenCode => {
+            "Return only a valid JSON object with one `results` array. No markdown, no explanation."
+        }
+    };
+    format!(
+        "You search cokacmux coding-agent session previews.\n\
+         Search only this preview directory: {}\n\
+         Search query JSON string: {}\n\n\
+         Requirements:\n\
+         - {}\n\
+         - Autonomously inspect the search directory using read-only operations.\n\
+         - Use only files ending in `.preview.md` as the evidence source.\n\
+         - Ignore preview files whose `load_status` is not `ok`.\n\
+         - Each preview file contains provider, session_id, updated_at_epoch_s, cwd, title, source, and the rendered session summary.\n\
+         - Each result must identify a session by exact provider and session_id from the preview metadata.\n\
+         - Rank the most relevant sessions first.\n\
+         - Use score from 0.0 to 1.0.\n\
+         - `reason` must be a short match label, not an explanation.\n\
+         - Do not put evidence, extra detail, clauses, or a full sentence in `reason`.\n\
+         - Write the short `reason` label in the query user's language when possible.\n\
+         - Return an empty results array if no session is relevant.\n\n\
+         Indexed sessions: {}\n",
+        search_dir.display(),
+        query_json,
+        output_requirement,
+        indexed_sessions,
+    )
+}
+
+fn run_ai_search_agent(
+    provider: Provider,
+    agent_programs: &AgentProgramSettings,
+    seq: u64,
+    search_dir: &Path,
+    prompt: &str,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    let configured_program = agent_programs.program_for(provider);
+    let program =
+        resolve_agent_program_for_provider(provider, agent_programs).ok_or_else(|| {
+            format!(
+                "{} CLI not found for AI search: {}",
+                provider.as_str(),
+                configured_program
+            )
+        })?;
+    debug_log(
+        "ai_search_agent_start",
+        serde_json::json!({
+            "seq": seq,
+            "provider": provider.as_str(),
+            "program": program.display().to_string(),
+            "cwd": search_dir.display().to_string(),
+            "prompt_len": prompt.len(),
+        }),
+    );
+    match provider {
+        Provider::Codex => run_codex_ai_search(&program, search_dir, seq, prompt, cancel),
+        Provider::Claude => run_claude_ai_search(&program, search_dir, prompt, cancel),
+        Provider::OpenCode => run_opencode_ai_search(&program, search_dir, prompt, cancel),
+    }
+}
+
+fn run_codex_ai_search(
+    program: &Path,
+    cwd: &Path,
+    seq: u64,
+    prompt: &str,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    let out_path = ai_title_temp_path("search-codex-last-message", seq);
+    let schema_path = ai_title_temp_path("search-codex-output-schema", seq);
+    let _ = fs::remove_file(&out_path);
+    let _ = fs::remove_file(&schema_path);
+    fs::write(&schema_path, AI_SEARCH_OUTPUT_SCHEMA)
+        .map_err(|e| format!("write codex search output schema failed: {}", e))?;
+    let mut command = Command::new(program);
+    command
+        .args([
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--color",
+            "never",
+            "--output-schema",
+        ])
+        .arg(&schema_path)
+        .args(["--output-last-message"])
+        .arg(&out_path)
+        .arg("-");
+    configure_ai_title_command(&mut command, program, cwd);
+    let output = run_prompt_command_with_cancel(
+        command,
+        prompt,
+        Duration::from_secs(AI_SEARCH_TIMEOUT_SECS),
+        cancel,
+    );
+    let last_message = fs::read_to_string(&out_path).ok();
+    let _ = fs::remove_file(&out_path);
+    let _ = fs::remove_file(&schema_path);
+    let output = output?;
+    if output.cancelled || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err(AI_SEARCH_CANCELLED_ERROR.to_string());
+    }
+    if output.timed_out {
+        return Err(format!(
+            "codex timed out after {}s",
+            output.duration.as_secs()
+        ));
+    }
+    if !output.status_success() {
+        return Err(ai_title_process_error("codex", &output));
+    }
+    match last_message {
+        Some(message) if !message.trim().is_empty() => Ok(message),
+        _ => Err(format!(
+            "codex produced no last-message output. {}",
+            ai_title_process_error("codex", &output)
+        )),
+    }
+}
+
+fn run_claude_ai_search(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    let mut command = Command::new(program);
+    command.args([
+        "-p",
+        "--no-session-persistence",
+        "--tools",
+        "Read,Grep,Glob,LS",
+        "--allowedTools",
+        "Read,Grep,Glob,LS",
+        "--add-dir",
+    ]);
+    command.arg(cwd);
+    command.args([
+        "--permission-mode",
+        "dontAsk",
+        "--output-format",
+        "json",
+        "--json-schema",
+        AI_SEARCH_OUTPUT_SCHEMA,
+    ]);
+    configure_ai_title_command(&mut command, program, cwd);
+    command
+        .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "8192")
+        .env_remove("CLAUDECODE");
+    let output = run_prompt_command_with_cancel(
+        command,
+        prompt,
+        Duration::from_secs(AI_SEARCH_TIMEOUT_SECS),
+        cancel,
+    )?;
+    if output.cancelled || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err(AI_SEARCH_CANCELLED_ERROR.to_string());
+    }
+    if output.timed_out {
+        return Err(format!(
+            "claude timed out after {}s",
+            output.duration.as_secs()
+        ));
+    }
+    if !output.status_success() {
+        return Err(ai_title_process_error("claude", &output));
+    }
+    if output.stdout.trim().is_empty() {
+        return Err(format!(
+            "claude produced empty output. {}",
+            ai_title_process_error("claude", &output)
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn run_opencode_ai_search(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    let mut command = Command::new(program);
+    command.args(["run", "--pure", "--format", "json"]);
+    configure_ai_title_command(&mut command, program, cwd);
+    command.env("OPENCODE_PERMISSION", OPENCODE_AI_SEARCH_PERMISSION);
+    let output = run_prompt_command_with_cancel(
+        command,
+        prompt,
+        Duration::from_secs(AI_SEARCH_TIMEOUT_SECS),
+        cancel,
+    )?;
+    let cleanup_result = cleanup_opencode_ai_title_sessions(program, cwd, &output.stdout);
+    if output.cancelled || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err(ai_title_error_with_cleanup(
+            AI_SEARCH_CANCELLED_ERROR.to_string(),
+            cleanup_result,
+        ));
+    }
+    if output.timed_out {
+        let error = format!("opencode timed out after {}s", output.duration.as_secs());
+        return Err(ai_title_error_with_cleanup(error, cleanup_result));
+    }
+    if !output.status_success() {
+        return Err(ai_title_error_with_cleanup(
+            ai_title_process_error("opencode", &output),
+            cleanup_result,
+        ));
+    }
+    if output.stdout.trim().is_empty() {
+        let error = format!(
+            "opencode produced empty output. {}",
+            ai_title_process_error("opencode", &output)
+        );
+        return Err(ai_title_error_with_cleanup(error, cleanup_result));
+    }
+    let payload = match opencode_ai_title_payload_from_events(&output.stdout) {
+        Ok(payload) => payload,
+        Err(e) => {
+            let error = format!(
+                "opencode JSON output parse failed: {}. {}",
+                e,
+                ai_title_process_error("opencode", &output)
+            );
+            return Err(ai_title_error_with_cleanup(error, cleanup_result));
+        }
+    };
+    cleanup_result?;
+    Ok(payload)
+}
+
+fn extract_ai_search_response(raw: &str) -> std::result::Result<Vec<AiSearchHit>, String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).map_err(|e| {
+        format!(
+            "AI search returned invalid JSON: {}; raw: {}",
+            e,
+            truncate_width(raw, 500)
+        )
+    })?;
+    parse_ai_search_value(&value)
+}
+
+fn validate_ai_search_hits(
+    hits: Vec<AiSearchHit>,
+    items: &[AiSearchIndexItem],
+) -> std::result::Result<Vec<AiSearchHit>, String> {
+    let known_keys: HashSet<AgentKey> =
+        items.iter().map(|item| AgentKey::new(&item.info)).collect();
+    let mut seen = HashSet::new();
+    let mut valid = Vec::new();
+    for hit in hits {
+        if !known_keys.contains(&hit.key) {
+            return Err(format!(
+                "AI search result references unknown session: {}:{}",
+                hit.key.provider.as_str(),
+                hit.key.session_id
+            ));
+        }
+        if seen.insert(hit.key.clone()) {
+            valid.push(hit);
+        }
+    }
+    Ok(valid)
+}
+
+fn ai_search_error_is_cancelled(error: &str) -> bool {
+    error == AI_SEARCH_CANCELLED_ERROR
+        || error.starts_with(&format!("{}.", AI_SEARCH_CANCELLED_ERROR))
+}
+
+fn parse_ai_search_value(
+    value: &serde_json::Value,
+) -> std::result::Result<Vec<AiSearchHit>, String> {
+    let results = ai_search_results_array(value)
+        .ok_or_else(|| "AI search response missing results array".to_string())?;
+    let mut hits = Vec::new();
+    for item in results {
+        let provider = item
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .and_then(Provider::parse)
+            .ok_or_else(|| "AI search result has invalid provider".to_string())?;
+        let session_id = item
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+            .ok_or_else(|| "AI search result missing session_id".to_string())?
+            .to_string();
+        let score = item
+            .get("score")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|score| score.is_finite() && (0.0..=1.0).contains(score))
+            .ok_or_else(|| "AI search result has invalid score".to_string())?;
+        let reason = item
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .ok_or_else(|| "AI search result missing reason".to_string())?;
+        if reason.contains('\n') || reason.contains('\r') {
+            return Err("AI search result reason must be single-line".to_string());
+        }
+        let reason = sanitize_for_single_line(reason);
+        hits.push(AiSearchHit {
+            key: AgentKey {
+                provider,
+                session_id,
+            },
+            score,
+            reason,
+        });
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.key.provider.as_str().cmp(b.key.provider.as_str()))
+            .then_with(|| a.key.session_id.cmp(&b.key.session_id))
+    });
+    Ok(hits)
+}
+
+fn ai_search_results_array(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    value
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| {
+            value
+                .get("structured_output")
+                .and_then(|structured| structured.get("results"))
+                .and_then(serde_json::Value::as_array)
+        })
+}
+
+struct AiTitleTranscript {
+    text: String,
+    mode: &'static str,
+    full_chars: usize,
+}
+
+fn ai_title_transcript_for_prompt(session: &UniversalSession) -> AiTitleTranscript {
+    let full = session::render::render(session, Mode::Full);
+    let full_chars = full.chars().count();
+    if full_chars <= AI_TITLE_FULL_TRANSCRIPT_MAX_CHARS {
+        return AiTitleTranscript {
+            text: full,
+            mode: "full",
+            full_chars,
+        };
+    }
+
+    let summary = session::render::render(session, Mode::Summary);
+    let summary = limit_ai_title_transcript(summary, AI_TITLE_PROMPT_TRANSCRIPT_MAX_CHARS);
+    AiTitleTranscript {
+        text: format!(
+            "[Large session note: full transcript was {} characters; this title prompt uses the full-session summary renderer, which preserves all visible messages while capping oversized blocks.]\n\n{}",
+            full_chars, summary
+        ),
+        mode: "summary",
+        full_chars,
+    }
+}
+
+fn limit_ai_title_transcript(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let notice = "\n\n[... middle omitted because the rendered summary exceeded the AI title prompt budget ...]\n\n";
+    let notice_chars = notice.chars().count();
+    if max_chars <= notice_chars.saturating_add(2) {
+        return text.chars().take(max_chars).collect();
+    }
+    let available = max_chars - notice_chars;
+    let head_chars = available / 2;
+    let tail_chars = available - head_chars;
+    let head: String = text.chars().take(head_chars).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{}{}{}", head, notice, tail)
+}
+
+fn build_ai_title_prompt(
+    source: &SessionInfo,
+    transcript: &AiTitleTranscript,
+    provider: Provider,
+) -> String {
+    let output_requirement = match provider {
+        Provider::Codex | Provider::Claude => {
+            "- Return a JSON object that matches the provided output schema, with the title in the `title` field.\n"
+        }
+        Provider::OpenCode => {
+            "- Return only a valid JSON object with exactly one string field named `title`. No markdown, no prefix, no explanation.\n"
+        }
+    };
+    format!(
+        "You generate titles for coding-agent sessions.\n\
+         Read the entire session transcript below and produce one concise title sentence for it.\n\n\
+         Requirements:\n\
+         {}\
+         - Use the main language of the session. If the user mostly wrote Korean, write Korean.\n\
+         - Summarize the concrete work or question, not the tool name or session id.\n\
+         - Keep it short enough for a session list title, ideally under 80 characters.\n\n\
+         Session metadata:\n\
+         provider: {}\n\
+         session_id: {}\n\
+         cwd: {}\n\n\
+         transcript_mode: {}\n\
+         full_transcript_chars: {}\n\n\
+         === SESSION TRANSCRIPT ===\n{}\n=== END SESSION TRANSCRIPT ===",
+        output_requirement,
+        source.provider.as_str(),
+        source.session_id,
+        source.cwd,
+        transcript.mode,
+        transcript.full_chars,
+        transcript.text
+    )
+}
+
+fn run_ai_title_agent(
+    source: &SessionInfo,
+    provider: Provider,
+    agent_programs: &AgentProgramSettings,
+    seq: u64,
+    prompt: &str,
+) -> std::result::Result<String, String> {
+    let configured_program = agent_programs.program_for(provider);
+    let program =
+        resolve_agent_program_for_provider(provider, agent_programs).ok_or_else(|| {
+            format!(
+                "{} CLI not found for AI title generation: {}",
+                provider.as_str(),
+                configured_program
+            )
+        })?;
+    let cwd = ai_title_working_dir(source);
+    debug_log(
+        "ai_title_agent_start",
+        serde_json::json!({
+            "seq": seq,
+            "provider": provider.as_str(),
+            "program": program.display().to_string(),
+            "cwd": cwd.display().to_string(),
+            "prompt_len": prompt.len(),
+        }),
+    );
+    match provider {
+        Provider::Codex => run_codex_ai_title(&program, &cwd, seq, prompt),
+        Provider::Claude => run_claude_ai_title(&program, &cwd, prompt),
+        Provider::OpenCode => run_opencode_ai_title(&program, &cwd, prompt),
+    }
+}
+
+fn run_codex_ai_title(
+    program: &Path,
+    cwd: &Path,
+    seq: u64,
+    prompt: &str,
+) -> std::result::Result<String, String> {
+    let out_path = ai_title_temp_path("codex-last-message", seq);
+    let schema_path = ai_title_temp_path("codex-output-schema", seq);
+    let _ = fs::remove_file(&out_path);
+    let _ = fs::remove_file(&schema_path);
+    fs::write(&schema_path, AI_TITLE_OUTPUT_SCHEMA)
+        .map_err(|e| format!("write codex output schema failed: {}", e))?;
+    let mut command = Command::new(program);
+    command
+        .args([
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--color",
+            "never",
+            "--output-schema",
+        ])
+        .arg(&schema_path)
+        .args(["--output-last-message"])
+        .arg(&out_path)
+        .arg("-");
+    configure_ai_title_command(&mut command, program, cwd);
+    let output = run_prompt_command(command, prompt, Duration::from_secs(AI_TITLE_TIMEOUT_SECS));
+    let last_message = fs::read_to_string(&out_path).ok();
+    let _ = fs::remove_file(&out_path);
+    let _ = fs::remove_file(&schema_path);
+    let output = output?;
+    if output.timed_out {
+        return Err(format!(
+            "codex timed out after {}s",
+            output.duration.as_secs()
+        ));
+    }
+    if !output.status_success() {
+        return Err(ai_title_process_error("codex", &output));
+    }
+    match last_message {
+        Some(message) if !message.trim().is_empty() => Ok(message),
+        _ => Err(format!(
+            "codex produced no last-message output. {}",
+            ai_title_process_error("codex", &output)
+        )),
+    }
+}
+
+fn run_claude_ai_title(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+) -> std::result::Result<String, String> {
+    let mut command = Command::new(program);
+    command.args([
+        "-p",
+        "--no-session-persistence",
+        "--max-turns",
+        "1",
+        "--tools",
+        "",
+        "--output-format",
+        "json",
+        "--json-schema",
+        AI_TITLE_OUTPUT_SCHEMA,
+    ]);
+    configure_ai_title_command(&mut command, program, cwd);
+    command
+        .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "4096")
+        .env_remove("CLAUDECODE");
+    let output = run_prompt_command(command, prompt, Duration::from_secs(AI_TITLE_TIMEOUT_SECS))?;
+    if output.timed_out {
+        return Err(format!(
+            "claude timed out after {}s",
+            output.duration.as_secs()
+        ));
+    }
+    if !output.status_success() {
+        return Err(ai_title_process_error("claude", &output));
+    }
+    if output.stdout.trim().is_empty() {
+        return Err(format!(
+            "claude produced empty output. {}",
+            ai_title_process_error("claude", &output)
+        ));
+    }
+    if let Some(error) = claude_structured_output_error(&output.stdout) {
+        return Err(error);
+    }
+    Ok(output.stdout)
+}
+
+fn run_opencode_ai_title(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+) -> std::result::Result<String, String> {
+    let mut command = Command::new(program);
+    command.args(["run", "--agent", "plan", "--format", "json"]);
+    configure_ai_title_command(&mut command, program, cwd);
+    command.env(
+        "OPENCODE_PERMISSION",
+        r#"{"*":"deny","question":"deny","plan_exit":"deny"}"#,
+    );
+    let output = run_prompt_command(command, prompt, Duration::from_secs(AI_TITLE_TIMEOUT_SECS))?;
+    let cleanup_result = cleanup_opencode_ai_title_sessions(program, cwd, &output.stdout);
+    if output.timed_out {
+        let error = format!("opencode timed out after {}s", output.duration.as_secs());
+        return Err(ai_title_error_with_cleanup(error, cleanup_result));
+    }
+    if !output.status_success() {
+        return Err(ai_title_error_with_cleanup(
+            ai_title_process_error("opencode", &output),
+            cleanup_result,
+        ));
+    }
+    if output.stdout.trim().is_empty() {
+        let error = format!(
+            "opencode produced empty output. {}",
+            ai_title_process_error("opencode", &output)
+        );
+        return Err(ai_title_error_with_cleanup(error, cleanup_result));
+    }
+    let payload = match opencode_ai_title_payload_from_events(&output.stdout) {
+        Ok(payload) => payload,
+        Err(e) => {
+            let error = format!(
+                "opencode JSON output parse failed: {}. {}",
+                e,
+                ai_title_process_error("opencode", &output)
+            );
+            return Err(ai_title_error_with_cleanup(error, cleanup_result));
+        }
+    };
+    cleanup_result?;
+    Ok(payload)
+}
+
+fn configure_ai_title_command(command: &mut Command, program: &Path, cwd: &Path) {
+    command.current_dir(cwd);
+    if let Some(path) = path_with_program_parent(program) {
+        command.env("PATH", path);
+    }
+}
+
+fn ai_title_working_dir(source: &SessionInfo) -> PathBuf {
+    let trimmed = source.cwd.trim();
+    if !trimmed.is_empty() {
+        let path = PathBuf::from(trimmed);
+        if path.is_dir() {
+            return path;
+        }
+    }
+    std::env::current_dir()
+        .ok()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn ai_title_temp_path(label: &str, seq: u64) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "cokacmux-ai-title-{}-{}-{}.txt",
+        label,
+        std::process::id(),
+        seq.saturating_add(nanos as u64)
+    ))
+}
+
+fn path_with_program_parent(program: &Path) -> Option<std::ffi::OsString> {
+    let parent = program.parent()?.to_path_buf();
+    let mut paths = vec![parent];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).ok()
+}
+
+struct AiTitleCommandOutput {
+    status: Option<ExitStatus>,
+    stdout: String,
+    stderr: String,
+    cancelled: bool,
+    timed_out: bool,
+    duration: Duration,
+}
+
+impl AiTitleCommandOutput {
+    fn status_success(&self) -> bool {
+        self.status.is_some_and(|status| status.success())
+    }
+}
+
+fn run_prompt_command(
+    command: Command,
+    prompt: &str,
+    timeout: Duration,
+) -> std::result::Result<AiTitleCommandOutput, String> {
+    run_prompt_command_with_cancel(command, prompt, timeout, None)
+}
+
+fn run_prompt_command_with_cancel(
+    mut command: Command,
+    prompt: &str,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<AiTitleCommandOutput, String> {
+    let started = Instant::now();
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Ok(AiTitleCommandOutput {
+            status: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            cancelled: true,
+            timed_out: false,
+            duration: started.elapsed(),
+        });
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {}", e))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout pipe unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr pipe unavailable".to_string())?;
+    let stdout_reader = spawn_pipe_reader(stdout);
+    let stderr_reader = spawn_pipe_reader(stderr);
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(prompt.as_bytes()) {
+            if e.kind() != ErrorKind::BrokenPipe {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_pipe_reader(stdout_reader, "stdout");
+                let _ = join_pipe_reader(stderr_reader, "stderr");
+                return Err(format!("stdin write failed: {}", e));
+            }
+        }
+    }
+
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) => {
+                cancelled = true;
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_pipe_reader(stdout_reader, "stdout");
+                let _ = join_pipe_reader(stderr_reader, "stderr");
+                return Err(format!("wait failed: {}", e));
+            }
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&join_pipe_reader(stdout_reader, "stdout")?).to_string();
+    let stderr = String::from_utf8_lossy(&join_pipe_reader(stderr_reader, "stderr")?).to_string();
+    Ok(AiTitleCommandOutput {
+        status,
+        stdout,
+        stderr,
+        cancelled,
+        timed_out,
+        duration: started.elapsed(),
+    })
+}
+
+fn spawn_pipe_reader<R>(mut reader: R) -> JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+fn join_pipe_reader(
+    handle: JoinHandle<io::Result<Vec<u8>>>,
+    label: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    handle
+        .join()
+        .map_err(|_| format!("{} reader panicked", label))?
+        .map_err(|e| format!("{} read failed: {}", label, e))
+}
+
+fn ai_title_process_error(tool: &str, output: &AiTitleCommandOutput) -> String {
+    let mut details = Vec::new();
+    if let Some(stdout) = command_output_tail("stdout", &output.stdout) {
+        details.push(stdout);
+    }
+    if let Some(stderr) = command_output_tail("stderr", &output.stderr) {
+        details.push(stderr);
+    }
+    let detail = if details.is_empty() {
+        "no output".to_string()
+    } else {
+        details.join("; ")
+    };
+    format!(
+        "{} exited {:?}: {}",
+        tool,
+        output.status.and_then(|status| status.code()),
+        truncate_width(&detail, 500)
+    )
+}
+
+fn command_output_tail(label: &str, text: &str) -> Option<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !codex_banner_line(line))
+        .map(|line| truncate_width(line, 160))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let start = lines.len().saturating_sub(8);
+    Some(format!("{}: {}", label, lines[start..].join(" | ")))
+}
+
+fn codex_banner_line(line: &str) -> bool {
+    line == "--------"
+        || line == "OpenAI Codex v0.0.0"
+        || line.starts_with("workdir: ")
+        || line.starts_with("model: ")
+        || line.starts_with("provider: ")
+        || line.starts_with("approval: ")
+        || line.starts_with("sandbox: ")
+        || line.starts_with("reasoning effort: ")
+        || line.starts_with("reasoning summaries: ")
+        || line.starts_with("session id: ")
+        || line == "user"
+        || line == "codex"
+        || line == "tokens used"
+}
+
+fn extract_ai_title_response(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => parse_structured_ai_title_value(&value),
+        Err(_) => sanitize_ai_title_response(raw),
+    }
+}
+
+fn parse_structured_ai_title_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .and_then(sanitize_ai_title_response)
+        .or_else(|| {
+            value
+                .get("structured")
+                .and_then(|structured| structured.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(sanitize_ai_title_response)
+        })
+        .or_else(|| {
+            value
+                .pointer("/info/structured/title")
+                .and_then(serde_json::Value::as_str)
+                .and_then(sanitize_ai_title_response)
+        })
+        .or_else(|| {
+            value
+                .pointer("/info/structured_output/title")
+                .and_then(serde_json::Value::as_str)
+                .and_then(sanitize_ai_title_response)
+        })
+        .or_else(|| {
+            value
+                .get("structured_output")
+                .and_then(|structured| structured.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(sanitize_ai_title_response)
+        })
+}
+
+fn claude_structured_output_error(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("result") {
+        return None;
+    }
+    let subtype = value
+        .get("subtype")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if subtype != "success" {
+        return Some(format!("claude structured output failed: {}", subtype));
+    }
+    if parse_structured_ai_title_value(&value).is_none() {
+        return Some("claude structured output missing title".to_string());
+    }
+    None
+}
+
+fn cleanup_opencode_ai_title_sessions(
+    program: &Path,
+    cwd: &Path,
+    raw_events: &str,
+) -> std::result::Result<(), String> {
+    let session_ids = opencode_ai_title_session_ids_from_events(raw_events);
+    if session_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    for session_id in session_ids {
+        let mut command = Command::new(program);
+        command.args(["session", "delete", &session_id]);
+        configure_ai_title_command(&mut command, program, cwd);
+        match run_prompt_command(command, "", Duration::from_secs(30)) {
+            Ok(output) if output.timed_out => {
+                errors.push(format!("delete {} timed out", session_id));
+            }
+            Ok(output) if output.status_success() || opencode_session_delete_not_found(&output) => {
+                debug_log(
+                    "ai_title_opencode_session_deleted",
+                    serde_json::json!({
+                        "session_id": session_id,
+                    }),
+                );
+            }
+            Ok(output) => errors.push(format!(
+                "delete {} failed: {}",
+                session_id,
+                ai_title_process_error("opencode session delete", &output)
+            )),
+            Err(e) => errors.push(format!("delete {} failed: {}", session_id, e)),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "opencode AI title session cleanup failed: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn opencode_session_delete_not_found(output: &AiTitleCommandOutput) -> bool {
+    !output.status_success()
+        && (output.stdout.contains("Session not found")
+            || output.stderr.contains("Session not found"))
+}
+
+fn ai_title_error_with_cleanup(
+    error: String,
+    cleanup_result: std::result::Result<(), String>,
+) -> String {
+    match cleanup_result {
+        Ok(()) => error,
+        Err(cleanup_error) => format!("{}. {}", error, cleanup_error),
+    }
+}
+
+fn opencode_ai_title_session_ids_from_events(raw: &str) -> Vec<String> {
+    let mut session_ids = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        for candidate in [
+            value.get("sessionID"),
+            value.pointer("/part/sessionID"),
+            value.pointer("/info/sessionID"),
+        ] {
+            let Some(session_id) = candidate.and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if session_id.starts_with("ses_")
+                && !session_ids.iter().any(|existing| existing == session_id)
+            {
+                session_ids.push(session_id.to_string());
+            }
+        }
+    }
+    session_ids
+}
+
+fn opencode_ai_title_payload_from_events(raw: &str) -> std::result::Result<String, String> {
+    let mut saw_event = false;
+    let mut final_text = String::new();
+    let mut fallback_text = String::new();
+
+    for (idx, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(trimmed)
+            .map_err(|e| format!("invalid JSON event on line {}: {}", idx + 1, e))?;
+        saw_event = true;
+        if let Some(error) = opencode_ai_title_event_error(&value) {
+            return Err(error);
+        }
+        let Some(text) = value
+            .get("part")
+            .and_then(|part| part.get("text"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        if opencode_ai_title_event_is_final_answer(&value) {
+            final_text.push_str(text);
+        }
+        fallback_text.push_str(text);
+    }
+
+    if !saw_event {
+        return Err("no JSON events".to_string());
+    }
+    let payload = if final_text.trim().is_empty() {
+        fallback_text.trim()
+    } else {
+        final_text.trim()
+    };
+    if payload.is_empty() {
+        return Err("no text payload events".to_string());
+    }
+    Ok(payload.to_string())
+}
+
+fn opencode_ai_title_event_is_final_answer(value: &serde_json::Value) -> bool {
+    value
+        .get("part")
+        .and_then(|part| part.get("metadata"))
+        .and_then(|metadata| metadata.get("openai"))
+        .and_then(|openai| openai.get("phase"))
+        .and_then(serde_json::Value::as_str)
+        == Some("final_answer")
+}
+
+fn opencode_ai_title_event_error(value: &serde_json::Value) -> Option<String> {
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+        return None;
+    }
+    value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(|message| format!("opencode event error: {}", message))
+        .or_else(|| Some("opencode emitted an error event".to_string()))
+}
+
+fn sanitize_ai_title_response(raw: &str) -> Option<String> {
+    let mut title = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| !line.starts_with("```"))?
+        .to_string();
+    title = title
+        .trim_start_matches(['-', '*'])
+        .trim_start()
+        .to_string();
+    title = strip_ai_title_prefix(&title).to_string();
+    title = title
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.chars().count() > AI_TITLE_MAX_CHARS {
+        title = title.chars().take(AI_TITLE_MAX_CHARS).collect();
+    }
+    (!title.trim().is_empty()).then_some(title)
+}
+
+fn strip_ai_title_prefix(title: &str) -> &str {
+    let trimmed = title.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in ["title:", "title -", "title --"] {
+        if lower.starts_with(prefix) {
+            return trimmed[prefix.len()..].trim();
+        }
+    }
+    for prefix in ["제목:", "제목 -", "타이틀:", "타이틀 -"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.trim();
+        }
+    }
+    trimmed
+}
+
 fn session_info_from_clone_report(
     source: &SessionInfo,
     report: &session::clone::CloneReport,
@@ -11608,9 +14216,12 @@ fn main_event_kind(event: &MainEvent) -> &'static str {
         MainEvent::LiveShellDiscoveryResult(_) => "live_shell_discovery_result",
         MainEvent::SessionRefreshResult(_) => "session_refresh_result",
         MainEvent::SearchResult(_) => "search_result",
+        MainEvent::AiSearchProgress(_) => "ai_search_progress",
+        MainEvent::AiSearchResult(_) => "ai_search_result",
         MainEvent::DataTaskProgress(_) => "data_task_progress",
         MainEvent::CloneResult(_) => "clone_result",
         MainEvent::RestoreResult(_) => "restore_result",
+        MainEvent::AiTitleResult(_) => "ai_title_result",
         MainEvent::AttachResult(_) => "attach_result",
         MainEvent::KeybindingsReloaded(_) => "keybindings_reloaded",
     }
@@ -11644,6 +14255,9 @@ fn main_event_queued_at_epoch_ms(event: &MainEvent) -> Option<u64> {
         } => *queued_at_epoch_ms,
         MainEvent::SessionRefreshResult(result) => result.queued_at_epoch_ms,
         MainEvent::SearchResult(result) => result.queued_at_epoch_ms,
+        MainEvent::AiSearchProgress(result) => result.queued_at_epoch_ms,
+        MainEvent::AiSearchResult(result) => result.queued_at_epoch_ms,
+        MainEvent::AiTitleResult(result) => result.queued_at_epoch_ms,
         MainEvent::LiveShellDiscoveryResult(result) => result.queued_at_epoch_ms,
         MainEvent::AttachResult(result) => result.queued_at_epoch_ms,
         _ => return None,
@@ -11843,6 +14457,19 @@ fn handle_paste_input_event(app: &mut App, text: String) {
     if text.is_empty() {
         return;
     }
+    if app.ai_search_pending.is_some() {
+        app.status = "AI search in progress; press Esc to cancel.".into();
+        debug_log(
+            "input_paste_ignored",
+            serde_json::json!({
+                "reason": "ai_search_pending",
+                "len": text.len(),
+                "agent_view": app.is_agent_view(),
+                "input_mode": input_mode_label(&app.input_mode),
+            }),
+        );
+        return;
+    }
     if app.is_agent_view() && matches!(app.input_mode, InputMode::Normal) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let _ = app.sync_active_agent_viewport(cols, rows);
@@ -11869,6 +14496,13 @@ fn paste_text_into_input_mode(app: &mut App, text: &str) -> bool {
     match &mut app.input_mode {
         InputMode::Filter { draft, cursor } => {
             if app.search_pending.is_some() {
+                return true;
+            }
+            insert_str_at_cursor(draft, cursor, &text);
+            true
+        }
+        InputMode::AiSearch { draft, cursor } => {
+            if app.ai_search_pending.is_some() {
                 return true;
             }
             insert_str_at_cursor(draft, cursor, &text);
@@ -11950,6 +14584,12 @@ fn handle_main_event(
         MainEvent::SearchResult(result) => {
             app.on_search_result(result);
         }
+        MainEvent::AiSearchProgress(progress) => {
+            app.on_ai_search_progress(progress);
+        }
+        MainEvent::AiSearchResult(result) => {
+            app.on_ai_search_worker_result(result);
+        }
         MainEvent::DataTaskProgress(progress) => {
             app.on_data_task_progress(progress);
         }
@@ -11958,6 +14598,9 @@ fn handle_main_event(
         }
         MainEvent::RestoreResult(result) => {
             app.on_restore_worker_result(result);
+        }
+        MainEvent::AiTitleResult(result) => {
+            app.on_ai_title_worker_result(result);
         }
         MainEvent::AttachResult(result) => {
             app.on_attach_result(result);
@@ -18714,8 +21357,14 @@ fn resolve_agent_program_for_provider(
 }
 
 #[cfg(unix)]
-fn resolve_agent_program_candidate(_provider: Provider, program: &str) -> Option<PathBuf> {
-    resolve_unix_agent_program(program)
+fn resolve_agent_program_candidate(provider: Provider, program: &str) -> Option<PathBuf> {
+    resolve_unix_agent_program(program).or_else(|| {
+        if provider == Provider::OpenCode && program.trim() == default_agent_program(provider) {
+            resolve_unix_opencode_default_install()
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(windows)]
@@ -18748,6 +21397,22 @@ fn resolve_unix_agent_program(program: &str) -> Option<PathBuf> {
 
     resolve_unix_program_with_which(&expanded)
         .or_else(|| resolve_unix_program_with_login_shell(&expanded))
+}
+
+#[cfg(unix)]
+fn resolve_unix_opencode_default_install() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    opencode_unix_default_install_candidates(&home)
+        .into_iter()
+        .find(|path| unix_runnable_file(path))
+}
+
+#[cfg(unix)]
+fn opencode_unix_default_install_candidates(home: &Path) -> [PathBuf; 2] {
+    [
+        home.join(".opencode").join("bin").join("opencode"),
+        home.join(".local").join("bin").join("opencode"),
+    ]
 }
 
 #[cfg(unix)]
@@ -19249,6 +21914,9 @@ fn new_session_cwd_text_key(selected: usize, key: KeyEvent) -> bool {
 }
 
 fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_rows: u16) {
+    if handle_ai_search_locked_key(app, key) {
+        return;
+    }
     if app.handle_data_task_key(key) {
         return;
     }
@@ -19388,6 +22056,30 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
     }
     let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
     app.send_key_to_active_agent(key);
+}
+
+fn handle_ai_search_locked_key(app: &mut App, key: KeyEvent) -> bool {
+    if app.ai_search_pending.is_none() {
+        return false;
+    }
+    let is_plain_esc = key.code == KeyCode::Esc && key.modifiers.is_empty();
+    if is_plain_esc {
+        app.cancel_pending_ai_search("escape");
+        debug_log_key_event(key, "ai_search_escape_cancel");
+    } else {
+        let cancelling = app
+            .ai_search_pending
+            .as_ref()
+            .is_some_and(|pending| pending.cancel_requested);
+        app.status = if cancelling {
+            "AI search is cancelling; other actions are locked."
+        } else {
+            "AI search in progress; press Esc to cancel."
+        }
+        .into();
+        debug_log_key_event(key, "ai_search_locked_ignored");
+    }
+    true
 }
 
 fn handle_notice_key(app: &mut App, key: KeyEvent) -> bool {
@@ -19767,6 +22459,7 @@ fn input_mode_label(mode: &InputMode) -> &'static str {
     match mode {
         InputMode::Normal => "normal",
         InputMode::Filter { .. } => "filter",
+        InputMode::AiSearch { .. } => "ai_search",
         InputMode::DeleteConfirm { .. } => "delete_confirm",
         InputMode::CreateFolderConfirm { .. } => "create_folder_confirm",
         InputMode::RestoreDataConfirm { .. } => "restore_data_confirm",
@@ -19774,6 +22467,7 @@ fn input_mode_label(mode: &InputMode) -> &'static str {
         InputMode::CloneOptions { .. } => "clone_options",
         InputMode::NewSession { .. } => "new_session",
         InputMode::TitleEdit { .. } => "title_edit",
+        InputMode::AiTitleSettings { .. } => "ai_title_settings",
         InputMode::Notice { .. } => "notice",
     }
 }
@@ -20115,6 +22809,29 @@ fn copy_stats_summary(stats: &session::data::CopyStats) -> String {
     )
 }
 
+fn ai_search_progress_percent(indexed: usize, total: usize) -> Option<u8> {
+    if total == 0 {
+        return None;
+    }
+    let percent = indexed.saturating_mul(100).saturating_add(total / 2) / total;
+    Some(percent.min(100) as u8)
+}
+
+fn ai_search_progress_summary(pending: &AiSearchPending) -> Option<String> {
+    if pending.total == 0 {
+        return Some("0 sessions indexed".to_string());
+    }
+    let percent = ai_search_progress_percent(pending.indexed, pending.total).unwrap_or(0);
+    Some(format!(
+        "{}/{} previews  {}%  reused {}  written {}",
+        pending.indexed.min(pending.total),
+        pending.total,
+        percent,
+        pending.reused,
+        pending.written
+    ))
+}
+
 fn copy_percent_summary(
     stats: Option<&session::data::CopyStats>,
     total: Option<&session::data::CopyStats>,
@@ -20361,7 +23078,9 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     let modal_drawn = draw_input_modal(f, area, app);
-    if !modal_drawn {
+    let ai_search_overlay_drawn =
+        draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref());
+    if !modal_drawn && !ai_search_overlay_drawn {
         if let Some(cursor) = agent_cursor {
             f.set_cursor_position(cursor);
         }
@@ -20409,6 +23128,15 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
             draft,
             *cursor,
             app.search_pending.as_ref(),
+            &app.keybindings,
+        );
+    } else if let InputMode::AiSearch { draft, cursor } = &app.input_mode {
+        draw_ai_search_modal(
+            f,
+            area,
+            draft,
+            *cursor,
+            app.ai_search_pending.as_ref(),
             &app.keybindings,
         );
     } else if let InputMode::AgentLaunch { source, selected } = &app.input_mode {
@@ -20466,7 +23194,25 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
         cursor,
     } = &app.input_mode
     {
-        draw_title_edit_modal(f, area, source, draft, *cursor, &app.keybindings);
+        let ai_title_pending = app
+            .ai_title_pending
+            .as_ref()
+            .filter(|pending| pending.key == AgentKey::new(source));
+        draw_title_edit_modal(
+            f,
+            area,
+            source,
+            draft,
+            *cursor,
+            ai_title_pending,
+            &app.keybindings,
+        );
+    } else if let InputMode::AiTitleSettings {
+        selected,
+        return_to: _,
+    } = &app.input_mode
+    {
+        draw_ai_title_settings_modal(f, area, *selected, &app.keybindings);
     } else if let InputMode::Notice { title, message } = &app.input_mode {
         draw_notice_modal(f, area, title, message);
     } else {
@@ -20497,7 +23243,7 @@ fn draw_notice_modal(f: &mut ratatui::Frame, area: Rect, title: &str, message: &
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: true });
     f.render_widget(Clear, modal_area);
     f.render_widget(p, modal_area);
 }
@@ -20579,7 +23325,7 @@ fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPendi
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: true });
     f.render_widget(Clear, modal_area);
     f.render_widget(p, modal_area);
 }
@@ -21019,11 +23765,14 @@ fn color_distance(r: u16, g: u16, b: u16, cr: u16, cg: u16, cb: u16) -> u32 {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, agent_rows: u16) {
+    let keybindings = app.keybindings.clone();
+    debug_log_session_key(app, key, "received");
+    if handle_ai_search_locked_key(app, key) {
+        return;
+    }
     if app.handle_data_task_key(key) {
         return;
     }
-    let keybindings = app.keybindings.clone();
-    debug_log_session_key(app, key, "received");
     if keybindings.matches(KeyAction::GlobalQuit, key) {
         if app.request_quit("global_quit", false) {
             debug_log_session_key(app, key, "global_quit");
@@ -21498,6 +24247,65 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         }
         return;
     }
+    // AI title settings dialog
+    if let InputMode::AiTitleSettings {
+        selected,
+        return_to,
+    } = &mut app.input_mode
+    {
+        let mut next_mode: Option<InputMode> = None;
+        let mut save_provider: Option<Option<Provider>> = None;
+        if keybindings.matches(KeyAction::AiTitleSettingsCancel, key) {
+            next_mode = Some(return_to.clone().into_input_mode());
+            app.status = "cancelled.".into();
+            debug_log_key_event(key, "ai_title_settings_cancel");
+        } else if keybindings.matches(KeyAction::AiTitleSettingsSave, key) {
+            let provider = ai_title_provider_at(*selected);
+            save_provider = Some(provider);
+            next_mode = Some(return_to.clone().into_input_mode());
+            debug_log(
+                "ai_title_settings_save",
+                serde_json::json!({
+                    "provider": ai_title_provider_label(provider),
+                }),
+            );
+        } else if keybindings.matches(KeyAction::AiTitleSettingsNext, key) {
+            *selected = move_ai_title_provider_index(*selected, 1);
+            debug_log(
+                "ai_title_settings_move",
+                serde_json::json!({
+                    "selected": *selected,
+                    "provider": ai_title_provider_label(ai_title_provider_at(*selected)),
+                }),
+            );
+        } else if keybindings.matches(KeyAction::AiTitleSettingsPrev, key) {
+            *selected = move_ai_title_provider_index(*selected, -1);
+            debug_log(
+                "ai_title_settings_move",
+                serde_json::json!({
+                    "selected": *selected,
+                    "provider": ai_title_provider_label(ai_title_provider_at(*selected)),
+                }),
+            );
+        } else if keybindings.matches(KeyAction::AiTitleSettingsNone, key) {
+            *selected = ai_title_provider_index(None);
+        } else if keybindings.matches(KeyAction::AiTitleSettingsClaude, key) {
+            *selected = ai_title_provider_index(Some(Provider::Claude));
+        } else if keybindings.matches(KeyAction::AiTitleSettingsCodex, key) {
+            *selected = ai_title_provider_index(Some(Provider::Codex));
+        } else if keybindings.matches(KeyAction::AiTitleSettingsOpenCode, key) {
+            *selected = ai_title_provider_index(Some(Provider::OpenCode));
+        } else {
+            debug_log_key_event(key, "ai_title_settings_ignored");
+        }
+        if let Some(mode) = next_mode {
+            app.input_mode = mode;
+        }
+        if let Some(provider) = save_provider {
+            app.save_ai_title_provider(provider);
+        }
+        return;
+    }
     // New session dialog
     if matches!(app.input_mode, InputMode::NewSession { .. }) {
         handle_new_session_key(app, key, agent_cols.max(1), agent_rows.max(1), &keybindings);
@@ -21567,11 +24375,29 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     {
         let mut next_mode: Option<InputMode> = None;
         let mut save_action: Option<(SessionInfo, String)> = None;
+        let mut ai_title_action: Option<SessionInfo> = None;
+        let ai_title_running_for_title = app
+            .ai_title_pending
+            .as_ref()
+            .is_some_and(|pending| pending.key == AgentKey::new(source));
         if keybindings.matches(KeyAction::TitleCancel, key) {
             next_mode = Some(InputMode::Normal);
             app.status = "cancelled.".into();
             debug_log(
                 "title_edit_cancel",
+                serde_json::json!({
+                    "provider": source.provider.as_str(),
+                    "session_id": &source.session_id,
+                    "draft_len": draft.len(),
+                    "cursor": *cursor,
+                }),
+            );
+        } else if ai_title_running_for_title
+            && !keybindings.matches(KeyAction::TitleAiGenerate, key)
+        {
+            app.status = "AI title is running; title editing is paused.".into();
+            debug_log(
+                "title_edit_paused_for_ai_title",
                 serde_json::json!({
                     "provider": source.provider.as_str(),
                     "session_id": &source.session_id,
@@ -21608,6 +24434,32 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         } else if keybindings.matches(KeyAction::TitleDelete, key) {
             delete_at_cursor(draft, cursor);
             debug_log_title_edit_cursor(source, draft, *cursor, "delete");
+        } else if keybindings.matches(KeyAction::TitleAiGenerate, key) {
+            if app.ai_title_pending.is_some() {
+                app.status = "AI title already running.".into();
+                debug_log_key_event(key, "title_ai_generate_pending");
+            } else if app.settings.cokacmux.ai.provider.is_none() {
+                next_mode = Some(InputMode::AiTitleSettings {
+                    selected: ai_title_provider_index(app.settings.cokacmux.ai.provider),
+                    return_to: AiTitleSettingsReturn::TitleEdit {
+                        source: source.clone(),
+                        draft: draft.clone(),
+                        cursor: *cursor,
+                    },
+                });
+                app.status = "choose AI title agent before generating.".into();
+                debug_log_key_event(key, "title_ai_generate_needs_settings");
+            } else {
+                ai_title_action = Some(source.clone());
+                debug_log(
+                    "title_ai_generate",
+                    serde_json::json!({
+                        "provider": app.settings.cokacmux.ai.provider.map(|p| p.as_str()),
+                        "source_provider": source.provider.as_str(),
+                        "session_id": &source.session_id,
+                    }),
+                );
+            }
         } else if let KeyCode::Char(c) = key.code {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT)
@@ -21625,6 +24477,140 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         }
         if let Some((source, title)) = save_action {
             app.set_session_title(source, title);
+        }
+        if let Some(source) = ai_title_action {
+            app.start_ai_title_generation(source);
+        }
+        return;
+    }
+    // AI search prompt mode
+    let ai_search_is_searching = app.ai_search_pending.is_some();
+    if let InputMode::AiSearch { draft, cursor } = &mut app.input_mode {
+        let mut next_mode: Option<InputMode> = None;
+        let mut apply_query: Option<String> = None;
+        let mut quit_after_search: Option<bool> = None;
+        if keybindings.matches(KeyAction::FilterCancel, key) {
+            next_mode = Some(InputMode::Normal);
+            app.status = "cancelled.".into();
+            debug_log(
+                "ai_search_cancel",
+                serde_json::json!({
+                    "draft_len": draft.chars().count(),
+                    "searching": ai_search_is_searching,
+                }),
+            );
+        } else if ai_search_is_searching
+            && (keybindings.matches(KeyAction::GlobalQuit, key)
+                || keybindings.matches(KeyAction::SessionQuit, key))
+        {
+            next_mode = Some(InputMode::Normal);
+            quit_after_search = Some(false);
+            debug_log_key_event(key, "ai_search_searching_quit");
+        } else if ai_search_is_searching && keybindings.matches(KeyAction::SessionForceQuit, key) {
+            next_mode = Some(InputMode::Normal);
+            quit_after_search = Some(true);
+            debug_log_key_event(key, "ai_search_searching_force_quit");
+        } else if ai_search_is_searching {
+            debug_log_key_event(key, "ai_search_searching_ignored");
+        } else if keybindings.matches(KeyAction::FilterApply, key) {
+            if !draft.trim().is_empty() && app.settings.cokacmux.ai.provider.is_none() {
+                next_mode = Some(InputMode::AiTitleSettings {
+                    selected: ai_title_provider_index(app.settings.cokacmux.ai.provider),
+                    return_to: AiTitleSettingsReturn::AiSearch {
+                        draft: draft.clone(),
+                        cursor: *cursor,
+                    },
+                });
+                app.status = "choose AI agent before searching.".into();
+                debug_log_key_event(key, "ai_search_needs_settings");
+            } else {
+                apply_query = Some(draft.clone());
+            }
+        } else if keybindings.matches(KeyAction::FilterMoveLeft, key) {
+            *cursor = prev_char_boundary(draft, *cursor);
+            debug_log(
+                "ai_search_cursor",
+                serde_json::json!({
+                    "action": "left",
+                    "draft_len": draft.chars().count(),
+                    "cursor": *cursor,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::FilterMoveRight, key) {
+            *cursor = next_char_boundary(draft, *cursor);
+            debug_log(
+                "ai_search_cursor",
+                serde_json::json!({
+                    "action": "right",
+                    "draft_len": draft.chars().count(),
+                    "cursor": *cursor,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::FilterHome, key) {
+            *cursor = 0;
+            debug_log(
+                "ai_search_cursor",
+                serde_json::json!({
+                    "action": "home",
+                    "draft_len": draft.chars().count(),
+                    "cursor": *cursor,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::FilterEnd, key) {
+            *cursor = draft.len();
+            debug_log(
+                "ai_search_cursor",
+                serde_json::json!({
+                    "action": "end",
+                    "draft_len": draft.chars().count(),
+                    "cursor": *cursor,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::FilterBackspace, key) {
+            delete_before_cursor(draft, cursor);
+            debug_log(
+                "ai_search_backspace",
+                serde_json::json!({
+                    "draft_len": draft.chars().count(),
+                    "cursor": *cursor,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::FilterDelete, key) {
+            delete_at_cursor(draft, cursor);
+            debug_log(
+                "ai_search_delete",
+                serde_json::json!({
+                    "draft_len": draft.chars().count(),
+                    "cursor": *cursor,
+                }),
+            );
+        } else if let KeyCode::Char(c) = key.code {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+            {
+                insert_at_cursor(draft, cursor, c);
+                debug_log(
+                    "ai_search_insert",
+                    serde_json::json!({
+                        "draft_len": draft.chars().count(),
+                        "cursor": *cursor,
+                    }),
+                );
+            } else {
+                debug_log_key_event(key, "ai_search_ignored");
+            }
+        } else {
+            debug_log_key_event(key, "ai_search_ignored");
+        }
+        if let Some(mode) = next_mode {
+            app.input_mode = mode;
+        }
+        if let Some(force) = quit_after_search {
+            app.request_quit("ai_search_searching_quit", force);
+            return;
+        }
+        if let Some(query) = apply_query {
+            app.start_ai_search(query);
         }
         return;
     }
@@ -21764,6 +24750,18 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         app.move_selection(delta);
         return;
     }
+    if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        if app.clear_session_search_results("esc") {
+            debug_log_session_key(app, key, "esc_clear_search");
+            return;
+        }
+        if app.request_quit("esc_quit", false) {
+            debug_log_session_key(app, key, "esc_quit");
+        } else {
+            debug_log_session_key(app, key, "esc_quit_blocked");
+        }
+        return;
+    }
     if keybindings.matches(KeyAction::SessionToggleAgent, key) {
         // Window toggle. If an agent is already active in this process,
         // flip to its view. Otherwise reconnect to a known live daemon
@@ -21851,6 +24849,8 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         }
     } else if keybindings.matches(KeyAction::SessionFilter, key) {
         app.begin_filter();
+    } else if keybindings.matches(KeyAction::SessionAiSearch, key) {
+        app.begin_ai_search();
     } else if keybindings.matches(KeyAction::SessionToggleView, key) {
         app.toggle_session_view();
     } else if keybindings.matches(KeyAction::SessionRefresh, key) {
@@ -21889,6 +24889,10 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             let target = info.provider;
             app.begin_clone_session(info, target);
         }
+    } else if keybindings.matches(KeyAction::SessionAiTitleSettings, key)
+        && app.focus == FocusPane::Sessions
+    {
+        app.begin_ai_title_settings(AiTitleSettingsReturn::Normal);
     } else if keybindings.matches(KeyAction::SessionEditTitle, key)
         && app.focus == FocusPane::Sessions
     {
@@ -21941,6 +24945,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     draw_status(f, app, outer[1]);
 
     draw_input_modal(f, area, app);
+    draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref());
 }
 
 fn draw_delete_confirm_modal(
@@ -22245,14 +25250,14 @@ fn draw_filter_modal(
     let provisional_area =
         modal_area_from_content_rows(area, "Search sessions", desired_width, 4, 44, 84, 6, 12);
     let input_width = provisional_area.width.saturating_sub(4) as usize;
-    let input = title_edit_display(draft, cursor, input_width);
+    let input = input_viewport(draft, cursor, input_width);
     let lines = vec![
         Line::from(Span::styled(
             "Query",
             Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
         )),
         Line::from(Span::styled(
-            input,
+            modal_input_display_text(&input.text, input_width),
             Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
         )),
         Line::from(vec![
@@ -22266,18 +25271,254 @@ fn draw_filter_modal(
         )),
     ];
     let modal_area = modal_area_for_wrapped_lines(area, "Search sessions", &lines, 44, 84, 6, 12);
+    draw_fixed_modal_lines(f, modal_area, "Search sessions", lines);
+    if pending.is_none() {
+        set_modal_input_cursor(f, modal_area, 1, input.cursor_col);
+    }
+}
+
+fn draw_ai_search_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    draft: &str,
+    cursor: usize,
+    pending: Option<&AiSearchPending>,
+    keybindings: &KeyBindings,
+) {
+    let search_label = if let Some(pending) = pending {
+        format!(
+            "{} AI searching",
+            startup_spinner_frame(pending.started_at.elapsed())
+        )
+    } else {
+        format!(
+            "{} Search",
+            keybindings.help(KeyAction::FilterApply, "Enter")
+        )
+    };
+    let cancel_label = format!(
+        "{} Cancel",
+        keybindings.help(KeyAction::FilterCancel, "Esc")
+    );
+    let help = if pending.is_some() {
+        format!(
+            "{} cancel",
+            keybindings.help(KeyAction::FilterCancel, "Esc")
+        )
+    } else {
+        filter_help_text(keybindings)
+    };
+    let button_width = UnicodeWidthStr::width(search_label.as_str())
+        .saturating_add(UnicodeWidthStr::width(cancel_label.as_str()))
+        .saturating_add(8);
+    let desired_width = UnicodeWidthStr::width(draft)
+        .saturating_add(1)
+        .max(UnicodeWidthStr::width("Prompt"))
+        .max(button_width)
+        .max(UnicodeWidthStr::width(help.as_str()));
+    let provisional_area =
+        modal_area_from_content_rows(area, "AI search sessions", desired_width, 4, 48, 90, 6, 12);
+    let input_width = provisional_area.width.saturating_sub(4) as usize;
+    let input = input_viewport(draft, cursor, input_width);
+    let lines = vec![
+        Line::from(Span::styled(
+            "Prompt",
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            modal_input_display_text(&input.text, input_width),
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(vec![
+            modal_button_span(&search_label, true, pending.is_none()),
+            Span::raw("  "),
+            modal_button_span(&cancel_label, false, true),
+        ]),
+        Line::from(Span::styled(
+            help,
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ];
+    let modal_area =
+        modal_area_for_wrapped_lines(area, "AI search sessions", &lines, 48, 90, 6, 12);
+    draw_fixed_modal_lines(f, modal_area, "AI search sessions", lines);
+    if pending.is_none() {
+        set_modal_input_cursor(f, modal_area, 1, input.cursor_col);
+    }
+}
+
+fn draw_fixed_modal_lines(
+    f: &mut ratatui::Frame,
+    modal_area: Rect,
+    title: &'static str,
+    lines: Vec<Line<'static>>,
+) {
+    f.render_widget(ratatui::widgets::Clear, modal_area);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
         .style(theme_alt_style())
-        .title("Search sessions");
+        .title(title);
+    f.render_widget(block, modal_area);
+
+    let inner = Rect {
+        x: modal_area.x.saturating_add(1),
+        y: modal_area.y.saturating_add(1),
+        width: modal_area.width.saturating_sub(2),
+        height: modal_area.height.saturating_sub(2),
+    };
+    for (idx, line) in lines.into_iter().enumerate() {
+        if idx >= inner.height as usize {
+            break;
+        }
+        f.render_widget(
+            line,
+            Rect::new(inner.x, inner.y.saturating_add(idx as u16), inner.width, 1),
+        );
+    }
+}
+
+fn draw_ai_search_pending_overlay(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    pending: Option<&AiSearchPending>,
+) -> bool {
+    let Some(pending) = pending else {
+        return false;
+    };
+    let modal_area = ai_search_pending_overlay_area(area);
+    let content_width = modal_area.width.saturating_sub(2).max(1) as usize;
+    let lines = ai_search_pending_overlay_lines(pending, content_width);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("AI search");
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
         .wrap(Wrap { trim: false });
     f.render_widget(ratatui::widgets::Clear, modal_area);
     f.render_widget(p, modal_area);
+    true
+}
+
+fn ai_search_pending_overlay_area(area: Rect) -> Rect {
+    let available_width = modal_available_width(area).max(1);
+    let min_width = 48.min(available_width);
+    let width = available_width
+        .min(AI_SEARCH_PENDING_OVERLAY_MAX_WIDTH)
+        .max(min_width);
+    let height = modal_height(area, 6, 8, 10);
+    centered_rect_fixed(width, height, area)
+}
+
+fn ai_search_pending_overlay_lines(
+    pending: &AiSearchPending,
+    content_width: usize,
+) -> Vec<Line<'static>> {
+    let elapsed = pending.started_at.elapsed();
+    let headline = if pending.cancel_requested {
+        "Cancelling AI search"
+    } else {
+        "AI search running"
+    };
+    let phase = pending.phase.label();
+    let provider = pending.provider.as_str();
+    let query_width = content_width.saturating_sub(8).max(8);
+    let summary_width = content_width.max(1);
+    let query = truncate_width(&pending.query, query_width);
+    let summary = truncate_width(
+        &ai_search_progress_summary(pending).unwrap_or_default(),
+        summary_width,
+    );
+    vec![
+        Line::from(vec![
+            Span::styled(
+                startup_spinner_frame(elapsed),
+                Style::default()
+                    .fg(THEME_SHORTCUT)
+                    .bg(THEME_BG_ALT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                headline.to_string(),
+                Style::default()
+                    .fg(THEME_FG_STRONG)
+                    .bg(THEME_BG_ALT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}s", elapsed.as_secs()),
+                Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                provider.to_string(),
+                Style::default()
+                    .fg(provider_color(pending.provider))
+                    .bg(THEME_BG_ALT),
+            ),
+            Span::styled(
+                format!("  {}", phase),
+                Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Prompt ",
+                Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+            ),
+            Span::styled(query, Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT)),
+        ]),
+        ai_search_progress_bar_line(pending, content_width),
+        Line::from(Span::styled(
+            summary,
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+        Line::from(vec![
+            Span::styled("Esc", Style::default().fg(THEME_SHORTCUT).bg(THEME_BG_ALT)),
+            Span::styled(
+                " cancel  ·  input locked",
+                Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+            ),
+        ]),
+    ]
+}
+
+fn ai_search_progress_bar_line(pending: &AiSearchPending, content_width: usize) -> Line<'static> {
+    let percent = ai_search_progress_percent(pending.indexed, pending.total).unwrap_or(0);
+    let suffix = format!(" {:>3}%", percent);
+    let suffix_width = UnicodeWidthStr::width(suffix.as_str());
+    let bar_width = content_width.saturating_sub(suffix_width);
+    let filled = if pending.total == 0 {
+        0
+    } else {
+        bar_width
+            .saturating_mul(pending.indexed.min(pending.total))
+            .saturating_add(pending.total / 2)
+            / pending.total
+    }
+    .min(bar_width);
+    let empty = bar_width.saturating_sub(filled);
+    Line::from(vec![
+        Span::styled(
+            "━".repeat(filled),
+            Style::default().fg(THEME_POSITIVE).bg(THEME_BG_ALT),
+        ),
+        Span::styled(
+            "─".repeat(empty),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        ),
+        Span::styled(
+            suffix,
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        ),
+    ])
 }
 
 fn draw_title_edit_modal(
@@ -22286,6 +25527,7 @@ fn draw_title_edit_modal(
     source: &SessionInfo,
     draft: &str,
     cursor: usize,
+    ai_title_pending: Option<&AiTitlePending>,
     keybindings: &KeyBindings,
 ) {
     let session_line = format!(
@@ -22293,40 +25535,137 @@ fn draw_title_edit_modal(
         source.provider.as_str(),
         truncate_width(&source.session_id, 24)
     );
-    let help = title_edit_help_text(keybindings);
+    let pending_status = ai_title_pending.map(title_edit_ai_title_pending_text);
+    let help = pending_status
+        .clone()
+        .unwrap_or_else(|| title_edit_help_text(keybindings));
     let desired_width = UnicodeWidthStr::width(session_line.as_str())
         .max(UnicodeWidthStr::width(draft).saturating_add(1))
         .max(UnicodeWidthStr::width(help.as_str()));
     let provisional_area =
         modal_area_from_content_rows(area, "Edit title", desired_width, 3, 44, 84, 5, 10);
     let input_width = provisional_area.width.saturating_sub(4) as usize;
-    let input = title_edit_display(draft, cursor, input_width);
-    let lines = vec![
-        Line::from(session_line),
-        Line::from(Span::styled(
-            input,
-            Style::default()
-                .fg(THEME_SELECTED_TEXT)
-                .bg(THEME_SELECTED_BG),
-        )),
-        Line::from(Span::styled(
-            help,
-            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-        )),
-    ];
+    let input = if ai_title_pending.is_none() {
+        Some(input_viewport(draft, cursor, input_width))
+    } else {
+        None
+    };
+    let input_text = input
+        .as_ref()
+        .map(|input| modal_input_display_text(&input.text, input_width))
+        .unwrap_or_else(|| title_edit_readonly_display(draft, input_width));
+    let mut lines = vec![Line::from(session_line)];
+    let input_style = if ai_title_pending.is_some() {
+        Style::default().fg(THEME_FG_DIM).bg(THEME_STATUS_BG)
+    } else {
+        Style::default()
+            .fg(THEME_SELECTED_TEXT)
+            .bg(THEME_SELECTED_BG)
+    };
+    let help_style = if ai_title_pending.is_some() {
+        Style::default()
+            .fg(THEME_ACCENT)
+            .bg(THEME_BG_ALT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT)
+    };
+    lines.extend([
+        Line::from(Span::styled(input_text, input_style)),
+        Line::from(Span::styled(help, help_style)),
+    ]);
     let modal_area = modal_area_for_wrapped_lines(area, "Edit title", &lines, 44, 84, 5, 10);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let title = if ai_title_pending.is_some() {
+        "Edit title · AI running"
+    } else {
+        "Edit title"
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .border_style(Style::default().fg(if ai_title_pending.is_some() {
+            THEME_ACCENT
+        } else {
+            THEME_BORDER_ACTIVE
+        }))
         .style(theme_alt_style())
-        .title("Edit title");
+        .title(title);
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
         .wrap(Wrap { trim: false });
     f.render_widget(ratatui::widgets::Clear, modal_area);
     f.render_widget(p, modal_area);
+    if let Some(input) = input {
+        set_modal_input_cursor(f, modal_area, 1, input.cursor_col);
+    }
+}
+
+fn draw_ai_title_settings_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    selected: usize,
+    keybindings: &KeyBindings,
+) {
+    let help = ai_title_settings_help_text(keybindings);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "AI agent",
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Current selection: {}",
+                ai_title_provider_label(ai_title_provider_at(selected))
+            ),
+            Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
+        )),
+        Line::from(""),
+    ];
+    for (index, provider) in AI_TITLE_PROVIDER_OPTIONS.iter().enumerate() {
+        lines.push(ai_title_provider_option_line(
+            index,
+            *provider,
+            selected == index,
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        help,
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+    )));
+    let modal_area = modal_area_for_wrapped_lines(area, "AI agent settings", &lines, 42, 76, 9, 14);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("AI agent settings");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    f.render_widget(p, modal_area);
+}
+
+fn ai_title_provider_option_line(
+    index: usize,
+    provider: Option<Provider>,
+    selected: bool,
+) -> Line<'static> {
+    let label = match provider {
+        Some(provider) => provider.as_str().to_string(),
+        None => "None (disabled)".to_string(),
+    };
+    let text = format!("{}{} {}", selection_marker(selected), index + 1, label);
+    let style = if selected {
+        theme_selected_style()
+    } else {
+        let fg = provider.map(provider_color).unwrap_or(THEME_FG_STRONG);
+        Style::default().fg(fg).bg(THEME_BG_ALT)
+    };
+    Line::from(Span::styled(text, style))
 }
 
 fn draw_agent_launch_modal(
@@ -22597,8 +25936,13 @@ fn draw_new_session_modal(
         label_width,
         value_width,
     ));
-    let cwd_value = if selected == NEW_SESSION_FIELD_CWD {
-        editable_value_display(cwd, cwd_cursor, value_width)
+    let cwd_input = if selected == NEW_SESSION_FIELD_CWD {
+        Some(input_viewport(cwd, cwd_cursor, value_width))
+    } else {
+        None
+    };
+    let cwd_value = if let Some(input) = cwd_input.as_ref() {
+        input.text.clone()
     } else {
         fit_width(cwd, value_width, Align::Left)
     };
@@ -22656,6 +26000,13 @@ fn draw_new_session_modal(
         .wrap(Wrap { trim: false });
     f.render_widget(ratatui::widgets::Clear, modal_area);
     f.render_widget(p, modal_area);
+    if let Some(input) = cwd_input {
+        let cursor_col = UnicodeWidthStr::width(selection_marker(true))
+            .saturating_add(label_width)
+            .saturating_add(1)
+            .saturating_add(input.cursor_col);
+        set_modal_input_cursor(f, modal_area, 2, cursor_col);
+    }
 }
 
 fn new_session_field_line(
@@ -22679,11 +26030,6 @@ fn new_session_field_line(
         ),
         style,
     ))
-}
-
-fn editable_value_display(value: &str, cursor: usize, width: usize) -> String {
-    let display = sanitize_for_single_line(value);
-    title_edit_display(&display, cursor.min(display.len()), width)
 }
 
 fn new_session_preview_command(
@@ -22740,7 +26086,7 @@ fn new_session_preview_command(
 
 fn title_edit_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} move  {}  {}  {} save  {} cancel",
+        "{} move  {}  {}  {} AI title  {} save  {} cancel",
         keybindings.help_pair(
             KeyAction::TitleMoveLeft,
             KeyAction::TitleMoveRight,
@@ -22754,8 +26100,23 @@ fn title_edit_help_text(keybindings: &KeyBindings) -> String {
             "Del",
             "Bksp",
         ),
+        keybindings.help(KeyAction::TitleAiGenerate, "Ctrl+T"),
         keybindings.help(KeyAction::TitleSave, "Enter"),
         keybindings.help(KeyAction::TitleCancel, "Esc"),
+    )
+}
+
+fn ai_title_settings_help_text(keybindings: &KeyBindings) -> String {
+    format!(
+        "{} move  1/2/3/4 choose  {} save  {} cancel",
+        keybindings.help_pair(
+            KeyAction::AiTitleSettingsPrev,
+            KeyAction::AiTitleSettingsNext,
+            "Up",
+            "Down",
+        ),
+        keybindings.help(KeyAction::AiTitleSettingsSave, "Enter"),
+        keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc"),
     )
 }
 
@@ -22900,69 +26261,84 @@ fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let cols = list_columns(inner.width);
     debug_assert!(inner.width < 20 || cols.row_width() == inner.width as usize);
     let selected = app.list_state.selected();
-    let items: Vec<ListItem> = rows
-        .iter()
-        .enumerate()
-        .map(|(idx, row)| {
-            let s = row.info;
-            let agent_state = app.agent_state_for(s);
-            let prov = prov_span(s.provider);
-            let title = s.title.as_deref().unwrap_or("");
-            let age = age_label(s.updated_at_epoch_s);
-            let marker = selection_marker(selected == Some(idx));
-            let session_label = if app.session_view == SessionViewMode::Tree {
-                tree_session_label(row.depth, &s.session_id)
-            } else {
-                session_id_display_label(&s.session_id)
-            };
-            let mut spans = vec![
-                Span::raw(marker),
-                Span::styled(
-                    fit_width(agent_state.label(), cols.state, Align::Left),
-                    agent_state.style(),
-                ),
-                Span::raw(" "),
-                prov,
-            ];
-            if cols.title > 0 {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    fit_width(title, cols.title, Align::Left),
-                    Style::default().fg(THEME_FG_STRONG),
-                ));
-            }
-            if cols.age > 0 {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    fit_width(&age, cols.age, Align::Right),
-                    Style::default().fg(THEME_FG_DIM),
-                ));
-            }
-            if cols.cwd > 0 {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    fit_width(&s.cwd, cols.cwd, Align::Left),
-                    Style::default().fg(THEME_FG_DIM),
-                ));
-            }
-            spans.extend([
-                Span::raw(" "),
-                Span::styled(
-                    fit_width(&session_label, cols.id, Align::Left),
-                    Style::default().fg(THEME_FG_DIM),
-                ),
-            ]);
-            let line = Line::from(spans);
-            ListItem::new(line)
-        })
-        .collect();
+    let items: Vec<ListItem> =
+        rows.iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let s = row.info;
+                let ai_search_hit = app.ai_search_results.as_ref().and_then(|results| {
+                    results.hits.iter().find(|hit| hit.key == AgentKey::new(s))
+                });
+                let agent_state = app.agent_state_for(s);
+                let prov = prov_span(s.provider);
+                let title_text = ai_search_hit
+                    .map(|hit| {
+                        let score = (hit.score * 100.0).round().clamp(0.0, 100.0) as u8;
+                        let session_title = s.title.as_deref().unwrap_or("");
+                        if session_title.is_empty() {
+                            format!("{:>3}% {}", score, hit.reason)
+                        } else {
+                            format!("{:>3}% {} - {}", score, hit.reason, session_title)
+                        }
+                    })
+                    .unwrap_or_else(|| s.title.as_deref().unwrap_or("").to_string());
+                let age = age_label(s.updated_at_epoch_s);
+                let marker = selection_marker(selected == Some(idx));
+                let session_label = if app.session_view == SessionViewMode::Tree {
+                    tree_session_label(row.depth, &s.session_id)
+                } else {
+                    session_id_display_label(&s.session_id)
+                };
+                let mut spans = vec![
+                    Span::raw(marker),
+                    Span::styled(
+                        fit_width(agent_state.label(), cols.state, Align::Left),
+                        agent_state.style(),
+                    ),
+                    Span::raw(" "),
+                    prov,
+                ];
+                if cols.title > 0 {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        fit_width(&title_text, cols.title, Align::Left),
+                        Style::default().fg(THEME_FG_STRONG),
+                    ));
+                }
+                if cols.age > 0 {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        fit_width(&age, cols.age, Align::Right),
+                        Style::default().fg(THEME_FG_DIM),
+                    ));
+                }
+                if cols.cwd > 0 {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        fit_width(&s.cwd, cols.cwd, Align::Left),
+                        Style::default().fg(THEME_FG_DIM),
+                    ));
+                }
+                spans.extend([
+                    Span::raw(" "),
+                    Span::styled(
+                        fit_width(&session_label, cols.id, Align::Left),
+                        Style::default().fg(THEME_FG_DIM),
+                    ),
+                ]);
+                let line = Line::from(spans);
+                ListItem::new(line)
+            })
+            .collect();
 
     let title = format!(
         " sessions {} {} {}{} ",
         rows.len(),
         app.provider_filter.label(),
         app.session_view.label(),
-        if app.text_filter.is_empty() {
+        if let Some(results) = app.ai_search_results.as_ref() {
+            format!(" AI {}", truncate_width(&results.query, 24))
+        } else if app.text_filter.is_empty() {
             String::new()
         } else {
             format!(" search {}", app.text_filter)
@@ -23526,8 +26902,8 @@ fn draw_status(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> String {
     match focus {
-        FocusPane::Sessions if width >= 92 => format!(
-            "{} preview  {} select  {} new  {} tree  {} title  {} delete  {} launch  {}/{} quit",
+        FocusPane::Sessions if width >= 104 => format!(
+            "{} preview  {} select  {} new  {} search  {} AI search  {} tree  {} title  {} AI  {} delete  {} launch  {}/{} quit",
             keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
             keybindings.help_pair(
                 KeyAction::SessionMovePrev,
@@ -23536,8 +26912,11 @@ fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Strin
                 "Down",
             ),
             keybindings.help(KeyAction::SessionNewShell, "Ctrl+N"),
+            keybindings.help(KeyAction::SessionFilter, "/"),
+            keybindings.help(KeyAction::SessionAiSearch, "Ctrl+S"),
             keybindings.help(KeyAction::SessionToggleView, "v"),
             keybindings.help(KeyAction::SessionEditTitle, "t"),
+            keybindings.help(KeyAction::SessionAiTitleSettings, "Ctrl+T"),
             keybindings.help(KeyAction::SessionDelete, "Delete/d"),
             keybindings.help(KeyAction::SessionLaunchAgent, "e"),
             keybindings.help(KeyAction::SessionQuit, "q"),
@@ -23687,6 +27066,14 @@ fn agent_help_text(keybindings: &KeyBindings) -> String {
     )
 }
 
+fn provider_color(provider: Provider) -> Color {
+    match provider {
+        Provider::Claude => THEME_PROVIDER_CLAUDE,
+        Provider::Codex => THEME_PROVIDER_CODEX,
+        Provider::OpenCode => THEME_PROVIDER_OPENCODE,
+    }
+}
+
 fn prov_span(p: Provider) -> Span<'static> {
     let (text, color) = match p {
         Provider::Claude => ("claude  ", THEME_PROVIDER_CLAUDE),
@@ -23758,28 +27145,80 @@ fn session_id_display_part(session_id: &str) -> &str {
         .unwrap_or(session_id)
 }
 
-fn title_edit_display(draft: &str, cursor: usize, width: usize) -> String {
-    let cursor = clamp_to_char_boundary(draft, cursor);
-    let before = &draft[..cursor];
-    let after = &draft[cursor..];
-    let full = format!("{}|{}", before, after);
-    if UnicodeWidthStr::width(full.as_str()) <= width {
-        return fit_width(&full, width, Align::Left);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputViewport {
+    text: String,
+    cursor_col: usize,
+}
+
+fn input_viewport(value: &str, cursor: usize, width: usize) -> InputViewport {
+    if width == 0 {
+        return InputViewport {
+            text: String::new(),
+            cursor_col: 0,
+        };
     }
 
-    if width <= 1 {
-        return fit_width("|", width, Align::Left);
+    let display = sanitize_for_single_line(value);
+    let cursor = clamp_to_char_boundary(&display, cursor.min(display.len()));
+    let before = &display[..cursor];
+    let after = &display[cursor..];
+    let before_width = UnicodeWidthStr::width(before);
+
+    if before_width < width {
+        let after_visible = prefix_width(after, width - before_width);
+        return InputViewport {
+            text: fit_width(&format!("{}{}", before, after_visible), width, Align::Left),
+            cursor_col: before_width,
+        };
     }
 
-    let before_target = (width - 1) / 2;
-    let before_visible = suffix_width(before, before_target);
-    let before_width = UnicodeWidthStr::width(before_visible.as_str());
-    let after_visible = prefix_width(after, width.saturating_sub(1 + before_width));
-    fit_width(
-        &format!("{}|{}", before_visible, after_visible),
-        width,
-        Align::Left,
+    let before_visible = suffix_width(before, width.saturating_sub(1));
+    let cursor_col = UnicodeWidthStr::width(before_visible.as_str());
+    let after_visible = prefix_width(after, width.saturating_sub(cursor_col));
+    InputViewport {
+        text: fit_width(
+            &format!("{}{}", before_visible, after_visible),
+            width,
+            Align::Left,
+        ),
+        cursor_col,
+    }
+}
+
+fn title_edit_readonly_display(draft: &str, width: usize) -> String {
+    fit_width(draft, width, Align::Left)
+}
+
+fn modal_input_display_text(text: &str, width: usize) -> String {
+    fit_width(text, width, Align::Left)
+}
+
+fn title_edit_ai_title_pending_text(pending: &AiTitlePending) -> String {
+    let elapsed = pending.started_at.elapsed();
+    format!(
+        "{} AI title running with {} ({}s) · editing paused",
+        startup_spinner_frame(elapsed),
+        pending.provider.as_str(),
+        elapsed.as_secs()
     )
+}
+
+fn set_modal_input_cursor(f: &mut ratatui::Frame, modal_area: Rect, row: usize, col: usize) {
+    let inner_width = modal_area.width.saturating_sub(2);
+    let inner_height = modal_area.height.saturating_sub(2);
+    if inner_width == 0 || inner_height == 0 {
+        return;
+    }
+    let x = modal_area
+        .x
+        .saturating_add(1)
+        .saturating_add(col.min(inner_width.saturating_sub(1) as usize) as u16);
+    let y = modal_area
+        .y
+        .saturating_add(1)
+        .saturating_add(row.min(inner_height.saturating_sub(1) as usize) as u16);
+    f.set_cursor_position((x, y));
 }
 
 fn insert_at_cursor(draft: &mut String, cursor: &mut usize, ch: char) {
@@ -24335,6 +27774,624 @@ mod tests {
         }
     }
 
+    fn ai_search_pending_for_test(cancel: Arc<AtomicBool>) -> AiSearchPending {
+        AiSearchPending {
+            seq: 7,
+            query: "release".to_string(),
+            provider: Provider::Codex,
+            phase: AiSearchPhase::Indexing,
+            indexed: 1,
+            total: 4,
+            reused: 1,
+            written: 0,
+            cancel_requested: false,
+            cancel,
+            started_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn ai_search_response_parses_results_from_json() {
+        let hits = extract_ai_search_response(
+            r#"{
+                "results": [
+                    {
+                        "provider": "codex",
+                        "session_id": "session-a",
+                        "score": 0.42,
+                        "reason": "r1"
+                    },
+                    {
+                        "provider": "claude",
+                        "session_id": "session-b",
+                        "score": 0.91,
+                        "reason": "r2"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].key.provider, Provider::Claude);
+        assert_eq!(hits[0].key.session_id, "session-b");
+        assert_eq!(hits[1].key.provider, Provider::Codex);
+        assert_eq!(hits[1].key.session_id, "session-a");
+    }
+
+    #[test]
+    fn ai_search_response_rejects_multiline_reason() {
+        let error = extract_ai_search_response(
+            r#"{
+                "results": [
+                    {
+                        "provider": "codex",
+                        "session_id": "session-a",
+                        "score": 0.42,
+                        "reason": "r1\nr2"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("single-line"));
+    }
+
+    #[test]
+    fn ai_search_response_rejects_missing_required_result_fields() {
+        let missing_score = extract_ai_search_response(
+            r#"{
+                "results": [
+                    {
+                        "provider": "codex",
+                        "session_id": "session-a",
+                        "reason": "r1"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(missing_score.contains("invalid score"));
+
+        let missing_reason = extract_ai_search_response(
+            r#"{
+                "results": [
+                    {
+                        "provider": "codex",
+                        "session_id": "session-a",
+                        "score": 0.42
+                    }
+                ]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(missing_reason.contains("missing reason"));
+    }
+
+    #[test]
+    fn ai_search_response_rejects_non_json_wrappers() {
+        let error = extract_ai_search_response(
+            r#"prefix {"results":[{"provider":"codex","session_id":"session-a","score":0.42,"reason":"r1"}]} suffix"#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn ai_search_response_rejects_unsupported_structured_wrappers() {
+        let error = extract_ai_search_response(
+            r#"{"structured":{"results":[{"provider":"codex","session_id":"session-a","score":0.42,"reason":"r1"}]}}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("missing results array"));
+    }
+
+    #[test]
+    fn ai_search_results_drive_visible_session_order() {
+        let mut app = app_for_key_tests();
+        let first = session_info(Provider::Codex, "first", "/repo/first");
+        let second = session_info(Provider::Claude, "second", "/repo/second");
+        let third = session_info(Provider::OpenCode, "third", "/repo/third");
+        app.sessions = vec![first.clone(), second.clone(), third];
+        app.ai_search_results = Some(AiSearchResults {
+            query: "release issue".to_string(),
+            hits: vec![
+                AiSearchHit {
+                    key: AgentKey::new(&second),
+                    score: 0.95,
+                    reason: "r2".to_string(),
+                },
+                AiSearchHit {
+                    key: AgentKey::new(&first),
+                    score: 0.72,
+                    reason: "r1".to_string(),
+                },
+            ],
+        });
+
+        let visible_ids: Vec<String> = app
+            .visible()
+            .into_iter()
+            .map(|info| info.session_id.clone())
+            .collect();
+
+        assert_eq!(visible_ids, vec!["second".to_string(), "first".to_string()]);
+    }
+
+    #[test]
+    fn ai_search_empty_agent_results_stay_empty() {
+        let item = AiSearchIndexItem {
+            info: session_info(Provider::Codex, "session-a", "/repo/session-a"),
+        };
+        let hits = validate_ai_search_hits(Vec::new(), std::slice::from_ref(&item)).unwrap();
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn ai_search_rejects_agent_results_for_unknown_sessions() {
+        let item = AiSearchIndexItem {
+            info: session_info(Provider::Codex, "session-a", "/repo/session-a"),
+        };
+        let error = validate_ai_search_hits(
+            vec![AiSearchHit {
+                key: AgentKey {
+                    provider: Provider::Codex,
+                    session_id: "unknown-session".to_string(),
+                },
+                score: 0.8,
+                reason: "match".to_string(),
+            }],
+            std::slice::from_ref(&item),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("unknown session"));
+    }
+
+    #[test]
+    fn ai_search_prompt_points_agent_to_searchdata_without_local_candidates() {
+        let prompt = build_ai_search_prompt(
+            "release query",
+            Path::new("/tmp/searchdata"),
+            3,
+            Provider::Codex,
+        );
+
+        assert!(prompt.contains("Search only this preview directory: /tmp/searchdata"));
+        assert!(prompt.contains(r#"Search query JSON string: "release query""#));
+        assert!(prompt.contains("Autonomously inspect the search directory"));
+        assert!(prompt.contains("Use only files ending in `.preview.md`"));
+        assert!(prompt.contains("Ignore preview files whose `load_status` is not `ok`"));
+        assert!(prompt.contains("`reason` must be a short match label, not an explanation"));
+        assert!(prompt.contains("Do not put evidence, extra detail, clauses"));
+        assert!(prompt.contains("full sentence in `reason`"));
+        assert!(prompt.contains("Indexed sessions: 3"));
+    }
+
+    #[test]
+    fn ai_search_preview_filename_uses_title_when_available() {
+        let mut info = session_info(Provider::Claude, "session-id-123", "/repo");
+        info.updated_at_epoch_s = 1_704_067_200;
+        info.title = Some("Fix release search".to_string());
+
+        let filename = ai_search_preview_filename(&info);
+
+        assert!(filename.starts_with("claude__20240101T000000Z__"));
+        assert!(filename.contains("__Fix_release_search.preview.md"));
+        assert!(!filename.contains("session-id-123.preview.md"));
+    }
+
+    #[test]
+    fn ai_search_preview_cache_reuses_only_current_successful_files() {
+        let info = session_info(Provider::Codex, "session-a", "/repo");
+        let current = format!(
+            "# cokacmux session preview\n\ncache_version: {}\ncache_key: {}\nload_status: ok\nprovider: codex\n",
+            AI_SEARCH_PREVIEW_FORMAT_VERSION,
+            ai_search_preview_cache_key(&info)
+        );
+        let stale_key = format!(
+            "# cokacmux session preview\n\ncache_version: {}\ncache_key: stale\nload_status: ok\nprovider: codex\n",
+            AI_SEARCH_PREVIEW_FORMAT_VERSION
+        );
+        let previous_error = format!(
+            "# cokacmux session preview\n\ncache_version: {}\ncache_key: {}\nload_status: error\nprovider: codex\n",
+            AI_SEARCH_PREVIEW_FORMAT_VERSION,
+            ai_search_preview_cache_key(&info)
+        );
+
+        assert!(ai_search_preview_is_current(&current, &info));
+        assert!(!ai_search_preview_is_current(&stale_key, &info));
+        assert!(!ai_search_preview_is_current(&previous_error, &info));
+        assert!(ai_search_preview_load_status_ok(&current));
+        assert!(!ai_search_preview_load_status_ok(&previous_error));
+        assert!(!ai_search_preview_is_current(
+            "old preview without metadata",
+            &info
+        ));
+    }
+
+    #[test]
+    fn ai_search_preview_loader_rewrites_stale_cache_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(Provider::Codex, "session-a", "/repo");
+        let path = dir.path().join(ai_search_preview_filename(&info));
+        fs::write(&path, "old preview without metadata").unwrap();
+
+        let (text, reused) = load_or_render_ai_search_preview(&path, &info).unwrap();
+
+        assert!(!reused);
+        assert!(text.contains("cache_version: 2"));
+        assert!(text.contains("load_status: error"));
+        assert!(!ai_search_preview_load_status_ok(&text));
+        assert_eq!(fs::read_to_string(path).unwrap(), text);
+    }
+
+    #[test]
+    fn ai_search_data_dir_rejects_invalid_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let search_dir = dir.path().join("searchdata");
+        fs::write(&search_dir, "not a directory").unwrap();
+
+        let error = ensure_ai_search_data_dir(&search_dir).unwrap_err();
+
+        assert!(error.contains("not a directory"));
+        assert!(search_dir.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ai_search_data_dir_rejects_symlink_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let search_dir = dir.path().join("searchdata");
+        let target = dir.path().join("outside-searchdata");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &search_dir).unwrap();
+
+        let error = ensure_ai_search_data_dir(&search_dir).unwrap_err();
+
+        assert!(error.contains("not a directory"));
+        assert!(fs::symlink_metadata(&search_dir)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn ai_search_preview_loader_rejects_preview_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(Provider::Codex, "session-a", "/repo");
+        let path = dir.path().join(ai_search_preview_filename(&info));
+        fs::create_dir(&path).unwrap();
+
+        let error = load_or_render_ai_search_preview(&path, &info).unwrap_err();
+
+        assert!(error.contains("not a regular file"));
+        assert!(path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ai_search_preview_loader_rejects_preview_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(Provider::Codex, "session-a", "/repo");
+        let path = dir.path().join(ai_search_preview_filename(&info));
+        let target = dir.path().join("outside-target.txt");
+        fs::write(&target, "outside").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let error = load_or_render_ai_search_preview(&path, &info).unwrap_err();
+
+        assert!(error.contains("not a regular file"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "outside");
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn ai_search_orphan_cleanup_removes_preview_files_not_in_current_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = session_info(Provider::Codex, "current-session", "/repo");
+        let current_path = dir.path().join(ai_search_preview_filename(&current));
+        let orphan = SessionInfo {
+            session_id: "deleted-session".to_string(),
+            ..current.clone()
+        };
+        let orphan_path = dir.path().join(ai_search_preview_filename(&orphan));
+        let invalid_preview_path = dir.path().join("invalid.preview.md");
+        let invalid_preview_dir = dir.path().join("invalid-dir.preview.md");
+        let unrelated_path = dir.path().join("notes.txt");
+        fs::write(&current_path, "current").unwrap();
+        fs::write(&orphan_path, "orphan").unwrap();
+        fs::write(&invalid_preview_path, "invalid").unwrap();
+        fs::create_dir(&invalid_preview_dir).unwrap();
+        fs::write(&unrelated_path, "keep").unwrap();
+
+        let removed = cleanup_orphan_ai_search_preview_files(dir.path(), &[current]).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(current_path.exists());
+        assert!(!orphan_path.exists());
+        assert!(invalid_preview_path.exists());
+        assert!(invalid_preview_dir.exists());
+        assert!(unrelated_path.exists());
+    }
+
+    #[test]
+    fn ai_search_prompt_tells_agent_to_use_preview_metadata() {
+        let prompt =
+            build_ai_search_prompt("release", Path::new("/tmp/searchdata"), 1, Provider::Codex);
+
+        assert!(prompt.contains("Each preview file contains provider, session_id"));
+        assert!(
+            prompt.contains("Each result must identify a session by exact provider and session_id")
+        );
+    }
+
+    #[test]
+    fn ai_tasks_do_not_start_while_another_ai_task_is_pending() {
+        let mut app = app_for_key_tests();
+        let source = session_info(Provider::Codex, "session-a", "/repo");
+        app.settings.cokacmux.ai.provider = Some(Provider::Codex);
+        app.ai_search_pending = Some(ai_search_pending_for_test(Arc::new(AtomicBool::new(false))));
+
+        app.start_ai_title_generation(source.clone());
+
+        assert!(app.ai_title_pending.is_none());
+        assert!(app.status.contains("AI search is running"));
+
+        app.ai_search_pending = None;
+        app.ai_title_pending = Some(AiTitlePending {
+            seq: 8,
+            key: AgentKey::new(&source),
+            provider: Provider::Codex,
+            started_at: Instant::now(),
+        });
+
+        app.start_ai_search("release".to_string());
+
+        assert!(app.ai_search_pending.is_none());
+        assert!(app.status.contains("AI title is running"));
+    }
+
+    #[test]
+    fn ai_search_enter_without_agent_opens_settings_and_returns_to_prompt() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::AiSearch {
+            draft: "release issue".to_string(),
+            cursor: "release issue".len(),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::AiTitleSettings {
+                selected,
+                return_to:
+                    AiTitleSettingsReturn::AiSearch {
+                        draft,
+                        cursor,
+                    },
+            } => {
+                assert_eq!(*selected, ai_title_provider_index(None));
+                assert_eq!(draft, "release issue");
+                assert_eq!(*cursor, "release issue".len());
+            }
+            other => panic!("expected AI settings mode, got {:?}", other),
+        }
+        assert!(app.status.contains("choose AI agent"));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::AiSearch { draft, cursor } => {
+                assert_eq!(draft, "release issue");
+                assert_eq!(*cursor, "release issue".len());
+            }
+            other => panic!("expected AI search prompt mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ai_search_pending_locks_input_except_escape_cancel() {
+        let mut app = app_for_key_tests();
+        app.sessions = vec![
+            session_info(Provider::Codex, "first", "/repo/first"),
+            session_info(Provider::Codex, "second", "/repo/second"),
+        ];
+        app.list_state.select(Some(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.ai_search_pending = Some(ai_search_pending_for_test(cancel.clone()));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        assert_eq!(app.list_state.selected(), Some(0));
+        assert!(!app.should_quit);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(app.status.contains("press Esc"));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        let pending = app.ai_search_pending.as_ref().unwrap();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(pending.cancel_requested);
+        assert_eq!(pending.phase, AiSearchPhase::Cancelling);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ai_search_pending_escape_takes_priority_over_clone_data_task() {
+        let mut app = app_for_key_tests();
+        let ai_cancel = Arc::new(AtomicBool::new(false));
+        let clone_cancel = Arc::new(AtomicBool::new(false));
+        app.ai_search_pending = Some(ai_search_pending_for_test(ai_cancel.clone()));
+        app.data_task = Some(
+            DataTaskPending::new(3, DataTaskKind::Clone, "clone".to_string())
+                .with_cancel_token(clone_cancel.clone()),
+        );
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(ai_cancel.load(Ordering::Relaxed));
+        assert!(!clone_cancel.load(Ordering::Relaxed));
+        assert!(app.ai_search_pending.as_ref().unwrap().cancel_requested);
+        assert!(!app.data_task.as_ref().unwrap().cancel_requested);
+    }
+
+    #[test]
+    fn ai_search_progress_updates_matching_pending() {
+        let mut app = app_for_key_tests();
+        app.ai_search_pending = Some(ai_search_pending_for_test(Arc::new(AtomicBool::new(false))));
+
+        app.on_ai_search_progress(AiSearchProgressEvent {
+            seq: 7,
+            query: "release".to_string(),
+            provider: Provider::Codex,
+            phase: AiSearchPhase::AskingAgent,
+            indexed: 4,
+            total: 4,
+            reused: 2,
+            written: 2,
+            queued_at_epoch_ms: current_epoch_ms(),
+        });
+
+        let pending = app.ai_search_pending.as_ref().unwrap();
+        assert_eq!(pending.phase, AiSearchPhase::AskingAgent);
+        assert_eq!(pending.indexed, 4);
+        assert_eq!(pending.total, 4);
+        assert_eq!(pending.reused, 2);
+        assert_eq!(pending.written, 2);
+        assert_eq!(
+            ai_search_progress_percent(pending.indexed, pending.total),
+            Some(100)
+        );
+
+        app.cancel_pending_ai_search("test");
+        app.on_ai_search_progress(AiSearchProgressEvent {
+            seq: 7,
+            query: "release".to_string(),
+            provider: Provider::Codex,
+            phase: AiSearchPhase::Indexing,
+            indexed: 3,
+            total: 4,
+            reused: 3,
+            written: 0,
+            queued_at_epoch_ms: current_epoch_ms(),
+        });
+
+        let pending = app.ai_search_pending.as_ref().unwrap();
+        assert_eq!(pending.phase, AiSearchPhase::Cancelling);
+        assert_eq!(pending.indexed, 3);
+        assert_eq!(pending.reused, 3);
+    }
+
+    #[test]
+    #[ignore = "requires REAL_AI_SEARCH=1 and a configured local AI agent"]
+    fn real_ai_search_uses_configured_agent_and_real_sessions() {
+        if std::env::var("REAL_AI_SEARCH").ok().as_deref() != Some("1") {
+            eprintln!("skipping real AI search smoke test; set REAL_AI_SEARCH=1");
+            return;
+        }
+        let settings = Settings::load();
+        let provider = settings
+            .cokacmux
+            .ai
+            .provider
+            .expect("configure cokacmux.ai.provider before real AI search smoke test");
+        let sessions = session::list_all().expect("real session discovery should succeed");
+        assert!(
+            !sessions.is_empty(),
+            "real AI search smoke test needs at least one discovered session"
+        );
+        let query = std::env::var("REAL_AI_SEARCH_QUERY")
+            .unwrap_or_else(|_| "AI search progress overlay Esc cancel input locked".to_string());
+        let started = Instant::now();
+        let cancel = AtomicBool::new(false);
+        let outcome = generate_ai_search_for_sessions(
+            &query,
+            &sessions,
+            provider,
+            &settings.cokacmux.agent_programs,
+            909_001,
+            None,
+            &cancel,
+        )
+        .expect("real AI search should complete with the configured agent");
+
+        let known_keys: HashSet<AgentKey> = sessions.iter().map(AgentKey::new).collect();
+        let result_ids: Vec<String> = outcome
+            .hits
+            .iter()
+            .map(|hit| format!("{}:{}", hit.key.provider.as_str(), hit.key.session_id))
+            .collect();
+        eprintln!(
+            "real_ai_search provider={} query={:?} sessions={} hits={} indexed={} reused={} written={} elapsed_ms={} results={:?}",
+            provider.as_str(),
+            query,
+            sessions.len(),
+            outcome.hits.len(),
+            outcome.indexed,
+            outcome.reused,
+            outcome.written,
+            started.elapsed().as_millis(),
+            result_ids,
+        );
+
+        assert!(
+            !outcome.hits.is_empty(),
+            "real AI search should return at least one relevant session"
+        );
+        assert_eq!(outcome.indexed, sessions.len());
+        assert!(outcome.reused + outcome.written <= outcome.indexed);
+        assert!(
+            outcome.hits.iter().all(|hit| known_keys.contains(&hit.key)),
+            "real AI search returned a session not present in the current index"
+        );
+    }
+
     fn write_test_cwd_lock_for_info(info: &SessionInfo, owner_kind: &'static str) -> PathBuf {
         let lock_path = coding_agent_cwd_lock_path(info).unwrap().unwrap();
         fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
@@ -24699,6 +28756,11 @@ mod tests {
             text_filter_matches: HashSet::new(),
             search_seq: 0,
             search_pending: None,
+            ai_search_seq: 0,
+            ai_search_pending: None,
+            ai_search_results: None,
+            ai_title_seq: 0,
+            ai_title_pending: None,
             data_task_seq: 0,
             data_task: None,
             input_mode: InputMode::Normal,
@@ -25430,6 +29492,20 @@ mod tests {
     }
 
     #[test]
+    fn ai_search_pending_overlay_uses_available_wide_viewport() {
+        let wide = ai_search_pending_overlay_area(Rect::new(0, 0, 180, 40));
+        assert_eq!(wide.width, AI_SEARCH_PENDING_OVERLAY_MAX_WIDTH);
+        assert_eq!(wide.x, 10);
+
+        let normal = ai_search_pending_overlay_area(Rect::new(0, 0, 80, 24));
+        assert_eq!(normal.width, 76);
+        assert_eq!(normal.x, 2);
+
+        let pending = ai_search_pending_for_test(Arc::new(AtomicBool::new(false)));
+        assert!(ai_search_progress_bar_line(&pending, 120).width() > 100);
+    }
+
+    #[test]
     fn input_modals_render_on_narrow_viewports() {
         let keybindings = KeyBindings::default();
         let agent_programs = AgentProgramSettings::default();
@@ -25511,12 +29587,48 @@ mod tests {
                 .unwrap();
             terminal
                 .draw(|f| {
+                    let pending = ai_search_pending_for_test(Arc::new(AtomicBool::new(false)));
+                    assert!(draw_ai_search_pending_overlay(f, f.area(), Some(&pending)));
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
                     draw_title_edit_modal(
                         f,
                         f.area(),
                         &source,
                         "a title long enough to exercise input clipping",
                         12,
+                        None,
+                        &keybindings,
+                    );
+                })
+                .unwrap();
+            let pending = AiTitlePending {
+                seq: 1,
+                key: AgentKey::new(&source),
+                provider: Provider::Codex,
+                started_at: Instant::now(),
+            };
+            terminal
+                .draw(|f| {
+                    draw_title_edit_modal(
+                        f,
+                        f.area(),
+                        &source,
+                        "a title waiting for AI",
+                        5,
+                        Some(&pending),
+                        &keybindings,
+                    );
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_ai_title_settings_modal(
+                        f,
+                        f.area(),
+                        ai_title_provider_index(Some(Provider::Codex)),
                         &keybindings,
                     );
                 })
@@ -25568,6 +29680,63 @@ mod tests {
                     );
                 })
                 .unwrap();
+        }
+    }
+
+    fn rendered_filter_modal(cols: u16, rows: u16, draft: &str) -> String {
+        let keybindings = KeyBindings::default();
+        let backend = ratatui::backend::TestBackend::new(cols, rows);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_filter_modal(f, f.area(), draft, draft.len(), None, &keybindings);
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn rendered_ai_search_modal(cols: u16, rows: u16, draft: &str) -> String {
+        let keybindings = KeyBindings::default();
+        let backend = ratatui::backend::TestBackend::new(cols, rows);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_ai_search_modal(f, f.area(), draft, draft.len(), None, &keybindings);
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = *buffer.area();
+        let mut text = String::new();
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn search_modals_show_shortcut_help_before_and_after_typing() {
+        for render in [
+            rendered_filter_modal as fn(u16, u16, &str) -> String,
+            rendered_ai_search_modal,
+        ] {
+            let empty = render(80, 24, "");
+            let typed = render(80, 24, "needle");
+
+            for screen in [empty, typed] {
+                assert!(screen.contains("Left/Right"), "{screen}");
+                assert!(screen.contains("Home/End"), "{screen}");
+                assert!(screen.contains("Delete/Backspace"), "{screen}");
+                assert!(screen.contains("Enter"), "{screen}");
+                assert!(screen.contains("Esc"), "{screen}");
+            }
         }
     }
 
@@ -25869,6 +30038,859 @@ mod tests {
     }
 
     #[test]
+    fn ai_provider_default_is_unconfigured() {
+        let settings = Settings::default();
+        let serialized = serde_json::to_value(&settings).unwrap();
+
+        assert_eq!(settings.cokacmux.ai.provider, None);
+        assert!(serialized
+            .pointer("/cokacmux/ai/provider")
+            .is_some_and(serde_json::Value::is_null));
+    }
+
+    #[test]
+    fn ai_provider_loads_legacy_ai_title_settings_key() {
+        let mut value = serde_json::json!({
+            "cokacmux": {
+                "ai_title": {
+                    "provider": "codex"
+                }
+            }
+        });
+        migrate_legacy_ai_settings_json(&mut value);
+        let settings = serde_json::from_value::<Settings>(value)
+            .unwrap()
+            .normalized();
+
+        assert_eq!(settings.cokacmux.ai.provider, Some(Provider::Codex));
+        let serialized = serde_json::to_value(&settings).unwrap();
+        assert!(serialized.pointer("/cokacmux/ai/provider").is_some());
+        assert!(serialized.pointer("/cokacmux/ai_title/provider").is_none());
+    }
+
+    #[test]
+    fn ai_provider_prefers_new_key_when_legacy_key_is_also_present() {
+        let mut value = serde_json::json!({
+            "cokacmux": {
+                "ai": {
+                    "provider": "claude"
+                },
+                "ai_title": {
+                    "provider": "codex"
+                }
+            }
+        });
+        migrate_legacy_ai_settings_json(&mut value);
+        let settings = serde_json::from_value::<Settings>(value)
+            .unwrap()
+            .normalized();
+
+        assert_eq!(settings.cokacmux.ai.provider, Some(Provider::Claude));
+        let serialized = serde_json::to_value(&settings).unwrap();
+        assert!(serialized.pointer("/cokacmux/ai/provider").is_some());
+        assert!(serialized.pointer("/cokacmux/ai_title/provider").is_none());
+    }
+
+    #[test]
+    fn ai_provider_new_key_null_overrides_legacy_key() {
+        let mut value = serde_json::json!({
+            "cokacmux": {
+                "ai": {
+                    "provider": null
+                },
+                "ai_title": {
+                    "provider": "codex"
+                }
+            }
+        });
+        migrate_legacy_ai_settings_json(&mut value);
+        let settings = serde_json::from_value::<Settings>(value)
+            .unwrap()
+            .normalized();
+
+        assert_eq!(settings.cokacmux.ai.provider, None);
+        let serialized = serde_json::to_value(&settings).unwrap();
+        assert!(serialized.pointer("/cokacmux/ai/provider").is_some());
+        assert!(serialized.pointer("/cokacmux/ai_title/provider").is_none());
+    }
+
+    #[test]
+    fn ai_provider_invalid_json_value_normalizes_to_unconfigured() {
+        let mut value = serde_json::json!({
+            "cokacmux": {
+                "sessions_pane_percent": 30,
+                "ai": {
+                    "provider": "unknown-agent"
+                }
+            }
+        });
+        migrate_legacy_ai_settings_json(&mut value);
+        let settings = serde_json::from_value::<Settings>(value)
+            .unwrap()
+            .normalized();
+
+        assert_eq!(settings.cokacmux.sessions_pane_percent, 30);
+        assert_eq!(settings.cokacmux.ai.provider, None);
+    }
+
+    #[test]
+    fn ai_provider_non_object_json_value_normalizes_to_unconfigured() {
+        let mut value = serde_json::json!({
+            "cokacmux": {
+                "sessions_pane_percent": 30,
+                "ai": "codex"
+            }
+        });
+        migrate_legacy_ai_settings_json(&mut value);
+        let settings = serde_json::from_value::<Settings>(value)
+            .unwrap()
+            .normalized();
+
+        assert_eq!(settings.cokacmux.sessions_pane_percent, 30);
+        assert_eq!(settings.cokacmux.ai.provider, None);
+    }
+
+    #[test]
+    fn ctrl_t_opens_ai_title_settings_from_sessions() {
+        let mut app = app_for_key_tests();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        match app.input_mode {
+            InputMode::AiTitleSettings {
+                selected,
+                return_to: AiTitleSettingsReturn::Normal,
+            } => assert_eq!(selected, ai_title_provider_index(None)),
+            other => panic!("expected AI title settings mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ai_title_settings_save_persists_selected_provider() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::AiTitleSettings {
+            selected: ai_title_provider_index(None),
+            return_to: AiTitleSettingsReturn::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert_eq!(
+            app.settings.cokacmux.ai.provider,
+            Some(Provider::Codex)
+        );
+        assert!(app.status.contains("codex"));
+    }
+
+    #[test]
+    fn title_ctrl_t_without_agent_opens_ai_title_settings_and_returns_to_title_edit() {
+        let source = session_info(Provider::Claude, "s1", "/tmp/project");
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::TitleEdit {
+            source,
+            draft: "Draft".to_string(),
+            cursor: "Draft".len(),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(
+            app.input_mode,
+            InputMode::AiTitleSettings {
+                return_to: AiTitleSettingsReturn::TitleEdit { .. },
+                ..
+            }
+        ));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::TitleEdit { draft, cursor, .. } => {
+                assert_eq!(draft, "Draft");
+                assert_eq!(*cursor, "Draft".len());
+            }
+            other => panic!("expected title edit mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn title_ctrl_t_with_agent_starts_ai_title_generation() {
+        let source = session_info(Provider::Claude, "s1", "/tmp/project");
+        let (tx, _rx) = mpsc::channel::<MainEvent>();
+        let mut app = app_for_key_tests();
+        app.main_tx = Some(tx);
+        app.settings.cokacmux.ai.provider = Some(Provider::Codex);
+        app.input_mode = InputMode::TitleEdit {
+            source: source.clone(),
+            draft: "Draft".to_string(),
+            cursor: "Draft".len(),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::TitleEdit { draft, cursor, .. } => {
+                assert_eq!(draft, "Draft");
+                assert_eq!(*cursor, "Draft".len());
+            }
+            other => panic!("expected title edit mode, got {:?}", other),
+        }
+        let pending = app.ai_title_pending.as_ref().unwrap();
+        assert_eq!(pending.key, AgentKey::new(&source));
+        assert_eq!(pending.provider, Provider::Codex);
+        assert!(app.status.contains("generating AI title"));
+    }
+
+    #[test]
+    fn title_edit_pauses_editing_while_ai_title_is_running() {
+        let source = session_info(Provider::Claude, "s1", "/tmp/project");
+        let mut app = app_for_key_tests();
+        app.ai_title_pending = Some(AiTitlePending {
+            seq: 3,
+            key: AgentKey::new(&source),
+            provider: Provider::Claude,
+            started_at: Instant::now(),
+        });
+        app.input_mode = InputMode::TitleEdit {
+            source,
+            draft: "Draft".to_string(),
+            cursor: "Draft".len(),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::TitleEdit { draft, cursor, .. } => {
+                assert_eq!(draft, "Draft");
+                assert_eq!(*cursor, "Draft".len());
+            }
+            other => panic!("expected title edit mode, got {:?}", other),
+        }
+        assert!(app.status.contains("editing is paused"));
+    }
+
+    #[test]
+    fn title_edit_pending_display_removes_cursor_marker() {
+        let pending = AiTitlePending {
+            seq: 3,
+            key: AgentKey {
+                provider: Provider::Claude,
+                session_id: "s1".into(),
+            },
+            provider: Provider::Claude,
+            started_at: Instant::now(),
+        };
+
+        assert_eq!(title_edit_readonly_display("Draft", 8), "Draft   ");
+        assert!(!title_edit_readonly_display("Draft", 8).contains('|'));
+        assert!(title_edit_ai_title_pending_text(&pending).contains("AI title running"));
+        assert!(title_edit_ai_title_pending_text(&pending).contains("editing paused"));
+    }
+
+    #[test]
+    fn input_viewport_returns_text_and_real_cursor_column() {
+        let visible = input_viewport("abc", 2, 8);
+        assert_eq!(visible.text, "abc     ");
+        assert_eq!(visible.cursor_col, 2);
+        assert!(!visible.text.contains('|'));
+
+        let end_at_full_width = input_viewport("abcdef", 6, 6);
+        assert_eq!(UnicodeWidthStr::width(end_at_full_width.text.as_str()), 6);
+        assert!(end_at_full_width.cursor_col < 6);
+        assert!(!end_at_full_width.text.contains('|'));
+
+        let wide = input_viewport("가나다", "가나".len(), 6);
+        assert_eq!(wide.cursor_col, 4);
+        assert_eq!(UnicodeWidthStr::width(wide.text.as_str()), 6);
+    }
+
+    #[test]
+    fn ai_title_result_updates_matching_title_edit_draft() {
+        let source = session_info(Provider::Claude, "s1", "/tmp/project");
+        let key = AgentKey::new(&source);
+        let mut app = app_for_key_tests();
+        app.ai_title_pending = Some(AiTitlePending {
+            seq: 7,
+            key,
+            provider: Provider::Codex,
+            started_at: Instant::now(),
+        });
+        app.input_mode = InputMode::TitleEdit {
+            source: source.clone(),
+            draft: "Draft".to_string(),
+            cursor: "Draft".len(),
+        };
+
+        app.on_ai_title_worker_result(AiTitleWorkerResult {
+            seq: 7,
+            source,
+            provider: Provider::Codex,
+            outcome: Ok("Generated session title".to_string()),
+            elapsed_ms: 12,
+            queued_at_epoch_ms: current_epoch_ms(),
+        });
+
+        assert!(app.ai_title_pending.is_none());
+        match &app.input_mode {
+            InputMode::TitleEdit { draft, cursor, .. } => {
+                assert_eq!(draft, "Generated session title");
+                assert_eq!(*cursor, "Generated session title".len());
+            }
+            other => panic!("expected title edit mode, got {:?}", other),
+        }
+        assert!(app.status.contains("AI title ready"));
+    }
+
+    #[test]
+    fn sanitize_ai_title_response_keeps_first_clean_title_line() {
+        assert_eq!(
+            sanitize_ai_title_response("Title: Build AI title generation\n\nextra").as_deref(),
+            Some("Build AI title generation")
+        );
+        assert_eq!(
+            sanitize_ai_title_response("```\n제목: 세션 제목 자동 생성\n```").as_deref(),
+            Some("세션 제목 자동 생성")
+        );
+        assert_eq!(sanitize_ai_title_response("   ").as_deref(), None);
+    }
+
+    #[test]
+    fn extract_ai_title_response_prefers_structured_title() {
+        assert_eq!(
+            extract_ai_title_response(r#"{"title":"제목: 구조화된 AI 제목"}"#).as_deref(),
+            Some("구조화된 AI 제목")
+        );
+        assert_eq!(
+            extract_ai_title_response(
+                r#"{"type":"result","subtype":"success","structured_output":{"title":"Claude structured title"}}"#
+            )
+            .as_deref(),
+            Some("Claude structured title")
+        );
+        assert_eq!(
+            extract_ai_title_response(
+                r#"{"info":{"structured":{"title":"OpenCode API structured title"}}}"#
+            )
+            .as_deref(),
+            Some("OpenCode API structured title")
+        );
+        assert_eq!(
+            extract_ai_title_response(
+                r#"{"info":{"structured_output":{"title":"OpenCode docs structured title"}}}"#
+            )
+            .as_deref(),
+            Some("OpenCode docs structured title")
+        );
+        assert_eq!(
+            extract_ai_title_response(
+                r#"{"type":"result","subtype":"error_max_structured_output_retries"}"#
+            )
+            .as_deref(),
+            None
+        );
+        assert_eq!(
+            extract_ai_title_response("Title: Plain fallback title").as_deref(),
+            Some("Plain fallback title")
+        );
+    }
+
+    #[test]
+    fn claude_structured_output_error_reports_result_subtype() {
+        assert_eq!(
+            claude_structured_output_error(
+                r#"{"type":"result","subtype":"error_max_structured_output_retries"}"#
+            )
+            .as_deref(),
+            Some("claude structured output failed: error_max_structured_output_retries")
+        );
+        assert_eq!(
+            claude_structured_output_error(r#"{"type":"result","subtype":"success"}"#).as_deref(),
+            Some("claude structured output missing title")
+        );
+        assert_eq!(
+            claude_structured_output_error(
+                r#"{"type":"result","subtype":"success","structured_output":{"title":"ok"}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_ai_title_payload_from_events_prefers_final_answer_text() {
+        let raw = concat!(
+            r#"{"type":"text","part":{"type":"text","text":"draft"}}"#,
+            "\n",
+            r#"{"type":"text","part":{"type":"text","text":"{\"title\":\"Final OpenCode title\"}","metadata":{"openai":{"phase":"final_answer"}}}}"#,
+            "\n",
+            r#"{"type":"step_finish","reason":"stop"}"#
+        );
+
+        assert_eq!(
+            opencode_ai_title_payload_from_events(raw).as_deref(),
+            Ok(r#"{"title":"Final OpenCode title"}"#)
+        );
+    }
+
+    #[test]
+    fn opencode_ai_title_payload_from_events_reports_invalid_json() {
+        assert!(opencode_ai_title_payload_from_events("not json")
+            .unwrap_err()
+            .contains("invalid JSON event on line 1"));
+    }
+
+    #[test]
+    fn opencode_ai_title_session_ids_from_events_collects_unique_ids() {
+        let raw = concat!(
+            r#"{"type":"step_start","sessionID":"ses_one","part":{"sessionID":"ses_one"}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_one","part":{"sessionID":"ses_two","text":"x"}}"#,
+            "\n",
+            "not json",
+            "\n",
+            r#"{"info":{"sessionID":"ses_three"}}"#
+        );
+
+        assert_eq!(
+            opencode_ai_title_session_ids_from_events(raw),
+            vec![
+                "ses_one".to_string(),
+                "ses_two".to_string(),
+                "ses_three".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ai_title_transcript_uses_summary_for_large_sessions() {
+        let mut session =
+            UniversalSession::new("large-ai-title", Provider::Codex, "/shared/cokacmux");
+        session.messages.push(test_message(
+            0,
+            cokacmux::Role::User,
+            &"x".repeat(AI_TITLE_FULL_TRANSCRIPT_MAX_CHARS + 1_000),
+        ));
+
+        let transcript = ai_title_transcript_for_prompt(&session);
+
+        assert_eq!(transcript.mode, "summary");
+        assert!(transcript.full_chars > AI_TITLE_FULL_TRANSCRIPT_MAX_CHARS);
+        assert!(transcript.text.contains("Large session note"));
+        assert!(transcript.text.contains("USER #0"));
+        assert!(
+            transcript.text.chars().count() < AI_TITLE_FULL_TRANSCRIPT_MAX_CHARS / 4,
+            "summary transcript should be much smaller than the full rendered session"
+        );
+    }
+
+    #[test]
+    fn ai_title_process_error_reports_tail_instead_of_codex_banner() {
+        let output = AiTitleCommandOutput {
+            status: None,
+            stdout: "context length exceeded\ntry a shorter prompt\n".to_string(),
+            stderr: format!(
+                "OpenAI Codex v0.0.0\n--------\nworkdir: /shared/cokacmux\nmodel: gpt-5.5\nprovider: openai\nuser\n{}\nerror: request too large\n",
+                "prompt ".repeat(200)
+            ),
+            cancelled: false,
+            timed_out: false,
+            duration: Duration::from_secs(1),
+        };
+
+        let error = ai_title_process_error("codex", &output);
+
+        assert!(error.contains("context length exceeded"));
+        assert!(error.contains("error: request too large"));
+        assert!(!error.contains("OpenAI Codex v0.0.0"));
+        assert!(!error.contains("workdir: /shared/cokacmux"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ai_title_agent_runners_accept_fake_provider_clis() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = write_executable_test_script(
+            dir.path(),
+            "fake-codex",
+            r#"#!/bin/sh
+out=""
+schema=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--output-last-message" ]; then
+    out="$arg"
+  fi
+  if [ "$prev" = "--output-schema" ]; then
+    schema="$arg"
+  fi
+  prev="$arg"
+done
+[ -n "$schema" ] || exit 3
+[ -s "$schema" ] || exit 4
+grep -q '"title"' "$schema" || exit 5
+cat >/dev/null
+printf '%s' '{"title":"Codex generated title"}' > "$out"
+printf '%s' 'stdout noise'
+"#,
+        );
+        let claude = write_executable_test_script(
+            dir.path(),
+            "fake-claude",
+            r#"#!/bin/sh
+schema=""
+output_format=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--json-schema" ]; then
+    schema="$arg"
+  fi
+  if [ "$prev" = "--output-format" ]; then
+    output_format="$arg"
+  fi
+  prev="$arg"
+done
+[ "$output_format" = "json" ] || exit 6
+[ -n "$schema" ] || exit 7
+printf '%s' "$schema" | grep -q '"title"' || exit 8
+cat >/dev/null
+printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"title":"Claude generated title"}}'
+"#,
+        );
+        let opencode = write_executable_test_script(
+            dir.path(),
+            "fake-opencode",
+            r#"#!/bin/sh
+if [ "$1" = "session" ] && [ "$2" = "delete" ]; then
+  printf '%s\n' "$3" >> deleted-opencode-sessions
+  printf '%s\n' "Session $3 deleted"
+  exit 0
+fi
+format=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--format" ]; then
+    format="$arg"
+  fi
+  prev="$arg"
+done
+[ "$format" = "json" ] || exit 9
+case "$*" in
+  *"SESSION TRANSCRIPT"*) exit 10 ;;
+esac
+prompt="$(cat)"
+case "$prompt" in
+  *"SESSION TRANSCRIPT"*) ;;
+  *) exit 2 ;;
+esac
+printf '%s\n' '{"type":"text","sessionID":"ses_fake_ai_title","part":{"type":"text","sessionID":"ses_fake_ai_title","text":"{\"title\":\"OpenCode generated title\"}","metadata":{"openai":{"phase":"final_answer"}}}}'
+"#,
+        );
+
+        let codex_raw = run_codex_ai_title(&codex, dir.path(), 42, "embedded transcript").unwrap();
+        let claude_raw = run_claude_ai_title(&claude, dir.path(), "embedded transcript").unwrap();
+        let opencode_raw =
+            run_opencode_ai_title(&opencode, dir.path(), "=== SESSION TRANSCRIPT ===").unwrap();
+
+        assert_eq!(
+            extract_ai_title_response(&codex_raw).as_deref(),
+            Some("Codex generated title")
+        );
+        assert_eq!(
+            extract_ai_title_response(&claude_raw).as_deref(),
+            Some("Claude generated title")
+        );
+        assert_eq!(
+            extract_ai_title_response(&opencode_raw).as_deref(),
+            Some("OpenCode generated title")
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("deleted-opencode-sessions"))
+                .unwrap()
+                .trim(),
+            "ses_fake_ai_title"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ai_search_agent_runners_accept_fake_provider_clis() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = write_executable_test_script(
+            dir.path(),
+            "fake-search-codex",
+            r#"#!/bin/sh
+out=""
+schema=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--output-last-message" ]; then
+    out="$arg"
+  fi
+  if [ "$prev" = "--output-schema" ]; then
+    schema="$arg"
+  fi
+  prev="$arg"
+done
+[ -n "$schema" ] || exit 3
+[ -s "$schema" ] || exit 4
+grep -q '"results"' "$schema" || exit 5
+prompt="$(cat)"
+case "$prompt" in
+  *"Search only this preview directory"*) ;;
+  *) exit 6 ;;
+esac
+printf '%s' '{"results":[{"provider":"codex","session_id":"codex-hit","score":0.9,"reason":"r"}]}' > "$out"
+"#,
+        );
+        let claude = write_executable_test_script(
+            dir.path(),
+            "fake-search-claude",
+            r#"#!/bin/sh
+schema=""
+output_format=""
+tools=""
+add_dir=""
+prev=""
+for arg in "$@"; do
+  if [ "$arg" = "--max-turns" ]; then
+    exit 16
+  fi
+  if [ "$prev" = "--json-schema" ]; then
+    schema="$arg"
+  fi
+  if [ "$prev" = "--output-format" ]; then
+    output_format="$arg"
+  fi
+  if [ "$prev" = "--tools" ]; then
+    tools="$arg"
+  fi
+  if [ "$prev" = "--add-dir" ]; then
+    add_dir="$arg"
+  fi
+  prev="$arg"
+done
+[ "$output_format" = "json" ] || exit 7
+[ -n "$schema" ] || exit 8
+printf '%s' "$schema" | grep -q '"results"' || exit 9
+printf '%s' "$tools" | grep -q 'Grep' || exit 10
+[ "$add_dir" = "$(pwd)" ] || exit 11
+cat >/dev/null
+printf '%s\n' '{"type":"result","subtype":"success","structured_output":{"results":[{"provider":"claude","session_id":"claude-hit","score":0.8,"reason":"r"}]}}'
+"#,
+        );
+        let opencode = write_executable_test_script(
+            dir.path(),
+            "fake-search-opencode",
+            r#"#!/bin/sh
+if [ "$1" = "session" ] && [ "$2" = "delete" ]; then
+  printf '%s\n' "$3" >> deleted-opencode-search-sessions
+  exit 0
+fi
+format=""
+dangerous=""
+pure=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--format" ]; then
+    format="$arg"
+  fi
+  if [ "$arg" = "--dangerously-skip-permissions" ]; then
+    dangerous="yes"
+  fi
+  if [ "$arg" = "--pure" ]; then
+    pure="yes"
+  fi
+  prev="$arg"
+done
+[ "$format" = "json" ] || exit 12
+[ "$pure" = "yes" ] || exit 14
+[ -z "$dangerous" ] || exit 16
+[ "$OPENCODE_PERMISSION" = '{"read":"allow","glob":"allow","grep":"allow","list":"allow","edit":"deny","bash":"deny","task":"deny"}' ] || exit 15
+prompt="$(cat)"
+case "$prompt" in
+  *"Search only this preview directory"*) ;;
+  *) exit 13 ;;
+esac
+printf '%s\n' '{"type":"text","sessionID":"ses_fake_ai_search","part":{"type":"text","sessionID":"ses_fake_ai_search","text":"{\"results\":[{\"provider\":\"opencode\",\"session_id\":\"opencode-hit\",\"score\":0.7,\"reason\":\"r\"}]}","metadata":{"openai":{"phase":"final_answer"}}}}'
+"#,
+        );
+        let prompt = concat!(
+            "Query: release\n",
+            "Search only this preview directory: /tmp/searchdata\n"
+        );
+
+        let codex_hits = extract_ai_search_response(
+            &run_codex_ai_search(&codex, dir.path(), 91, prompt, None).unwrap(),
+        )
+        .unwrap();
+        let claude_hits = extract_ai_search_response(
+            &run_claude_ai_search(&claude, dir.path(), prompt, None).unwrap(),
+        )
+        .unwrap();
+        let opencode_hits = extract_ai_search_response(
+            &run_opencode_ai_search(&opencode, dir.path(), prompt, None).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(codex_hits[0].key.session_id, "codex-hit");
+        assert_eq!(claude_hits[0].key.session_id, "claude-hit");
+        assert_eq!(opencode_hits[0].key.session_id, "opencode-hit");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("deleted-opencode-search-sessions"))
+                .unwrap()
+                .trim(),
+            "ses_fake_ai_search"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_ai_title_fails_when_session_cleanup_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let opencode = write_executable_test_script(
+            dir.path(),
+            "fake-opencode-cleanup-fails",
+            r#"#!/bin/sh
+if [ "$1" = "session" ] && [ "$2" = "delete" ]; then
+  printf '%s\n' "delete failed"
+  exit 11
+fi
+cat >/dev/null
+printf '%s\n' '{"type":"text","sessionID":"ses_cleanup_failure","part":{"type":"text","sessionID":"ses_cleanup_failure","text":"{\"title\":\"OpenCode generated title\"}","metadata":{"openai":{"phase":"final_answer"}}}}'
+"#,
+        );
+
+        let error =
+            run_opencode_ai_title(&opencode, dir.path(), "=== SESSION TRANSCRIPT ===").unwrap_err();
+
+        assert!(error.contains("opencode AI title session cleanup failed"));
+        assert!(error.contains("ses_cleanup_failure"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_ai_title_sends_large_prompt_over_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let opencode = write_executable_test_script(
+            dir.path(),
+            "fake-opencode-large-stdin",
+            r#"#!/bin/sh
+case "$*" in
+  *"SESSION TRANSCRIPT"*) exit 10 ;;
+esac
+prompt="$(cat)"
+printf '%s\n' "${#prompt}" > prompt-len
+case "$prompt" in
+  *"SESSION TRANSCRIPT"*) ;;
+  *) exit 2 ;;
+esac
+printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large stdin title\"}","metadata":{"openai":{"phase":"final_answer"}}}}'
+"#,
+        );
+        let prompt = format!("=== SESSION TRANSCRIPT ===\n{}", "x".repeat(400_000));
+
+        let raw = run_opencode_ai_title(&opencode, dir.path(), &prompt).unwrap();
+
+        assert_eq!(
+            extract_ai_title_response(&raw).as_deref(),
+            Some("Large stdin title")
+        );
+        let prompt_len = fs::read_to_string(dir.path().join("prompt-len"))
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        assert!(prompt_len > 400_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unix_default_install_candidates_include_home_install() {
+        let home = Path::new("/home/example");
+
+        assert_eq!(
+            opencode_unix_default_install_candidates(home),
+            [
+                PathBuf::from("/home/example/.opencode/bin/opencode"),
+                PathBuf::from("/home/example/.local/bin/opencode"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_executable_test_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn test_message(index: u32, role: cokacmux::Role, text: &str) -> cokacmux::UMessage {
+        cokacmux::UMessage {
+            id: format!("m{index}"),
+            parent_id: None,
+            index,
+            timestamp: None,
+            role,
+            model: None,
+            usage: None,
+            stop_reason: None,
+            content: vec![cokacmux::ContentBlock::text(text)],
+            flags: cokacmux::MessageFlags::default(),
+            provenance: cokacmux::Provenance {
+                source_event_type: "test".into(),
+                raw: serde_json::Value::Null,
+            },
+            extras: Default::default(),
+        }
+    }
+
+    #[test]
     fn slash_opens_search_dialog_without_live_filtering() {
         let mut app = app_for_key_tests();
         app.text_filter = "old".to_string();
@@ -25975,6 +30997,89 @@ mod tests {
         assert!(app.search_pending.is_none());
         assert_eq!(app.text_filter, "needle");
         assert!(app.text_filter_matches.contains(&AgentKey::new(&info)));
+    }
+
+    #[test]
+    fn esc_clears_text_search_results_to_full_list() {
+        let mut app = app_for_key_tests();
+        let first = session_info(Provider::Codex, "needle-session", "/repo/one");
+        let second = session_info(Provider::Claude, "other-session", "/repo/two");
+        app.sessions = vec![first.clone(), second.clone()];
+        app.text_filter = "needle".to_string();
+        app.text_filter_matches.insert(AgentKey::new(&first));
+        app.focus = FocusPane::Preview;
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(!app.should_quit);
+        assert!(app.text_filter.is_empty());
+        assert!(app.text_filter_matches.is_empty());
+        assert!(app.ai_search_results.is_none());
+        assert_eq!(app.focus, FocusPane::Sessions);
+        assert_eq!(app.visible().len(), 2);
+        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.status, "search cleared: 2 sessions");
+    }
+
+    #[test]
+    fn esc_clears_ai_search_results_to_full_list() {
+        let mut app = app_for_key_tests();
+        let first = session_info(Provider::Codex, "ai-hit", "/repo/one");
+        let second = session_info(Provider::Claude, "not-in-ai-results", "/repo/two");
+        app.sessions = vec![first.clone(), second.clone()];
+        app.ai_search_results = Some(AiSearchResults {
+            query: "needle".to_string(),
+            hits: vec![AiSearchHit {
+                key: AgentKey::new(&first),
+                score: 0.9,
+                reason: "r".to_string(),
+            }],
+        });
+        app.focus = FocusPane::Preview;
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(!app.should_quit);
+        assert!(app.text_filter.is_empty());
+        assert!(app.text_filter_matches.is_empty());
+        assert!(app.ai_search_results.is_none());
+        assert_eq!(app.focus, FocusPane::Sessions);
+        assert_eq!(app.visible().len(), 2);
+        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.status, "search cleared: 2 sessions");
+    }
+
+    #[test]
+    fn esc_quits_when_full_list_has_no_active_search() {
+        let mut app = app_for_key_tests();
+        app.sessions
+            .push(session_info(Provider::Codex, "session", "/repo"));
+        app.focus = FocusPane::Sessions;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(app.should_quit);
+        assert_eq!(app.focus, FocusPane::Sessions);
     }
 
     #[test]
