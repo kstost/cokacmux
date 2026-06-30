@@ -38,13 +38,17 @@ cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다
 
 액션을 설정하면 기본값에 추가되는 것이 아니라 그 액션의 기본 단축키 전체를 대체합니다. 예를 들어 `"sessions.quit": ["ctrl+q"]`만 쓰면 `q` 종료는 꺼지고 `ctrl+q`만 남습니다.
 
-현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma", "ctrl+t"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다.
+현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.toggle_focus`는 `["tab"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다.
 
 구버전에서 자동 생성된 `sessions.launch_agent: ["e"]` + `sessions.toggle_preview: ["enter"]` 조합은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 
 구버전에서 자동 생성된 `sessions.filter: ["/"]`와 `sessions.ai_search: ["ctrl+s"]` 값도 새 검색 선택창 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 
-구버전에서 자동 생성된 `sessions.ai_title_settings: ["ctrl+t"]` 값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+구버전에서 자동 생성된 `sessions.ai_title_settings: ["ctrl+t"]` 또는 `["comma", "ctrl+t"]` 값도 `["comma"]` 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+
+구버전에서 자동 생성된 `sessions.toggle_focus: ["tab", "esc"]` 값도 `["tab"]` 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+
+구버전에서 자동 생성된 이동 계열 기본값의 `h`, `j`, `k`, `l` 별칭도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 
 구버전에서 자동 생성된 `agent.scroll_page_up` / `agent.scroll_page_down` 값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 
@@ -53,7 +57,7 @@ cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다
 ```json
 {
   "sessions.launch_agent": ["x"],
-  "agent.scroll_page_down": ["alt+j"]
+  "agent.scroll_page_down": ["alt+d"]
 }
 ```
 
@@ -147,7 +151,7 @@ G
 
 ### sessions
 
-세션 목록/미리보기 화면에서 쓰는 액션입니다.
+세션 목록/미리보기 화면에서 쓰는 액션입니다. `Esc`는 `sessions.toggle_focus` 기본값이 아닙니다. normal 세션 화면에서는 적용된 검색 결과를 먼저 해제하고, 검색 결과가 없으면 종료합니다.
 
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
@@ -156,10 +160,10 @@ G
 | `sessions.toggle_agent` | `ctrl+]`, `ctrl+[`, `ctrl+3`, `ctrl+5` | 세션 화면과 agent 화면 전환 |
 | `sessions.kill_agent` | `ctrl+k` | 선택한 실행 중 대상 종료 |
 | `sessions.new_shell` | `ctrl+n` | 새 세션 모달 열기 |
-| `sessions.toggle_focus` | `tab`, `esc` | 세션 목록과 미리보기 포커스 전환 |
+| `sessions.toggle_focus` | `tab` | 세션 목록과 미리보기 포커스 전환 |
 | `sessions.toggle_preview` | 없음 | 미리보기를 summary 모드로 되돌림. 기본값에서는 비활성화 |
-| `sessions.move_next` | `down`, `j` | 다음 행 선택 또는 미리보기 아래로 스크롤 |
-| `sessions.move_prev` | `up`, `k` | 이전 행 선택 또는 미리보기 위로 스크롤 |
+| `sessions.move_next` | `down` | 다음 행 선택 또는 미리보기 아래로 스크롤 |
+| `sessions.move_prev` | `up` | 이전 행 선택 또는 미리보기 위로 스크롤 |
 | `sessions.page_next` | `pagedown` | 10행 아래 또는 미리보기 한 페이지 아래 |
 | `sessions.page_prev` | `pageup` | 10행 위 또는 미리보기 한 페이지 위 |
 | `sessions.top` | `home`, `g` | 처음으로 이동 |
@@ -171,7 +175,7 @@ G
 | `sessions.delete` | `delete`, `d` | 선택 세션 삭제 확인 열기 |
 | `sessions.clone` | `c` | 선택 세션 복제 |
 | `sessions.edit_title` | `t` | 선택 세션 제목 편집 |
-| `sessions.ai_title_settings` | `comma`, `ctrl+t` | 설정 화면 열기 |
+| `sessions.ai_title_settings` | `comma` | 설정 화면 열기 |
 | `sessions.launch_agent` | `e`, `enter` | agent launch 모드 선택 열기 또는 live agent 연결 |
 | `sessions.refresh_preview` | `space` | 미리보기 캐시 무시하고 다시 그리기 |
 | `sessions.resize_left` | `alt+left`, `ctrl+shift+left` | 세션 패널 좁히기 |
@@ -187,8 +191,8 @@ G
 |---|---|---|
 | `search.cancel` | `esc` | 취소 |
 | `search.confirm` | `enter` | 선택한 검색 방식 열기 |
-| `search.next` | `down`, `j`, `tab` | 다음 검색 방식 |
-| `search.prev` | `up`, `k`, `backtab` | 이전 검색 방식 |
+| `search.next` | `down`, `tab` | 다음 검색 방식 |
+| `search.prev` | `up`, `backtab` | 이전 검색 방식 |
 | `search.text` | `1` | 일반 검색 선택 |
 | `search.ai` | `2` | AI 검색 선택 |
 
@@ -209,7 +213,7 @@ G
 | `agent.scroll_top` | `shift+home`, `alt+home` | transcript/scrollback 맨 위 |
 | `agent.scroll_bottom` | `shift+end`, `alt+end` | transcript/scrollback 맨 아래 |
 | `agent.resize_left` | `alt+left`, `ctrl+shift+left` | agents 사이드바 좁히기 |
-| `agent.resize_right` | `alt+right`, `ctrl+shift+right` | agents 사이드바 넓히기 |
+| `agent.resize_right` | `alt+right`, `ctrl+shift+right` | agents 사이드바 넓히기. 숨김 상태에서는 0폭에서 한 단계만 표시 |
 | `agent.sidebar_prev` | `alt+up`, `ctrl+shift+up` | agents 사이드바 선택 위로 이동 |
 | `agent.sidebar_next` | `alt+down`, `ctrl+shift+down` | agents 사이드바 선택 아래로 이동 |
 | `agent.switch_prev` | `ctrl+pageup` | 이전 live agent로 전환 |
@@ -223,8 +227,8 @@ G
 |---|---|---|
 | `delete_confirm.cancel` | `esc`, `n`, `N` | 삭제 취소 |
 | `delete_confirm.confirm` | `enter` | 선택한 버튼 실행 |
-| `delete_confirm.next` | `right`, `down`, `l`, `j`, `tab` | 다음 버튼 선택 |
-| `delete_confirm.prev` | `left`, `up`, `h`, `k`, `backtab` | 이전 버튼 선택 |
+| `delete_confirm.next` | `right`, `down`, `tab` | 다음 버튼 선택 |
+| `delete_confirm.prev` | `left`, `up`, `backtab` | 이전 버튼 선택 |
 | `delete_confirm.delete` | `1`, `y`, `Y` | Delete session 버튼 실행 |
 | `delete_confirm.cancel_choice` | `2` | Cancel 버튼 실행 |
 
@@ -236,8 +240,8 @@ G
 |---|---|---|
 | `create_folder.cancel` | `esc`, `n`, `N` | 생성하지 않고 취소 |
 | `create_folder.confirm` | `enter` | 선택한 버튼 실행 |
-| `create_folder.next` | `right`, `down`, `l`, `j`, `tab` | 다음 버튼 선택 |
-| `create_folder.prev` | `left`, `up`, `h`, `k`, `backtab` | 이전 버튼 선택 |
+| `create_folder.next` | `right`, `down`, `tab` | 다음 버튼 선택 |
+| `create_folder.prev` | `left`, `up`, `backtab` | 이전 버튼 선택 |
 | `create_folder.create` | `1`, `y`, `Y` | Create/start 버튼 실행 |
 | `create_folder.cancel_choice` | `2` | Cancel 버튼 실행 |
 
@@ -249,8 +253,8 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 |---|---|---|
 | `restore_data.skip` | `esc`, `n`, `N` | 복원 없이 시작 |
 | `restore_data.confirm` | `enter` | 선택한 버튼 실행 |
-| `restore_data.next` | `right`, `down`, `l`, `j`, `tab` | 다음 버튼 선택 |
-| `restore_data.prev` | `left`, `up`, `h`, `k`, `backtab` | 이전 버튼 선택 |
+| `restore_data.next` | `right`, `down`, `tab` | 다음 버튼 선택 |
+| `restore_data.prev` | `left`, `up`, `backtab` | 이전 버튼 선택 |
 | `restore_data.restore` | `1`, `y`, `Y` | Restore/start 버튼 실행 |
 | `restore_data.skip_choice` | `2` | Start without restore 버튼 실행 |
 
@@ -293,14 +297,14 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 |---|---|---|
 | `ai_title_settings.cancel` | `esc` | 변경하지 않고 닫기. 실행 파일 경로 편집 중에는 편집 내용을 버리고 편집 종료 |
 | `ai_title_settings.save` | `enter` | 설정 저장. 실행 파일 경로 행에서는 편집 시작/완료. 편집 완료 직후 다시 누르면 저장 |
-| `ai_title_settings.next` | `down`, `j`, `tab` | 다음 행 |
-| `ai_title_settings.prev` | `up`, `k`, `backtab` | 이전 행 |
+| `ai_title_settings.next` | `down`, `tab` | 다음 행 |
+| `ai_title_settings.prev` | `up`, `backtab` | 이전 행 |
 | `ai_title_settings.none` | `1` | 설정 없음 선택 |
 | `ai_title_settings.claude` | `2` | Claude 선택 |
 | `ai_title_settings.codex` | `3` | Codex 선택 |
 | `ai_title_settings.opencode` | `4` | OpenCode 선택 |
 
-설정 화면의 섹션 이동은 `Left` / `Right`입니다. `Space`는 현재 행의 값을 바꾸거나 reset합니다. Keybindings와 Data 섹션은 읽기 전용이며, 저장 전 변경사항은 설정 화면 상단에 표시됩니다.
+설정 화면의 섹션 이동은 `←` / `→`입니다. `Space`는 현재 행의 값을 바꾸거나 AI provider를 선택합니다. Keybindings와 Data 섹션은 읽기 전용이며, 저장 전 변경사항은 설정 화면 상단에 표시됩니다.
 
 ### agent_launch
 
@@ -310,8 +314,8 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 |---|---|---|
 | `agent_launch.cancel` | `esc` | 취소 |
 | `agent_launch.confirm` | `enter` | 선택한 launch mode로 start/attach |
-| `agent_launch.next` | `down`, `j` | 다음 launch mode |
-| `agent_launch.prev` | `up`, `k` | 이전 launch mode |
+| `agent_launch.next` | `down` | 다음 launch mode |
+| `agent_launch.prev` | `up` | 이전 launch mode |
 | `agent_launch.normal` | `1` | normal 선택 |
 | `agent_launch.skip_permissions` | `2` | skip permissions 선택 |
 
@@ -323,10 +327,10 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 |---|---|---|
 | `new_session.cancel` | `esc` | 취소 |
 | `new_session.confirm` | `enter` | 선택한 설정으로 시작 |
-| `new_session.next` | `down`, `j`, `tab` | 다음 입력 항목 |
-| `new_session.prev` | `up`, `k`, `backtab` | 이전 입력 항목 |
-| `new_session.choice_next` | `right`, `l`, `space` | Type / Agent / Permissions 다음 값 |
-| `new_session.choice_prev` | `left`, `h` | Type / Agent / Permissions 이전 값 |
+| `new_session.next` | `down`, `tab` | 다음 입력 항목 |
+| `new_session.prev` | `up`, `backtab` | 이전 입력 항목 |
+| `new_session.choice_next` | `right`, `space` | Type / Agent / Permissions 다음 값 |
+| `new_session.choice_prev` | `left` | Type / Agent / Permissions 이전 값 |
 | `new_session.move_left` | `left` | 폴더 경로 커서 왼쪽 이동 |
 | `new_session.move_right` | `right` | 폴더 경로 커서 오른쪽 이동 |
 | `new_session.backspace` | `backspace` | 폴더 경로에서 커서 앞 글자 삭제 |
@@ -334,7 +338,7 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 | `new_session.home` | `home` | 폴더 경로 커서 처음으로 |
 | `new_session.end` | `end` | 폴더 경로 커서 끝으로 |
 
-폴더 경로 입력 항목에서는 일반 문자 키가 경로 입력으로 우선 처리됩니다. 그래서 기본값에 `j`, `k`, `h`, `l`, `space`가 포함되어 있어도 경로 입력 중에는 문자로 들어갑니다. 입력 항목을 이동하려면 `up`, `down`, `tab`, `backtab`을 쓰면 됩니다.
+폴더 경로 입력 항목에서는 일반 문자 키가 경로 입력으로 우선 처리됩니다. 입력 항목을 이동하려면 `up`, `down`, `tab`, `backtab`을 쓰면 됩니다.
 
 ### clone_options
 
@@ -344,8 +348,8 @@ clone 실행 전에 세션만 복제할지, 저장 가능한 폴더 데이터도
 |---|---|---|
 | `clone_options.cancel` | `esc` | clone 취소 |
 | `clone_options.confirm` | `enter` | 선택한 버튼 실행 |
-| `clone_options.next` | `right`, `down`, `l`, `j` | 다음 버튼 선택 |
-| `clone_options.prev` | `left`, `up`, `h`, `k` | 이전 버튼 선택 |
+| `clone_options.next` | `right`, `down` | 다음 버튼 선택 |
+| `clone_options.prev` | `left`, `up` | 이전 버튼 선택 |
 | `clone_options.target_next` | `tab` | 다음 대상 provider 선택 |
 | `clone_options.target_prev` | `backtab` | 이전 대상 provider 선택 |
 | `clone_options.session_only` | `1` | Session only 버튼 실행 |

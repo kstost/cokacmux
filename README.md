@@ -153,7 +153,7 @@ cokacmux
 
 | 하고 싶은 일 | 키 |
 |---|---|
-| 세션 선택 이동 | `↑`/`↓` 또는 `j`/`k` |
+| 세션 선택 이동 | `↑`/`↓` |
 | 오른쪽 미리보기로 포커스 이동 | `Tab` |
 | 검색 | `Ctrl+F` |
 | 선택한 세션 이어 실행 | `e` 또는 `Enter` |
@@ -369,9 +369,9 @@ cokacmux
 |---|---|---|
 | 1 | 세션이 보이는지 터미널에서 확인 | `cokacmux --check` |
 | 2 | TUI 시작 | `cokacmux` |
-| 3 | 세션 목록에서 위아래로 이동 | `↑`/`↓` 또는 `j`/`k` |
+| 3 | 세션 목록에서 위아래로 이동 | `↑`/`↓` |
 | 4 | Tree/List 보기 차이 확인 | `v` |
-| 5 | 미리보기로 포커스를 옮기고 읽기 | `Tab`, `↑`/`↓`, `PageUp`/`PageDown`, `Esc` |
+| 5 | 미리보기로 포커스를 옮기고 읽기 | `Tab`, `↑`/`↓`, `PageUp`/`PageDown` |
 | 6 | 미리보기 캐시를 다시 읽기 | `Space` |
 | 7 | 검색하고, 빈 검색으로 전체 목록 복귀 | `Ctrl+F`, `Enter`, 검색어 입력, `Enter`; 다시 `Ctrl+F`, `Enter`, 빈 상태로 `Enter` |
 | 8 | 실행 모달만 열어 보고 취소 | `e` 또는 `Enter`, `Esc` |
@@ -384,7 +384,7 @@ cokacmux
 
 ### 6-1. 세션 둘러보기
 
-`↑`/`↓` 또는 `j`/`k`로 세션을 고릅니다. 미리보기는 선택이 바뀔 때 자동으로 갱신됩니다.
+`↑`/`↓`로 세션을 고릅니다. 미리보기는 선택이 바뀔 때 자동으로 갱신됩니다.
 
 빠르게 이동하려면:
 
@@ -416,16 +416,16 @@ cokacmux
 
 ### 6-2. 미리보기 읽기
 
-기본 포커스는 세션 목록에 있습니다. 오른쪽 미리보기를 스크롤하려면 `Tab` 또는 `Esc`로 포커스를 옮깁니다.
+기본 포커스는 세션 목록에 있습니다. 오른쪽 미리보기를 스크롤하려면 `Tab`으로 포커스를 옮깁니다.
 
 미리보기 포커스에서:
 
 | 동작 | 키 |
 |---|---|
-| 위/아래 스크롤 | `↑`/`↓` 또는 `j`/`k` |
+| 위/아래 스크롤 | `↑`/`↓` |
 | 한 페이지 위/아래 | `PageUp` / `PageDown` |
 | 처음/끝 | `Home` / `End` 또는 `g` / `G` |
-| 목록으로 돌아가기 | `Tab` 또는 `Esc` |
+| 목록으로 돌아가기 | `Tab` |
 
 `Space`를 누르면 미리보기 캐시를 무시하고 다시 읽습니다.
 
@@ -513,7 +513,7 @@ Text search 대상:
 
 Text search 중에는 버튼이 Searching 상태로 바뀌고 처리한 세션 수와 hit 수가 표시됩니다. 긴 세션이 많아도 검색 작업은 백그라운드에서 진행됩니다. 취소하려면 `Esc`를 누르세요.
 
-AI search는 먼저 세션 summary preview 인덱스를 `~/.cokacmux/searchdata`에 준비한 뒤, 설정 화면에서 고른 agent CLI에게 그 폴더를 탐색하게 합니다. AI search를 쓰려면 세션 목록에서 `,` 또는 `Ctrl+T`로 설정 화면을 열어 AI agent를 먼저 골라야 합니다. 진행 중에는 중앙 오버레이에 현재 단계와 인덱싱 진행률이 표시됩니다.
+AI search는 먼저 세션 summary preview 인덱스를 `~/.cokacmux/searchdata`에 준비한 뒤, 설정 화면에서 고른 agent CLI에게 그 폴더를 탐색하게 합니다. AI search를 쓰려면 세션 목록에서 `,`로 설정 화면을 열어 AI agent를 먼저 골라야 합니다. 진행 중에는 중앙 오버레이에 현재 단계와 인덱싱 진행률이 표시됩니다.
 
 검색 결과를 지우고 전체 목록으로 돌아가려면 빈 검색어로 Search를 실행하면 됩니다.
 
@@ -526,7 +526,7 @@ AI search는 먼저 세션 summary preview 인덱스를 `~/.cokacmux/searchdata`
 | Normal | 일반 실행입니다. 에이전트가 평소처럼 권한 확인을 요청할 수 있습니다. |
 | Skip permissions (danger) | 권한 확인을 우회하는 옵션을 붙입니다. 신뢰하는 폴더에서만 사용하세요. |
 
-모달에서 `↑`/`↓` 또는 `j`/`k`로 선택하고 `Enter`로 시작합니다. `1`은 Normal, `2`는 Skip permissions로 선택을 옮깁니다. `Esc`는 취소입니다.
+모달에서 `↑`/`↓`로 선택하고 `Enter`로 시작합니다. `1`은 Normal, `2`는 Skip permissions로 선택을 옮깁니다. `Esc`는 취소입니다.
 
 이미 같은 세션의 백그라운드 에이전트가 살아 있으면 새로 실행하지 않고 바로 다시 연결하므로 launch mode 선택을 거치지 않습니다. 다른 cokacmux 프로세스가 이미 붙어 있는 세션은 자동으로 뺏어오지 않습니다. 같은 작업 폴더를 쓰는 다른 live 코딩에이전트가 있으면 새 실행은 차단됩니다. 터미널과 `cokacdir` 같은 일반 PTY 도구는 이 제한에서 제외됩니다.
 
@@ -595,6 +595,8 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 | 사이드바 선택 이동 | `Alt+↑` / `Alt+↓` 또는 `Ctrl+Shift+↑` / `Ctrl+Shift+↓` |
 | 사이드바 폭 조절 | `Alt+←` / `Alt+→` 또는 `Ctrl+Shift+←` / `Ctrl+Shift+→` |
 
+사이드바를 숨긴 상태에서 `Alt+→` / `Ctrl+Shift+→`를 누르면 이전 폭을 복원하지 않고 0폭에서 한 단계만 펼칩니다.
+
 `cokacdir` 화면에서는 `Ctrl+K`를 cokacmux가 종료 단축키로 잡지 않고 `cokacdir`에 전달합니다. `cokacdir`을 cokacmux 쪽에서 종료하려면 세션 목록 화면으로 돌아간 뒤 실행 중인 항목을 선택하고 `Ctrl+K`를 누르세요.
 
 ### 6-8. 에이전트 화면 스크롤
@@ -619,7 +621,7 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 
 원본 세션의 작업 폴더가 존재하면, 복제 시 실제 폴더 데이터도 함께 복제할지 확인합니다. 동의하면 원본 폴더와 겹치지 않는 형제 폴더를 만들고 그곳으로 폴더 내용을 복사합니다. 새 세션 기록의 cwd는 이 전용 폴더로 패치되므로, 원본 세션과 복제 세션이 같은 경로를 번갈아 덮어쓰지 않습니다. 복사 중 원본 폴더가 바뀌거나 복제본의 내용 해시가 원본과 맞지 않으면 복제는 실패하고 부분 복사 폴더를 정리합니다. 저장된 폴더 데이터를 복원할 때도 같은 cwd에 live 코딩에이전트가 있으면 복원/시작을 차단합니다.
 
-폴더 데이터 스냅샷이 저장된 복제 세션을 나중에 실행하면 저장 폴더 복원 확인창이 열립니다. 기본 선택은 `Start without restore`입니다. `1` 또는 `y`는 저장된 폴더 데이터를 복원한 뒤 시작하고, `2`, `n`, `Esc`는 복원 없이 시작합니다. `←`/`→`, `↑`/`↓`, `h`/`j`/`k`/`l`, `Tab`/`BackTab`으로 버튼을 고른 뒤 `Enter`로 실행할 수도 있습니다. 대상 폴더가 이미 있으면 기존 폴더를 `.cokacmux-backup-<timestamp>` 이름으로 백업한 뒤 복원합니다.
+폴더 데이터 스냅샷이 저장된 복제 세션을 나중에 실행하면 저장 폴더 복원 확인창이 열립니다. 기본 선택은 `Start without restore`입니다. `1` 또는 `y`는 저장된 폴더 데이터를 복원한 뒤 시작하고, `2`, `n`, `Esc`는 복원 없이 시작합니다. `←`/`→`, `↑`/`↓`, `Tab`/`BackTab`으로 버튼을 고른 뒤 `Enter`로 실행할 수도 있습니다. 대상 폴더가 이미 있으면 기존 폴더를 `.cokacmux-backup-<timestamp>` 이름으로 백업한 뒤 복원합니다.
 
 ### 6-10. 세션 타이틀 바꾸기
 
@@ -627,7 +629,7 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 
 저장 위치는 `~/.cokacmux/titles.json`입니다. 원본 에이전트의 대화 파일을 직접 수정하지 않고, cokacmux가 보여줄 표시 이름만 저장합니다.
 
-AI 제목 생성과 AI 검색에 사용할 agent는 세션 목록에서 `,` 또는 `Ctrl+T` 설정 화면으로 고릅니다. 기본값은 설정 없음입니다. 제목 편집창에서 `Ctrl+T`를 누르면 선택한 agent가 현재 세션 전체 내용을 읽고 한 문장 제목을 draft에 채웁니다. 처리 중에는 제목 편집창 안에 진행 상태가 표시되고 입력이 잠시 잠깁니다. 설정이 없으면 먼저 설정 화면이 열립니다.
+AI 제목 생성과 AI 검색에 사용할 agent는 세션 목록에서 `,` 설정 화면으로 고릅니다. 기본값은 설정 없음입니다. 제목 편집창에서 `Ctrl+T`를 누르면 선택한 agent가 현재 세션 전체 내용을 읽고 한 문장 제목을 draft에 채웁니다. 처리 중에는 제목 편집창 안에 진행 상태가 표시되고 입력이 잠시 잠깁니다. 설정이 없으면 먼저 설정 화면이 열립니다.
 
 세션 원문이 너무 크면 agent CLI의 입력 한계를 피하기 위해 전체 세션 summary 렌더러를 사용합니다.
 
@@ -637,7 +639,7 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 
 ### 6-11. 세션 삭제하기
 
-세션을 선택하고 `Delete` 또는 `d`를 누르면 확인창이 열립니다. 기본 선택은 Cancel입니다. `1` 또는 `y`로 바로 삭제하고, `2`, `n`, `Esc`로 취소합니다. `←`/`→`, `↑`/`↓`, `h`/`j`/`k`/`l`, `Tab`/`BackTab`으로 버튼을 고른 뒤 `Enter`로 실행할 수도 있습니다.
+세션을 선택하고 `Delete` 또는 `d`를 누르면 확인창이 열립니다. 기본 선택은 Cancel입니다. `1` 또는 `y`로 바로 삭제하고, `2`, `n`, `Esc`로 취소합니다. `←`/`→`, `↑`/`↓`, `Tab`/`BackTab`으로 버튼을 고른 뒤 `Enter`로 실행할 수도 있습니다.
 
 삭제는 실제 저장소의 세션 기록을 지우는 동작입니다.
 
@@ -669,17 +671,18 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | 키 | 동작 |
 |---|---|
 | `q` | 종료 |
+| `Esc` | 종료. 검색 결과가 적용되어 있으면 먼저 전체 목록으로 복귀 |
 | `Ctrl+Q` | 어디서든 종료 |
 | `Ctrl+C` | 세션 화면에서 종료 |
-| `↑`/`↓`, `j`/`k` | 선택 이동. 미리보기 포커스에서는 미리보기 스크롤 |
+| `↑`/`↓` | 선택 이동. 미리보기 포커스에서는 미리보기 스크롤 |
 | `PageUp` / `PageDown` | 10칸 이동. 미리보기 포커스에서는 페이지 스크롤 |
 | `Home`/`g`, `End`/`G` | 맨 위 / 맨 아래 |
-| `Tab` / `Esc` | 세션 목록과 미리보기 포커스 전환 |
+| `Tab` | 세션 목록과 미리보기 포커스 전환 |
 | `Space` | 미리보기 강제 새로고침 |
 | `Ctrl+F` | 검색 방식 선택창 열기 |
 | `v` | 트리 보기 / 목록 보기 전환 |
 | `t` | 제목 편집 |
-| `,` / `Ctrl+T` | 설정 화면 열기 |
+| `,` | 설정 화면 열기 |
 | `r` | 세션 목록 새로고침 |
 | `c` | 복제 옵션 열기. 같은 provider는 native clone, 다른 provider는 2-message context handoff. 폴더 데이터 포함 시 전용 cwd 생성 |
 | `Delete` / `d` | 세션 삭제 확인창 열기 |
@@ -700,7 +703,7 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | 키 | 동작 |
 |---|---|
 | `Enter` | 선택한 모드로 시작/연결 |
-| `↑`/`↓`, `j`/`k` | 선택 이동 |
+| `↑`/`↓` | 선택 이동 |
 | `1` | Normal 선택 |
 | `2` | Skip permissions 선택 |
 | `Esc` | 취소 |
@@ -712,8 +715,8 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | 키 | 동작 |
 |---|---|
 | `Enter` | 선택한 설정으로 시작 |
-| `↑`/`↓`, `j`/`k`, `Tab` / `BackTab` | 입력 항목 이동 |
-| `←`/`→`, `h`/`l`, `Space` | Type / Agent / Permissions 값 변경 |
+| `↑`/`↓`, `Tab` / `BackTab` | 입력 항목 이동 |
+| `←`/`→`, `Space` | Type / Agent / Permissions 값 변경 |
 | 폴더 입력 중 문자 키 | 경로 입력 |
 | 폴더 입력 중 `←`/`→` | 커서 이동 |
 | 폴더 입력 중 `Home` / `End` | 처음 / 끝으로 이동 |
@@ -770,7 +773,7 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | 키 | 동작 |
 |---|---|
 | `Enter` | 선택한 옵션으로 복제 |
-| `←`/`→`, `↑`/`↓`, `h`/`j`/`k`/`l` | 옵션 이동 |
+| `←`/`→`, `↑`/`↓` | 옵션 이동 |
 | `Tab` / `BackTab` | 대상 provider 변경 |
 | `1` | 세션만 복제 |
 | `2` | 폴더 데이터도 함께 복제 |
@@ -784,7 +787,7 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | 키 | 동작 |
 |---|---|
 | `Enter` | 선택한 버튼 실행 |
-| `←`/`→`, `↑`/`↓`, `h`/`j`/`k`/`l`, `Tab` / `BackTab` | 버튼 선택 |
+| `←`/`→`, `↑`/`↓`, `Tab` / `BackTab` | 버튼 선택 |
 | `1` 또는 `y` / `Y` | Restore/start |
 | `2` 또는 `n` / `N` / `Esc` | Start without restore |
 
@@ -793,7 +796,7 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | 키 | 동작 |
 |---|---|
 | `Enter` | 선택한 버튼 실행 |
-| `←`/`→`, `↑`/`↓`, `h`/`j`/`k`/`l`, `Tab` / `BackTab` | 버튼 선택 |
+| `←`/`→`, `↑`/`↓`, `Tab` / `BackTab` | 버튼 선택 |
 | `1` 또는 `y` / `Y` | 삭제 |
 | `2` 또는 `n` / `N` / `Esc` | 취소 |
 
@@ -850,7 +853,7 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 
 ## 9. 설정 파일
 
-설정 파일은 `~/.cokacmux/settings.json`입니다. 처음 실행할 때 파일이 없으면 기본 파일이 자동으로 생성됩니다. 세션 목록에서 `,` 또는 `Ctrl+T`를 누르면 설정 화면이 열리고, 여기서 AI agent, 세션 보기 방식, 일부 layout reset, agent 실행 파일 경로, `cokacdir` 실행 파일 경로를 저장할 수 있습니다. 저장 전 변경사항은 설정 화면 상단에 표시됩니다. Keybindings와 Data 섹션은 현재 경로와 동작 상태를 보여주는 읽기 전용 섹션입니다.
+설정 파일은 `~/.cokacmux/settings.json`입니다. 처음 실행할 때 파일이 없으면 기본 파일이 자동으로 생성됩니다. 세션 목록에서 `,`를 누르면 설정 화면이 열리고, 여기서 AI agent, 세션 보기 방식, agent 실행 파일 경로, `cokacdir` 실행 파일 경로를 저장할 수 있습니다. 저장 전 변경사항은 설정 화면 상단에 표시됩니다. Keybindings와 Data 섹션은 현재 경로와 동작 상태를 보여주는 읽기 전용 섹션입니다.
 
 기본 생성 예:
 
@@ -885,7 +888,7 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 | `agent_sidebar_visible` | 에이전트 사이드바를 처음에 보일지 정합니다. |
 | `session_view` | `"tree"` 또는 `"list"`입니다. `v` 키로도 바뀝니다. |
 | `agent_programs` | 현재 지원 provider의 실행 파일 경로를 직접 지정하는 곳입니다. |
-| `ai.provider` | AI 제목 생성과 AI 검색에 사용할 agent입니다. 기본값은 `null`이며, 세션 목록의 `,` 또는 `Ctrl+T` 설정 화면으로 직접 선택해야 합니다. |
+| `ai.provider` | AI 제목 생성과 AI 검색에 사용할 agent입니다. 기본값은 `null`이며, 세션 목록의 `,` 설정 화면으로 직접 선택해야 합니다. |
 | `cokacdir_program` | `cokacdir` 실행 파일 경로를 직접 지정하는 곳입니다. |
 
 `agent_programs`와 `cokacdir_program`의 빈 문자열은 placeholder입니다. 비워 두면 기존처럼 PATH에서 기본 명령 이름을 찾습니다. `cokacdir`은 PATH에서 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용하고, 그 파일도 없을 때 자동 다운로드합니다.
@@ -953,10 +956,11 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 - 파일에 없는 액션은 기본값을 그대로 씁니다.
 - 빈 배열 `[]` 또는 `null`을 넣으면 해당 액션이 비활성화됩니다.
 - 점 표기(`"sessions.launch_agent": ["x"]`)도 사용할 수 있습니다.
-- 현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma", "ctrl+t"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다.
+- 현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.toggle_focus`는 `["tab"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다.
 - 구버전에서 자동 생성된 `sessions.launch_agent: ["e"]` + `sessions.toggle_preview: ["enter"]` 조합은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 - 구버전에서 자동 생성된 `sessions.filter: ["/"]`와 `sessions.ai_search: ["ctrl+s"]` 값도 새 검색 선택창 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
-- 구버전에서 자동 생성된 `sessions.ai_title_settings: ["ctrl+t"]` 값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+- 구버전에서 자동 생성된 `sessions.ai_title_settings: ["ctrl+t"]` 또는 `["comma", "ctrl+t"]` 값도 `["comma"]` 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+- 구버전에서 자동 생성된 `sessions.toggle_focus: ["tab", "esc"]` 값도 `["tab"]` 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 - 구버전에서 자동 생성된 agent page scroll 기본값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 
 키 표기 예:
@@ -1102,7 +1106,7 @@ Get-Command opencode
 
 ### 맥북에 PageUp/PageDown 키가 없어요.
 
-에이전트 화면 page scroll은 기본적으로 `Shift+Alt+↑`, `Shift+Alt+↓`도 지원하므로 전용 Page 키가 없어도 사용할 수 있습니다. `fn+↑`, `fn+↓`가 PageUp/PageDown으로 동작하는 터미널에서는 `Shift+Alt+PageUp`, `Shift+Alt+PageDown`도 같은 동작입니다. 터미널이 이 키를 전달하지 않으면 `keybinding.json`에서 다른 키를 지정하세요. 예를 들어 에이전트 스크롤을 `alt+k`, `alt+j`로 바꿀 수 있습니다.
+에이전트 화면 page scroll은 기본적으로 `Shift+Alt+↑`, `Shift+Alt+↓`도 지원하므로 전용 Page 키가 없어도 사용할 수 있습니다. `fn+↑`, `fn+↓`가 PageUp/PageDown으로 동작하는 터미널에서는 `Shift+Alt+PageUp`, `Shift+Alt+PageDown`도 같은 동작입니다. 터미널이 이 키를 전달하지 않으면 `keybinding.json`에서 다른 키를 지정하세요. 예를 들어 에이전트 스크롤을 `alt+u`, `alt+d`로 바꿀 수 있습니다.
 
 ### Windows에서 한글이나 박스 문자가 깨져요.
 

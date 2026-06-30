@@ -5,7 +5,7 @@
 //!   │ session list (filterable)  │ preview (summary render)    │
 //!   │                            │                             │
 //!   └────────────────────────────┴─────────────────────────────┘
-//!   q/Ctrl+Q quit · ↑↓ nav · / filter · v tree · t title · c clone · Delete/d del · r refresh
+//!   Esc/q/Ctrl+Q quit · ↑/↓ move · Ctrl+F search · v view · t title · c clone · Delete/d delete · r refresh
 
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 #[cfg(windows)]
@@ -62,7 +62,10 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -218,12 +221,43 @@ const COKACDIR_DIST_BASE_URL: &str = "https://raw.githubusercontent.com/kstost/c
 const SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e", "enter"];
 const SESSION_FILTER_DEFAULTS: &[&str] = &["ctrl+f"];
 const SESSION_AI_SEARCH_DEFAULTS: &[&str] = &[];
-const SESSION_AI_TITLE_SETTINGS_DEFAULTS: &[&str] = &["comma", "ctrl+t"];
+const SESSION_AI_TITLE_SETTINGS_DEFAULTS: &[&str] = &["comma"];
+const SESSION_TOGGLE_FOCUS_DEFAULTS: &[&str] = &["tab"];
+const SESSION_MOVE_NEXT_DEFAULTS: &[&str] = &["down"];
+const SESSION_MOVE_PREV_DEFAULTS: &[&str] = &["up"];
+const SEARCH_CHOICE_NEXT_DEFAULTS: &[&str] = &["down", "tab"];
+const SEARCH_CHOICE_PREV_DEFAULTS: &[&str] = &["up", "backtab"];
+const HORIZONTAL_CHOICE_NEXT_DEFAULTS: &[&str] = &["right", "down", "tab"];
+const HORIZONTAL_CHOICE_PREV_DEFAULTS: &[&str] = &["left", "up", "backtab"];
+const CLONE_OPTIONS_NEXT_DEFAULTS: &[&str] = &["right", "down"];
+const CLONE_OPTIONS_PREV_DEFAULTS: &[&str] = &["left", "up"];
+const AGENT_LAUNCH_NEXT_DEFAULTS: &[&str] = &["down"];
+const AGENT_LAUNCH_PREV_DEFAULTS: &[&str] = &["up"];
+const NEW_SESSION_NEXT_DEFAULTS: &[&str] = &["down", "tab"];
+const NEW_SESSION_PREV_DEFAULTS: &[&str] = &["up", "backtab"];
+const NEW_SESSION_CHOICE_NEXT_DEFAULTS: &[&str] = &["right", "space"];
+const NEW_SESSION_CHOICE_PREV_DEFAULTS: &[&str] = &["left"];
 const PREVIOUS_SESSION_FILTER_DEFAULTS: &[&str] = &["/"];
 const PREVIOUS_SESSION_AI_SEARCH_DEFAULTS: &[&str] = &["ctrl+s"];
 const PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS: &[&str] = &["ctrl+t"];
+const PREVIOUS_SESSION_AI_TITLE_SETTINGS_WITH_COMMA_DEFAULTS: &[&str] = &["comma", "ctrl+t"];
+const PREVIOUS_SESSION_TOGGLE_FOCUS_DEFAULTS: &[&str] = &["tab", "esc"];
 const PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e"];
 const PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS: &[&str] = &["enter"];
+const PREVIOUS_SESSION_MOVE_NEXT_DEFAULTS: &[&str] = &["down", "j"];
+const PREVIOUS_SESSION_MOVE_PREV_DEFAULTS: &[&str] = &["up", "k"];
+const PREVIOUS_SEARCH_CHOICE_NEXT_DEFAULTS: &[&str] = &["down", "j", "tab"];
+const PREVIOUS_SEARCH_CHOICE_PREV_DEFAULTS: &[&str] = &["up", "k", "backtab"];
+const PREVIOUS_HORIZONTAL_CHOICE_NEXT_DEFAULTS: &[&str] = &["right", "down", "l", "j", "tab"];
+const PREVIOUS_HORIZONTAL_CHOICE_PREV_DEFAULTS: &[&str] = &["left", "up", "h", "k", "backtab"];
+const PREVIOUS_CLONE_OPTIONS_NEXT_DEFAULTS: &[&str] = &["right", "down", "l", "j"];
+const PREVIOUS_CLONE_OPTIONS_PREV_DEFAULTS: &[&str] = &["left", "up", "h", "k"];
+const PREVIOUS_AGENT_LAUNCH_NEXT_DEFAULTS: &[&str] = &["down", "j"];
+const PREVIOUS_AGENT_LAUNCH_PREV_DEFAULTS: &[&str] = &["up", "k"];
+const PREVIOUS_NEW_SESSION_NEXT_DEFAULTS: &[&str] = &["down", "j", "tab"];
+const PREVIOUS_NEW_SESSION_PREV_DEFAULTS: &[&str] = &["up", "k", "backtab"];
+const PREVIOUS_NEW_SESSION_CHOICE_NEXT_DEFAULTS: &[&str] = &["right", "l", "space"];
+const PREVIOUS_NEW_SESSION_CHOICE_PREV_DEFAULTS: &[&str] = &["left", "h"];
 const AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+up", "shift+alt+pageup"];
 const AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+down", "shift+alt+pagedown"];
 const PREVIOUS_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+pageup"];
@@ -231,7 +265,6 @@ const PREVIOUS_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+pagedown"
 const LEGACY_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+pageup", "alt+pageup"];
 const LEGACY_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+pagedown", "alt+pagedown"];
 const CODEX_TRANSCRIPT_OPEN_BINDINGS: &[&str] = &[
-    "ctrl-t",
     "shift-up",
     "shift-down",
     "alt-shift-up",
@@ -243,8 +276,8 @@ const CODEX_TRANSCRIPT_OPEN_BINDINGS: &[&str] = &[
     "alt-home",
     "alt-end",
 ];
-const CODEX_PAGER_SCROLL_UP_BINDINGS: &[&str] = &["up", "k", "shift-up"];
-const CODEX_PAGER_SCROLL_DOWN_BINDINGS: &[&str] = &["down", "j", "shift-down"];
+const CODEX_PAGER_SCROLL_UP_BINDINGS: &[&str] = &["up", "shift-up"];
+const CODEX_PAGER_SCROLL_DOWN_BINDINGS: &[&str] = &["down", "shift-down"];
 const CODEX_PAGER_PAGE_UP_BINDINGS: &[&str] = &[
     "page-up",
     "shift-space",
@@ -332,7 +365,6 @@ const STARTUP_SPINNER_TICK_MS: u128 = 180;
 const DATA_TASK_PROGRESS_THROTTLE_MS: u64 = 100;
 const UI_SELECTED_MARKER: &str = "› ";
 const UI_UNSELECTED_MARKER: &str = "  ";
-const UI_CURRENT_MARKER: &str = "● ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Settings {
@@ -791,7 +823,7 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "sessions.toggle_focus",
         KeyAction::SessionToggleFocus,
-        &["tab", "esc"],
+        SESSION_TOGGLE_FOCUS_DEFAULTS,
     ),
     (
         "sessions.toggle_preview",
@@ -801,12 +833,12 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "sessions.move_next",
         KeyAction::SessionMoveNext,
-        &["down", "j"],
+        SESSION_MOVE_NEXT_DEFAULTS,
     ),
     (
         "sessions.move_prev",
         KeyAction::SessionMovePrev,
-        &["up", "k"],
+        SESSION_MOVE_PREV_DEFAULTS,
     ),
     (
         "sessions.page_next",
@@ -959,12 +991,12 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "delete_confirm.next",
         KeyAction::DeleteConfirmNext,
-        &["right", "down", "l", "j", "tab"],
+        HORIZONTAL_CHOICE_NEXT_DEFAULTS,
     ),
     (
         "delete_confirm.prev",
         KeyAction::DeleteConfirmPrev,
-        &["left", "up", "h", "k", "backtab"],
+        HORIZONTAL_CHOICE_PREV_DEFAULTS,
     ),
     (
         "delete_confirm.delete",
@@ -989,12 +1021,12 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "create_folder.next",
         KeyAction::CreateFolderNext,
-        &["right", "down", "l", "j", "tab"],
+        HORIZONTAL_CHOICE_NEXT_DEFAULTS,
     ),
     (
         "create_folder.prev",
         KeyAction::CreateFolderPrev,
-        &["left", "up", "h", "k", "backtab"],
+        HORIZONTAL_CHOICE_PREV_DEFAULTS,
     ),
     (
         "create_folder.create",
@@ -1019,12 +1051,12 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "restore_data.next",
         KeyAction::RestoreDataNext,
-        &["right", "down", "l", "j", "tab"],
+        HORIZONTAL_CHOICE_NEXT_DEFAULTS,
     ),
     (
         "restore_data.prev",
         KeyAction::RestoreDataPrev,
-        &["left", "up", "h", "k", "backtab"],
+        HORIZONTAL_CHOICE_PREV_DEFAULTS,
     ),
     (
         "restore_data.restore",
@@ -1041,12 +1073,12 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "search.next",
         KeyAction::SearchChoiceNext,
-        &["down", "j", "tab"],
+        SEARCH_CHOICE_NEXT_DEFAULTS,
     ),
     (
         "search.prev",
         KeyAction::SearchChoicePrev,
-        &["up", "k", "backtab"],
+        SEARCH_CHOICE_PREV_DEFAULTS,
     ),
     ("search.text", KeyAction::SearchChoiceText, &["1"]),
     ("search.ai", KeyAction::SearchChoiceAi, &["2"]),
@@ -1063,12 +1095,12 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "clone_options.next",
         KeyAction::CloneOptionsNext,
-        &["right", "down", "l", "j"],
+        CLONE_OPTIONS_NEXT_DEFAULTS,
     ),
     (
         "clone_options.prev",
         KeyAction::CloneOptionsPrev,
-        &["left", "up", "h", "k"],
+        CLONE_OPTIONS_PREV_DEFAULTS,
     ),
     (
         "clone_options.target_next",
@@ -1129,12 +1161,12 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "ai_title_settings.next",
         KeyAction::AiTitleSettingsNext,
-        &["down", "j", "tab"],
+        &["down", "tab"],
     ),
     (
         "ai_title_settings.prev",
         KeyAction::AiTitleSettingsPrev,
-        &["up", "k", "backtab"],
+        &["up", "backtab"],
     ),
     (
         "ai_title_settings.none",
@@ -1169,12 +1201,12 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "agent_launch.next",
         KeyAction::AgentLaunchNext,
-        &["down", "j"],
+        AGENT_LAUNCH_NEXT_DEFAULTS,
     ),
     (
         "agent_launch.prev",
         KeyAction::AgentLaunchPrev,
-        &["up", "k"],
+        AGENT_LAUNCH_PREV_DEFAULTS,
     ),
     ("agent_launch.normal", KeyAction::AgentLaunchNormal, &["1"]),
     (
@@ -1191,22 +1223,22 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "new_session.next",
         KeyAction::NewSessionNext,
-        &["down", "j", "tab"],
+        NEW_SESSION_NEXT_DEFAULTS,
     ),
     (
         "new_session.prev",
         KeyAction::NewSessionPrev,
-        &["up", "k", "backtab"],
+        NEW_SESSION_PREV_DEFAULTS,
     ),
     (
         "new_session.choice_next",
         KeyAction::NewSessionChoiceNext,
-        &["right", "l", "space"],
+        NEW_SESSION_CHOICE_NEXT_DEFAULTS,
     ),
     (
         "new_session.choice_prev",
         KeyAction::NewSessionChoicePrev,
-        &["left", "h"],
+        NEW_SESSION_CHOICE_PREV_DEFAULTS,
     ),
     (
         "new_session.move_left",
@@ -1297,11 +1329,11 @@ impl KeyBinding {
         if self.modifiers.contains(KeyModifiers::CONTROL) {
             parts.push("Ctrl".to_string());
         }
-        if self.modifiers.contains(KeyModifiers::ALT) {
-            parts.push("Alt".to_string());
-        }
         if self.modifiers.contains(KeyModifiers::SHIFT) {
             parts.push("Shift".to_string());
+        }
+        if self.modifiers.contains(KeyModifiers::ALT) {
+            parts.push("Alt".to_string());
         }
         if self.modifiers.contains(KeyModifiers::SUPER) {
             parts.push("Super".to_string());
@@ -1612,13 +1644,29 @@ fn migrate_legacy_keybinding_defaults(root: &mut serde_json::Value) -> bool {
     );
     migrated |= migrate_generated_keybinding_value(
         flat_keybinding_json_value_mut(root, "sessions.ai_title_settings"),
-        &[PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS],
+        &[
+            PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS,
+            PREVIOUS_SESSION_AI_TITLE_SETTINGS_WITH_COMMA_DEFAULTS,
+        ],
         SESSION_AI_TITLE_SETTINGS_DEFAULTS,
     );
     migrated |= migrate_generated_keybinding_value(
         nested_keybinding_json_value_mut(root, &["sessions", "ai_title_settings"]),
-        &[PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS],
+        &[
+            PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS,
+            PREVIOUS_SESSION_AI_TITLE_SETTINGS_WITH_COMMA_DEFAULTS,
+        ],
         SESSION_AI_TITLE_SETTINGS_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "sessions.toggle_focus"),
+        &[PREVIOUS_SESSION_TOGGLE_FOCUS_DEFAULTS],
+        SESSION_TOGGLE_FOCUS_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["sessions", "toggle_focus"]),
+        &[PREVIOUS_SESSION_TOGGLE_FOCUS_DEFAULTS],
+        SESSION_TOGGLE_FOCUS_DEFAULTS,
     );
     migrated |= migrate_generated_keybinding_value(
         flat_keybinding_json_value_mut(root, "sessions.launch_agent"),
@@ -1639,6 +1687,138 @@ fn migrate_legacy_keybinding_defaults(root: &mut serde_json::Value) -> bool {
         nested_keybinding_json_value_mut(root, &["sessions", "toggle_preview"]),
         &[PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS],
         &[],
+    );
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "sessions.move_next"),
+        &[PREVIOUS_SESSION_MOVE_NEXT_DEFAULTS],
+        SESSION_MOVE_NEXT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["sessions", "move_next"]),
+        &[PREVIOUS_SESSION_MOVE_NEXT_DEFAULTS],
+        SESSION_MOVE_NEXT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "sessions.move_prev"),
+        &[PREVIOUS_SESSION_MOVE_PREV_DEFAULTS],
+        SESSION_MOVE_PREV_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["sessions", "move_prev"]),
+        &[PREVIOUS_SESSION_MOVE_PREV_DEFAULTS],
+        SESSION_MOVE_PREV_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "search.next",
+        &["search", "next"],
+        &[PREVIOUS_SEARCH_CHOICE_NEXT_DEFAULTS],
+        SEARCH_CHOICE_NEXT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "search.prev",
+        &["search", "prev"],
+        &[PREVIOUS_SEARCH_CHOICE_PREV_DEFAULTS],
+        SEARCH_CHOICE_PREV_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "delete_confirm.next",
+        &["delete_confirm", "next"],
+        &[PREVIOUS_HORIZONTAL_CHOICE_NEXT_DEFAULTS],
+        HORIZONTAL_CHOICE_NEXT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "delete_confirm.prev",
+        &["delete_confirm", "prev"],
+        &[PREVIOUS_HORIZONTAL_CHOICE_PREV_DEFAULTS],
+        HORIZONTAL_CHOICE_PREV_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "create_folder.next",
+        &["create_folder", "next"],
+        &[PREVIOUS_HORIZONTAL_CHOICE_NEXT_DEFAULTS],
+        HORIZONTAL_CHOICE_NEXT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "create_folder.prev",
+        &["create_folder", "prev"],
+        &[PREVIOUS_HORIZONTAL_CHOICE_PREV_DEFAULTS],
+        HORIZONTAL_CHOICE_PREV_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "restore_data.next",
+        &["restore_data", "next"],
+        &[PREVIOUS_HORIZONTAL_CHOICE_NEXT_DEFAULTS],
+        HORIZONTAL_CHOICE_NEXT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "restore_data.prev",
+        &["restore_data", "prev"],
+        &[PREVIOUS_HORIZONTAL_CHOICE_PREV_DEFAULTS],
+        HORIZONTAL_CHOICE_PREV_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "clone_options.next",
+        &["clone_options", "next"],
+        &[PREVIOUS_CLONE_OPTIONS_NEXT_DEFAULTS],
+        CLONE_OPTIONS_NEXT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "clone_options.prev",
+        &["clone_options", "prev"],
+        &[PREVIOUS_CLONE_OPTIONS_PREV_DEFAULTS],
+        CLONE_OPTIONS_PREV_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "agent_launch.next",
+        &["agent_launch", "next"],
+        &[PREVIOUS_AGENT_LAUNCH_NEXT_DEFAULTS],
+        AGENT_LAUNCH_NEXT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "agent_launch.prev",
+        &["agent_launch", "prev"],
+        &[PREVIOUS_AGENT_LAUNCH_PREV_DEFAULTS],
+        AGENT_LAUNCH_PREV_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "new_session.next",
+        &["new_session", "next"],
+        &[PREVIOUS_NEW_SESSION_NEXT_DEFAULTS],
+        NEW_SESSION_NEXT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "new_session.prev",
+        &["new_session", "prev"],
+        &[PREVIOUS_NEW_SESSION_PREV_DEFAULTS],
+        NEW_SESSION_PREV_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "new_session.choice_next",
+        &["new_session", "choice_next"],
+        &[PREVIOUS_NEW_SESSION_CHOICE_NEXT_DEFAULTS],
+        NEW_SESSION_CHOICE_NEXT_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "new_session.choice_prev",
+        &["new_session", "choice_prev"],
+        &[PREVIOUS_NEW_SESSION_CHOICE_PREV_DEFAULTS],
+        NEW_SESSION_CHOICE_PREV_DEFAULTS,
     );
     migrated |= migrate_generated_keybinding_value(
         flat_keybinding_json_value_mut(root, "agent.scroll_page_up"),
@@ -1671,6 +1851,27 @@ fn migrate_legacy_keybinding_defaults(root: &mut serde_json::Value) -> bool {
             PREVIOUS_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
         ],
         AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
+    );
+    migrated
+}
+
+fn migrate_generated_keybinding_paths(
+    root: &mut serde_json::Value,
+    flat_path: &str,
+    nested_path: &[&str],
+    previous_defaults: &[&[&str]],
+    current_defaults: &[&str],
+) -> bool {
+    let mut migrated = false;
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, flat_path),
+        previous_defaults,
+        current_defaults,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, nested_path),
+        previous_defaults,
+        current_defaults,
     );
     migrated
 }
@@ -1821,10 +2022,10 @@ fn key_code_display(code: KeyCode) -> String {
     match code {
         KeyCode::Backspace => "Backspace".to_string(),
         KeyCode::Enter => "Enter".to_string(),
-        KeyCode::Left => "Left".to_string(),
-        KeyCode::Right => "Right".to_string(),
-        KeyCode::Up => "Up".to_string(),
-        KeyCode::Down => "Down".to_string(),
+        KeyCode::Left => "←".to_string(),
+        KeyCode::Right => "→".to_string(),
+        KeyCode::Up => "↑".to_string(),
+        KeyCode::Down => "↓".to_string(),
         KeyCode::Home => "Home".to_string(),
         KeyCode::End => "End".to_string(),
         KeyCode::PageUp => "PgUp".to_string(),
@@ -2000,11 +2201,6 @@ fn ai_title_provider_index(provider: Option<Provider>) -> usize {
         .unwrap_or(0)
 }
 
-fn move_ai_title_provider_index(current: usize, delta: i32) -> usize {
-    let len = AI_TITLE_PROVIDER_OPTIONS.len() as i32;
-    (current as i32 + delta).rem_euclid(len) as usize
-}
-
 fn ai_title_provider_label(provider: Option<Provider>) -> &'static str {
     provider.map(Provider::as_str).unwrap_or("not configured")
 }
@@ -2139,9 +2335,10 @@ struct SettingsState {
 impl SettingsState {
     fn new(settings: &CokacmuxSettings) -> Self {
         let draft = SettingsDraft::from_settings(settings);
+        let selected = ai_title_provider_index(draft.ai_provider);
         Self {
             section: SettingsSection::Ai,
-            selected: 0,
+            selected,
             original: draft.clone(),
             draft,
             editing: None,
@@ -2190,11 +2387,11 @@ impl SettingsState {
     fn selected_row_kind(&self) -> SettingsRowKind {
         match (self.section, self.selected) {
             (SettingsSection::General, SETTINGS_GENERAL_SESSION_VIEW)
-            | (SettingsSection::General, SETTINGS_GENERAL_AGENT_SIDEBAR_VISIBLE)
-            | (SettingsSection::Ai, SETTINGS_AI_PROVIDER) => SettingsRowKind::Change,
-            (SettingsSection::General, SETTINGS_GENERAL_SESSIONS_WIDTH_RESET)
-            | (SettingsSection::General, SETTINGS_GENERAL_AGENT_SIDEBAR_WIDTH_RESET) => {
-                SettingsRowKind::Reset
+            | (SettingsSection::General, SETTINGS_GENERAL_AGENT_SIDEBAR_VISIBLE) => {
+                SettingsRowKind::Change
+            }
+            (SettingsSection::Ai, _) if self.selected < SETTINGS_AI_ROW_COUNT => {
+                SettingsRowKind::Select
             }
             (SettingsSection::Agents, SETTINGS_AGENTS_CODEX)
             | (SettingsSection::Agents, SETTINGS_AGENTS_CLAUDE)
@@ -2248,34 +2445,25 @@ impl SettingsState {
         true
     }
 
-    fn activate_selected(&mut self) -> &'static str {
+    fn activate_selected(&mut self) -> String {
         self.edit_finished = false;
         match (self.section, self.selected) {
             (SettingsSection::General, SETTINGS_GENERAL_SESSION_VIEW) => {
                 self.draft.session_view = self.draft.session_view.toggle();
-                "session view changed"
+                "session view changed".to_string()
             }
             (SettingsSection::General, SETTINGS_GENERAL_AGENT_SIDEBAR_VISIBLE) => {
                 self.draft.agent_sidebar_visible = !self.draft.agent_sidebar_visible;
-                "agent sidebar visibility changed"
+                "agent sidebar visibility changed".to_string()
             }
-            (SettingsSection::General, SETTINGS_GENERAL_SESSIONS_WIDTH_RESET) => {
-                self.draft.sessions_pane_width = None;
-                self.draft.sessions_pane_percent = DEFAULT_SESSIONS_PANE_PERCENT;
-                "sessions pane width reset"
+            (SettingsSection::Ai, index) if index < SETTINGS_AI_ROW_COUNT => {
+                self.draft.ai_provider = ai_title_provider_at(index);
+                format!(
+                    "AI agent: {}",
+                    ai_title_provider_label(self.draft.ai_provider)
+                )
             }
-            (SettingsSection::General, SETTINGS_GENERAL_AGENT_SIDEBAR_WIDTH_RESET) => {
-                self.draft.agent_sidebar_width = DEFAULT_AGENT_SIDEBAR_WIDTH;
-                "agent sidebar width reset"
-            }
-            (SettingsSection::Ai, SETTINGS_AI_PROVIDER) => {
-                self.draft.ai_provider = ai_title_provider_at(move_ai_title_provider_index(
-                    ai_title_provider_index(self.draft.ai_provider),
-                    1,
-                ));
-                "AI agent changed"
-            }
-            _ => "no editable value on this row",
+            _ => "no editable value on this row".to_string(),
         }
     }
 }
@@ -2353,19 +2541,20 @@ enum SettingsTextField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsRowKind {
     Change,
-    Reset,
+    Select,
     Text,
     ReadOnly,
 }
 
 const SETTINGS_GENERAL_SESSION_VIEW: usize = 0;
 const SETTINGS_GENERAL_AGENT_SIDEBAR_VISIBLE: usize = 1;
-const SETTINGS_GENERAL_SESSIONS_WIDTH_RESET: usize = 2;
-const SETTINGS_GENERAL_AGENT_SIDEBAR_WIDTH_RESET: usize = 3;
-const SETTINGS_GENERAL_ROW_COUNT: usize = 4;
+const SETTINGS_GENERAL_ROW_COUNT: usize = 2;
 
-const SETTINGS_AI_PROVIDER: usize = 0;
-const SETTINGS_AI_ROW_COUNT: usize = 1;
+const SETTINGS_AI_NONE: usize = 0;
+const SETTINGS_AI_CLAUDE: usize = 1;
+const SETTINGS_AI_CODEX: usize = 2;
+const SETTINGS_AI_OPENCODE: usize = 3;
+const SETTINGS_AI_ROW_COUNT: usize = AI_TITLE_PROVIDER_OPTIONS.len();
 
 const SETTINGS_AGENTS_CODEX: usize = 0;
 const SETTINGS_AGENTS_CLAUDE: usize = 1;
@@ -2381,6 +2570,8 @@ const SETTINGS_DATA_SETTINGS_FILE: usize = 0;
 const SETTINGS_DATA_KEYBINDING_FILE: usize = 1;
 const SETTINGS_DATA_AI_SEARCHDATA: usize = 2;
 const SETTINGS_DATA_ROW_COUNT: usize = 3;
+
+const SETTINGS_MODAL_CONTENT_ROWS: usize = 13;
 
 fn settings_section_row_count(section: SettingsSection) -> usize {
     match section {
@@ -6946,8 +7137,13 @@ impl App {
     }
 
     fn adjust_agent_sidebar_width(&mut self, delta: i16, total_width: u16) {
-        let (next, limited) =
-            adjusted_agent_sidebar_width(self.agent_sidebar_config_width(), total_width, delta);
+        let was_hidden = !self.settings.cokacmux.agent_sidebar_visible;
+        let current_width = if was_hidden {
+            0
+        } else {
+            self.agent_sidebar_config_width()
+        };
+        let (next, limited) = adjusted_agent_sidebar_width(current_width, total_width, delta);
         if limited {
             self.status = format!("layout limit: agent sidebar {} cols", next);
             debug_log(
@@ -6962,13 +7158,21 @@ impl App {
         }
 
         self.settings.cokacmux.agent_sidebar_width = next;
+        if was_hidden && next > 0 {
+            self.settings.cokacmux.agent_sidebar_visible = true;
+        }
         match self.settings.save() {
             Ok(()) => {
-                self.status = format!("layout saved: agent sidebar {} cols", next);
+                self.status = if was_hidden && self.settings.cokacmux.agent_sidebar_visible {
+                    format!("layout saved: agent sidebar shown at {} cols", next)
+                } else {
+                    format!("layout saved: agent sidebar {} cols", next)
+                };
                 debug_log(
                     "agent_sidebar_resize_saved",
                     serde_json::json!({
                         "next": next,
+                        "visible": self.settings.cokacmux.agent_sidebar_visible,
                         "total_width": total_width,
                         "delta": delta,
                     }),
@@ -6980,6 +7184,7 @@ impl App {
                     "agent_sidebar_resize_save_failed",
                     serde_json::json!({
                         "next": next,
+                        "visible": self.settings.cokacmux.agent_sidebar_visible,
                         "total_width": total_width,
                         "delta": delta,
                         "error": e.to_string(),
@@ -7699,7 +7904,7 @@ impl App {
             return;
         }
         let Some(provider) = self.settings.cokacmux.ai.provider else {
-            self.status = "choose an AI agent first with , or Ctrl+T.".into();
+            self.status = "choose an AI agent first: press comma.".into();
             debug_log(
                 "ai_search_request_ignored",
                 serde_json::json!({
@@ -14685,18 +14890,18 @@ fn print_help() {
          cokacmux --version    print version\n\n\
          CONFIG:\n  ~/.cokacmux/settings.json\n  ~/.cokacmux/keybinding.json\n\n\
          INTERACTIVE KEYS:\n  \
-         q / Ctrl+Q    quit\n  \
-         ↑↓ / j k     navigate\n  \
+         Esc/q/Ctrl+q quit\n  \
+         ↑↓            navigate\n  \
          Alt+↑/↓ or Ctrl+Shift+↑/↓ select from sidebar/list\n  \
          Alt+←/→ or Ctrl+Shift+←/→ resize panes (saved)\n  \
          Agent: Shift+↑/↓ child transcript line, Shift+Alt+↑/↓ page, Shift/Alt+Home/End top/bottom\n  \
          PgUp / PgDn   jump 10\n  \
          g/Home / G/End top / bottom\n  \
-         Tab / Esc     switch focus between session list and preview\n  \
+         Tab           switch focus between session list and preview\n  \
          Ctrl+F        open search mode chooser\n  \
          v             toggle session list/tree view\n  \
          t             edit selected session title\n  \
-         , / Ctrl+T    configure AI agent; in title edit, Ctrl+T generates AI title\n  \
+         ,             configure AI agent; title edit Ctrl+T generates AI title\n  \
          r             refresh from disk\n  \
          c             clone selected session\n  \
          e / Enter     switch to live selected agent, or choose launch mode to start it\n  \
@@ -22817,9 +23022,6 @@ fn codex_transcript_overlay_state_after_key(
     {
         return current_open;
     }
-    if is_ctrl_char_key(key, 't') {
-        return !current_open;
-    }
     if current_open && (is_plain_char_key(key, 'q') || is_ctrl_char_key(key, 'c')) {
         return false;
     }
@@ -23642,7 +23844,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
 
     let buf = f.buffer_mut();
     fill_area(buf, status_area, theme_status_style());
-    let agent_help = agent_help_text(&app.keybindings);
+    let agent_help_items = agent_help_items(&app.keybindings);
     let agent_status_subject = if is_plain_pty_tool_session_info(&agent.info) {
         live_agent_status_label(&agent.info)
     } else {
@@ -23659,16 +23861,44 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     if scrollback_offset > 0 {
         status_parts.push(format!("scrollback {} up", scrollback_offset));
     }
-    status_parts.push(agent_help);
-    status_parts.push(agent.command_line.clone());
-    let status = format!(" {}", status_parts.join("  "));
-    buf.set_stringn(
-        status_area.x,
-        status_area.y,
-        truncate_width(&status, status_area.width as usize),
-        status_area.width as usize,
-        theme_status_style(),
-    );
+    let mut status_spans = Vec::new();
+    let mut used = 0usize;
+    let width = status_area.width as usize;
+    let status_style = theme_status_style();
+    let status_dim_style = Style::default().fg(THEME_FG_DIM).bg(THEME_STATUS_BG);
+    let shortcut_style = Style::default().fg(THEME_SHORTCUT).bg(THEME_STATUS_BG);
+    let mut first = true;
+    for part in status_parts {
+        let separator = if first { " " } else { "  " };
+        if !push_help_span(&mut status_spans, separator, status_style, &mut used, width)
+            || !push_help_span(&mut status_spans, &part, status_style, &mut used, width)
+        {
+            break;
+        }
+        first = false;
+    }
+    if used < width {
+        let _ = push_help_span(&mut status_spans, "  ", status_dim_style, &mut used, width);
+        push_help_item_spans(
+            &agent_help_items,
+            &mut status_spans,
+            status_dim_style,
+            shortcut_style,
+            &mut used,
+            width,
+        );
+    }
+    if used < width {
+        let _ = push_help_span(&mut status_spans, "  ", status_dim_style, &mut used, width);
+        let _ = push_help_span(
+            &mut status_spans,
+            &agent.command_line,
+            status_dim_style,
+            &mut used,
+            width,
+        );
+    }
+    f.render_widget(Line::from(status_spans), status_area);
 
     app.poll_agent_runtime_states();
     if let (Some(sidebar_area), Some(active_key)) = (sidebar_area, active_key.as_ref()) {
@@ -23824,16 +24054,14 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
 }
 
 fn draw_notice_modal(f: &mut ratatui::Frame, area: Rect, title: &str, message: &str) {
+    let help_items = [direct_help_item("Enter/Esc", "close")];
     let lines = vec![
         Line::from(Span::styled(
             message.to_string(),
             Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "Enter / Esc close",
-            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-        )),
+        modal_help_line(&help_items),
     ];
     let modal_area = modal_area_for_wrapped_lines(area, title, &lines, 40, 92, 5, 12);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
@@ -23907,15 +24135,18 @@ fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPendi
     }
 
     lines.push(Line::from(""));
-    let help = if task.cancel_requested {
-        "Esc pressed  cancelling and rolling back when safe"
+    let help_items = if task.cancel_requested {
+        [direct_help_item(
+            "Esc",
+            "pressed · cancelling and rolling back when safe",
+        )]
     } else {
-        "Esc cancel  all other actions are locked until clone completes"
+        [direct_help_item(
+            "Esc",
+            "cancel · all other actions locked until clone completes",
+        )]
     };
-    lines.push(Line::from(Span::styled(
-        help,
-        Style::default().fg(THEME_SHORTCUT).bg(THEME_BG_ALT),
-    )));
+    lines.push(modal_help_line(&help_items));
 
     let modal_area = modal_area_for_wrapped_lines(area, "Clone in progress", &lines, 44, 86, 7, 12);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
@@ -24187,7 +24418,10 @@ fn draw_agent_sidebar(
         return;
     }
 
-    let id_width = inner.width.saturating_sub(19) as usize;
+    let id_width = inner
+        .width
+        .saturating_sub((STATE_COLUMN_WIDTH + PROVIDER_COLUMN_WIDTH + 3) as u16)
+        as usize;
     let items: Vec<ListItem> = candidates
         .iter()
         .map(|info| {
@@ -24221,7 +24455,10 @@ fn draw_agent_sidebar(
                 (prov_span(info.provider), label)
             };
             ListItem::new(Line::from(vec![
-                Span::styled(fit_width(state.label(), 8, Align::Left), state.style()),
+                Span::styled(
+                    fit_width(state.label(), STATE_COLUMN_WIDTH, Align::Left),
+                    state.style(),
+                ),
                 Span::raw(" "),
                 badge_span,
                 Span::raw(" "),
@@ -24998,25 +25235,25 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             debug_log_key_event(key, "settings_row_prev");
         } else if keybindings.matches(KeyAction::AiTitleSettingsNone, key) {
             state.section = SettingsSection::Ai;
-            state.selected = SETTINGS_AI_PROVIDER;
+            state.selected = SETTINGS_AI_NONE;
             state.draft.ai_provider = None;
             state.edit_finished = false;
             app.status = "AI agent: none".into();
         } else if keybindings.matches(KeyAction::AiTitleSettingsClaude, key) {
             state.section = SettingsSection::Ai;
-            state.selected = SETTINGS_AI_PROVIDER;
+            state.selected = SETTINGS_AI_CLAUDE;
             state.draft.ai_provider = Some(Provider::Claude);
             state.edit_finished = false;
             app.status = "AI agent: claude".into();
         } else if keybindings.matches(KeyAction::AiTitleSettingsCodex, key) {
             state.section = SettingsSection::Ai;
-            state.selected = SETTINGS_AI_PROVIDER;
+            state.selected = SETTINGS_AI_CODEX;
             state.draft.ai_provider = Some(Provider::Codex);
             state.edit_finished = false;
             app.status = "AI agent: codex".into();
         } else if keybindings.matches(KeyAction::AiTitleSettingsOpenCode, key) {
             state.section = SettingsSection::Ai;
-            state.selected = SETTINGS_AI_PROVIDER;
+            state.selected = SETTINGS_AI_OPENCODE;
             state.draft.ai_provider = Some(Provider::OpenCode);
             state.edit_finished = false;
             app.status = "AI agent: opencode".into();
@@ -25731,10 +25968,7 @@ fn delete_confirm_lines(
         )),
         Line::from(""),
         delete_confirm_button_line(selected),
-        Line::from(Span::styled(
-            delete_confirm_help_text(keybindings),
-            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-        )),
+        modal_help_line(&delete_confirm_help_items(keybindings)),
     ]
 }
 
@@ -25804,10 +26038,7 @@ fn create_folder_confirm_lines(
         )),
         Line::from(""),
         create_folder_button_line(selected),
-        Line::from(Span::styled(
-            create_folder_help_text(keybindings),
-            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-        )),
+        modal_help_line(&create_folder_help_items(keybindings)),
     ]
 }
 
@@ -25884,10 +26115,7 @@ fn restore_data_confirm_lines(
         )),
         Line::from(""),
         restore_data_button_line(selected),
-        Line::from(Span::styled(
-            restore_data_help_text(keybindings),
-            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-        )),
+        modal_help_line(&restore_data_help_items(keybindings)),
     ]
 }
 
@@ -25931,7 +26159,7 @@ fn draw_search_choice_modal(
     selected: usize,
     keybindings: &KeyBindings,
 ) {
-    let help = search_choice_help_text(keybindings);
+    let help_items = search_choice_help_items(keybindings);
     let lines = vec![
         Line::from(Span::styled(
             "Choose search mode",
@@ -25941,10 +26169,7 @@ fn draw_search_choice_modal(
         search_choice_option_line(SEARCH_CHOICE_TEXT, selected == SEARCH_CHOICE_TEXT),
         search_choice_option_line(SEARCH_CHOICE_AI, selected == SEARCH_CHOICE_AI),
         Line::from(""),
-        Line::from(Span::styled(
-            help,
-            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-        )),
+        modal_help_line(&help_items),
     ];
     let modal_area = modal_area_for_wrapped_lines(area, "Search", &lines, 42, 72, 8, 12);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
@@ -26023,14 +26248,17 @@ fn draw_filter_modal(
         "{} Cancel",
         keybindings.help(KeyAction::FilterCancel, "Esc")
     );
-    let help = if pending.is_some() {
-        format!(
-            "{} cancel",
-            keybindings.help(KeyAction::FilterCancel, "Esc")
-        )
+    let help_items = if pending.is_some() {
+        vec![help_item(
+            keybindings,
+            KeyAction::FilterCancel,
+            "Esc",
+            "cancel",
+        )]
     } else {
-        filter_help_text(keybindings)
+        filter_help_items(keybindings)
     };
+    let help = help_text_from_items(&help_items);
     let progress_summary = pending.map(search_progress_summary);
     let button_width = UnicodeWidthStr::width(search_label.as_str())
         .saturating_add(UnicodeWidthStr::width(cancel_label.as_str()))
@@ -26086,10 +26314,7 @@ fn draw_filter_modal(
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        help,
-        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-    )));
+    lines.push(modal_help_line(&help_items));
     let modal_area = modal_area_for_wrapped_lines(area, "Search sessions", &lines, 44, 84, 6, 12);
     draw_fixed_modal_lines(f, modal_area, "Search sessions", lines);
     if pending.is_none() {
@@ -26120,14 +26345,17 @@ fn draw_ai_search_modal(
         "{} Cancel",
         keybindings.help(KeyAction::FilterCancel, "Esc")
     );
-    let help = if pending.is_some() {
-        format!(
-            "{} cancel",
-            keybindings.help(KeyAction::FilterCancel, "Esc")
-        )
+    let help_items = if pending.is_some() {
+        vec![help_item(
+            keybindings,
+            KeyAction::FilterCancel,
+            "Esc",
+            "cancel",
+        )]
     } else {
-        filter_help_text(keybindings)
+        filter_help_items(keybindings)
     };
+    let help = help_text_from_items(&help_items);
     let button_width = UnicodeWidthStr::width(search_label.as_str())
         .saturating_add(UnicodeWidthStr::width(cancel_label.as_str()))
         .saturating_add(8);
@@ -26154,10 +26382,7 @@ fn draw_ai_search_modal(
             Span::raw("  "),
             modal_button_span(&cancel_label, false, true),
         ]),
-        Line::from(Span::styled(
-            help,
-            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-        )),
+        modal_help_line(&help_items),
     ];
     let modal_area =
         modal_area_for_wrapped_lines(area, "AI search sessions", &lines, 48, 90, 6, 12);
@@ -26300,13 +26525,7 @@ fn ai_search_pending_overlay_lines(
             summary,
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
         )),
-        Line::from(vec![
-            Span::styled("Esc", Style::default().fg(THEME_SHORTCUT).bg(THEME_BG_ALT)),
-            Span::styled(
-                " cancel  ·  input locked",
-                Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-            ),
-        ]),
+        modal_help_line(&[direct_help_item("Esc", "cancel · input locked")]),
     ]
 }
 
@@ -26364,9 +26583,10 @@ fn draw_title_edit_modal(
         truncate_width(&source.session_id, 24)
     );
     let pending_status = ai_title_pending.map(title_edit_ai_title_pending_text);
+    let help_items = title_edit_help_items(keybindings);
     let help = pending_status
         .clone()
-        .unwrap_or_else(|| title_edit_help_text(keybindings));
+        .unwrap_or_else(|| help_text_from_items(&help_items));
     let desired_width = UnicodeWidthStr::width(session_line.as_str())
         .max(UnicodeWidthStr::width(draft).saturating_add(1))
         .max(UnicodeWidthStr::width(help.as_str()));
@@ -26398,10 +26618,12 @@ fn draw_title_edit_modal(
     } else {
         Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT)
     };
-    lines.extend([
-        Line::from(Span::styled(input_text, input_style)),
-        Line::from(Span::styled(help, help_style)),
-    ]);
+    lines.push(Line::from(Span::styled(input_text, input_style)));
+    if let Some(help) = pending_status {
+        lines.push(Line::from(Span::styled(help, help_style)));
+    } else {
+        lines.push(modal_help_line(&help_items));
+    }
     let modal_area = modal_area_for_wrapped_lines(area, "Edit title", &lines, 44, 84, 5, 10);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
     let title = if ai_title_pending.is_some() {
@@ -26435,11 +26657,44 @@ fn draw_settings_modal(
     state: &SettingsState,
     keybindings: &KeyBindings,
 ) {
-    let provisional_area = modal_area_from_content_rows(area, "Settings", 104, 15, 72, 120, 12, 22);
+    let provisional_area = modal_area_from_content_rows(
+        area,
+        "Settings",
+        104,
+        SETTINGS_MODAL_CONTENT_ROWS,
+        72,
+        120,
+        12,
+        22,
+    );
     let inner_width = provisional_area.width.saturating_sub(2) as usize;
-    let (lines, cursor) = settings_modal_lines(state, keybindings, inner_width);
-    let modal_area =
-        modal_area_from_content_rows(area, "Settings", 104, lines.len(), 72, 120, 12, 22);
+    let (content_lines, cursor) = settings_modal_lines(state, inner_width);
+    let modal_area = modal_area_from_content_rows(
+        area,
+        "Settings",
+        104,
+        SETTINGS_MODAL_CONTENT_ROWS,
+        72,
+        120,
+        12,
+        22,
+    );
+    let inner_height = modal_area.height.saturating_sub(2) as usize;
+    let help_row = inner_height.saturating_sub(1);
+    let help_line = modal_help_line(&settings_help_items(state, keybindings));
+    let mut lines = Vec::with_capacity(inner_height);
+    for row in 0..inner_height {
+        if row == help_row {
+            lines.push(help_line.clone());
+        } else {
+            lines.push(
+                content_lines
+                    .get(row)
+                    .cloned()
+                    .unwrap_or_else(|| Line::from("")),
+            );
+        }
+    }
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -26453,13 +26708,14 @@ fn draw_settings_modal(
     f.render_widget(ratatui::widgets::Clear, modal_area);
     f.render_widget(p, modal_area);
     if let Some((row, col)) = cursor {
-        set_modal_input_cursor(f, modal_area, row, col);
+        if row < help_row {
+            set_modal_input_cursor(f, modal_area, row, col);
+        }
     }
 }
 
 fn settings_modal_lines(
     state: &SettingsState,
-    keybindings: &KeyBindings,
     inner_width: usize,
 ) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
     let mut lines = vec![
@@ -26477,11 +26733,6 @@ fn settings_modal_lines(
         SettingsSection::Keybindings => settings_keybindings_lines(state, inner_width, &mut lines),
         SettingsSection::Data => settings_data_lines(state, inner_width, &mut lines),
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        settings_help_text(state, keybindings),
-        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-    )));
     (lines, cursor)
 }
 
@@ -26539,44 +26790,17 @@ fn settings_general_lines(
         },
         inner_width,
     ));
-    let sessions_width = match draft.sessions_pane_width {
-        Some(width) => format!("fixed {width} cols; Space resets to default percent"),
-        None => format!("{}% default", draft.sessions_pane_percent),
-    };
-    lines.push(settings_row_line(
-        state.selected == SETTINGS_GENERAL_SESSIONS_WIDTH_RESET,
-        SettingsRowKind::Reset,
-        "Sessions width",
-        &sessions_width,
-        inner_width,
-    ));
-    let agent_width = format!(
-        "{} cols; Space resets to {}",
-        draft.agent_sidebar_width, DEFAULT_AGENT_SIDEBAR_WIDTH
-    );
-    lines.push(settings_row_line(
-        state.selected == SETTINGS_GENERAL_AGENT_SIDEBAR_WIDTH_RESET,
-        SettingsRowKind::Reset,
-        "Agent sidebar width",
-        &agent_width,
-        inner_width,
-    ));
 }
 
 fn settings_ai_lines(state: &SettingsState, inner_width: usize, lines: &mut Vec<Line<'static>>) {
-    lines.push(settings_row_line(
-        state.selected == SETTINGS_AI_PROVIDER,
-        SettingsRowKind::Change,
-        "AI agent",
-        ai_title_provider_label(state.draft.ai_provider),
-        inner_width,
-    ));
-    lines.push(Line::from(""));
+    lines.push(settings_heading_line("Choose AI agent", inner_width));
     for (index, provider) in AI_TITLE_PROVIDER_OPTIONS.iter().enumerate() {
         lines.push(ai_title_provider_option_line(
             index,
             *provider,
+            state.selected == index,
             state.draft.ai_provider == *provider,
+            inner_width,
         ));
     }
 }
@@ -26689,6 +26913,13 @@ fn settings_row_line(
     );
     let style = settings_row_style(selected, kind);
     Line::from(Span::styled(text, style))
+}
+
+fn settings_heading_line(label: &str, inner_width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        fit_width(label, inner_width, Align::Left),
+        Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+    ))
 }
 
 fn settings_row_style(selected: bool, kind: SettingsRowKind) -> Style {
@@ -26846,45 +27077,92 @@ fn settings_text_status(draft: &SettingsDraft, field: SettingsTextField) -> Sett
     }
 }
 
-fn settings_help_text(state: &SettingsState, keybindings: &KeyBindings) -> String {
+fn settings_help_items(state: &SettingsState, keybindings: &KeyBindings) -> Vec<HelpItem> {
     if state.editing.is_some() {
-        return format!(
-            "type path  Left/Right cursor  {} keep edit  {} discard edit",
-            keybindings.help(KeyAction::AiTitleSettingsSave, "Enter"),
-            keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc"),
-        );
+        return vec![
+            direct_help_item("type", "path"),
+            direct_help_item("←/→", "cursor"),
+            help_item(
+                keybindings,
+                KeyAction::AiTitleSettingsSave,
+                "Enter",
+                "keep edit",
+            ),
+            help_item(
+                keybindings,
+                KeyAction::AiTitleSettingsCancel,
+                "Esc",
+                "discard edit",
+            ),
+        ];
     }
-    let move_help = keybindings.help_pair(
-        KeyAction::AiTitleSettingsPrev,
-        KeyAction::AiTitleSettingsNext,
-        "Up",
-        "Down",
-    );
-    let save_key = keybindings.help(KeyAction::AiTitleSettingsSave, "Enter");
-    let cancel_key = keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc");
-    let dirty = if state.is_dirty() { "  ! unsaved" } else { "" };
+    let mut items = vec![
+        direct_help_item("←/→", "section"),
+        help_pair_item(
+            keybindings,
+            KeyAction::AiTitleSettingsPrev,
+            KeyAction::AiTitleSettingsNext,
+            "↑",
+            "↓",
+            "move",
+        ),
+    ];
     match state.selected_row_kind() {
-        SettingsRowKind::Text if state.edit_finished => format!(
-            "Left/Right section  {} move  {} save  type edit again  {} cancel{}",
-            move_help, save_key, cancel_key, dirty
-        ),
-        SettingsRowKind::Text => format!(
-            "Left/Right section  {} move  {} edit path  {} cancel{}",
-            move_help, save_key, cancel_key, dirty
-        ),
-        SettingsRowKind::ReadOnly => format!(
-            "Left/Right section  {} move  read-only  {} save  {} cancel{}",
-            move_help, save_key, cancel_key, dirty
-        ),
-        SettingsRowKind::Reset => format!(
-            "Left/Right section  {} move  Space reset  {} save  {} cancel{}",
-            move_help, save_key, cancel_key, dirty
-        ),
-        SettingsRowKind::Change => format!(
-            "Left/Right section  {} move  Space change  {} save  {} cancel{}",
-            move_help, save_key, cancel_key, dirty
-        ),
+        SettingsRowKind::Text if state.edit_finished => {
+            items.push(help_item(
+                keybindings,
+                KeyAction::AiTitleSettingsSave,
+                "Enter",
+                "save",
+            ));
+            items.push(direct_help_item("type", "edit again"));
+        }
+        SettingsRowKind::Text => {
+            items.push(help_item(
+                keybindings,
+                KeyAction::AiTitleSettingsSave,
+                "Enter",
+                "edit path",
+            ));
+        }
+        SettingsRowKind::ReadOnly => {
+            items.push(direct_help_item("read-only", "field"));
+            items.push(help_item(
+                keybindings,
+                KeyAction::AiTitleSettingsSave,
+                "Enter",
+                "save",
+            ));
+        }
+        SettingsRowKind::Select => {
+            items.push(direct_help_item("Space", "select"));
+            items.push(help_item(
+                keybindings,
+                KeyAction::AiTitleSettingsSave,
+                "Enter",
+                "save",
+            ));
+        }
+        SettingsRowKind::Change => {
+            items.push(direct_help_item("Space", "change"));
+            items.push(help_item(
+                keybindings,
+                KeyAction::AiTitleSettingsSave,
+                "Enter",
+                "save",
+            ));
+        }
     }
+    items.push(help_item(
+        keybindings,
+        KeyAction::AiTitleSettingsCancel,
+        "Esc",
+        "cancel",
+    ));
+    if state.is_dirty() {
+        items.push(direct_help_item("!", "unsaved"));
+    }
+    items
 }
 
 fn optional_path_label(path: Option<PathBuf>) -> String {
@@ -26895,20 +27173,25 @@ fn optional_path_label(path: Option<PathBuf>) -> String {
 fn ai_title_provider_option_line(
     index: usize,
     provider: Option<Provider>,
-    selected: bool,
+    focused: bool,
+    current: bool,
+    inner_width: usize,
 ) -> Line<'static> {
     let label = match provider {
         Some(provider) => provider.as_str().to_string(),
         None => "None (disabled)".to_string(),
     };
-    let marker = if selected {
-        UI_CURRENT_MARKER
-    } else {
-        UI_UNSELECTED_MARKER
-    };
-    let current = if selected { " current" } else { "" };
-    let text = format!("{}{} {}{}", marker, index + 1, label, current);
-    let style = if selected {
+    let current_label = if current { " current" } else { "" };
+    let text = format!(
+        "{}{} {}{}",
+        selection_marker(focused),
+        index + 1,
+        label,
+        current_label
+    );
+    let style = if focused {
+        theme_selected_style()
+    } else if current {
         Style::default()
             .fg(provider.map(provider_color).unwrap_or(THEME_POSITIVE))
             .bg(THEME_BG_ALT)
@@ -26917,7 +27200,10 @@ fn ai_title_provider_option_line(
         let fg = provider.map(provider_color).unwrap_or(THEME_FG_STRONG);
         Style::default().fg(fg).bg(THEME_BG_ALT)
     };
-    Line::from(Span::styled(text, style))
+    Line::from(Span::styled(
+        fit_width(&text, inner_width, Align::Left),
+        style,
+    ))
 }
 
 fn draw_agent_launch_modal(
@@ -26933,7 +27219,8 @@ fn draw_agent_launch_modal(
         source.provider.as_str(),
         truncate_width(&source.session_id, 24)
     );
-    let help = agent_launch_help_text(keybindings);
+    let help_items = agent_launch_help_items(keybindings);
+    let help = help_text_from_items(&help_items);
     let option_width = AGENT_LAUNCH_MODE_OPTIONS
         .iter()
         .copied()
@@ -26988,10 +27275,7 @@ fn draw_agent_launch_modal(
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        help,
-        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-    )));
+    lines.push(modal_help_line(&help_items));
 
     let modal_area = modal_area_for_wrapped_lines(area, "Agent launch", &lines, 54, 96, 8, 12);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
@@ -27029,7 +27313,7 @@ fn draw_clone_options_modal(
     };
     let target_line = format!("Target: {} ({})", target.as_str(), target_kind);
     let data_line = clone_options_data_line(folder_data);
-    let help = clone_options_help_text(keybindings);
+    let help_items = clone_options_help_items(keybindings);
     let lines = vec![
         Line::from(Span::styled(
             intro,
@@ -27042,10 +27326,7 @@ fn draw_clone_options_modal(
         clone_options_data_status_line(folder_data, data_line),
         Line::from(""),
         clone_options_button_line(selected, folder_data, target == source.provider),
-        Line::from(Span::styled(
-            help,
-            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-        )),
+        modal_help_line(&help_items),
     ];
     let modal_area = modal_area_for_wrapped_lines(area, "Clone session", &lines, 58, 94, 8, 12);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
@@ -27148,7 +27429,8 @@ fn draw_new_session_modal(
     keybindings: &KeyBindings,
 ) {
     let selected = clamp_new_session_field(selected, kind);
-    let help = new_session_help_text(keybindings);
+    let help_items = new_session_help_items(keybindings);
+    let help = help_text_from_items(&help_items);
     let preview_command =
         new_session_preview_command(kind, cwd, provider, provider_options, launch_mode, settings);
     let desired_width = UnicodeWidthStr::width("Choose what to start")
@@ -27233,10 +27515,7 @@ fn draw_new_session_modal(
         Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
     )));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        help,
-        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-    )));
+    lines.push(modal_help_line(&help_items));
 
     let modal_area =
         modal_area_for_wrapped_lines(area, "New session", &lines, 56, 98, min_height, 14);
@@ -27336,184 +27615,293 @@ fn new_session_preview_command(
     }
 }
 
-fn title_edit_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} move  {}  {}  {} AI title  {} save  {} cancel",
-        keybindings.help_pair(
+fn title_edit_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_pair_item(
+            keybindings,
             KeyAction::TitleMoveLeft,
             KeyAction::TitleMoveRight,
-            "Left",
-            "Right",
+            "←",
+            "→",
+            "move",
         ),
-        keybindings.help_pair(KeyAction::TitleHome, KeyAction::TitleEnd, "Home", "End"),
-        keybindings.help_pair(
+        help_pair_item(
+            keybindings,
+            KeyAction::TitleHome,
+            KeyAction::TitleEnd,
+            "Home",
+            "End",
+            "ends",
+        ),
+        help_pair_item(
+            keybindings,
             KeyAction::TitleDelete,
             KeyAction::TitleBackspace,
             "Del",
             "Bksp",
+            "delete",
         ),
-        keybindings.help(KeyAction::TitleAiGenerate, "Ctrl+T"),
-        keybindings.help(KeyAction::TitleSave, "Enter"),
-        keybindings.help(KeyAction::TitleCancel, "Esc"),
-    )
+        help_item(
+            keybindings,
+            KeyAction::TitleAiGenerate,
+            "Ctrl+T",
+            "AI title",
+        ),
+        help_item(keybindings, KeyAction::TitleSave, "Enter", "save"),
+        help_item(keybindings, KeyAction::TitleCancel, "Esc", "cancel"),
+    ]
 }
 
-fn search_choice_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} choose  {} move  {}/{} select  {} cancel",
-        keybindings.help(KeyAction::SearchChoiceConfirm, "Enter"),
-        keybindings.help_pair(
+fn search_choice_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_item(
+            keybindings,
+            KeyAction::SearchChoiceConfirm,
+            "Enter",
+            "choose",
+        ),
+        help_pair_item(
+            keybindings,
             KeyAction::SearchChoicePrev,
             KeyAction::SearchChoiceNext,
-            "Up",
-            "Down",
+            "↑",
+            "↓",
+            "move",
         ),
-        keybindings.help(KeyAction::SearchChoiceText, "1"),
-        keybindings.help(KeyAction::SearchChoiceAi, "2"),
-        keybindings.help(KeyAction::SearchChoiceCancel, "Esc"),
-    )
+        direct_help_item(
+            format!(
+                "{}/{}",
+                keybindings.help(KeyAction::SearchChoiceText, "1"),
+                keybindings.help(KeyAction::SearchChoiceAi, "2")
+            ),
+            "select",
+        ),
+        help_item(keybindings, KeyAction::SearchChoiceCancel, "Esc", "cancel"),
+    ]
 }
 
-fn filter_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} move  {}  {}  {} search  {} cancel",
-        keybindings.help_pair(
+fn filter_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_pair_item(
+            keybindings,
             KeyAction::FilterMoveLeft,
             KeyAction::FilterMoveRight,
-            "Left",
-            "Right",
+            "←",
+            "→",
+            "cursor",
         ),
-        keybindings.help_pair(KeyAction::FilterHome, KeyAction::FilterEnd, "Home", "End"),
-        keybindings.help_pair(
+        help_pair_item(
+            keybindings,
+            KeyAction::FilterHome,
+            KeyAction::FilterEnd,
+            "Home",
+            "End",
+            "ends",
+        ),
+        help_pair_item(
+            keybindings,
             KeyAction::FilterDelete,
             KeyAction::FilterBackspace,
             "Del",
             "Bksp",
+            "delete",
         ),
-        keybindings.help(KeyAction::FilterApply, "Enter"),
-        keybindings.help(KeyAction::FilterCancel, "Esc"),
-    )
+        help_item(keybindings, KeyAction::FilterApply, "Enter", "search"),
+        help_item(keybindings, KeyAction::FilterCancel, "Esc", "cancel"),
+    ]
 }
 
-fn agent_launch_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} start/attach  {} choose  {}/{} select  {} cancel",
-        keybindings.help(KeyAction::AgentLaunchConfirm, "Enter"),
-        keybindings.help_pair(
+fn agent_launch_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_item(
+            keybindings,
+            KeyAction::AgentLaunchConfirm,
+            "Enter",
+            "start/attach",
+        ),
+        help_pair_item(
+            keybindings,
             KeyAction::AgentLaunchPrev,
             KeyAction::AgentLaunchNext,
-            "Up",
-            "Down",
+            "↑",
+            "↓",
+            "move",
         ),
-        keybindings.help(KeyAction::AgentLaunchNormal, "1"),
-        keybindings.help(KeyAction::AgentLaunchSkipPermissions, "2"),
-        keybindings.help(KeyAction::AgentLaunchCancel, "Esc"),
-    )
+        direct_help_item(
+            format!(
+                "{}/{}",
+                keybindings.help(KeyAction::AgentLaunchNormal, "1"),
+                keybindings.help(KeyAction::AgentLaunchSkipPermissions, "2")
+            ),
+            "select",
+        ),
+        help_item(keybindings, KeyAction::AgentLaunchCancel, "Esc", "cancel"),
+    ]
 }
 
-fn delete_confirm_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} choose  {} select  {} delete  {}/{} cancel",
-        keybindings.help(KeyAction::DeleteConfirmConfirm, "Enter"),
-        keybindings.help_pair(
+fn delete_confirm_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_item(
+            keybindings,
+            KeyAction::DeleteConfirmConfirm,
+            "Enter",
+            "choose",
+        ),
+        help_pair_item(
+            keybindings,
             KeyAction::DeleteConfirmPrev,
             KeyAction::DeleteConfirmNext,
-            "Left",
-            "Right",
+            "←",
+            "→",
+            "select",
         ),
-        keybindings.help(KeyAction::DeleteConfirmDelete, "1"),
-        keybindings.help(KeyAction::DeleteConfirmCancelChoice, "2"),
-        keybindings.help(KeyAction::DeleteConfirmCancel, "Esc"),
-    )
+        help_item(keybindings, KeyAction::DeleteConfirmDelete, "1", "delete"),
+        direct_help_item(
+            format!(
+                "{}/{}",
+                keybindings.help(KeyAction::DeleteConfirmCancelChoice, "2"),
+                keybindings.help(KeyAction::DeleteConfirmCancel, "Esc")
+            ),
+            "cancel",
+        ),
+    ]
 }
 
-fn create_folder_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} choose  {} select  {} create  {}/{} cancel",
-        keybindings.help(KeyAction::CreateFolderConfirm, "Enter"),
-        keybindings.help_pair(
+fn create_folder_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_item(
+            keybindings,
+            KeyAction::CreateFolderConfirm,
+            "Enter",
+            "choose",
+        ),
+        help_pair_item(
+            keybindings,
             KeyAction::CreateFolderPrev,
             KeyAction::CreateFolderNext,
-            "Left",
-            "Right",
+            "←",
+            "→",
+            "select",
         ),
-        keybindings.help(KeyAction::CreateFolderCreate, "1"),
-        keybindings.help(KeyAction::CreateFolderCancelChoice, "2"),
-        keybindings.help(KeyAction::CreateFolderCancel, "Esc"),
-    )
+        help_item(keybindings, KeyAction::CreateFolderCreate, "1", "create"),
+        direct_help_item(
+            format!(
+                "{}/{}",
+                keybindings.help(KeyAction::CreateFolderCancelChoice, "2"),
+                keybindings.help(KeyAction::CreateFolderCancel, "Esc")
+            ),
+            "cancel",
+        ),
+    ]
 }
 
-fn restore_data_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} choose  {} select  {} restore  {}/{} skip",
-        keybindings.help(KeyAction::RestoreDataConfirm, "Enter"),
-        keybindings.help_pair(
+fn restore_data_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_item(
+            keybindings,
+            KeyAction::RestoreDataConfirm,
+            "Enter",
+            "choose",
+        ),
+        help_pair_item(
+            keybindings,
             KeyAction::RestoreDataPrev,
             KeyAction::RestoreDataNext,
-            "Left",
-            "Right",
+            "←",
+            "→",
+            "select",
         ),
-        keybindings.help(KeyAction::RestoreDataRestore, "1"),
-        keybindings.help(KeyAction::RestoreDataSkipChoice, "2"),
-        keybindings.help(KeyAction::RestoreDataSkip, "Esc"),
-    )
+        help_item(keybindings, KeyAction::RestoreDataRestore, "1", "restore"),
+        direct_help_item(
+            format!(
+                "{}/{}",
+                keybindings.help(KeyAction::RestoreDataSkipChoice, "2"),
+                keybindings.help(KeyAction::RestoreDataSkip, "Esc")
+            ),
+            "skip",
+        ),
+    ]
 }
 
-fn clone_options_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} choose  {} option  {} target  {}/{}/{} direct  {} cancel",
-        keybindings.help(KeyAction::CloneOptionsConfirm, "Enter"),
-        keybindings.help_pair(
+fn clone_options_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_item(
+            keybindings,
+            KeyAction::CloneOptionsConfirm,
+            "Enter",
+            "choose",
+        ),
+        help_pair_item(
+            keybindings,
             KeyAction::CloneOptionsPrev,
             KeyAction::CloneOptionsNext,
-            "Left",
-            "Right",
+            "←",
+            "→",
+            "option",
         ),
-        keybindings.help_pair(
+        help_pair_item(
+            keybindings,
             KeyAction::CloneOptionsTargetPrev,
             KeyAction::CloneOptionsTargetNext,
             "Shift+Tab",
             "Tab",
+            "target",
         ),
-        keybindings.help(KeyAction::CloneOptionsSessionOnly, "1"),
-        keybindings.help(KeyAction::CloneOptionsFolderData, "2"),
-        keybindings.help(KeyAction::CloneOptionsCancelChoice, "3"),
-        keybindings.help(KeyAction::CloneOptionsCancel, "Esc"),
-    )
+        direct_help_item(
+            format!(
+                "{}/{}/{}",
+                keybindings.help(KeyAction::CloneOptionsSessionOnly, "1"),
+                keybindings.help(KeyAction::CloneOptionsFolderData, "2"),
+                keybindings.help(KeyAction::CloneOptionsCancelChoice, "3")
+            ),
+            "direct",
+        ),
+        help_item(keybindings, KeyAction::CloneOptionsCancel, "Esc", "cancel"),
+    ]
 }
 
-fn new_session_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} start  {} field  {} change  {} cursor  {} cancel",
-        keybindings.help(KeyAction::NewSessionConfirm, "Enter"),
-        keybindings.help_pair(
+fn new_session_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_item(keybindings, KeyAction::NewSessionConfirm, "Enter", "start"),
+        help_pair_item(
+            keybindings,
             KeyAction::NewSessionPrev,
             KeyAction::NewSessionNext,
-            "Up",
-            "Down",
+            "↑",
+            "↓",
+            "field",
         ),
-        keybindings.help_pair(
+        help_pair_item(
+            keybindings,
             KeyAction::NewSessionChoicePrev,
             KeyAction::NewSessionChoiceNext,
-            "Left",
-            "Right",
+            "←",
+            "→",
+            "change",
         ),
-        keybindings.help_pair(
+        help_pair_item(
+            keybindings,
             KeyAction::NewSessionMoveLeft,
             KeyAction::NewSessionMoveRight,
-            "Left",
-            "Right",
+            "←",
+            "→",
+            "cursor",
         ),
-        keybindings.help(KeyAction::NewSessionCancel, "Esc"),
-    )
+        help_item(keybindings, KeyAction::NewSessionCancel, "Esc", "cancel"),
+    ]
 }
 
 fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let rows = app.visible_rows();
+    let row_count = rows.len();
     let inner = pane_inner(area);
+    let list_viewport_height = inner.height.saturating_sub(1);
+    let show_scrollbar =
+        inner.width > 1 && list_viewport_height > 0 && row_count > list_viewport_height as usize;
+    let content_inner = scroll_content_area(inner, show_scrollbar);
     fill_area(f.buffer_mut(), area, theme_base_style());
-    let cols = list_columns(inner.width);
-    debug_assert!(inner.width < 20 || cols.row_width() == inner.width as usize);
+    let cols = list_columns(content_inner.width);
+    debug_assert!(content_inner.width < 20 || cols.row_width() == content_inner.width as usize);
     let selected = app.list_state.selected();
     let items: Vec<ListItem> =
         rows.iter()
@@ -27587,7 +27975,7 @@ fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let title = format!(
         " sessions {} {} {}{} ",
-        rows.len(),
+        row_count,
         app.provider_filter.label(),
         app.session_view.label(),
         if let Some(results) = app.ai_search_results.as_ref() {
@@ -27609,12 +27997,16 @@ fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let header = fit_width(&list_header(&cols), inner.width as usize, Align::Left);
+    let header = fit_width(
+        &list_header(&cols),
+        content_inner.width as usize,
+        Align::Left,
+    );
     f.buffer_mut().set_stringn(
-        inner.x,
-        inner.y,
+        content_inner.x,
+        content_inner.y,
         header,
-        inner.width as usize,
+        content_inner.width as usize,
         Style::default()
             .fg(THEME_FG_DIM)
             .bg(THEME_BG)
@@ -27626,15 +28018,30 @@ fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
 
     let list_area = Rect::new(
-        inner.x,
-        inner.y.saturating_add(1),
-        inner.width,
-        inner.height.saturating_sub(1),
+        content_inner.x,
+        content_inner.y.saturating_add(1),
+        content_inner.width,
+        content_inner.height.saturating_sub(1),
     );
     let list = List::new(items)
         .style(theme_base_style())
         .highlight_style(theme_selected_style());
     f.render_stateful_widget(list, list_area, &mut app.list_state);
+    if show_scrollbar {
+        let scrollbar_area = Rect::new(
+            inner.right().saturating_sub(1),
+            inner.y.saturating_add(1),
+            1,
+            list_viewport_height,
+        );
+        render_vertical_scrollbar(
+            f,
+            scrollbar_area,
+            row_count,
+            app.list_state.offset(),
+            list_viewport_height as usize,
+        );
+    }
 }
 
 fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -27646,23 +28053,36 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let mut lines = Vec::new();
     let mut summary_style_state = PreviewSummaryStyleState::default();
     let mut max_scroll = 0u16;
+    let mut line_count = 0usize;
+    let mut show_scrollbar = false;
     let title = if inner.width < MIN_PREVIEW_WRAP_WIDTH {
         app.preview_scroll = 0;
         " preview ".to_string()
     } else if let Some(info) = current {
         let key = PreviewKey::new(&info, app.preview_mode);
         app.request_preview(info.clone(), key.clone(), inner.width as usize);
-        if let Some(line_count) = app.ensure_wrapped_preview(&key, inner.width as usize) {
+        if let Some(full_line_count) = app.ensure_wrapped_preview(&key, inner.width as usize) {
+            show_scrollbar = inner.width > 1 && full_line_count > inner.height as usize;
+            let content_area = scroll_content_area(inner, show_scrollbar);
+            line_count = if show_scrollbar {
+                app.ensure_wrapped_preview(&key, content_area.width as usize)
+                    .unwrap_or(full_line_count)
+            } else {
+                full_line_count
+            };
             max_scroll = line_count
-                .saturating_sub(inner.height as usize)
+                .saturating_sub(content_area.height as usize)
                 .min(u16::MAX as usize) as u16;
             if app.preview_scroll > max_scroll {
                 app.preview_scroll = max_scroll;
             }
             summary_style_state =
                 app.preview_summary_style_state_before(&key, app.preview_scroll as usize);
-            lines =
-                app.preview_visible_lines(&key, app.preview_scroll as usize, inner.height as usize);
+            lines = app.preview_visible_lines(
+                &key,
+                app.preview_scroll as usize,
+                content_area.height as usize,
+            );
         } else {
             app.preview_scroll = 0;
             lines.push(format!(
@@ -27697,17 +28117,28 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let buf = f.buffer_mut();
     fill_area(buf, inner, theme_base_style());
+    let content_inner = scroll_content_area(inner, show_scrollbar);
     let styled_lines: Vec<Line> = lines
         .iter()
-        .take(inner.height as usize)
+        .take(content_inner.height as usize)
         .scan(summary_style_state, |state, line| {
             Some(preview_line_with_state(line, app.preview_mode, state))
         })
         .collect();
     f.render_widget(
         Paragraph::new(styled_lines).style(theme_base_style()),
-        inner,
+        content_inner,
     );
+    if show_scrollbar {
+        let scrollbar_area = Rect::new(inner.right().saturating_sub(1), inner.y, 1, inner.height);
+        render_vertical_scrollbar(
+            f,
+            scrollbar_area,
+            line_count,
+            app.preview_scroll as usize,
+            content_inner.height as usize,
+        );
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -28106,6 +28537,48 @@ fn pane_inner(area: Rect) -> Rect {
     )
 }
 
+fn scroll_content_area(area: Rect, show_scrollbar: bool) -> Rect {
+    if show_scrollbar {
+        Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height)
+    } else {
+        area
+    }
+}
+
+fn vertical_scrollbar() -> Scrollbar<'static> {
+    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .track_style(Style::default().fg(THEME_FG_DIM).bg(THEME_BG))
+        .thumb_symbol("┃")
+        .thumb_style(Style::default().fg(THEME_SHORTCUT).bg(THEME_BG))
+}
+
+fn render_vertical_scrollbar(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    content_length: usize,
+    position: usize,
+    viewport_content_length: usize,
+) {
+    if area.width == 0
+        || area.height == 0
+        || viewport_content_length == 0
+        || content_length <= viewport_content_length
+    {
+        return;
+    }
+    let scrollable_positions = content_length
+        .saturating_sub(viewport_content_length)
+        .saturating_add(1);
+    let max_position = scrollable_positions.saturating_sub(1);
+    let mut state = ScrollbarState::new(scrollable_positions)
+        .position(position.min(max_position))
+        .viewport_content_length(viewport_content_length);
+    f.render_stateful_widget(vertical_scrollbar(), area, &mut state);
+}
+
 fn fill_area(buf: &mut Buffer, area: Rect, style: Style) {
     let area = area.intersection(buf.area);
     for y in area.top()..area.bottom() {
@@ -28119,7 +28592,6 @@ fn fill_area(buf: &mut Buffer, area: Rect, style: Style) {
 fn draw_status(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     fill_area(f.buffer_mut(), area, theme_status_style());
     let width = area.width as usize;
-    let help = truncate_width(&help_text(app.focus, width, &app.keybindings), width);
     let mode = format!(
         "{} focus  {} preview",
         match app.focus {
@@ -28146,177 +28618,375 @@ fn draw_status(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
     let lines = vec![
         Line::from(status_spans),
-        Line::from(Span::styled(
-            help,
-            Style::default().fg(THEME_FG_DIM).bg(THEME_STATUS_BG),
-        )),
+        help_line(app.focus, width, &app.keybindings),
     ];
     f.render_widget(Paragraph::new(lines).style(theme_status_style()), area);
 }
 
+#[derive(Debug, Clone)]
+struct HelpItem {
+    keys: String,
+    label: &'static str,
+}
+
+impl HelpItem {
+    fn new(keys: String, label: &'static str) -> Self {
+        Self { keys, label }
+    }
+}
+
+fn direct_help_item(keys: impl Into<String>, label: &'static str) -> HelpItem {
+    HelpItem::new(keys.into(), label)
+}
+
+fn help_item(
+    keybindings: &KeyBindings,
+    action: KeyAction,
+    fallback: &str,
+    label: &'static str,
+) -> HelpItem {
+    HelpItem::new(keybindings.help(action, fallback), label)
+}
+
+fn help_pair_item(
+    keybindings: &KeyBindings,
+    previous: KeyAction,
+    next: KeyAction,
+    fallback_previous: &str,
+    fallback_next: &str,
+    label: &'static str,
+) -> HelpItem {
+    HelpItem::new(
+        keybindings.help_pair(previous, next, fallback_previous, fallback_next),
+        label,
+    )
+}
+
 fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> String {
+    truncate_width(
+        &help_text_from_items(&help_items(focus, width, keybindings)),
+        width,
+    )
+}
+
+fn help_line(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Line<'static> {
+    help_line_from_items(&help_items(focus, width, keybindings), width)
+}
+
+fn help_text_from_items(items: &[HelpItem]) -> String {
+    items
+        .iter()
+        .map(|item| format!("{} {}", item.keys, item.label))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn help_line_from_items(items: &[HelpItem], width: usize) -> Line<'static> {
+    help_line_from_items_with_bg(items, width, THEME_STATUS_BG)
+}
+
+fn modal_help_line(items: &[HelpItem]) -> Line<'static> {
+    help_line_from_items_with_bg(items, usize::MAX, THEME_BG_ALT)
+}
+
+fn help_line_from_items_with_bg(items: &[HelpItem], width: usize, bg: Color) -> Line<'static> {
+    let key_style = Style::default().fg(THEME_SHORTCUT).bg(bg);
+    let label_style = Style::default().fg(THEME_FG_DIM).bg(bg);
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    push_help_item_spans(items, &mut spans, label_style, key_style, &mut used, width);
+    Line::from(spans)
+}
+
+fn push_help_item_spans(
+    items: &[HelpItem],
+    spans: &mut Vec<Span<'static>>,
+    label_style: Style,
+    key_style: Style,
+    used: &mut usize,
+    width: usize,
+) {
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 && !push_help_span(spans, "  ", label_style, used, width) {
+            return;
+        }
+        if !push_help_span(spans, &item.keys, key_style, used, width) {
+            return;
+        }
+        if !push_help_span(spans, " ", label_style, used, width) {
+            return;
+        }
+        if !push_help_span(spans, item.label, label_style, used, width) {
+            return;
+        }
+    }
+}
+
+fn push_help_span(
+    spans: &mut Vec<Span<'static>>,
+    text: &str,
+    style: Style,
+    used: &mut usize,
+    width: usize,
+) -> bool {
+    if *used >= width {
+        return false;
+    }
+    let clipped = truncate_width(text, width.saturating_sub(*used));
+    if clipped.is_empty() {
+        return false;
+    }
+    *used = used.saturating_add(UnicodeWidthStr::width(clipped.as_str()));
+    spans.push(Span::styled(clipped, style));
+    *used < width
+}
+
+fn quit_help_item(keybindings: &KeyBindings) -> HelpItem {
+    HelpItem::new(
+        format!(
+            "Esc/{}/{}",
+            keybindings.help(KeyAction::SessionQuit, "q"),
+            keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q")
+        ),
+        "quit",
+    )
+}
+
+fn help_items(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Vec<HelpItem> {
     match focus {
-        FocusPane::Sessions if width >= 104 => format!(
-            "{} preview  {} select  {} new  {} search  {} tree  {} title  {} AI  {} delete  {} launch  {}/{} quit",
-            keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
-            keybindings.help_pair(
+        FocusPane::Sessions if width >= 132 => vec![
+            help_item(keybindings, KeyAction::SessionToggleFocus, "Tab", "preview"),
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionMovePrev,
                 KeyAction::SessionMoveNext,
-                "Up",
-                "Down",
+                "↑",
+                "↓",
+                "move",
             ),
-            keybindings.help(KeyAction::SessionNewShell, "Ctrl+N"),
-            keybindings.help(KeyAction::SessionFilter, "Ctrl+F"),
-            keybindings.help(KeyAction::SessionToggleView, "v"),
-            keybindings.help(KeyAction::SessionEditTitle, "t"),
-            keybindings.help(KeyAction::SessionAiTitleSettings, ",/Ctrl+T"),
-            keybindings.help(KeyAction::SessionDelete, "Delete/d"),
-            keybindings.help(KeyAction::SessionLaunchAgent, "e"),
-            keybindings.help(KeyAction::SessionQuit, "q"),
-            keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
-        ),
-        FocusPane::Sessions if width >= 68 => format!(
-            "{} preview  {} select  {} new  {} title  {} launch  {}/{} quit",
-            keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
-            keybindings.help_pair(
+            help_item(keybindings, KeyAction::SessionNewShell, "Ctrl+N", "new"),
+            help_item(keybindings, KeyAction::SessionFilter, "Ctrl+F", "search"),
+            help_item(keybindings, KeyAction::SessionToggleView, "v", "view"),
+            help_item(keybindings, KeyAction::SessionRefresh, "r", "refresh"),
+            help_item(keybindings, KeyAction::SessionEditTitle, "t", "title"),
+            help_item(keybindings, KeyAction::SessionAiTitleSettings, ",", "AI"),
+            help_item(keybindings, KeyAction::SessionClone, "c", "clone"),
+            help_item(keybindings, KeyAction::SessionDelete, "Delete/d", "delete"),
+            help_item(keybindings, KeyAction::SessionLaunchAgent, "e", "launch"),
+            quit_help_item(keybindings),
+        ],
+        FocusPane::Sessions if width >= 104 => vec![
+            help_item(keybindings, KeyAction::SessionToggleFocus, "Tab", "preview"),
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionMovePrev,
                 KeyAction::SessionMoveNext,
-                "Up",
-                "Down",
+                "↑",
+                "↓",
+                "move",
             ),
-            keybindings.help(KeyAction::SessionNewShell, "Ctrl+N"),
-            keybindings.help(KeyAction::SessionEditTitle, "t"),
-            keybindings.help(KeyAction::SessionLaunchAgent, "e"),
-            keybindings.help(KeyAction::SessionQuit, "q"),
-            keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
-        ),
-        FocusPane::Sessions => format!(
-            "{} preview  {} select  {} title  {} launch  {}/{} quit",
-            keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
-            keybindings.help_pair(
+            help_item(keybindings, KeyAction::SessionNewShell, "Ctrl+N", "new"),
+            help_item(keybindings, KeyAction::SessionFilter, "Ctrl+F", "search"),
+            help_item(keybindings, KeyAction::SessionToggleView, "v", "view"),
+            help_item(keybindings, KeyAction::SessionEditTitle, "t", "title"),
+            help_item(keybindings, KeyAction::SessionAiTitleSettings, ",", "AI"),
+            help_item(keybindings, KeyAction::SessionClone, "c", "clone"),
+            help_item(keybindings, KeyAction::SessionLaunchAgent, "e", "launch"),
+            quit_help_item(keybindings),
+        ],
+        FocusPane::Sessions if width >= 68 => vec![
+            help_item(keybindings, KeyAction::SessionToggleFocus, "Tab", "preview"),
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionMovePrev,
                 KeyAction::SessionMoveNext,
-                "Up",
-                "Down",
+                "↑",
+                "↓",
+                "move",
             ),
-            keybindings.help(KeyAction::SessionEditTitle, "t"),
-            keybindings.help(KeyAction::SessionLaunchAgent, "e"),
-            keybindings.help(KeyAction::SessionQuit, "q"),
-            keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
-        ),
-        FocusPane::Preview if width >= 92 => format!(
-            "{} sessions  {} scroll  {} select  {} resize  {} page  {} top/bottom  {}/{} quit",
-            keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
-            keybindings.help_pair(
+            help_item(keybindings, KeyAction::SessionNewShell, "Ctrl+N", "new"),
+            help_item(keybindings, KeyAction::SessionEditTitle, "t", "title"),
+            help_item(keybindings, KeyAction::SessionLaunchAgent, "e", "launch"),
+            quit_help_item(keybindings),
+        ],
+        FocusPane::Sessions => vec![
+            help_item(keybindings, KeyAction::SessionToggleFocus, "Tab", "preview"),
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionMovePrev,
                 KeyAction::SessionMoveNext,
-                "Up",
-                "Down",
+                "↑",
+                "↓",
+                "move",
             ),
-            keybindings.help_pair(
+            help_item(keybindings, KeyAction::SessionLaunchAgent, "e", "launch"),
+            quit_help_item(keybindings),
+        ],
+        FocusPane::Preview if width >= 92 => vec![
+            help_item(
+                keybindings,
+                KeyAction::SessionToggleFocus,
+                "Tab",
+                "sessions",
+            ),
+            help_pair_item(
+                keybindings,
+                KeyAction::SessionMovePrev,
+                KeyAction::SessionMoveNext,
+                "↑",
+                "↓",
+                "scroll",
+            ),
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionsSidebarPrev,
                 KeyAction::SessionsSidebarNext,
-                "Alt+Up",
-                "Alt+Down",
+                "Alt+↑",
+                "Alt+↓",
+                "list",
             ),
-            keybindings.help_pair(
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionsPaneResizeLeft,
                 KeyAction::SessionsPaneResizeRight,
-                "Alt+Left",
-                "Alt+Right",
+                "Alt+←",
+                "Alt+→",
+                "resize",
             ),
-            keybindings.help_pair(
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionPagePrev,
                 KeyAction::SessionPageNext,
                 "PgUp",
                 "PgDn",
+                "page",
             ),
-            keybindings.help_pair(
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionTop,
                 KeyAction::SessionBottom,
                 "Home",
                 "End",
+                "top/bottom",
             ),
-            keybindings.help(KeyAction::SessionQuit, "q"),
-            keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
-        ),
-        FocusPane::Preview if width >= 68 => format!(
-            "{} sessions  {} scroll  {} resize  {} page  {}/{} quit",
-            keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
-            keybindings.help_pair(
+            quit_help_item(keybindings),
+        ],
+        FocusPane::Preview if width >= 68 => vec![
+            help_item(
+                keybindings,
+                KeyAction::SessionToggleFocus,
+                "Tab",
+                "sessions",
+            ),
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionMovePrev,
                 KeyAction::SessionMoveNext,
-                "Up",
-                "Down",
+                "↑",
+                "↓",
+                "scroll",
             ),
-            keybindings.help_pair(
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionsPaneResizeLeft,
                 KeyAction::SessionsPaneResizeRight,
-                "Alt+Left",
-                "Alt+Right",
+                "Alt+←",
+                "Alt+→",
+                "resize",
             ),
-            keybindings.help_pair(
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionPagePrev,
                 KeyAction::SessionPageNext,
                 "PgUp",
                 "PgDn",
+                "page",
             ),
-            keybindings.help(KeyAction::SessionQuit, "q"),
-            keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
-        ),
-        FocusPane::Preview => format!(
-            "{} sessions  {} scroll  {} resize  {}/{} quit",
-            keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
-            keybindings.help_pair(
+            quit_help_item(keybindings),
+        ],
+        FocusPane::Preview => vec![
+            help_item(
+                keybindings,
+                KeyAction::SessionToggleFocus,
+                "Tab",
+                "sessions",
+            ),
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionMovePrev,
                 KeyAction::SessionMoveNext,
-                "Up",
-                "Down",
+                "↑",
+                "↓",
+                "scroll",
             ),
-            keybindings.help_pair(
+            help_pair_item(
+                keybindings,
                 KeyAction::SessionsPaneResizeLeft,
                 KeyAction::SessionsPaneResizeRight,
-                "Alt+Left",
-                "Alt+Right",
+                "Alt+←",
+                "Alt+→",
+                "resize",
             ),
-            keybindings.help(KeyAction::SessionQuit, "q"),
-            keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
-        ),
+            quit_help_item(keybindings),
+        ],
     }
 }
 
+#[cfg(test)]
 fn agent_help_text(keybindings: &KeyBindings) -> String {
-    format!(
-        "{} sessions  {} new  {} kill  {} quit  {} scroll  {} switch  {} select  {} resize",
-        keybindings.help(KeyAction::AgentToggleSessions, "Ctrl+]"),
-        keybindings.help(KeyAction::AgentNewShell, "Ctrl+N"),
-        keybindings.help(KeyAction::AgentKill, "Ctrl+K"),
-        keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q"),
-        keybindings.help_pair(
+    help_text_from_items(&agent_help_items(keybindings))
+}
+
+fn agent_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_item(
+            keybindings,
+            KeyAction::AgentToggleSessions,
+            "Ctrl+]",
+            "sessions",
+        ),
+        help_item(keybindings, KeyAction::AgentNewShell, "Ctrl+N", "new"),
+        help_item(
+            keybindings,
+            KeyAction::AgentToggleSidebar,
+            "Ctrl+B",
+            "sidebar",
+        ),
+        help_pair_item(
+            keybindings,
             KeyAction::AgentScrollPageUp,
             KeyAction::AgentScrollPageDown,
-            "Shift+Alt+Up",
-            "Shift+Alt+Down",
+            "Shift+Alt+↑",
+            "Shift+Alt+↓",
+            "scroll",
         ),
-        keybindings.help_pair(
+        help_pair_item(
+            keybindings,
             KeyAction::AgentSwitchPrev,
             KeyAction::AgentSwitchNext,
             "Ctrl+PgUp",
             "Ctrl+PgDn",
+            "switch",
         ),
-        keybindings.help_pair(
+        help_pair_item(
+            keybindings,
             KeyAction::AgentSidebarPrev,
             KeyAction::AgentSidebarNext,
-            "Alt+Up",
-            "Alt+Down",
+            "Alt+↑",
+            "Alt+↓",
+            "select",
         ),
-        keybindings.help_pair(
+        help_pair_item(
+            keybindings,
             KeyAction::AgentPaneResizeLeft,
             KeyAction::AgentPaneResizeRight,
-            "Alt+Left",
-            "Alt+Right",
+            "Alt+←",
+            "Alt+→",
+            "resize",
         ),
-    )
+        help_item(keybindings, KeyAction::AgentKill, "Ctrl+K", "kill"),
+        help_item(keybindings, KeyAction::GlobalQuit, "Ctrl+Q", "quit"),
+    ]
 }
 
 fn provider_color(provider: Provider) -> Color {
@@ -28589,7 +29259,7 @@ impl ListColumns {
 }
 
 const LIST_MARKER_WIDTH: usize = 2;
-const STATE_COLUMN_WIDTH: usize = 8;
+const STATE_COLUMN_WIDTH: usize = 5;
 const PROVIDER_COLUMN_WIDTH: usize = 8;
 const AGE_COLUMN_WIDTH: usize = 4;
 const SESSION_DISPLAY_WIDTH: usize = 10;
@@ -30097,6 +30767,51 @@ mod tests {
     }
 
     #[test]
+    fn default_move_bindings_do_not_use_hjkl() {
+        let keybindings = KeyBindings::default();
+        let movement_actions = [
+            KeyAction::SessionMoveNext,
+            KeyAction::SessionMovePrev,
+            KeyAction::SearchChoiceNext,
+            KeyAction::SearchChoicePrev,
+            KeyAction::DeleteConfirmNext,
+            KeyAction::DeleteConfirmPrev,
+            KeyAction::CreateFolderNext,
+            KeyAction::CreateFolderPrev,
+            KeyAction::RestoreDataNext,
+            KeyAction::RestoreDataPrev,
+            KeyAction::CloneOptionsNext,
+            KeyAction::CloneOptionsPrev,
+            KeyAction::AgentLaunchNext,
+            KeyAction::AgentLaunchPrev,
+            KeyAction::AiTitleSettingsNext,
+            KeyAction::AiTitleSettingsPrev,
+            KeyAction::NewSessionNext,
+            KeyAction::NewSessionPrev,
+            KeyAction::NewSessionChoiceNext,
+            KeyAction::NewSessionChoicePrev,
+            KeyAction::FilterMoveLeft,
+            KeyAction::FilterMoveRight,
+            KeyAction::TitleMoveLeft,
+            KeyAction::TitleMoveRight,
+        ];
+
+        for action in movement_actions {
+            for ch in ['h', 'j', 'k', 'l'] {
+                assert!(
+                    !keybindings
+                        .matches(action, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+                    "{:?} should not use plain {}",
+                    action,
+                    ch
+                );
+            }
+        }
+        assert!(!CODEX_PAGER_SCROLL_UP_BINDINGS.contains(&"k"));
+        assert!(!CODEX_PAGER_SCROLL_DOWN_BINDINGS.contains(&"j"));
+    }
+
+    #[test]
     fn missing_keybinding_file_is_created_with_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keybinding.json");
@@ -30137,9 +30852,17 @@ mod tests {
             KeyAction::SessionAiTitleSettings,
             KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)
         ));
-        assert!(keybindings.matches(
+        assert!(!keybindings.matches(
             KeyAction::SessionAiTitleSettings,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
+        ));
+        assert!(keybindings.matches(
+            KeyAction::SessionToggleFocus,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::SessionToggleFocus,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
         ));
         let content = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -30155,11 +30878,54 @@ mod tests {
         assert_eq!(value["sessions"]["ai_search"], serde_json::json!([]));
         assert_eq!(
             value["sessions"]["ai_title_settings"],
-            serde_json::json!(["comma", "ctrl+t"])
+            serde_json::json!(["comma"])
         );
         assert_eq!(
-            value["search"]["next"],
-            serde_json::json!(["down", "j", "tab"])
+            value["sessions"]["toggle_focus"],
+            serde_json::json!(["tab"])
+        );
+        assert_eq!(value["sessions"]["move_next"], serde_json::json!(["down"]));
+        assert_eq!(value["sessions"]["move_prev"], serde_json::json!(["up"]));
+        assert_eq!(value["search"]["next"], serde_json::json!(["down", "tab"]));
+        assert_eq!(
+            value["search"]["prev"],
+            serde_json::json!(["up", "backtab"])
+        );
+        for section in ["delete_confirm", "create_folder", "restore_data"] {
+            assert_eq!(
+                value[section]["next"],
+                serde_json::json!(["right", "down", "tab"])
+            );
+            assert_eq!(
+                value[section]["prev"],
+                serde_json::json!(["left", "up", "backtab"])
+            );
+        }
+        assert_eq!(
+            value["clone_options"]["next"],
+            serde_json::json!(["right", "down"])
+        );
+        assert_eq!(
+            value["clone_options"]["prev"],
+            serde_json::json!(["left", "up"])
+        );
+        assert_eq!(value["agent_launch"]["next"], serde_json::json!(["down"]));
+        assert_eq!(value["agent_launch"]["prev"], serde_json::json!(["up"]));
+        assert_eq!(
+            value["new_session"]["next"],
+            serde_json::json!(["down", "tab"])
+        );
+        assert_eq!(
+            value["new_session"]["prev"],
+            serde_json::json!(["up", "backtab"])
+        );
+        assert_eq!(
+            value["new_session"]["choice_next"],
+            serde_json::json!(["right", "space"])
+        );
+        assert_eq!(
+            value["new_session"]["choice_prev"],
+            serde_json::json!(["left"])
         );
         assert_eq!(value["sessions"]["toggle_preview"], serde_json::json!([]));
         assert!(!keybindings.matches(
@@ -30214,7 +30980,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_generated_ai_settings_binding_adds_comma() {
+    fn legacy_generated_ai_settings_binding_uses_comma_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keybinding.json");
         fs::write(
@@ -30234,7 +31000,7 @@ mod tests {
             KeyAction::SessionAiTitleSettings,
             KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)
         ));
-        assert!(keybindings.matches(
+        assert!(!keybindings.matches(
             KeyAction::SessionAiTitleSettings,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
         ));
@@ -30243,7 +31009,41 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             value["sessions"]["ai_title_settings"],
-            serde_json::json!(["comma", "ctrl+t"])
+            serde_json::json!(["comma"])
+        );
+    }
+
+    #[test]
+    fn previous_generated_ai_settings_binding_drops_ctrl_t() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "sessions": {
+    "ai_title_settings": ["comma", "ctrl+t"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        assert!(keybindings.matches(
+            KeyAction::SessionAiTitleSettings,
+            KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::SessionAiTitleSettings,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
+        ));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            value["sessions"]["ai_title_settings"],
+            serde_json::json!(["comma"])
         );
     }
 
@@ -30351,6 +31151,210 @@ mod tests {
             serde_json::json!(["e", "enter"])
         );
         assert_eq!(value["sessions"]["toggle_preview"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn legacy_generated_toggle_focus_binding_drops_esc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "sessions": {
+    "toggle_focus": ["tab", "esc"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        assert!(keybindings.matches(
+            KeyAction::SessionToggleFocus,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::SessionToggleFocus,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+        ));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            value["sessions"]["toggle_focus"],
+            serde_json::json!(["tab"])
+        );
+    }
+
+    #[test]
+    fn legacy_generated_session_move_bindings_drop_j_k() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "sessions": {
+    "move_next": ["down", "j"],
+    "move_prev": ["up", "k"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        assert!(keybindings.matches(
+            KeyAction::SessionMoveNext,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+        ));
+        assert!(keybindings.matches(
+            KeyAction::SessionMovePrev,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::SessionMoveNext,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::SessionMovePrev,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
+        ));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["sessions"]["move_next"], serde_json::json!(["down"]));
+        assert_eq!(value["sessions"]["move_prev"], serde_json::json!(["up"]));
+    }
+
+    #[test]
+    fn legacy_generated_modal_move_bindings_drop_hjkl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "search": {
+    "next": ["down", "j", "tab"],
+    "prev": ["up", "k", "backtab"]
+  },
+  "delete_confirm": {
+    "next": ["right", "down", "l", "j", "tab"],
+    "prev": ["left", "up", "h", "k", "backtab"]
+  },
+  "create_folder": {
+    "next": ["right", "down", "l", "j", "tab"],
+    "prev": ["left", "up", "h", "k", "backtab"]
+  },
+  "restore_data": {
+    "next": ["right", "down", "l", "j", "tab"],
+    "prev": ["left", "up", "h", "k", "backtab"]
+  },
+  "clone_options": {
+    "next": ["right", "down", "l", "j"],
+    "prev": ["left", "up", "h", "k"]
+  },
+  "agent_launch": {
+    "next": ["down", "j"],
+    "prev": ["up", "k"]
+  },
+  "new_session": {
+    "next": ["down", "j", "tab"],
+    "prev": ["up", "k", "backtab"],
+    "choice_next": ["right", "l", "space"],
+    "choice_prev": ["left", "h"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        for action in [
+            KeyAction::SearchChoiceNext,
+            KeyAction::SearchChoicePrev,
+            KeyAction::DeleteConfirmNext,
+            KeyAction::DeleteConfirmPrev,
+            KeyAction::CreateFolderNext,
+            KeyAction::CreateFolderPrev,
+            KeyAction::RestoreDataNext,
+            KeyAction::RestoreDataPrev,
+            KeyAction::CloneOptionsNext,
+            KeyAction::CloneOptionsPrev,
+            KeyAction::AgentLaunchNext,
+            KeyAction::AgentLaunchPrev,
+            KeyAction::NewSessionNext,
+            KeyAction::NewSessionPrev,
+            KeyAction::NewSessionChoiceNext,
+            KeyAction::NewSessionChoicePrev,
+        ] {
+            for ch in ['h', 'j', 'k', 'l'] {
+                assert!(
+                    !keybindings
+                        .matches(action, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+                    "{:?} should not use plain {}",
+                    action,
+                    ch
+                );
+            }
+        }
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        for (section, action, expected) in [
+            ("search", "next", serde_json::json!(["down", "tab"])),
+            ("search", "prev", serde_json::json!(["up", "backtab"])),
+            (
+                "delete_confirm",
+                "next",
+                serde_json::json!(["right", "down", "tab"]),
+            ),
+            (
+                "delete_confirm",
+                "prev",
+                serde_json::json!(["left", "up", "backtab"]),
+            ),
+            (
+                "create_folder",
+                "next",
+                serde_json::json!(["right", "down", "tab"]),
+            ),
+            (
+                "create_folder",
+                "prev",
+                serde_json::json!(["left", "up", "backtab"]),
+            ),
+            (
+                "restore_data",
+                "next",
+                serde_json::json!(["right", "down", "tab"]),
+            ),
+            (
+                "restore_data",
+                "prev",
+                serde_json::json!(["left", "up", "backtab"]),
+            ),
+            (
+                "clone_options",
+                "next",
+                serde_json::json!(["right", "down"]),
+            ),
+            ("clone_options", "prev", serde_json::json!(["left", "up"])),
+            ("agent_launch", "next", serde_json::json!(["down"])),
+            ("agent_launch", "prev", serde_json::json!(["up"])),
+            ("new_session", "next", serde_json::json!(["down", "tab"])),
+            ("new_session", "prev", serde_json::json!(["up", "backtab"])),
+            (
+                "new_session",
+                "choice_next",
+                serde_json::json!(["right", "space"]),
+            ),
+            ("new_session", "choice_prev", serde_json::json!(["left"])),
+        ] {
+            assert_eq!(value[section][action], expected, "{section}.{action}");
+        }
     }
 
     #[test]
@@ -31123,6 +32127,28 @@ mod tests {
         buffer_text(terminal.backend().buffer())
     }
 
+    fn rendered_line_index(text: &str, pattern: &str) -> usize {
+        text.lines()
+            .position(|line| line.contains(pattern))
+            .unwrap_or_else(|| panic!("rendered output should contain {pattern:?}\n{text}"))
+    }
+
+    fn settings_modal_border_rows(text: &str) -> (usize, usize) {
+        let top = text
+            .lines()
+            .position(|line| line.contains('┌'))
+            .unwrap_or_else(|| panic!("rendered settings modal should have a top border\n{text}"));
+        let bottom = text
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| line.contains('└').then_some(index))
+            .last()
+            .unwrap_or_else(|| {
+                panic!("rendered settings modal should have a bottom border\n{text}")
+            });
+        (top, bottom)
+    }
+
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         let area = *buffer.area();
         let mut text = String::new();
@@ -31137,6 +32163,27 @@ mod tests {
         text
     }
 
+    fn buffer_column_contains_symbol(
+        buffer: &ratatui::buffer::Buffer,
+        x: u16,
+        start_y: u16,
+        end_y: u16,
+        symbol: &str,
+    ) -> bool {
+        (start_y..end_y).any(|y| {
+            buffer
+                .cell((x, y))
+                .is_some_and(|cell| cell.symbol() == symbol)
+        })
+    }
+
+    fn buffer_symbol(buffer: &ratatui::buffer::Buffer, x: u16, y: u16) -> &str {
+        buffer
+            .cell((x, y))
+            .unwrap_or_else(|| panic!("buffer should contain cell at ({x}, {y})"))
+            .symbol()
+    }
+
     #[test]
     fn search_modals_show_shortcut_help_before_and_after_typing() {
         for render in [
@@ -31147,7 +32194,7 @@ mod tests {
             let typed = render(80, 24, "needle");
 
             for screen in [empty, typed] {
-                assert!(screen.contains("Left/Right"), "{screen}");
+                assert!(screen.contains("←/→"), "{screen}");
                 assert!(screen.contains("Home/End"), "{screen}");
                 assert!(screen.contains("Delete/Backspace"), "{screen}");
                 assert!(screen.contains("Enter"), "{screen}");
@@ -31577,7 +32624,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_opens_settings_from_sessions() {
+    fn ctrl_t_does_not_open_settings_from_sessions() {
         let mut app = app_for_key_tests();
 
         handle_key(
@@ -31588,16 +32635,7 @@ mod tests {
             20,
         );
 
-        match app.input_mode {
-            InputMode::Settings {
-                state,
-                return_to: AiTitleSettingsReturn::Normal,
-            } => {
-                assert_eq!(state.section, SettingsSection::Ai);
-                assert_eq!(state.draft.ai_provider, None);
-            }
-            other => panic!("expected settings mode, got {:?}", other),
-        }
+        assert!(matches!(app.input_mode, InputMode::Normal));
     }
 
     #[test]
@@ -31761,12 +32799,149 @@ mod tests {
         let ai = rendered_settings_modal(80, 24, &state);
         assert!(ai.contains("! unsaved"));
         assert!(ai.contains("codex current"));
+        assert!(ai.contains("Choose AI agent"));
+        assert!(!ai.contains("› AI agent"));
 
         state.section = SettingsSection::Keybindings;
         state.selected = SETTINGS_KEYBINDINGS_FILE;
         let keybindings = rendered_settings_modal(80, 24, &state);
         assert!(keybindings.contains("read-only"));
         assert!(!keybindings.contains("Space change"));
+    }
+
+    #[test]
+    fn settings_ai_space_selects_focused_provider_row() {
+        let mut app = app_for_key_tests();
+        let mut state = SettingsState::new(&app.settings.cokacmux);
+        state.selected = SETTINGS_AI_CODEX;
+        app.input_mode = InputMode::Settings {
+            state,
+            return_to: AiTitleSettingsReturn::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::Settings { state, .. } => {
+                assert_eq!(state.selected, SETTINGS_AI_CODEX);
+                assert_eq!(state.draft.ai_provider, Some(Provider::Codex));
+                assert!(state.is_dirty());
+            }
+            other => panic!("expected settings mode, got {:?}", other),
+        }
+        assert!(app.status.contains("AI agent: codex"));
+    }
+
+    #[test]
+    fn settings_item_move_defaults_ignore_j_k() {
+        let keybindings = KeyBindings::default();
+        assert!(!keybindings.matches(
+            KeyAction::AiTitleSettingsNext,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::AiTitleSettingsPrev,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
+        ));
+
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::Settings {
+            state: SettingsState::new(&app.settings.cokacmux),
+            return_to: AiTitleSettingsReturn::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::Settings { state, .. } => {
+                assert_eq!(state.selected, SETTINGS_AI_NONE);
+            }
+            other => panic!("expected settings mode, got {:?}", other),
+        }
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::Settings { state, .. } => {
+                assert_eq!(state.selected, SETTINGS_AI_CLAUDE);
+            }
+            other => panic!("expected settings mode, got {:?}", other),
+        }
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::Settings { state, .. } => {
+                assert_eq!(state.selected, SETTINGS_AI_CLAUDE);
+            }
+            other => panic!("expected settings mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn settings_general_omits_width_reset_rows() {
+        let mut state = SettingsState::new(&CokacmuxSettings::default());
+        state.section = SettingsSection::General;
+        state.selected = SETTINGS_GENERAL_SESSION_VIEW;
+
+        let rendered = rendered_settings_modal(80, 24, &state);
+        assert!(rendered.contains("Session view"));
+        assert!(rendered.contains("Agent sidebar"));
+        assert!(!rendered.contains("Sessions width"));
+        assert!(!rendered.contains("Agent sidebar width"));
+        assert!(!rendered.contains("Space reset"));
+    }
+
+    #[test]
+    fn settings_modal_height_and_help_row_are_fixed_across_sections() {
+        let mut expected_bounds = None;
+        for section in SETTINGS_SECTIONS {
+            let mut state = SettingsState::new(&CokacmuxSettings::default());
+            state.section = section;
+            state.selected = state
+                .selected
+                .min(settings_section_row_count(section).saturating_sub(1));
+            let rendered = rendered_settings_modal(80, 24, &state);
+            let bounds = settings_modal_border_rows(&rendered);
+            if let Some(expected) = expected_bounds {
+                assert_eq!(bounds, expected, "section {}", section.label());
+            } else {
+                expected_bounds = Some(bounds);
+            }
+
+            let help_pattern = match state.selected_row_kind() {
+                SettingsRowKind::Select => "Space select",
+                SettingsRowKind::Text => "edit path",
+                SettingsRowKind::ReadOnly => "read-only",
+                SettingsRowKind::Change => "Space change",
+            };
+            let help_row = rendered_line_index(&rendered, help_pattern);
+            assert_eq!(help_row + 1, bounds.1, "section {}", section.label());
+        }
     }
 
     #[test]
@@ -32855,6 +34030,25 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
 
         assert!(app.should_quit);
         assert_eq!(app.focus, FocusPane::Sessions);
+    }
+
+    #[test]
+    fn esc_quits_from_preview_when_full_list_has_no_active_search() {
+        let mut app = app_for_key_tests();
+        app.sessions
+            .push(session_info(Provider::Codex, "session", "/repo"));
+        app.focus = FocusPane::Preview;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(app.should_quit);
+        assert_eq!(app.focus, FocusPane::Preview);
     }
 
     #[test]
@@ -34862,6 +36056,105 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn session_item_move_defaults_ignore_j_k() {
+        let mut app = app_for_key_tests();
+        app.sessions
+            .push(session_info(Provider::Codex, "first", "/repo/one"));
+        app.sessions
+            .push(session_info(Provider::Codex, "second", "/repo/two"));
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        assert_eq!(app.list_state.selected(), Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        assert_eq!(app.list_state.selected(), Some(1));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        assert_eq!(app.list_state.selected(), Some(1));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn sessions_list_renders_scrollbar_when_rows_overflow() {
+        let mut app = app_for_key_tests();
+        app.session_view = SessionViewMode::List;
+        for idx in 0..20 {
+            app.sessions.push(session_info(
+                Provider::Codex,
+                &format!("session-{idx:02}"),
+                "/repo",
+            ));
+        }
+        app.list_state.select(Some(0));
+
+        let backend = ratatui::backend::TestBackend::new(60, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_list(f, &mut app, Rect::new(0, 0, 60, 8)))
+            .unwrap();
+
+        assert!(
+            buffer_column_contains_symbol(terminal.backend().buffer(), 58, 2, 7, "┃"),
+            "{}",
+            buffer_text(terminal.backend().buffer())
+        );
+    }
+
+    #[test]
+    fn sessions_list_scrollbar_reaches_bottom_at_list_bottom() {
+        let mut app = app_for_key_tests();
+        app.session_view = SessionViewMode::List;
+        for idx in 0..20 {
+            app.sessions.push(session_info(
+                Provider::Codex,
+                &format!("session-{idx:02}"),
+                "/repo",
+            ));
+        }
+        app.list_state.select(Some(19));
+
+        let backend = ratatui::backend::TestBackend::new(60, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_list(f, &mut app, Rect::new(0, 0, 60, 8)))
+            .unwrap();
+
+        assert_eq!(
+            buffer_symbol(terminal.backend().buffer(), 58, 6),
+            "┃",
+            "{}",
+            buffer_text(terminal.backend().buffer())
+        );
+    }
+
+    #[test]
     fn restore_visible_selection_keeps_matching_session_after_refresh() {
         let mut app = app_for_key_tests();
         app.session_view = SessionViewMode::List;
@@ -35035,6 +36328,62 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn preview_renders_scrollbar_when_content_overflows() {
+        let mut app = app_for_key_tests();
+        let info = session_info(Provider::Codex, "preview-scrollbar", "/repo");
+        let key = PreviewKey::new(&info, app.preview_mode);
+        let text = (0..30)
+            .map(|idx| format!("line {idx:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = wrap_preview_lines(&text, 28);
+        app.sessions.push(info);
+        app.list_state.select(Some(0));
+        app.cache_preview(key, text, 28, lines);
+
+        let backend = ratatui::backend::TestBackend::new(30, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_preview(f, &mut app, Rect::new(0, 0, 30, 8)))
+            .unwrap();
+
+        assert!(
+            buffer_column_contains_symbol(terminal.backend().buffer(), 28, 1, 7, "┃"),
+            "{}",
+            buffer_text(terminal.backend().buffer())
+        );
+    }
+
+    #[test]
+    fn preview_scrollbar_reaches_bottom_at_preview_bottom() {
+        let mut app = app_for_key_tests();
+        let info = session_info(Provider::Codex, "preview-scrollbar-bottom", "/repo");
+        let key = PreviewKey::new(&info, app.preview_mode);
+        let text = (0..30)
+            .map(|idx| format!("line {idx:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = wrap_preview_lines(&text, 28);
+        app.sessions.push(info);
+        app.list_state.select(Some(0));
+        app.preview_scroll = u16::MAX;
+        app.cache_preview(key, text, 28, lines);
+
+        let backend = ratatui::backend::TestBackend::new(30, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_preview(f, &mut app, Rect::new(0, 0, 30, 8)))
+            .unwrap();
+
+        assert_eq!(
+            buffer_symbol(terminal.backend().buffer(), 28, 6),
+            "┃",
+            "{}",
+            buffer_text(terminal.backend().buffer())
+        );
+    }
+
+    #[test]
     fn preview_worker_wakes_main_loop_when_result_is_ready() {
         let (request_tx, request_rx) = mpsc::channel::<PreviewRequest>();
         let (result_tx, result_rx) = mpsc::channel::<PreviewResult>();
@@ -35072,6 +36421,28 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn agent_resize_right_shows_hidden_sidebar_one_step_from_zero() {
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.agent_sidebar_visible = false;
+        app.settings.cokacmux.agent_sidebar_width = DEFAULT_AGENT_SIDEBAR_WIDTH;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            100,
+            24,
+        );
+
+        assert!(app.settings.cokacmux.agent_sidebar_visible);
+        assert_eq!(
+            app.settings.cokacmux.agent_sidebar_width,
+            AGENT_SIDEBAR_RESIZE_STEP
+        );
+        assert_eq!(app.agent_sidebar_config_width(), AGENT_SIDEBAR_RESIZE_STEP);
+        assert!(app.status.contains("shown"));
+    }
+
+    #[test]
     fn agent_screen_size_keeps_internal_pty_safe_for_narrow_panes() {
         assert_eq!(
             agent_screen_size_for_area(Rect::new(0, 0, 0, 0)),
@@ -35094,14 +36465,101 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     fn list_header_includes_agent_state_column() {
         let cols = list_columns(120);
         let header = list_header(&cols);
+        assert_eq!(cols.state, 5);
         assert!(header.contains("state"));
         assert!(header.contains("provider"));
         assert!(header.contains("session"));
         assert!(header.contains("title"));
+        assert_eq!(
+            header.find("provider").unwrap(),
+            LIST_MARKER_WIDTH + STATE_COLUMN_WIDTH + 1
+        );
         assert!(header.find("provider").unwrap() < header.find("title").unwrap());
         assert!(header.find("title").unwrap() < header.find("age").unwrap());
         assert!(header.find("age").unwrap() < header.find("cwd").unwrap());
         assert!(header.find("cwd").unwrap() < header.find("session").unwrap());
+    }
+
+    #[test]
+    fn status_help_updates_stale_session_labels() {
+        let help = help_text(FocusPane::Sessions, 180, &KeyBindings::default());
+        assert!(help.contains("Tab preview"));
+        assert!(help.contains("Esc/q/Ctrl+q quit"));
+        assert!(help.contains("↑/↓ move"));
+        assert!(help.contains("move"));
+        assert!(help.contains("view"));
+        assert!(help.contains("clone"));
+        assert!(help.contains("refresh"));
+        assert!(!help.contains("Tab/Esc preview"));
+        assert!(!help.contains("↑/k/↓/j"));
+        assert!(!help.contains("select"));
+        assert!(!help.contains("tree"));
+
+        let preview_help = help_text(FocusPane::Preview, 120, &KeyBindings::default());
+        assert!(preview_help.contains("Tab sessions"));
+        assert!(!preview_help.contains("Tab/Esc sessions"));
+        assert!(preview_help.contains("↑/↓ scroll"));
+        assert!(preview_help.contains("Alt+↑"));
+        assert!(preview_help.contains("Ctrl+Shift+↑"));
+        assert!(preview_help.contains("Alt+↓"));
+        assert!(preview_help.contains("list"));
+        assert!(!preview_help.contains("↑/k/↓/j"));
+        let wide_preview_help = help_text(FocusPane::Preview, 180, &KeyBindings::default());
+        assert!(wide_preview_help.contains("Esc/q/Ctrl+q quit"));
+        assert!(wide_preview_help.contains("Alt+←"));
+        assert!(wide_preview_help.contains("Alt+→"));
+        assert!(wide_preview_help.contains("resize"));
+        assert!(preview_help.contains("scroll"));
+        assert!(preview_help.contains("list"));
+        assert!(!preview_help.contains("select"));
+    }
+
+    #[test]
+    fn agent_help_includes_sidebar_toggle() {
+        let help = agent_help_text(&KeyBindings::default());
+        assert!(help.contains("Ctrl+b sidebar"));
+        assert!(help.contains("Shift+Alt+↑"));
+        assert!(help.contains("Shift+Alt+↓"));
+        assert!(help.contains("scroll"));
+        assert!(help.contains("Alt+←"));
+        assert!(help.contains("Alt+→"));
+        assert!(help.contains("resize"));
+    }
+
+    #[test]
+    fn status_help_line_fits_terminal_widths() {
+        let keybindings = KeyBindings::default();
+        for focus in [FocusPane::Sessions, FocusPane::Preview] {
+            for width in [32usize, 68, 104, 132, 180] {
+                let line = help_line(focus, width, &keybindings);
+                assert!(
+                    line.width() <= width,
+                    "focus={:?} width={} line_width={} text={}",
+                    focus,
+                    width,
+                    line.width(),
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modal_help_line_matches_status_help_format() {
+        let line = modal_help_line(&[direct_help_item("Esc", "cancel")]);
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[0].content.as_ref(), "Esc");
+        assert_eq!(line.spans[0].style.fg, Some(THEME_SHORTCUT));
+        assert_eq!(line.spans[0].style.bg, Some(THEME_BG_ALT));
+        assert_eq!(line.spans[1].content.as_ref(), " ");
+        assert_eq!(line.spans[1].style.fg, Some(THEME_FG_DIM));
+        assert_eq!(line.spans[1].style.bg, Some(THEME_BG_ALT));
+        assert_eq!(line.spans[2].content.as_ref(), "cancel");
+        assert_eq!(line.spans[2].style.fg, Some(THEME_FG_DIM));
+        assert_eq!(line.spans[2].style.bg, Some(THEME_BG_ALT));
     }
 
     #[test]
@@ -36739,6 +38197,7 @@ IF EXIST "%~dp0\node.exe" (
         let args = codex_scroll_keymap_cli_args();
         assert_eq!(args.len(), CODEX_SCROLL_KEYMAP_OVERRIDES.len() * 2);
         assert!(args.chunks_exact(2).all(|chunk| chunk[0] == "-c"));
+        assert!(!CODEX_TRANSCRIPT_OPEN_BINDINGS.contains(&"ctrl-t"));
         assert!(args.contains(&format!(
             "tui.keymap.global.open_transcript={}",
             codex_keybinding_array_toml(CODEX_TRANSCRIPT_OPEN_BINDINGS)
@@ -36790,18 +38249,18 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn codex_transcript_overlay_assumption_tracks_open_and_close_keys() {
+    fn codex_transcript_overlay_assumption_ignores_ctrl_t() {
         let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
         let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let page_up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
 
-        assert!(codex_transcript_overlay_state_after_key(
+        assert!(!codex_transcript_overlay_state_after_key(
             Provider::Codex,
             false,
             ctrl_t
         ));
-        assert!(!codex_transcript_overlay_state_after_key(
+        assert!(codex_transcript_overlay_state_after_key(
             Provider::Codex,
             true,
             ctrl_t
