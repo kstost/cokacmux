@@ -592,10 +592,12 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 | 현재 코딩 에이전트/일반 터미널 종료 | `Ctrl+K` |
 | 이전/다음 실행 중인 대상 전환 | `Ctrl+PageUp` / `Ctrl+PageDown` |
 | 사이드바 보이기/숨기기 | `Ctrl+B` |
+| 오른쪽 `cokacdir`/terminal 패널 표시/숨김 | `Ctrl+F` / `Ctrl+T` |
+| 포커스 이동 | `Ctrl+1` agents, `Ctrl+2` agent, `Ctrl+3` right panel |
 | 사이드바 선택 이동 | `Alt+↑` / `Alt+↓` 또는 `Ctrl+Shift+↑` / `Ctrl+Shift+↓` |
-| 사이드바 폭 조절 | `Alt+←` / `Alt+→` 또는 `Ctrl+Shift+←` / `Ctrl+Shift+→` |
+| 포커스된 side panel 폭 조절 | `Alt+←` / `Alt+→` 또는 `Ctrl+Shift+←` / `Ctrl+Shift+→` |
 
-사이드바를 숨긴 상태에서 `Alt+→` / `Ctrl+Shift+→`를 누르면 이전 폭을 복원하지 않고 0폭에서 한 단계만 펼칩니다.
+사이드바를 숨긴 상태에서 왼쪽 패널 resize 대상에 `Alt+→` / `Ctrl+Shift+→`를 누르면 이전 폭을 복원하지 않고 0폭에서 한 단계만 펼칩니다. 중앙 agent에 포커스가 있고 양쪽 side panel이 모두 열려 있으면 resize는 동작하지 않습니다. 오른쪽 `cokacdir`와 terminal 패널은 한 번에 하나만 보이며, 숨겨져 있는 동안에도 자식 앱은 계속 실행됩니다.
 
 `cokacdir` 화면에서는 `Ctrl+K`를 cokacmux가 종료 단축키로 잡지 않고 `cokacdir`에 전달합니다. `cokacdir`을 cokacmux 쪽에서 종료하려면 세션 목록 화면으로 돌아간 뒤 실행 중인 항목을 선택하고 `Ctrl+K`를 누르세요.
 
@@ -690,7 +692,6 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | `Ctrl+N` | 새 터미널/cokacdir/새 코딩 에이전트 모달 열기 |
 | `Ctrl+K` | 선택한 실행 중 대상 종료 |
 | `Ctrl+]` / `Ctrl+[` | 활성 에이전트 화면으로 전환 또는 다시 연결 |
-| `Ctrl+3` / `Ctrl+5` | `Ctrl+]` / `Ctrl+[` 대체 입력 |
 | `Alt+↑` / `Alt+↓` | 세션 사이드바 선택 이동 |
 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓` | 세션 사이드바 선택 이동 |
 | `Alt+←` / `Alt+→` | 세션 패널 크기 조절 |
@@ -730,11 +731,15 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | 키 | 동작 |
 |---|---|
 | `Ctrl+]` / `Ctrl+[` | 세션 목록으로 돌아가기 |
-| `Ctrl+3` / `Ctrl+5` | `Ctrl+]` / `Ctrl+[` 대체 입력 |
 | `Ctrl+Q` | TUI 종료 |
 | `Ctrl+K` | 현재 코딩 에이전트/일반 터미널 종료. `cokacdir` 화면에서는 자식 앱에 전달 |
 | `Ctrl+N` | 현재 작업 폴더를 기본값으로 새 세션 모달 열기 |
 | `Ctrl+B` | 에이전트 사이드바 표시/숨김 |
+| `Ctrl+F` | Codex/Claude/OpenCode의 현재 작업 폴더로 오른쪽 `cokacdir` 패널 표시/숨김 |
+| `Ctrl+T` | Codex/Claude/OpenCode의 현재 작업 폴더로 오른쪽 terminal 패널 표시/숨김 |
+| `Ctrl+1` | 왼쪽 agents 패널로 포커스 이동. 숨겨져 있으면 표시 |
+| `Ctrl+2` | 중앙 agent 패널로 포커스 이동 |
+| `Ctrl+3` | 오른쪽 보조 패널로 포커스 이동 |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | 이전/다음 실행 중 대상 전환 |
 | `Shift+↑` / `Shift+↓` | transcript/scrollback 한 줄 위/아래 |
 | `Shift+Alt+↑` / `Shift+Alt+↓` | transcript/scrollback 한 화면 위/아래 |
@@ -743,9 +748,11 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | `Alt+Home` / `Alt+End` | transcript/scrollback 맨 위/아래 |
 | `Alt+↑` / `Alt+↓` | 에이전트 사이드바 선택 이동 |
 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓` | 에이전트 사이드바 선택 이동 |
-| `Alt+←` / `Alt+→` | 에이전트 사이드바 폭 조절 |
-| `Ctrl+Shift+←` / `Ctrl+Shift+→` | 에이전트 사이드바 폭 조절 |
+| `Alt+←` / `Alt+→` | 포커스된 side panel 폭 조절. 중앙 포커스에서 양쪽이 모두 열려 있으면 동작하지 않음 |
+| `Ctrl+Shift+←` / `Ctrl+Shift+→` | 포커스된 side panel 폭 조절. 중앙 포커스에서 양쪽이 모두 열려 있으면 동작하지 않음 |
 | 그 외 키 | 현재 에이전트에 그대로 전달 |
+
+오른쪽 보조 패널은 한 번에 하나만 보입니다. `cokacdir`가 보이는 상태에서 terminal을 표시하면 `cokacdir`는 숨겨지고 terminal이 보입니다. 숨겨진 `cokacdir`/terminal은 자식 앱 안에서 직접 종료하기 전까지 계속 실행되며, 다시 표시하면 이전 화면 상태가 유지됩니다.
 
 ### 검색창
 
@@ -956,7 +963,7 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 - 파일에 없는 액션은 기본값을 그대로 씁니다.
 - 빈 배열 `[]` 또는 `null`을 넣으면 해당 액션이 비활성화됩니다.
 - 점 표기(`"sessions.launch_agent": ["x"]`)도 사용할 수 있습니다.
-- 현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.toggle_focus`는 `["tab"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다.
+- 현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.toggle_focus`는 `["tab"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다. Agent 화면에서는 `agent.toggle_cokacdir_panel`이 `["ctrl+f"]`, `agent.toggle_terminal_panel`이 `["ctrl+t"]`, `agent.focus_sidebar`/`agent.focus_main`/`agent.focus_auxiliary`가 각각 `["ctrl+1"]`/`["ctrl+2"]`/`["ctrl+3"]`입니다.
 - 구버전에서 자동 생성된 `sessions.launch_agent: ["e"]` + `sessions.toggle_preview: ["enter"]` 조합은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 - 구버전에서 자동 생성된 `sessions.filter: ["/"]`와 `sessions.ai_search: ["ctrl+s"]` 값도 새 검색 선택창 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 - 구버전에서 자동 생성된 `sessions.ai_title_settings: ["ctrl+t"]` 또는 `["comma", "ctrl+t"]` 값도 `["comma"]` 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
@@ -1074,8 +1081,6 @@ Get-Command opencode
 ### `Ctrl+]` / `Ctrl+[`가 안 먹혀요.
 
 일부 터미널은 `Ctrl+[`를 `Esc`로 보내거나, 특정 Ctrl 조합을 가로챌 수 있습니다. 이 경우 `Ctrl+]`를 먼저 써 보세요. 그래도 어렵다면 `keybinding.json`에서 `sessions.toggle_agent`와 `agent.toggle_sessions`를 다른 키로 바꾸면 됩니다.
-
-기본값에는 대체 입력으로 `Ctrl+3`, `Ctrl+5`도 들어 있습니다.
 
 ### 백그라운드 에이전트는 언제 종료되나요?
 

@@ -38,7 +38,7 @@ cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다
 
 액션을 설정하면 기본값에 추가되는 것이 아니라 그 액션의 기본 단축키 전체를 대체합니다. 예를 들어 `"sessions.quit": ["ctrl+q"]`만 쓰면 `q` 종료는 꺼지고 `ctrl+q`만 남습니다.
 
-현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.toggle_focus`는 `["tab"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다.
+현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.toggle_focus`는 `["tab"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다. Agent 화면에서는 `agent.toggle_cokacdir_panel`이 `["ctrl+f"]`, `agent.toggle_terminal_panel`이 `["ctrl+t"]`, `agent.focus_sidebar`/`agent.focus_main`/`agent.focus_auxiliary`가 각각 `["ctrl+1"]`/`["ctrl+2"]`/`["ctrl+3"]`입니다.
 
 구버전에서 자동 생성된 `sessions.launch_agent: ["e"]` + `sessions.toggle_preview: ["enter"]` 조합은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 
@@ -157,7 +157,7 @@ G
 |---|---|---|
 | `sessions.quit` | `q` | 종료 |
 | `sessions.force_quit` | `ctrl+c` | 종료 |
-| `sessions.toggle_agent` | `ctrl+]`, `ctrl+[`, `ctrl+3`, `ctrl+5` | 세션 화면과 agent 화면 전환 |
+| `sessions.toggle_agent` | `ctrl+]`, `ctrl+[` | 세션 화면과 agent 화면 전환 |
 | `sessions.kill_agent` | `ctrl+k` | 선택한 실행 중 대상 종료 |
 | `sessions.new_shell` | `ctrl+n` | 새 세션 모달 열기 |
 | `sessions.toggle_focus` | `tab` | 세션 목록과 미리보기 포커스 전환 |
@@ -202,18 +202,23 @@ G
 
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
-| `agent.toggle_sessions` | `ctrl+]`, `ctrl+[`, `ctrl+3`, `ctrl+5` | 세션 화면으로 전환 |
+| `agent.toggle_sessions` | `ctrl+]`, `ctrl+[` | 세션 화면으로 전환 |
 | `agent.kill` | `ctrl+k` | 현재 코딩 agent/일반 터미널 종료. `cokacdir` 화면에서는 자식 앱에 전달 |
 | `agent.new_shell` | `ctrl+n` | 현재 agent cwd를 기본값으로 새 세션 모달 열기 |
 | `agent.toggle_sidebar` | `ctrl+b` | agents 사이드바 표시/숨김 |
+| `agent.toggle_cokacdir_panel` | `ctrl+f` | Codex/Claude/OpenCode의 현재 cwd로 오른쪽 cokacdir 패널 표시/숨김. 숨김 중에도 자식 앱은 계속 실행 |
+| `agent.toggle_terminal_panel` | `ctrl+t` | Codex/Claude/OpenCode의 현재 cwd로 오른쪽 terminal 패널 표시/숨김. 숨김 중에도 자식 앱은 계속 실행 |
+| `agent.focus_sidebar` | `ctrl+1` | 왼쪽 agents 패널로 포커스 이동. 숨겨져 있으면 표시 |
+| `agent.focus_main` | `ctrl+2` | 중앙 agent 패널로 포커스 이동 |
+| `agent.focus_auxiliary` | `ctrl+3` | 오른쪽 보조 패널로 포커스 이동 |
 | `agent.scroll_line_up` | `shift+up` | transcript/scrollback 한 줄 위 |
 | `agent.scroll_line_down` | `shift+down` | transcript/scrollback 한 줄 아래 |
 | `agent.scroll_page_up` | `shift+alt+up`, `shift+alt+pageup` | transcript/scrollback 한 페이지 위 |
 | `agent.scroll_page_down` | `shift+alt+down`, `shift+alt+pagedown` | transcript/scrollback 한 페이지 아래 |
 | `agent.scroll_top` | `shift+home`, `alt+home` | transcript/scrollback 맨 위 |
 | `agent.scroll_bottom` | `shift+end`, `alt+end` | transcript/scrollback 맨 아래 |
-| `agent.resize_left` | `alt+left`, `ctrl+shift+left` | agents 사이드바 좁히기 |
-| `agent.resize_right` | `alt+right`, `ctrl+shift+right` | agents 사이드바 넓히기. 숨김 상태에서는 0폭에서 한 단계만 표시 |
+| `agent.resize_left` | `alt+left`, `ctrl+shift+left` | 포커스된 side panel 경계 왼쪽 이동. 중앙 포커스에서 양쪽이 모두 열려 있으면 동작하지 않음 |
+| `agent.resize_right` | `alt+right`, `ctrl+shift+right` | 포커스된 side panel 경계 오른쪽 이동. 왼쪽 패널 숨김 상태에서 왼쪽 resize 대상이면 한 단계 표시 |
 | `agent.sidebar_prev` | `alt+up`, `ctrl+shift+up` | agents 사이드바 선택 위로 이동 |
 | `agent.sidebar_next` | `alt+down`, `ctrl+shift+down` | agents 사이드바 선택 아래로 이동 |
 | `agent.switch_prev` | `ctrl+pageup` | 이전 live agent로 전환 |

@@ -145,6 +145,9 @@ const DEFAULT_AGENT_SIDEBAR_WIDTH: u16 = AGENT_SIDEBAR_WIDTH;
 const AGENT_SIDEBAR_RESIZE_STEP: u16 = PANE_RESIZE_STEP_COLUMNS;
 const AGENT_MIN_PTY_COLS: u16 = 20;
 const AGENT_MIN_PTY_ROWS: u16 = 5;
+const AGENT_AUX_PANE_MIN_WIDTH: u16 = 28;
+const AGENT_AUX_PANE_TARGET_WIDTH: u16 = 52;
+const AGENT_MAIN_MIN_WIDTH_WITH_AUX: u16 = 36;
 const AGENT_OUTPUT_POLL_LIMIT: usize = 256;
 const AGENT_OUTPUT_DRAIN_BUDGET_MS: u64 = 8;
 const TERMINAL_RESPONSE_SCAN_TAIL_BYTES: usize = 4;
@@ -216,6 +219,7 @@ const DEBUG_LOG_FILE: &str = "cokacmux.log";
 const DEBUG_STALL_LOG_FILE: &str = "cokacmux-stalls.log";
 const DEBUG_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const APP_DIR_NAME: &str = ".cokacmux";
+const AGENT_AUXILIARY_REGISTRY_FILE: &str = "agent_auxiliary.json";
 const COKACDIR_PROGRAM_NAME: &str = "cokacdir";
 const COKACDIR_DIST_BASE_URL: &str = "https://raw.githubusercontent.com/kstost/cokacdir/main/dist";
 const SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e", "enter"];
@@ -260,8 +264,10 @@ const PREVIOUS_NEW_SESSION_CHOICE_NEXT_DEFAULTS: &[&str] = &["right", "l", "spac
 const PREVIOUS_NEW_SESSION_CHOICE_PREV_DEFAULTS: &[&str] = &["left", "h"];
 const AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+up", "shift+alt+pageup"];
 const AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+down", "shift+alt+pagedown"];
+const AGENT_FOCUS_AUXILIARY_DEFAULTS: &[&str] = &["ctrl+3"];
 const PREVIOUS_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+pageup"];
 const PREVIOUS_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+pagedown"];
+const PREVIOUS_AGENT_FOCUS_AUXILIARY_DEFAULTS: &[&str] = &[];
 const LEGACY_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+pageup", "alt+pageup"];
 const LEGACY_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+pagedown", "alt+pagedown"];
 const CODEX_TRANSCRIPT_OPEN_BINDINGS: &[&str] = &[
@@ -669,6 +675,10 @@ fn keybinding_path() -> Option<PathBuf> {
     app_config_dir().map(|dir| dir.join("keybinding.json"))
 }
 
+fn agent_auxiliary_registry_path() -> Option<PathBuf> {
+    app_config_dir().map(|dir| dir.join(AGENT_AUXILIARY_REGISTRY_FILE))
+}
+
 fn app_config_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(APP_DIR_NAME))
 }
@@ -707,6 +717,11 @@ enum KeyAction {
     AgentKill,
     AgentNewShell,
     AgentToggleSidebar,
+    AgentToggleCokacdirPanel,
+    AgentToggleTerminalPanel,
+    AgentFocusSidebar,
+    AgentFocusMain,
+    AgentFocusAuxiliary,
     AgentScrollLineUp,
     AgentScrollLineDown,
     AgentScrollPageUp,
@@ -808,7 +823,7 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "sessions.toggle_agent",
         KeyAction::SessionToggleAgent,
-        &["ctrl+]", "ctrl+[", "ctrl+3", "ctrl+5"],
+        &["ctrl+]", "ctrl+["],
     ),
     (
         "sessions.kill_agent",
@@ -909,7 +924,7 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "agent.toggle_sessions",
         KeyAction::AgentToggleSessions,
-        &["ctrl+]", "ctrl+[", "ctrl+3", "ctrl+5"],
+        &["ctrl+]", "ctrl+["],
     ),
     ("agent.kill", KeyAction::AgentKill, &["ctrl+k"]),
     ("agent.new_shell", KeyAction::AgentNewShell, &["ctrl+n"]),
@@ -917,6 +932,27 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
         "agent.toggle_sidebar",
         KeyAction::AgentToggleSidebar,
         &["ctrl+b"],
+    ),
+    (
+        "agent.toggle_cokacdir_panel",
+        KeyAction::AgentToggleCokacdirPanel,
+        &["ctrl+f"],
+    ),
+    (
+        "agent.toggle_terminal_panel",
+        KeyAction::AgentToggleTerminalPanel,
+        &["ctrl+t"],
+    ),
+    (
+        "agent.focus_sidebar",
+        KeyAction::AgentFocusSidebar,
+        &["ctrl+1"],
+    ),
+    ("agent.focus_main", KeyAction::AgentFocusMain, &["ctrl+2"]),
+    (
+        "agent.focus_auxiliary",
+        KeyAction::AgentFocusAuxiliary,
+        AGENT_FOCUS_AUXILIARY_DEFAULTS,
     ),
     (
         "agent.scroll_line_up",
@@ -1298,6 +1334,9 @@ impl KeyBinding {
             }
         }
         let code = parse_key_code(key_part)?;
+        if is_disallowed_control_alias_binding(code, modifiers) {
+            return Err(format!("unsupported ambiguous control alias `{}`", trimmed));
+        }
         let encoded = key_binding_control_bytes(code, modifiers);
         Ok(Self {
             code,
@@ -1349,6 +1388,10 @@ impl KeyBinding {
     }
 }
 
+fn is_disallowed_control_alias_binding(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('5'))
+}
+
 fn key_binding_control_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
     if !modifiers.contains(KeyModifiers::CONTROL) {
         return None;
@@ -1357,7 +1400,7 @@ fn key_binding_control_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<V
         return None;
     };
     let bytes = key_event_to_bytes(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))?;
-    if bytes == [0x1b] {
+    if bytes == [0x1b] || bytes == [0x1d] {
         return None;
     }
     Some(bytes)
@@ -1366,13 +1409,13 @@ fn key_binding_control_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<V
 fn key_event_control_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if let Some(bytes) = key_event_to_bytes(key) {
-            if bytes != [0x1b] {
+            if bytes != [0x1b] && bytes != [0x1d] {
                 return Some(bytes);
             }
         }
     }
     if let KeyCode::Char(c) = key.code {
-        if c.is_control() && c != '\u{1b}' {
+        if c.is_control() && c != '\u{1b}' && c != '\u{1d}' {
             let mut buf = [0; 4];
             return Some(c.encode_utf8(&mut buf).as_bytes().to_vec());
         }
@@ -1852,6 +1895,16 @@ fn migrate_legacy_keybinding_defaults(root: &mut serde_json::Value) -> bool {
         ],
         AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
     );
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "agent.focus_auxiliary"),
+        &[PREVIOUS_AGENT_FOCUS_AUXILIARY_DEFAULTS],
+        AGENT_FOCUS_AUXILIARY_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["agent", "focus_auxiliary"]),
+        &[PREVIOUS_AGENT_FOCUS_AUXILIARY_DEFAULTS],
+        AGENT_FOCUS_AUXILIARY_DEFAULTS,
+    );
     migrated
 }
 
@@ -2221,6 +2274,42 @@ fn next_agent_candidate_index(len: usize, current: usize, delta: i32, wrap: bool
 enum FocusPane {
     Sessions,
     Preview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentFocusPane {
+    Sidebar,
+    Main,
+    Auxiliary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AgentAuxKind {
+    Cokacdir,
+    Terminal,
+}
+
+impl AgentAuxKind {
+    fn label(self) -> &'static str {
+        match self {
+            AgentAuxKind::Cokacdir => "cokacdir",
+            AgentAuxKind::Terminal => "terminal",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            AgentAuxKind::Cokacdir => " cokacdir ",
+            AgentAuxKind::Terminal => " terminal ",
+        }
+    }
+}
+
+struct AgentAuxPane {
+    kind: AgentAuxKind,
+    parent: AgentKey,
+    agent: AgentClient,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3142,7 +3231,7 @@ struct AiTitleWorkerResult {
     queued_at_epoch_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct AgentKey {
     provider: Provider,
     session_id: String,
@@ -3154,6 +3243,35 @@ impl AgentKey {
             provider: info.provider,
             session_id: info.session_id.clone(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedAgentAuxiliaryRegistry {
+    version: u32,
+    entries: Vec<PersistedAgentAuxiliaryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedAgentAuxiliaryEntry {
+    agent: AgentKey,
+    kind: AgentAuxKind,
+    parent: AgentKey,
+    parent_provider: Provider,
+    parent_cwd: String,
+    parent_source: String,
+    updated_at_epoch_s: u64,
+}
+
+impl PersistedAgentAuxiliaryEntry {
+    fn matches_parent_info(&self, info: &SessionInfo) -> bool {
+        let key = AgentKey::new(info);
+        if self.parent == key {
+            return true;
+        }
+        self.parent_provider == info.provider
+            && !self.parent_cwd.trim().is_empty()
+            && session_cwd_same_folder(&self.parent_cwd, &info.cwd)
     }
 }
 
@@ -3337,6 +3455,131 @@ fn session_info_debug_value(info: &SessionInfo) -> serde_json::Value {
     })
 }
 
+fn persisted_agent_auxiliary_entry_debug_value(
+    entry: &PersistedAgentAuxiliaryEntry,
+) -> serde_json::Value {
+    serde_json::json!({
+        "agent": agent_key_debug_value(&entry.agent),
+        "kind": entry.kind.label(),
+        "parent": agent_key_debug_value(&entry.parent),
+        "parent_provider": entry.parent_provider.as_str(),
+        "parent_cwd": &entry.parent_cwd,
+        "parent_source": &entry.parent_source,
+        "updated_at_epoch_s": entry.updated_at_epoch_s,
+    })
+}
+
+fn persisted_agent_auxiliary_entries_debug_value(
+    entries: &HashMap<AgentKey, PersistedAgentAuxiliaryEntry>,
+) -> Vec<serde_json::Value> {
+    let mut entries = entries.values().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| {
+        (
+            entry.agent.provider.as_str(),
+            entry.agent.session_id.as_str(),
+        )
+    });
+    entries
+        .into_iter()
+        .map(persisted_agent_auxiliary_entry_debug_value)
+        .collect()
+}
+
+fn session_info_for_persisted_agent_auxiliary(entry: &PersistedAgentAuxiliaryEntry) -> SessionInfo {
+    let mut info = match entry.kind {
+        AgentAuxKind::Cokacdir => cokacdir_session_info_for_cwd(entry.parent_cwd.clone()),
+        AgentAuxKind::Terminal => shell_session_info_for_cwd(entry.parent_cwd.clone()),
+    };
+    info.provider = entry.agent.provider;
+    info.session_id = entry.agent.session_id.clone();
+    info.updated_at_epoch_s = entry.updated_at_epoch_s;
+    info
+}
+
+fn load_persisted_agent_auxiliaries() -> HashMap<AgentKey, PersistedAgentAuxiliaryEntry> {
+    let Some(path) = agent_auxiliary_registry_path() else {
+        debug_log(
+            "agent_auxiliary_registry_load_skipped",
+            serde_json::json!({ "reason": "config_dir_unavailable" }),
+        );
+        return HashMap::new();
+    };
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            debug_log(
+                "agent_auxiliary_registry_load_failed",
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "error": e.to_string(),
+                }),
+            );
+            return HashMap::new();
+        }
+    };
+    let registry = match serde_json::from_str::<PersistedAgentAuxiliaryRegistry>(&content) {
+        Ok(registry) => registry,
+        Err(e) => {
+            debug_log(
+                "agent_auxiliary_registry_parse_failed",
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "error": e.to_string(),
+                    "content_sample": truncate_width(&content, 512),
+                }),
+            );
+            return HashMap::new();
+        }
+    };
+    let mut entries = HashMap::new();
+    for entry in registry.entries {
+        entries.insert(entry.agent.clone(), entry);
+    }
+    debug_log(
+        "agent_auxiliary_registry_loaded",
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "version": registry.version,
+            "entries": persisted_agent_auxiliary_entries_debug_value(&entries),
+        }),
+    );
+    entries
+}
+
+fn save_persisted_agent_auxiliaries(
+    entries: &HashMap<AgentKey, PersistedAgentAuxiliaryEntry>,
+) -> io::Result<()> {
+    let Some(path) = agent_auxiliary_registry_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if entries.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        return Ok(());
+    }
+    let mut sorted = entries.values().cloned().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        (left.agent.provider.as_str(), left.agent.session_id.as_str()).cmp(&(
+            right.agent.provider.as_str(),
+            right.agent.session_id.as_str(),
+        ))
+    });
+    let registry = PersistedAgentAuxiliaryRegistry {
+        version: 1,
+        entries: sorted,
+    };
+    let content = serde_json::to_string_pretty(&registry)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    fs::write(&path, content)
+}
+
 fn agent_state_entries_debug_value(
     states: &HashMap<AgentKey, AgentListState>,
 ) -> Vec<serde_json::Value> {
@@ -3367,6 +3610,42 @@ fn agent_alias_entries_debug_value(
         .collect();
     entries.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
     entries
+}
+
+fn pending_runtime_action_debug_value(action: Option<&PendingRuntimeAction>) -> serde_json::Value {
+    match action {
+        Some(PendingRuntimeAction::LaunchSelected { info, cols, rows }) => serde_json::json!({
+            "kind": "launch_selected",
+            "info": session_info_debug_value(info),
+            "cols": cols,
+            "rows": rows,
+        }),
+        Some(PendingRuntimeAction::RestoreLive {
+            selected_key,
+            cols,
+            rows,
+        }) => serde_json::json!({
+            "kind": "restore_live",
+            "selected_key": selected_key.as_ref().map(agent_key_debug_value),
+            "cols": cols,
+            "rows": rows,
+        }),
+        Some(PendingRuntimeAction::SwitchActive {
+            current_key,
+            delta,
+            wrap,
+            cols,
+            rows,
+        }) => serde_json::json!({
+            "kind": "switch_active",
+            "current_key": agent_key_debug_value(current_key),
+            "delta": delta,
+            "wrap": wrap,
+            "cols": cols,
+            "rows": rows,
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 fn agent_keys_debug_value(keys: &[AgentKey]) -> Vec<serde_json::Value> {
@@ -6304,6 +6583,21 @@ enum AttachJobKind {
     Existing,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AttachTarget {
+    MainAgent,
+    Auxiliary {
+        kind: AgentAuxKind,
+        parent: AgentKey,
+    },
+}
+
+impl AttachTarget {
+    fn is_main_agent(&self) -> bool {
+        matches!(self, Self::MainAgent)
+    }
+}
+
 /// Where an attach job failed; drives status wording and logging.
 #[derive(Clone, Copy, Debug)]
 enum AttachFailStage {
@@ -6316,10 +6610,13 @@ enum AttachFailStage {
 /// Pre-rendered at request time so the worker stays presentation-free.
 struct AttachUiCtx {
     key: AgentKey,
+    target: AttachTarget,
     status_attached: String,
     status_started: String,
     status_err_prefix: String,
     status_prepare_err_prefix: String,
+    focus_auxiliary_on_ready: bool,
+    terminate_auxiliary_on_stale: bool,
     select_visible: bool,
     cokacdir_dialog_on_error: bool,
     /// Remove the target from live runtime caches when the daemon socket is
@@ -6381,6 +6678,7 @@ struct AttachWorkerResult {
 struct AttachInFlight {
     seq: u64,
     key: AgentKey,
+    target: AttachTarget,
     started_at: Instant,
 }
 
@@ -6503,6 +6801,7 @@ struct AgentRuntimeRefreshRequest {
 
 struct AgentRuntimeRefreshResult {
     seq: u64,
+    discover_live_shells: bool,
     live_shells: Vec<SessionInfo>,
     agent_states: HashMap<AgentKey, AgentListState>,
     new_agent_backing_aliases: HashMap<AgentKey, AgentKey>,
@@ -6579,8 +6878,15 @@ struct App {
     preview_scroll: u16,
     preview_page_height: u16,
     focus: FocusPane,
+    agent_focus: AgentFocusPane,
     status: String,
     active_agent: Option<AgentClient>,
+    agent_aux: Option<AgentAuxPane>,
+    hidden_agent_aux: Vec<AgentAuxPane>,
+    agent_aux_parent_infos: HashMap<AgentKey, SessionInfo>,
+    persisted_agent_aux: HashMap<AgentKey, PersistedAgentAuxiliaryEntry>,
+    persist_agent_auxiliary_registry: bool,
+    agent_aux_width: Option<u16>,
     should_quit: bool,
     /// Sender installed by `run()` after the channel exists. Cloned and
     /// handed to each agent reader thread on attach so they can forward
@@ -6638,6 +6944,43 @@ struct VisibleSessionRow<'a> {
     depth: usize,
 }
 
+fn sync_plain_pty_tool_info_from_live_shells(
+    agent: &mut AgentClient,
+    live_shells: &[SessionInfo],
+    scope: &'static str,
+) {
+    if !is_plain_pty_tool_session_info(&agent.info) {
+        return;
+    }
+    let key = AgentKey::new(&agent.info);
+    let Some(info) = live_shells
+        .iter()
+        .find(|info| AgentKey::new(info) == key)
+        .cloned()
+    else {
+        return;
+    };
+    if agent.info.cwd == info.cwd
+        && agent.info.source == info.source
+        && agent.info.updated_at_epoch_s == info.updated_at_epoch_s
+        && agent.info.title == info.title
+    {
+        return;
+    }
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        debug_log(
+            "pty_tool_info_synced",
+            serde_json::json!({
+                "scope": scope,
+                "key": agent_key_debug_value(&key),
+                "before": session_info_debug_value(&agent.info),
+                "after": session_info_debug_value(&info),
+            }),
+        );
+    }
+    agent.info = info;
+}
+
 impl App {
     fn new() -> Self {
         let (preview_tx, preview_rx) = spawn_preview_worker();
@@ -6646,6 +6989,7 @@ impl App {
         let (keybindings, keybindings_mtime) =
             KeyBindings::load_with_mtime(keybindings_path.as_deref());
         let session_view = settings.cokacmux.session_view;
+        let persisted_agent_aux = load_persisted_agent_auxiliaries();
         let startup_runtime_sweep = cleanup_stale_agent_runtime_files("app_start_runtime_sweep");
         let mut app = Self {
             settings,
@@ -6686,8 +7030,15 @@ impl App {
             preview_scroll: 0,
             preview_page_height: 10,
             focus: FocusPane::Sessions,
+            agent_focus: AgentFocusPane::Main,
             status: String::from("loading…"),
             active_agent: None,
+            agent_aux: None,
+            hidden_agent_aux: Vec::new(),
+            agent_aux_parent_infos: HashMap::new(),
+            persisted_agent_aux,
+            persist_agent_auxiliary_registry: true,
+            agent_aux_width: None,
             should_quit: false,
             main_tx: None,
             runtime_tx: None,
@@ -6715,6 +7066,8 @@ impl App {
             next_reader_id: 0,
             show_sessions_view: true,
         };
+        let normalized_agent_auxiliaries =
+            app.normalize_persisted_agent_auxiliaries("app_start_registry_normalize");
         app.refresh();
         debug_log(
             "app_new",
@@ -6728,6 +7081,9 @@ impl App {
                 "child_processes_terminated": startup_runtime_sweep.child_processes_terminated,
                 "cwd_locks_removed": startup_runtime_sweep.cwd_locks_removed,
                 "runtime_files_removed": startup_runtime_sweep.runtime_files_removed,
+                "normalized_agent_auxiliaries": normalized_agent_auxiliaries,
+                "persisted_agent_auxiliaries": app.persisted_agent_aux.len(),
+                "persisted_agent_auxiliary_entries": persisted_agent_auxiliary_entries_debug_value(&app.persisted_agent_aux),
             }),
         );
         app
@@ -6752,20 +7108,29 @@ impl App {
         agent_sidebar_width(total_width, self.agent_sidebar_config_width())
     }
 
+    fn sync_agent_viewports(&mut self, total_width: u16, terminal_rows: u16) -> AgentViewports {
+        let viewports = agent_viewports_for_terminal(
+            total_width,
+            terminal_rows,
+            self.agent_sidebar_config_width(),
+            self.agent_aux.is_some(),
+            self.agent_aux_width,
+        );
+        if let Some(agent) = self.active_agent.as_mut() {
+            agent.resize(viewports.main.pty_cols, viewports.main.pty_rows);
+        }
+        if let (Some(aux), Some(viewport)) = (self.agent_aux.as_mut(), viewports.auxiliary) {
+            aux.agent.resize(viewport.pty_cols, viewport.pty_rows);
+        }
+        viewports
+    }
+
     fn sync_active_agent_viewport(
         &mut self,
         total_width: u16,
         terminal_rows: u16,
     ) -> AgentViewport {
-        let viewport = agent_viewport_for_terminal(
-            total_width,
-            terminal_rows,
-            self.agent_sidebar_config_width(),
-        );
-        if let Some(agent) = self.active_agent.as_mut() {
-            agent.resize(viewport.pty_cols, viewport.pty_rows);
-        }
-        viewport
+        self.sync_agent_viewports(total_width, terminal_rows).main
     }
 
     fn on_keybindings_reloaded(&mut self, reload: KeybindingsReload) {
@@ -7057,6 +7422,9 @@ impl App {
     fn toggle_agent_sidebar_visible(&mut self) {
         let next = !self.settings.cokacmux.agent_sidebar_visible;
         self.settings.cokacmux.agent_sidebar_visible = next;
+        if !next && self.agent_focus == AgentFocusPane::Sidebar {
+            self.agent_focus = AgentFocusPane::Main;
+        }
         self.status = if next {
             "agents sidebar: shown".into()
         } else {
@@ -7075,6 +7443,1148 @@ impl App {
             "agent_sidebar_visible_toggle",
             serde_json::json!({ "visible": next }),
         );
+    }
+
+    fn focus_agent_sidebar(&mut self) {
+        if !self.settings.cokacmux.agent_sidebar_visible {
+            self.settings.cokacmux.agent_sidebar_visible = true;
+            if let Err(e) = self.settings.save() {
+                debug_log(
+                    "settings_save_failed",
+                    serde_json::json!({
+                        "field": "agent_sidebar_visible",
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+            self.status = "focus: agents sidebar shown".into();
+        } else {
+            self.status = "focus: agents sidebar".into();
+        }
+        self.agent_focus = AgentFocusPane::Sidebar;
+    }
+
+    fn focus_main_agent(&mut self) {
+        self.agent_focus = AgentFocusPane::Main;
+        self.status = "focus: agent".into();
+    }
+
+    fn focus_auxiliary_agent(&mut self) {
+        if let Some(aux) = self.agent_aux.as_ref() {
+            self.agent_focus = AgentFocusPane::Auxiliary;
+            self.status = format!("focus: right {}", aux.kind.label());
+        } else {
+            self.status = "right panel is not open.".into();
+        }
+    }
+
+    fn active_main_agent_is_coding(&self) -> bool {
+        self.active_agent
+            .as_ref()
+            .is_some_and(|agent| is_coding_agent_session_info(&agent.info))
+    }
+
+    fn focused_agent_info(&self) -> Option<&SessionInfo> {
+        match self.agent_focus {
+            AgentFocusPane::Auxiliary => self.agent_aux.as_ref().map(|aux| &aux.agent.info),
+            AgentFocusPane::Sidebar | AgentFocusPane::Main => {
+                self.active_agent.as_ref().map(|agent| &agent.info)
+            }
+        }
+    }
+
+    fn close_auxiliary_agent(&mut self, reason: &'static str, terminate: bool) -> Option<AgentKey> {
+        let aux = self.agent_aux.take()?;
+        self.close_auxiliary_pane(aux, reason, terminate)
+    }
+
+    fn close_auxiliary_pane(
+        &mut self,
+        mut aux: AgentAuxPane,
+        reason: &'static str,
+        terminate: bool,
+    ) -> Option<AgentKey> {
+        let key = AgentKey::new(&aux.agent.info);
+        let label = live_agent_status_label(&aux.agent.info);
+        let info = aux.agent.info.clone();
+        let kind = aux.kind;
+        let parent = aux.parent.clone();
+        if self.agent_focus == AgentFocusPane::Auxiliary {
+            self.agent_focus = AgentFocusPane::Main;
+        }
+        if terminate {
+            self.remove_persisted_agent_auxiliary(&key, reason);
+            aux.agent.exited = Some(format!("terminated right panel: {}", reason));
+            match terminate_agent_daemon_for_info(&key, &info) {
+                Ok(outcome) => {
+                    let history_suffix = agent_history_deleted_suffix(outcome.pty_log_deleted);
+                    self.status = match outcome.pid {
+                        Some(pid) => {
+                            format!("closed right {} (pid {}){}", label, pid, history_suffix)
+                        }
+                        None => format!("closed right {}{}", label, history_suffix),
+                    };
+                }
+                Err(e) => {
+                    self.status = format!("close right {} failed: {}", label, e);
+                }
+            }
+            drop(aux);
+        } else {
+            self.remember_persisted_agent_auxiliary(kind, &parent, &info, reason);
+            drop(aux);
+            self.status = format!("right {} hidden", label);
+        }
+        self.live_shells.retain(|info| AgentKey::new(info) != key);
+        self.agent_states.remove(&key);
+        self.live_shell_missing_strikes.remove(&key);
+        self.new_agent_backing_aliases.remove(&key);
+        self.new_agent_backing_probe_after.remove(&key);
+        self.discard_pending_agent_runtime_refresh();
+        self.refresh_agent_runtime_states();
+        debug_log(
+            "agent_auxiliary_closed",
+            serde_json::json!({
+                "reason": reason,
+                "terminate": terminate,
+                "key": agent_key_debug_value(&key),
+            }),
+        );
+        Some(key)
+    }
+
+    fn hide_auxiliary_agent(&mut self, reason: &'static str) -> Option<AgentKey> {
+        let aux = self.agent_aux.take()?;
+        let key = AgentKey::new(&aux.agent.info);
+        let label = live_agent_status_label(&aux.agent.info);
+        let kind = aux.kind;
+        let parent = aux.parent.clone();
+        self.remember_active_auxiliary_parent_info(&parent);
+        if self.agent_focus == AgentFocusPane::Auxiliary {
+            self.agent_focus = AgentFocusPane::Main;
+        }
+        self.remove_hidden_auxiliary_for_parent(kind, &parent);
+        self.remember_persisted_agent_auxiliary(kind, &parent, &aux.agent.info, reason);
+        self.hidden_agent_aux.push(aux);
+        self.status = format!("right {} hidden", label);
+        debug_log(
+            "agent_auxiliary_hidden",
+            serde_json::json!({
+                "reason": reason,
+                "kind": kind.label(),
+                "parent": agent_key_debug_value(&parent),
+                "key": agent_key_debug_value(&key),
+            }),
+        );
+        Some(key)
+    }
+
+    fn take_hidden_auxiliary_agent(
+        &mut self,
+        kind: AgentAuxKind,
+        parent: &AgentKey,
+    ) -> Option<AgentAuxPane> {
+        let index = self.hidden_agent_aux.iter().position(|aux| {
+            aux.kind == kind && self.agent_aux_parent_matches(&aux.parent, parent)
+        })?;
+        Some(self.hidden_agent_aux.remove(index))
+    }
+
+    fn take_latest_hidden_auxiliary_agent(&mut self, parent: &AgentKey) -> Option<AgentAuxPane> {
+        let index = self
+            .hidden_agent_aux
+            .iter()
+            .rposition(|aux| self.agent_aux_parent_matches(&aux.parent, parent))?;
+        Some(self.hidden_agent_aux.remove(index))
+    }
+
+    fn remove_hidden_auxiliary_for_parent(&mut self, kind: AgentAuxKind, parent: &AgentKey) {
+        let hidden = std::mem::take(&mut self.hidden_agent_aux);
+        let mut kept = Vec::new();
+        for aux in hidden {
+            if aux.kind == kind && self.agent_aux_parent_matches(&aux.parent, parent) {
+                let _ = self.close_auxiliary_pane(aux, "hidden_replaced", true);
+            } else {
+                kept.push(aux);
+            }
+        }
+        self.hidden_agent_aux = kept;
+    }
+
+    fn terminate_hidden_auxiliaries_for_parent(
+        &mut self,
+        parent: &AgentKey,
+        reason: &'static str,
+    ) -> usize {
+        let hidden = std::mem::take(&mut self.hidden_agent_aux);
+        let mut kept = Vec::new();
+        let mut terminated = 0usize;
+        for aux in hidden {
+            if self.agent_aux_parent_matches(&aux.parent, parent) {
+                terminated = terminated.saturating_add(1);
+                let _ = self.close_auxiliary_pane(aux, reason, true);
+            } else {
+                kept.push(aux);
+            }
+        }
+        self.hidden_agent_aux = kept;
+        terminated
+    }
+
+    fn remember_auxiliary_parent_info(&mut self, info: &SessionInfo) -> AgentKey {
+        let key = AgentKey::new(info);
+        if is_coding_agent_session_info(info) {
+            self.agent_aux_parent_infos
+                .insert(key.clone(), info.clone());
+        }
+        key
+    }
+
+    fn remember_active_auxiliary_parent_info(&mut self, parent: &AgentKey) {
+        let Some(info) = self.active_agent.as_ref().map(|agent| agent.info.clone()) else {
+            return;
+        };
+        let active_key = self.remember_auxiliary_parent_info(&info);
+        if active_key != *parent && self.agent_keys_match_or_alias(&active_key, parent) {
+            self.agent_aux_parent_infos.insert(parent.clone(), info);
+        }
+    }
+
+    fn agent_info_for_auxiliary_parent_key(&self, key: &AgentKey) -> Option<&SessionInfo> {
+        if let Some(agent) = self.active_agent.as_ref() {
+            if AgentKey::new(&agent.info) == *key {
+                return Some(&agent.info);
+            }
+        }
+        if let Some(info) = self.agent_aux_parent_infos.get(key) {
+            return Some(info);
+        }
+        if let Some(info) = self
+            .sessions
+            .iter()
+            .find(|info| AgentKey::new(info) == *key)
+        {
+            return Some(info);
+        }
+        self.live_shells
+            .iter()
+            .find(|info| AgentKey::new(info) == *key)
+    }
+
+    fn remember_persisted_agent_auxiliary(
+        &mut self,
+        kind: AgentAuxKind,
+        parent: &AgentKey,
+        info: &SessionInfo,
+        reason: &'static str,
+    ) {
+        let key = AgentKey::new(info);
+        let parent_info = self.agent_info_for_auxiliary_parent_key(parent).cloned();
+        self.remove_persisted_auxiliaries_for_parent_kind_except(
+            parent,
+            kind,
+            Some(&key),
+            "parent_auxiliary_kind_replaced",
+        );
+        let entry = PersistedAgentAuxiliaryEntry {
+            agent: key.clone(),
+            kind,
+            parent: parent.clone(),
+            parent_provider: parent_info
+                .as_ref()
+                .map(|info| info.provider)
+                .unwrap_or(parent.provider),
+            parent_cwd: parent_info
+                .as_ref()
+                .map(|info| info.cwd.clone())
+                .unwrap_or_default(),
+            parent_source: parent_info
+                .as_ref()
+                .map(|info| info.source.display().to_string())
+                .unwrap_or_default(),
+            updated_at_epoch_s: current_epoch_s(),
+        };
+        self.persisted_agent_aux.insert(key.clone(), entry.clone());
+        if !self.persist_agent_auxiliary_registry {
+            return;
+        }
+        match save_persisted_agent_auxiliaries(&self.persisted_agent_aux) {
+            Ok(()) => debug_log(
+                "agent_auxiliary_registry_remembered",
+                serde_json::json!({
+                    "reason": reason,
+                    "entry": persisted_agent_auxiliary_entry_debug_value(&entry),
+                    "entries": persisted_agent_auxiliary_entries_debug_value(&self.persisted_agent_aux),
+                }),
+            ),
+            Err(e) => debug_log(
+                "agent_auxiliary_registry_save_failed",
+                serde_json::json!({
+                    "reason": reason,
+                    "key": agent_key_debug_value(&key),
+                    "error": e.to_string(),
+                }),
+            ),
+        }
+    }
+
+    fn persisted_auxiliary_parent_matches_key(
+        &self,
+        entry: &PersistedAgentAuxiliaryEntry,
+        parent: &AgentKey,
+    ) -> bool {
+        if self.agent_keys_match_or_alias(&entry.parent, parent) {
+            return true;
+        }
+        self.agent_info_for_auxiliary_parent_key(parent)
+            .is_some_and(|parent_info| {
+                self.persisted_auxiliary_can_match_parent_info(entry, parent_info)
+                    && entry.matches_parent_info(parent_info)
+            })
+    }
+
+    fn remove_persisted_auxiliaries_for_parent_kind_except(
+        &mut self,
+        parent: &AgentKey,
+        kind: AgentAuxKind,
+        keep: Option<&AgentKey>,
+        reason: &'static str,
+    ) {
+        let keys = self
+            .persisted_agent_aux
+            .iter()
+            .filter(|(key, entry)| {
+                keep != Some(*key)
+                    && entry.kind == kind
+                    && self.persisted_auxiliary_parent_matches_key(entry, parent)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.terminate_persisted_auxiliary_key(&key, reason);
+        }
+    }
+
+    fn terminate_persisted_auxiliaries_for_parent(
+        &mut self,
+        parent: &AgentKey,
+        reason: &'static str,
+    ) -> usize {
+        let keys = self
+            .persisted_agent_aux
+            .iter()
+            .filter(|(_, entry)| self.persisted_auxiliary_parent_matches_key(entry, parent))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut terminated = 0usize;
+        for key in keys {
+            terminated = terminated.saturating_add(1);
+            self.terminate_persisted_auxiliary_key(&key, reason);
+        }
+        terminated
+    }
+
+    fn terminate_persisted_auxiliary_key(&mut self, key: &AgentKey, reason: &'static str) {
+        let info = self
+            .live_shells
+            .iter()
+            .find(|info| AgentKey::new(info) == *key)
+            .cloned();
+        self.remove_persisted_agent_auxiliary(key, reason);
+        if self
+            .agent_aux
+            .as_ref()
+            .is_some_and(|aux| AgentKey::new(&aux.agent.info) == *key)
+        {
+            if let Some(mut aux) = self.agent_aux.take() {
+                aux.agent.exited = Some(format!("terminated right panel: {}", reason));
+                drop(aux);
+            }
+        }
+        let hidden = std::mem::take(&mut self.hidden_agent_aux);
+        let mut kept = Vec::new();
+        for mut aux in hidden {
+            if AgentKey::new(&aux.agent.info) == *key {
+                aux.agent.exited = Some(format!("terminated right panel: {}", reason));
+                drop(aux);
+            } else {
+                kept.push(aux);
+            }
+        }
+        self.hidden_agent_aux = kept;
+        let result = if let Some(info) = info.as_ref() {
+            terminate_agent_daemon_for_info(key, info)
+        } else {
+            terminate_agent_daemon_with_info(key, None)
+        };
+        self.live_shells.retain(|info| AgentKey::new(info) != *key);
+        self.agent_states.remove(key);
+        self.live_shell_missing_strikes.remove(key);
+        self.new_agent_backing_aliases.remove(key);
+        self.new_agent_backing_probe_after.remove(key);
+        debug_log(
+            "agent_auxiliary_terminated",
+            serde_json::json!({
+                "reason": reason,
+                "key": agent_key_debug_value(key),
+                "result": result.as_ref().ok().map(|outcome| {
+                    serde_json::json!({
+                        "daemon_pid": outcome.pid,
+                        "child_pid": outcome.child_pid,
+                        "pty_log_deleted": outcome.pty_log_deleted,
+                    })
+                }),
+                "error": result.err().map(|e| e.to_string()),
+            }),
+        );
+    }
+
+    fn terminate_auxiliaries_for_parent(
+        &mut self,
+        parent: &AgentKey,
+        reason: &'static str,
+    ) -> usize {
+        let mut terminated = 0usize;
+        if self
+            .agent_aux
+            .as_ref()
+            .is_some_and(|aux| self.agent_aux_parent_matches(&aux.parent, parent))
+        {
+            if let Some(aux) = self.agent_aux.take() {
+                terminated = terminated.saturating_add(1);
+                let _ = self.close_auxiliary_pane(aux, reason, true);
+            }
+        }
+        terminated =
+            terminated.saturating_add(self.terminate_hidden_auxiliaries_for_parent(parent, reason));
+        terminated = terminated
+            .saturating_add(self.terminate_persisted_auxiliaries_for_parent(parent, reason));
+        debug_log(
+            "agent_auxiliaries_terminated_for_parent",
+            serde_json::json!({
+                "reason": reason,
+                "parent": agent_key_debug_value(parent),
+                "count": terminated,
+            }),
+        );
+        terminated
+    }
+
+    fn persisted_auxiliary_parent_is_live(&self, entry: &PersistedAgentAuxiliaryEntry) -> bool {
+        if self.active_agent.as_ref().is_some_and(|agent| {
+            let key = AgentKey::new(&agent.info);
+            self.agent_keys_match_or_alias(&entry.parent, &key)
+                || (self.persisted_auxiliary_can_match_parent_info(entry, &agent.info)
+                    && entry.matches_parent_info(&agent.info))
+        }) {
+            return true;
+        }
+        self.live_shells.iter().any(|info| {
+            if !is_coding_agent_session_info(info) {
+                return false;
+            }
+            let key = AgentKey::new(info);
+            self.agent_keys_match_or_alias(&entry.parent, &key)
+                || (self.persisted_auxiliary_can_match_parent_info(entry, info)
+                    && entry.matches_parent_info(info))
+        })
+    }
+
+    fn persisted_auxiliary_can_match_parent_info(
+        &self,
+        entry: &PersistedAgentAuxiliaryEntry,
+        info: &SessionInfo,
+    ) -> bool {
+        entry.parent_source == NEW_AGENT_SESSION_SOURCE_MARKER
+            || entry
+                .parent
+                .session_id
+                .starts_with(NEW_AGENT_SESSION_ID_PREFIX)
+            || is_new_agent_session_info(info)
+    }
+
+    fn persisted_auxiliary_registry_parent_key(
+        entry: &PersistedAgentAuxiliaryEntry,
+    ) -> (bool, Provider, String, String, AgentAuxKind) {
+        let cwd_scoped = (entry.parent_source == NEW_AGENT_SESSION_SOURCE_MARKER
+            || entry
+                .parent
+                .session_id
+                .starts_with(NEW_AGENT_SESSION_ID_PREFIX))
+            && !entry.parent_cwd.trim().is_empty();
+        if cwd_scoped {
+            (
+                true,
+                entry.parent_provider,
+                entry.parent_cwd.clone(),
+                String::new(),
+                entry.kind,
+            )
+        } else {
+            (
+                false,
+                entry.parent.provider,
+                String::new(),
+                entry.parent.session_id.clone(),
+                entry.kind,
+            )
+        }
+    }
+
+    fn normalize_persisted_agent_auxiliaries(&mut self, reason: &'static str) -> usize {
+        let mut winners: HashMap<
+            (bool, Provider, String, String, AgentAuxKind),
+            (AgentKey, u64, String),
+        > = HashMap::new();
+        for (key, entry) in &self.persisted_agent_aux {
+            let parent_key = Self::persisted_auxiliary_registry_parent_key(entry);
+            let candidate_rank = (entry.updated_at_epoch_s, key.session_id.clone());
+            let replace = winners
+                .get(&parent_key)
+                .map_or(true, |(_, updated_at, session_id)| {
+                    candidate_rank > (*updated_at, session_id.clone())
+                });
+            if replace {
+                winners.insert(
+                    parent_key,
+                    (
+                        key.clone(),
+                        entry.updated_at_epoch_s,
+                        key.session_id.clone(),
+                    ),
+                );
+            }
+        }
+        let winner_keys = winners
+            .values()
+            .map(|(key, _, _)| key.clone())
+            .collect::<HashSet<_>>();
+        let keys = self
+            .persisted_agent_aux
+            .keys()
+            .filter(|key| !winner_keys.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut normalized = 0usize;
+        for key in keys {
+            normalized = normalized.saturating_add(1);
+            self.terminate_persisted_auxiliary_key(&key, reason);
+        }
+        if normalized > 0 {
+            debug_log(
+                "agent_auxiliary_registry_normalized",
+                serde_json::json!({
+                    "reason": reason,
+                    "removed": normalized,
+                    "remaining": persisted_agent_auxiliary_entries_debug_value(&self.persisted_agent_aux),
+                }),
+            );
+        }
+        normalized
+    }
+
+    fn auxiliary_parent_is_live(&self, parent: &AgentKey) -> bool {
+        if self.active_agent.as_ref().is_some_and(|agent| {
+            self.agent_keys_match_or_alias(&AgentKey::new(&agent.info), parent)
+        }) {
+            return true;
+        }
+        self.live_shells.iter().any(|info| {
+            is_coding_agent_session_info(info)
+                && self.agent_keys_match_or_alias(&AgentKey::new(info), parent)
+        })
+    }
+
+    fn terminate_orphan_persisted_auxiliaries(&mut self, reason: &'static str) -> usize {
+        let keys = self
+            .persisted_agent_aux
+            .iter()
+            .filter(|(_, entry)| !self.persisted_auxiliary_parent_is_live(entry))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut terminated = 0usize;
+        for key in keys {
+            terminated = terminated.saturating_add(1);
+            self.terminate_persisted_auxiliary_key(&key, reason);
+        }
+        if terminated > 0 {
+            debug_log(
+                "agent_auxiliary_orphans_terminated",
+                serde_json::json!({
+                    "reason": reason,
+                    "count": terminated,
+                }),
+            );
+        }
+        terminated
+    }
+
+    fn remove_persisted_agent_auxiliary(&mut self, key: &AgentKey, reason: &'static str) {
+        let Some(entry) = self.persisted_agent_aux.remove(key) else {
+            return;
+        };
+        if !self.persist_agent_auxiliary_registry {
+            return;
+        }
+        match save_persisted_agent_auxiliaries(&self.persisted_agent_aux) {
+            Ok(()) => debug_log(
+                "agent_auxiliary_registry_removed",
+                serde_json::json!({
+                    "reason": reason,
+                    "entry": persisted_agent_auxiliary_entry_debug_value(&entry),
+                    "remaining": persisted_agent_auxiliary_entries_debug_value(&self.persisted_agent_aux),
+                }),
+            ),
+            Err(e) => debug_log(
+                "agent_auxiliary_registry_save_failed",
+                serde_json::json!({
+                    "reason": reason,
+                    "key": agent_key_debug_value(key),
+                    "error": e.to_string(),
+                }),
+            ),
+        }
+    }
+
+    fn persisted_auxiliary_matches_active(
+        &self,
+        entry: &PersistedAgentAuxiliaryEntry,
+        active_info: &SessionInfo,
+    ) -> bool {
+        let active_key = AgentKey::new(active_info);
+        if self.agent_keys_match_or_alias(&entry.parent, &active_key) {
+            return true;
+        }
+        self.persisted_auxiliary_can_match_parent_info(entry, active_info)
+            && entry.matches_parent_info(active_info)
+    }
+
+    fn hidden_agent_aux_debug_values(&self) -> Vec<serde_json::Value> {
+        self.hidden_agent_aux
+            .iter()
+            .map(|aux| {
+                serde_json::json!({
+                    "kind": aux.kind.label(),
+                    "parent": agent_key_debug_value(&aux.parent),
+                    "parent_info": self
+                        .agent_info_for_auxiliary_parent_key(&aux.parent)
+                        .map(session_info_debug_value),
+                    "agent": session_info_debug_value(&aux.agent.info),
+                    "reader_id": aux.agent.reader_id,
+                })
+            })
+            .collect()
+    }
+
+    fn live_auxiliary_restore_candidate_entries_debug_value(
+        &self,
+        active_info: &SessionInfo,
+    ) -> Vec<serde_json::Value> {
+        let live_keys = self
+            .live_shells
+            .iter()
+            .map(AgentKey::new)
+            .collect::<HashSet<_>>();
+        let mut entries = self
+            .live_shells
+            .iter()
+            .filter_map(|info| {
+                let kind = auxiliary_kind_for_session_info(info)?;
+                let key = AgentKey::new(info);
+                let state = self
+                    .agent_states
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(AgentListState::Idle);
+                let same_cwd = session_cwd_same_folder(&active_info.cwd, &info.cwd);
+                let persisted_auxiliary = self.persisted_agent_aux.get(&key);
+                let persisted_matches_active = persisted_auxiliary.is_some_and(|entry| {
+                    entry.kind == kind && self.persisted_auxiliary_matches_active(entry, active_info)
+                });
+                let is_auxiliary = self.is_auxiliary_agent_key(&key);
+                let switchable = is_switchable_agent_state(state);
+                Some(serde_json::json!({
+                    "kind": kind.label(),
+                    "key": agent_key_debug_value(&key),
+                    "state": agent_list_state_debug_value(state),
+                    "same_cwd": same_cwd,
+                    "persisted_auxiliary": persisted_auxiliary.map(persisted_agent_auxiliary_entry_debug_value),
+                    "persisted_matches_active": persisted_matches_active,
+                    "excluded_auxiliary": is_auxiliary,
+                    "candidate": switchable && (persisted_matches_active || (same_cwd && !is_auxiliary)),
+                    "source": "live_discovery",
+                    "info": session_info_debug_value(info),
+                }))
+            })
+            .collect::<Vec<_>>();
+        entries.extend(
+            self.persisted_agent_aux
+                .values()
+                .filter(|entry| !live_keys.contains(&entry.agent))
+                .filter(|entry| self.persisted_auxiliary_matches_active(entry, active_info))
+                .map(|entry| {
+                    let info = session_info_for_persisted_agent_auxiliary(entry);
+                    serde_json::json!({
+                        "kind": entry.kind.label(),
+                        "key": agent_key_debug_value(&entry.agent),
+                        "state": "not_discovered",
+                        "same_cwd": session_cwd_same_folder(&active_info.cwd, &info.cwd),
+                        "persisted_auxiliary": persisted_agent_auxiliary_entry_debug_value(entry),
+                        "persisted_matches_active": true,
+                        "excluded_auxiliary": true,
+                        "candidate": true,
+                        "source": "persisted_registry",
+                        "info": session_info_debug_value(&info),
+                    })
+                }),
+        );
+        entries
+    }
+
+    fn live_auxiliary_restore_candidate_for_active_agent(
+        &self,
+        active_info: &SessionInfo,
+    ) -> Option<(AgentAuxKind, SessionInfo)> {
+        self.live_auxiliary_restore_candidate_for_active_agent_matching(active_info, None)
+    }
+
+    fn live_auxiliary_restore_candidate_for_active_agent_kind(
+        &self,
+        active_info: &SessionInfo,
+        desired_kind: AgentAuxKind,
+    ) -> Option<SessionInfo> {
+        self.live_auxiliary_restore_candidate_for_active_agent_matching(
+            active_info,
+            Some(desired_kind),
+        )
+        .map(|(_, info)| info)
+    }
+
+    fn live_auxiliary_restore_candidate_for_active_agent_matching(
+        &self,
+        active_info: &SessionInfo,
+        desired_kind: Option<AgentAuxKind>,
+    ) -> Option<(AgentAuxKind, SessionInfo)> {
+        let live_keys = self
+            .live_shells
+            .iter()
+            .map(AgentKey::new)
+            .collect::<HashSet<_>>();
+        let live_candidates = self.live_shells.iter().filter_map(|info| {
+            let kind = auxiliary_kind_for_session_info(info)?;
+            if desired_kind.is_some_and(|desired_kind| desired_kind != kind) {
+                return None;
+            }
+            let key = AgentKey::new(info);
+            let persisted_auxiliary = self.persisted_agent_aux.get(&key);
+            let persisted_matches_active = persisted_auxiliary.is_some_and(|entry| {
+                entry.kind == kind && self.persisted_auxiliary_matches_active(entry, active_info)
+            });
+            let persisted_updated_at = persisted_auxiliary
+                .map(|entry| entry.updated_at_epoch_s)
+                .unwrap_or(0);
+            if !persisted_matches_active {
+                if self.is_auxiliary_agent_key(&key) {
+                    return None;
+                }
+                if !session_cwd_same_folder(&active_info.cwd, &info.cwd) {
+                    return None;
+                }
+            }
+            let state = self
+                .agent_states
+                .get(&key)
+                .copied()
+                .unwrap_or(AgentListState::Idle);
+            if !is_switchable_agent_state(state) {
+                return None;
+            }
+            Some((
+                persisted_matches_active,
+                persisted_updated_at,
+                kind,
+                info.clone(),
+            ))
+        });
+        let persisted_candidates = self
+            .persisted_agent_aux
+            .values()
+            .filter(|entry| !live_keys.contains(&entry.agent))
+            .filter(|entry| desired_kind.map_or(true, |desired_kind| desired_kind == entry.kind))
+            .filter(|entry| self.persisted_auxiliary_matches_active(entry, active_info))
+            .map(|entry| {
+                (
+                    true,
+                    entry.updated_at_epoch_s,
+                    entry.kind,
+                    session_info_for_persisted_agent_auxiliary(entry),
+                )
+            });
+        live_candidates
+            .chain(persisted_candidates)
+            .max_by_key(|(persisted, persisted_updated_at, _, info)| {
+                (
+                    *persisted,
+                    *persisted_updated_at,
+                    info.updated_at_epoch_s,
+                    info.session_id.clone(),
+                )
+            })
+            .map(|(_, _, kind, info)| (kind, info))
+    }
+
+    fn agent_aux_parent_matches(&self, left: &AgentKey, right: &AgentKey) -> bool {
+        if self.agent_keys_match_or_alias(left, right) {
+            return true;
+        }
+        let Some(left_info) = self.agent_info_for_auxiliary_parent_key(left) else {
+            return false;
+        };
+        let Some(right_info) = self.agent_info_for_auxiliary_parent_key(right) else {
+            return false;
+        };
+        coding_agent_auxiliary_parent_infos_match(left_info, right_info)
+    }
+
+    fn agent_keys_match_or_alias(&self, left: &AgentKey, right: &AgentKey) -> bool {
+        left == right
+            || self
+                .new_agent_backing_aliases
+                .get(left)
+                .is_some_and(|alias| alias == right)
+            || self
+                .new_agent_backing_aliases
+                .get(right)
+                .is_some_and(|alias| alias == left)
+    }
+
+    fn show_auxiliary_agent(
+        &mut self,
+        mut aux: AgentAuxPane,
+        viewport: AgentViewport,
+        reason: &'static str,
+    ) {
+        let label = live_agent_status_label(&aux.agent.info);
+        let kind = aux.kind;
+        let parent = aux.parent.clone();
+        aux.agent.resize(viewport.pty_cols, viewport.pty_rows);
+        self.remember_active_auxiliary_parent_info(&parent);
+        self.remember_live_info_locally(&aux.agent.info.clone());
+        self.remember_persisted_agent_auxiliary(kind, &parent, &aux.agent.info, reason);
+        self.agent_aux = Some(aux);
+        self.agent_focus = AgentFocusPane::Auxiliary;
+        self.status = format!("right {} shown", label);
+        debug_log(
+            "agent_auxiliary_shown",
+            serde_json::json!({
+                "reason": reason,
+                "kind": kind.label(),
+                "parent": agent_key_debug_value(&parent),
+            }),
+        );
+    }
+
+    fn restore_hidden_auxiliary_for_active_agent(
+        &mut self,
+        total_width: u16,
+        terminal_rows: u16,
+        reason: &'static str,
+    ) -> bool {
+        if self.agent_aux.is_some() || !self.active_main_agent_is_coding() {
+            return false;
+        }
+        let Some(active_info) = self.active_agent.as_ref().map(|agent| agent.info.clone()) else {
+            return false;
+        };
+        let parent = self.remember_auxiliary_parent_info(&active_info);
+        let viewports = agent_viewports_for_terminal(
+            total_width,
+            terminal_rows,
+            self.agent_sidebar_config_width(),
+            true,
+            self.agent_aux_width,
+        );
+        let Some(aux_viewport) = viewports.auxiliary else {
+            debug_log(
+                "agent_auxiliary_restore_skipped",
+                serde_json::json!({
+                    "reason": reason,
+                    "parent": agent_key_debug_value(&parent),
+                    "terminal_cols": total_width,
+                    "terminal_rows": terminal_rows,
+                    "cause": "narrow_terminal",
+                }),
+            );
+            return false;
+        };
+        let Some(mut aux) = self.take_latest_hidden_auxiliary_agent(&parent) else {
+            if self.restore_live_auxiliary_for_active_agent(
+                &active_info,
+                &parent,
+                aux_viewport,
+                reason,
+            ) {
+                return true;
+            }
+            debug_log(
+                "agent_auxiliary_restore_skipped",
+                serde_json::json!({
+                    "reason": reason,
+                    "parent": agent_key_debug_value(&parent),
+                    "active_info": session_info_debug_value(&active_info),
+                    "cause": "no_hidden_match",
+                    "hidden": self.hidden_agent_aux_debug_values(),
+                    "live_auxiliary_candidates": self.live_auxiliary_restore_candidate_entries_debug_value(&active_info),
+                    "aliases": agent_alias_entries_debug_value(&self.new_agent_backing_aliases),
+                }),
+            );
+            return false;
+        };
+        let kind = aux.kind;
+        let previous_parent = aux.parent.clone();
+        aux.parent = parent.clone();
+        aux.agent
+            .resize(aux_viewport.pty_cols, aux_viewport.pty_rows);
+        self.remember_live_info_locally(&aux.agent.info.clone());
+        self.agent_aux = Some(aux);
+        let _ = self.sync_agent_viewports(total_width, terminal_rows);
+        debug_log(
+            "agent_auxiliary_restored_for_active",
+            serde_json::json!({
+                "reason": reason,
+                "kind": kind.label(),
+                "parent": agent_key_debug_value(&parent),
+                "previous_parent": agent_key_debug_value(&previous_parent),
+            }),
+        );
+        true
+    }
+
+    fn restore_live_auxiliary_for_active_agent(
+        &mut self,
+        active_info: &SessionInfo,
+        parent: &AgentKey,
+        aux_viewport: AgentViewport,
+        reason: &'static str,
+    ) -> bool {
+        self.restore_live_auxiliary_for_active_agent_matching(
+            active_info,
+            parent,
+            aux_viewport,
+            reason,
+            None,
+        )
+    }
+
+    fn restore_live_auxiliary_kind_for_active_agent(
+        &mut self,
+        kind: AgentAuxKind,
+        active_info: &SessionInfo,
+        parent: &AgentKey,
+        aux_viewport: AgentViewport,
+        reason: &'static str,
+    ) -> bool {
+        self.restore_live_auxiliary_for_active_agent_matching(
+            active_info,
+            parent,
+            aux_viewport,
+            reason,
+            Some(kind),
+        )
+    }
+
+    fn restore_live_auxiliary_for_active_agent_matching(
+        &mut self,
+        active_info: &SessionInfo,
+        parent: &AgentKey,
+        aux_viewport: AgentViewport,
+        reason: &'static str,
+        desired_kind: Option<AgentAuxKind>,
+    ) -> bool {
+        let Some((kind, info)) = self
+            .live_auxiliary_restore_candidate_for_active_agent_matching(active_info, desired_kind)
+        else {
+            return false;
+        };
+        let key = AgentKey::new(&info);
+        let cwd_label = truncate_width(&info.cwd, 40);
+        self.status = format!("restoring right {} at {}...", kind.label(), cwd_label);
+        debug_log(
+            "agent_auxiliary_restore_live_start",
+            serde_json::json!({
+                "reason": reason,
+                "kind": kind.label(),
+                "parent": agent_key_debug_value(parent),
+                "active_info": session_info_debug_value(active_info),
+                "candidate": session_info_debug_value(&info),
+                "cols": aux_viewport.pty_cols,
+                "rows": aux_viewport.pty_rows,
+            }),
+        );
+        self.request_attach(AttachJob {
+            info,
+            cols: aux_viewport.pty_cols,
+            rows: aux_viewport.pty_rows,
+            kind: AttachJobKind::Existing,
+            run_prechecks: false,
+            prompt_for_saved_data: false,
+            settings: self.settings.clone(),
+            ctx: AttachUiCtx {
+                key,
+                target: AttachTarget::Auxiliary {
+                    kind,
+                    parent: parent.clone(),
+                },
+                status_attached: format!("restored right {} at {}", kind.label(), cwd_label),
+                status_started: format!("restored right {} at {}", kind.label(), cwd_label),
+                status_err_prefix: format!("right {} restore failed: ", kind.label()),
+                status_prepare_err_prefix: format!("right {} restore failed: ", kind.label()),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: true,
+                log_origin: Some(format!("agent_auxiliary_restore:{}", kind.label())),
+                ready_event: "agent_auxiliary_restore_live_ready",
+                failed_event: "agent_auxiliary_restore_live_failed",
+            },
+        });
+        true
+    }
+
+    fn set_auxiliary_agent(&mut self, kind: AgentAuxKind, parent: AgentKey, agent: AgentClient) {
+        let key = AgentKey::new(&agent.info);
+        if self
+            .agent_aux
+            .as_ref()
+            .is_some_and(|aux| AgentKey::new(&aux.agent.info) != key)
+        {
+            let _ = self.hide_auxiliary_agent("replace_attached");
+        } else if self.agent_aux.is_some() {
+            let _ = self.agent_aux.take();
+        }
+        self.remember_active_auxiliary_parent_info(&parent);
+        let info = agent.info.clone();
+        self.remember_live_info_locally(&info);
+        self.remove_hidden_auxiliary_for_parent(kind, &parent);
+        self.remember_persisted_agent_auxiliary(kind, &parent, &info, "set_attached");
+        self.agent_aux = Some(AgentAuxPane {
+            kind,
+            parent,
+            agent,
+        });
+        self.agent_focus = AgentFocusPane::Auxiliary;
+    }
+
+    fn toggle_auxiliary_agent_panel(
+        &mut self,
+        kind: AgentAuxKind,
+        total_width: u16,
+        terminal_rows: u16,
+    ) {
+        if !self.active_main_agent_is_coding() {
+            self.status = format!(
+                "right {} panel is available from Codex, Claude, or OpenCode.",
+                kind.label()
+            );
+            return;
+        }
+        let Some(active_info) = self.active_agent.as_ref().map(|agent| agent.info.clone()) else {
+            self.status = format!("no active agent for right {} panel.", kind.label());
+            return;
+        };
+        let parent = self.remember_auxiliary_parent_info(&active_info);
+        let visible_same_panel = self.agent_aux.as_ref().is_some_and(|aux| {
+            aux.kind == kind && self.agent_aux_parent_matches(&aux.parent, &parent)
+        });
+        if visible_same_panel {
+            let _ = self.hide_auxiliary_agent("toggle");
+            return;
+        }
+
+        let viewports = agent_viewports_for_terminal(
+            total_width,
+            terminal_rows,
+            self.agent_sidebar_config_width(),
+            true,
+            self.agent_aux_width,
+        );
+        let Some(aux_viewport) = viewports.auxiliary else {
+            self.status = "terminal is too narrow for a right panel.".into();
+            return;
+        };
+        if let Some(aux) = self.take_hidden_auxiliary_agent(kind, &parent) {
+            if self.agent_aux.is_some() {
+                let _ = self.hide_auxiliary_agent("switch");
+            }
+            self.show_auxiliary_agent(aux, aux_viewport, "toggle_restore");
+            return;
+        }
+
+        if self.restore_live_auxiliary_kind_for_active_agent(
+            kind,
+            &active_info,
+            &parent,
+            aux_viewport,
+            "toggle_restore_live",
+        ) {
+            if self.agent_aux.is_some() {
+                let _ = self.hide_auxiliary_agent("switch");
+            }
+            return;
+        }
+
+        let Some(cwd) = self.active_agent_current_cwd() else {
+            self.status = format!("no cwd to open right {} panel at.", kind.label());
+            return;
+        };
+        if self.agent_aux.is_some() {
+            let _ = self.hide_auxiliary_agent("switch");
+        }
+
+        let info = match kind {
+            AgentAuxKind::Cokacdir => cokacdir_session_info_for_cwd(cwd.clone()),
+            AgentAuxKind::Terminal => shell_session_info_for_cwd(cwd.clone()),
+        };
+        let key = AgentKey::new(&info);
+        let cwd_label = truncate_width(&cwd, 40);
+        self.status = format!("opening right {} at {}...", kind.label(), cwd_label);
+        debug_log(
+            "agent_auxiliary_open_start",
+            serde_json::json!({
+                "kind": kind.label(),
+                "cwd": &cwd,
+                "cols": aux_viewport.pty_cols,
+                "rows": aux_viewport.pty_rows,
+            }),
+        );
+        self.request_attach(AttachJob {
+            info,
+            cols: aux_viewport.pty_cols,
+            rows: aux_viewport.pty_rows,
+            kind: AttachJobKind::OrStart {
+                launch_mode: AgentLaunchMode::Normal,
+            },
+            run_prechecks: false,
+            prompt_for_saved_data: false,
+            settings: self.settings.clone(),
+            ctx: AttachUiCtx {
+                key,
+                target: AttachTarget::Auxiliary { kind, parent },
+                status_attached: format!("attached right {} at {}", kind.label(), cwd_label),
+                status_started: format!("started right {} at {}", kind.label(), cwd_label),
+                status_err_prefix: format!("right {} open failed: ", kind.label()),
+                status_prepare_err_prefix: format!("right {} prepare failed: ", kind.label()),
+                focus_auxiliary_on_ready: true,
+                terminate_auxiliary_on_stale: true,
+                select_visible: false,
+                cokacdir_dialog_on_error: kind == AgentAuxKind::Cokacdir,
+                remove_dead_on_notfound: false,
+                log_origin: Some(format!("agent_auxiliary:{}", kind.label())),
+                ready_event: "agent_auxiliary_open_ready",
+                failed_event: "agent_auxiliary_open_failed",
+            },
+        });
     }
 
     fn adjust_sessions_pane_width(&mut self, delta: i16, total_width: u16) {
@@ -7192,6 +8702,70 @@ impl App {
                 );
             }
         }
+    }
+
+    fn resize_focused_agent_pane(&mut self, delta: i16, total_width: u16) {
+        let left_visible = self.agent_sidebar_config_width() > 0;
+        let right_visible = self.agent_aux.is_some();
+        match self.agent_focus {
+            AgentFocusPane::Sidebar => {
+                self.adjust_agent_sidebar_width(delta, total_width);
+            }
+            AgentFocusPane::Auxiliary => {
+                self.adjust_agent_auxiliary_width(-delta, total_width);
+            }
+            AgentFocusPane::Main => match (left_visible, right_visible) {
+                (true, true) => {
+                    self.status = "focus a side panel to resize.".into();
+                }
+                (true, false) => {
+                    self.adjust_agent_sidebar_width(delta, total_width);
+                }
+                (false, true) => {
+                    self.adjust_agent_auxiliary_width(-delta, total_width);
+                }
+                (false, false) => {
+                    self.adjust_agent_sidebar_width(delta, total_width);
+                }
+            },
+        }
+    }
+
+    fn adjust_agent_auxiliary_width(&mut self, delta: i16, total_width: u16) {
+        if self.agent_aux.is_none() {
+            self.status = "right panel is not open.".into();
+            return;
+        }
+        let sidebar_width = agent_sidebar_width(total_width, self.agent_sidebar_config_width());
+        let content_width = total_width.saturating_sub(sidebar_width);
+        let (next, limited) =
+            adjusted_agent_auxiliary_width(self.agent_aux_width, content_width, delta);
+        if limited {
+            self.status = format!("layout limit: right panel {} cols", next);
+            debug_log(
+                "agent_auxiliary_resize_limited",
+                serde_json::json!({
+                    "next": next,
+                    "content_width": content_width,
+                    "total_width": total_width,
+                    "delta": delta,
+                }),
+            );
+            return;
+        }
+        self.agent_aux_width = Some(next);
+        let main = content_width.saturating_sub(next);
+        self.status = format!("layout changed: agent {} cols, right {} cols", main, next);
+        debug_log(
+            "agent_auxiliary_resize_changed",
+            serde_json::json!({
+                "next": next,
+                "main": main,
+                "content_width": content_width,
+                "total_width": total_width,
+                "delta": delta,
+            }),
+        );
     }
 
     fn refresh(&mut self) {
@@ -8489,6 +10063,12 @@ impl App {
                 let live_shells = discover_live_shell_infos();
                 let elapsed_ms = started.elapsed().as_millis();
                 let live_shell_count = live_shells.len();
+                let live_shell_items = DEBUG_ENABLED.load(Ordering::Relaxed).then(|| {
+                    live_shells
+                        .iter()
+                        .map(session_info_debug_value)
+                        .collect::<Vec<_>>()
+                });
                 let result_sent = tx
                     .send(MainEvent::LiveShellDiscoveryResult(
                         LiveShellDiscoveryResult {
@@ -8506,6 +10086,7 @@ impl App {
                         "seq": seq,
                         "elapsed_ms": elapsed_ms,
                         "live_shells": live_shell_count,
+                        "items": live_shell_items,
                         "result_sent": result_sent,
                     }),
                 );
@@ -8679,7 +10260,7 @@ impl App {
                 }),
             );
         } else {
-            self.apply_agent_runtime_refresh_result(result);
+            self.apply_agent_runtime_refresh_result_with_pending(result, !refresh_queued);
         }
         if refresh_queued && !self.runtime_refresh_pending {
             self.refresh_agent_runtime_states();
@@ -8765,6 +10346,7 @@ impl App {
             .cloned()
             .collect::<Vec<_>>();
         for key in &removed_keys {
+            self.remove_persisted_agent_auxiliary(key, "live_shell_removed");
             self.agent_states.remove(key);
             self.new_agent_backing_aliases.remove(key);
             self.new_agent_backing_probe_after.remove(key);
@@ -8782,6 +10364,10 @@ impl App {
             &self.new_agent_backing_aliases,
             &mut self.agent_states,
         );
+        let normalized_auxiliaries =
+            self.normalize_persisted_agent_auxiliaries("live_shell_discovery_normalize");
+        let orphaned_auxiliaries =
+            self.terminate_orphan_persisted_auxiliaries("orphan_parent_missing");
 
         debug_log(
             "live_shell_discovery_applied",
@@ -8795,6 +10381,11 @@ impl App {
                 "added": added_keys.iter().map(agent_key_debug_value).collect::<Vec<_>>(),
                 "removed": removed_keys.iter().map(agent_key_debug_value).collect::<Vec<_>>(),
                 "preserved_missing": preserved_keys.iter().map(agent_key_debug_value).collect::<Vec<_>>(),
+                "normalized_auxiliaries": normalized_auxiliaries,
+                "orphaned_auxiliaries_terminated": orphaned_auxiliaries,
+                "next_live_shells": self.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
+                "agent_states": agent_state_entries_debug_value(&self.agent_states),
+                "persisted_agent_auxiliaries": persisted_agent_auxiliary_entries_debug_value(&self.persisted_agent_aux),
             }),
         );
 
@@ -8887,6 +10478,7 @@ impl App {
         self.attach_in_flight = Some(AttachInFlight {
             seq,
             key: ctx.key.clone(),
+            target: ctx.target.clone(),
             started_at: Instant::now(),
         });
         self.status = format!("attaching {}...", live_agent_status_label(&info));
@@ -8945,6 +10537,7 @@ impl App {
         if in_flight_seq != Some(result.seq) {
             // Dropping the outcome also drops any AgentClient it carries,
             // which detaches its daemon connection cleanly.
+            self.cleanup_stale_auxiliary_attach_result(&result, "stale_seq");
             debug_log(
                 "attach_result_stale",
                 serde_json::json!({
@@ -8958,17 +10551,27 @@ impl App {
         }
         self.attach_in_flight = None;
         if let Some(queued) = self.queued_attach.take() {
+            let result_seq = result.seq;
+            let result_provider = result.ctx.key.provider;
+            let result_session_id = result.ctx.key.session_id.clone();
+            let queued_provider = queued.ctx.key.provider;
+            let queued_session_id = queued.ctx.key.session_id.clone();
+            if queued.ctx.target.is_main_agent() {
+                self.hide_superseded_auxiliary_attach_result(result, "superseded_by_main_attach");
+            } else {
+                self.cleanup_stale_auxiliary_attach_result(&result, "superseded");
+                drop(result);
+            }
             debug_log(
                 "attach_result_superseded",
                 serde_json::json!({
-                    "seq": result.seq,
-                    "provider": result.ctx.key.provider.as_str(),
-                    "session_id": &result.ctx.key.session_id,
-                    "next_provider": queued.ctx.key.provider.as_str(),
-                    "next_session_id": &queued.ctx.key.session_id,
+                    "seq": result_seq,
+                    "provider": result_provider.as_str(),
+                    "session_id": result_session_id,
+                    "next_provider": queued_provider.as_str(),
+                    "next_session_id": queued_session_id,
                 }),
             );
-            drop(result);
             self.start_attach_job(queued);
             return;
         }
@@ -8990,13 +10593,82 @@ impl App {
                     ctx.status_attached
                 };
                 self.show_sessions_view = false;
-                self.set_active_agent(agent);
-                self.mark_agent_attached_locally(ctx.key.clone());
-                self.discard_pending_agent_runtime_refresh();
-                if ctx.select_visible {
-                    self.select_visible_session(&ctx.key);
+                match ctx.target {
+                    AttachTarget::MainAgent => {
+                        self.set_active_agent(agent);
+                        self.agent_focus = AgentFocusPane::Main;
+                        self.mark_agent_attached_locally(ctx.key.clone());
+                        self.discard_pending_agent_runtime_refresh();
+                        if ctx.select_visible {
+                            self.select_visible_session(&ctx.key);
+                        }
+                        self.refresh_agent_runtime_states();
+                        let (terminal_cols, terminal_rows) =
+                            crossterm::terminal::size().unwrap_or((
+                                cols.max(80),
+                                rows.saturating_add(AGENT_STATUS_HEIGHT).max(24),
+                            ));
+                        let _ = self.restore_hidden_auxiliary_for_active_agent(
+                            terminal_cols,
+                            terminal_rows,
+                            "main_agent_attached",
+                        );
+                    }
+                    AttachTarget::Auxiliary { kind, parent } => {
+                        let active_parent = self
+                            .active_agent
+                            .as_ref()
+                            .map(|agent| AgentKey::new(&agent.info));
+                        if active_parent.as_ref() == Some(&parent)
+                            && self.active_main_agent_is_coding()
+                        {
+                            self.set_auxiliary_agent(kind, parent, agent);
+                            if !ctx.focus_auxiliary_on_ready {
+                                self.agent_focus = AgentFocusPane::Main;
+                            }
+                            self.mark_agent_attached_locally(ctx.key.clone());
+                            self.discard_pending_agent_runtime_refresh();
+                            self.refresh_agent_runtime_states();
+                        } else {
+                            let stale_info = agent.info.clone();
+                            let stale_key = AgentKey::new(&stale_info);
+                            let stale_activity = agent.activity();
+                            if !ctx.terminate_auxiliary_on_stale {
+                                self.remember_persisted_agent_auxiliary(
+                                    kind,
+                                    &parent,
+                                    &stale_info,
+                                    "stale_preserved",
+                                );
+                                self.remember_live_info_locally(&stale_info);
+                                self.mark_agent_live_locally(stale_key.clone(), stale_activity);
+                            }
+                            drop(agent);
+                            let terminated = if ctx.terminate_auxiliary_on_stale {
+                                self.remove_persisted_agent_auxiliary(
+                                    &stale_key,
+                                    "stale_terminated",
+                                );
+                                terminate_agent_daemon_for_info(&stale_key, &stale_info).is_ok()
+                            } else {
+                                false
+                            };
+                            self.status = format!("discarded stale right {} panel", kind.label());
+                            self.discard_pending_agent_runtime_refresh();
+                            self.refresh_agent_runtime_states();
+                            debug_log(
+                                "agent_auxiliary_open_stale",
+                                serde_json::json!({
+                                    "kind": kind.label(),
+                                    "requested_parent": agent_key_debug_value(&parent),
+                                    "active_parent": active_parent.as_ref().map(agent_key_debug_value),
+                                    "terminated": terminated,
+                                    "preserved_live": !ctx.terminate_auxiliary_on_stale,
+                                }),
+                            );
+                        }
+                    }
                 }
-                self.refresh_agent_runtime_states();
                 // Drain any output the reader thread queued before this
                 // result was applied; its notification may have been ignored
                 // while the previous agent was still active.
@@ -9080,10 +10752,100 @@ impl App {
         }
     }
 
+    fn cleanup_stale_auxiliary_attach_result(
+        &mut self,
+        result: &AttachWorkerResult,
+        reason: &'static str,
+    ) {
+        let AttachTarget::Auxiliary { kind, parent } = &result.ctx.target else {
+            return;
+        };
+        let AttachWorkOutcome::Attached { agent, .. } = &result.outcome else {
+            return;
+        };
+        let info = agent.info.clone();
+        let key = AgentKey::new(&info);
+        let terminate_stale =
+            result.ctx.terminate_auxiliary_on_stale || !self.auxiliary_parent_is_live(parent);
+        if !terminate_stale {
+            let activity = agent.activity();
+            self.remember_persisted_agent_auxiliary(*kind, parent, &info, reason);
+            self.remember_live_info_locally(&info);
+            self.mark_agent_live_locally(key.clone(), activity);
+            self.discard_pending_agent_runtime_refresh();
+            self.refresh_agent_runtime_states();
+            debug_log(
+                "agent_auxiliary_attach_preserved",
+                serde_json::json!({
+                    "reason": reason,
+                    "kind": kind.label(),
+                    "requested_parent": agent_key_debug_value(parent),
+                    "key": agent_key_debug_value(&key),
+                }),
+            );
+            return;
+        }
+        self.remove_persisted_agent_auxiliary(&key, reason);
+        let _ = terminate_agent_daemon_for_info(&key, &info);
+        self.live_shells.retain(|info| AgentKey::new(info) != key);
+        self.agent_states.remove(&key);
+        self.live_shell_missing_strikes.remove(&key);
+        self.new_agent_backing_aliases.remove(&key);
+        self.new_agent_backing_probe_after.remove(&key);
+        self.discard_pending_agent_runtime_refresh();
+        self.refresh_agent_runtime_states();
+        debug_log(
+            "agent_auxiliary_attach_discarded",
+            serde_json::json!({
+                "reason": reason,
+                "kind": kind.label(),
+                "requested_parent": agent_key_debug_value(parent),
+                "key": agent_key_debug_value(&key),
+                "parent_live": self.auxiliary_parent_is_live(parent),
+            }),
+        );
+    }
+
+    fn hide_superseded_auxiliary_attach_result(
+        &mut self,
+        result: AttachWorkerResult,
+        reason: &'static str,
+    ) {
+        let AttachWorkerResult { ctx, outcome, .. } = result;
+        let AttachTarget::Auxiliary { kind, parent } = ctx.target else {
+            drop(outcome);
+            return;
+        };
+        let AttachWorkOutcome::Attached { agent, .. } = outcome else {
+            return;
+        };
+        let key = AgentKey::new(&agent.info);
+        let info = agent.info.clone();
+        self.remember_active_auxiliary_parent_info(&parent);
+        self.remember_live_info_locally(&info);
+        self.terminate_hidden_auxiliaries_for_parent(&parent, reason);
+        self.remember_persisted_agent_auxiliary(kind, &parent, &info, reason);
+        self.hidden_agent_aux.push(AgentAuxPane {
+            kind,
+            parent: parent.clone(),
+            agent,
+        });
+        debug_log(
+            "agent_auxiliary_hidden_after_superseded_attach",
+            serde_json::json!({
+                "reason": reason,
+                "kind": kind.label(),
+                "parent": agent_key_debug_value(&parent),
+                "key": agent_key_debug_value(&key),
+            }),
+        );
+    }
+
     /// Drop a daemon proven dead (its socket file is gone) from the live
     /// runtime caches so it stops appearing as a switchable agents-list
     /// entry. Mirrors the cleanup done for shells removed by discovery.
     fn remove_dead_live_shell(&mut self, key: &AgentKey) {
+        self.remove_persisted_agent_auxiliary(key, "dead_live_shell");
         self.live_shells.retain(|info| AgentKey::new(info) != *key);
         self.agent_states.remove(key);
         self.live_shell_missing_strikes.remove(key);
@@ -9121,14 +10883,26 @@ impl App {
             serde_json::json!({
                 "runtime_refresh_seq": self.runtime_refresh_seq,
                 "elapsed_ms": elapsed.as_millis(),
+                "pending_runtime_action": pending_runtime_action_debug_value(self.pending_runtime_action.as_ref()),
             }),
         );
         self.continue_pending_runtime_action();
     }
 
-    fn apply_agent_runtime_refresh_result(&mut self, result: AgentRuntimeRefreshResult) {
-        self.runtime_refresh_applied_seq = self.runtime_refresh_applied_seq.max(result.seq);
-        self.live_shells = result.live_shells;
+    fn apply_agent_runtime_refresh_result_with_pending(
+        &mut self,
+        result: AgentRuntimeRefreshResult,
+        continue_pending_action: bool,
+    ) {
+        let seq = result.seq;
+        let discover_live_shells = result.discover_live_shells;
+        let pending_before =
+            pending_runtime_action_debug_value(self.pending_runtime_action.as_ref());
+        self.runtime_refresh_applied_seq = self.runtime_refresh_applied_seq.max(seq);
+        let previous_live_shells_len = self.live_shells.len();
+        self.apply_runtime_refresh_live_shells(result.live_shells, discover_live_shells);
+        let live_shells_preserved =
+            !discover_live_shells && previous_live_shells_len > 0 && !self.live_shells.is_empty();
         self.sync_active_plain_pty_tool_info_from_live_shells();
         self.agent_states = result.agent_states;
         self.new_agent_backing_aliases = result.new_agent_backing_aliases;
@@ -9145,12 +10919,50 @@ impl App {
         {
             self.status = "live agents updated.".into();
         }
-        self.continue_pending_runtime_action();
+        if DEBUG_ENABLED.load(Ordering::Relaxed)
+            && (self.pending_runtime_action.is_some()
+                || (self.active_agent.is_none()
+                    && self.show_sessions_view
+                    && !self.live_shells.is_empty()
+                    && self.agent_states.is_empty()))
+        {
+            debug_log(
+                "agent_runtime_refresh_applied_summary",
+                serde_json::json!({
+                    "seq": seq,
+                    "discover_live_shells": discover_live_shells,
+                    "continue_pending_action": continue_pending_action,
+                    "live_shells_preserved": live_shells_preserved,
+                    "live_shells_len": self.live_shells.len(),
+                    "agent_states_len": self.agent_states.len(),
+                    "live_shells": self.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
+                    "agent_states": agent_state_entries_debug_value(&self.agent_states),
+                    "new_agent_backing_aliases": agent_alias_entries_debug_value(&self.new_agent_backing_aliases),
+                    "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                    "show_sessions_view": self.show_sessions_view,
+                    "pending_before": pending_before,
+                    "status": &self.status,
+                }),
+            );
+        }
+        if continue_pending_action {
+            self.continue_pending_runtime_action();
+        } else if self.pending_runtime_action.is_some() {
+            debug_log(
+                "pending_runtime_action_waiting_for_queued_refresh",
+                serde_json::json!({
+                    "seq": seq,
+                    "pending_runtime_action": pending_runtime_action_debug_value(self.pending_runtime_action.as_ref()),
+                    "live_shells_len": self.live_shells.len(),
+                    "agent_states_len": self.agent_states.len(),
+                }),
+            );
+        }
         if TRACE_ENABLED.load(Ordering::Relaxed) {
             trace_log(
                 "agent_runtime_refresh_applied",
                 serde_json::json!({
-                    "seq": result.seq,
+                    "seq": seq,
                     "agent_states_len": self.agent_states.len(),
                     "states": agent_state_entries_debug_value(&self.agent_states),
                     "new_agent_backing_aliases": agent_alias_entries_debug_value(&self.new_agent_backing_aliases),
@@ -9163,10 +10975,51 @@ impl App {
         }
     }
 
+    fn apply_runtime_refresh_live_shells(
+        &mut self,
+        refreshed_live_shells: Vec<SessionInfo>,
+        discover_live_shells: bool,
+    ) {
+        if discover_live_shells {
+            self.live_shells = refreshed_live_shells;
+            return;
+        }
+
+        let mut refreshed_by_key: HashMap<AgentKey, SessionInfo> = refreshed_live_shells
+            .into_iter()
+            .map(|info| (AgentKey::new(&info), info))
+            .collect();
+        let active_keys = self
+            .active_agent
+            .as_ref()
+            .into_iter()
+            .chain(self.agent_aux.as_ref().map(|aux| &aux.agent))
+            .chain(self.hidden_agent_aux.iter().map(|aux| &aux.agent))
+            .map(|agent| AgentKey::new(&agent.info))
+            .collect::<HashSet<_>>();
+
+        for info in self.live_shells.iter_mut() {
+            let key = AgentKey::new(info);
+            if let Some(refreshed) = refreshed_by_key.remove(&key) {
+                *info = refreshed;
+            }
+        }
+
+        for (key, info) in refreshed_by_key {
+            if active_keys.contains(&key) {
+                self.live_shells.push(info);
+            }
+        }
+    }
+
     fn continue_pending_runtime_action(&mut self) {
         let Some(action) = self.pending_runtime_action.take() else {
             return;
         };
+        debug_log(
+            "pending_runtime_action_continue",
+            pending_runtime_action_debug_value(Some(&action)),
+        );
         match action {
             PendingRuntimeAction::LaunchSelected { info, cols, rows } => {
                 if self.reject_while_data_task_running("launching an agent") {
@@ -9194,68 +11047,53 @@ impl App {
     }
 
     fn overlay_active_agent_runtime_state(&mut self) {
-        let Some(agent) = self.active_agent.as_ref() else {
-            return;
-        };
-        let key = AgentKey::new(&agent.info);
-        let previous_state = self.agent_states.get(&key).copied();
-        let client_activity = agent.activity();
-        let activity = previous_state
-            .map(|state| state.activity())
-            .unwrap_or(AgentActivity::Quiet)
-            .combine(client_activity);
-        let overlay_state = AgentListState::Attached {
-            mine: true,
-            activity,
-        };
-        self.agent_states.insert(key.clone(), overlay_state);
-        if TRACE_ENABLED.load(Ordering::Relaxed) {
-            trace_log(
-                "agent_runtime_refresh_active_overlay",
-                serde_json::json!({
-                    "key": agent_key_debug_value(&key),
-                    "previous_state": optional_agent_list_state_debug_value(previous_state),
-                    "client_activity": client_activity.label(),
-                    "overlay_state": agent_list_state_debug_value(overlay_state),
-                }),
-            );
+        let overlays = self
+            .active_agent
+            .as_ref()
+            .into_iter()
+            .chain(self.agent_aux.as_ref().map(|aux| &aux.agent))
+            .map(|agent| (AgentKey::new(&agent.info), agent.activity()))
+            .collect::<Vec<_>>();
+        for (key, client_activity) in overlays {
+            let previous_state = self.agent_states.get(&key).copied();
+            let activity = previous_state
+                .map(|state| state.activity())
+                .unwrap_or(AgentActivity::Quiet)
+                .combine(client_activity);
+            let overlay_state = AgentListState::Attached {
+                mine: true,
+                activity,
+            };
+            self.agent_states.insert(key.clone(), overlay_state);
+            if TRACE_ENABLED.load(Ordering::Relaxed) {
+                trace_log(
+                    "agent_runtime_refresh_active_overlay",
+                    serde_json::json!({
+                        "key": agent_key_debug_value(&key),
+                        "previous_state": optional_agent_list_state_debug_value(previous_state),
+                        "client_activity": client_activity.label(),
+                        "overlay_state": agent_list_state_debug_value(overlay_state),
+                    }),
+                );
+            }
         }
     }
 
     fn sync_active_plain_pty_tool_info_from_live_shells(&mut self) {
-        let Some(agent) = self.active_agent.as_mut() else {
-            return;
-        };
-        if !is_plain_pty_tool_session_info(&agent.info) {
-            return;
+        let live_shells = self.live_shells.clone();
+        if let Some(agent) = self.active_agent.as_mut() {
+            sync_plain_pty_tool_info_from_live_shells(agent, &live_shells, "active");
         }
-        let key = AgentKey::new(&agent.info);
-        let Some(info) = self
-            .live_shells
-            .iter()
-            .find(|info| AgentKey::new(info) == key)
-            .cloned()
-        else {
-            return;
-        };
-        if agent.info.cwd == info.cwd
-            && agent.info.source == info.source
-            && agent.info.updated_at_epoch_s == info.updated_at_epoch_s
-            && agent.info.title == info.title
-        {
-            return;
+        if let Some(aux) = self.agent_aux.as_mut() {
+            sync_plain_pty_tool_info_from_live_shells(&mut aux.agent, &live_shells, "auxiliary");
         }
-        if DEBUG_ENABLED.load(Ordering::Relaxed) {
-            debug_log(
-                "active_pty_tool_info_synced",
-                serde_json::json!({
-                    "key": agent_key_debug_value(&key),
-                    "before": session_info_debug_value(&agent.info),
-                    "after": session_info_debug_value(&info),
-                }),
+        for aux in self.hidden_agent_aux.iter_mut() {
+            sync_plain_pty_tool_info_from_live_shells(
+                &mut aux.agent,
+                &live_shells,
+                "hidden_auxiliary",
             );
         }
-        agent.info = info;
     }
 
     fn mark_agent_attached_locally(&mut self, key: AgentKey) {
@@ -9334,6 +11172,22 @@ impl App {
         if !is_coding_agent_session_info(info) || info.cwd.trim().is_empty() {
             return false;
         }
+        let target_key = AgentKey::new(info);
+        debug_log(
+            "agent_launch_cwd_conflict_check_start",
+            serde_json::json!({
+                "target": session_info_debug_value(info),
+                "target_key": agent_key_debug_value(&target_key),
+                "cached_state": optional_agent_list_state_debug_value(self.agent_states.get(&target_key).copied()),
+                "runtime_probe": agent_runtime_probe_debug_value(&target_key, std::process::id()),
+                "cwd_lock": coding_agent_cwd_lock_probe_debug_value(info),
+                "meta_conflict_including_target_key": live_coding_agent_cwd_meta_conflict_including_target_key(info).map(|info| session_info_debug_value(&info)),
+                "cwd_peers": self.live_coding_agent_cwd_peer_entries_debug_value(info),
+                "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                "agent_states": agent_state_entries_debug_value(&self.agent_states),
+                "live_shells": self.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
+            }),
+        );
         let _ = cleanup_stale_coding_agent_cwd_locks("agent_launch_cwd_lock_sweep");
         if let Some(conflict) = self.live_coding_agent_cwd_conflict(info) {
             self.status = coding_agent_cwd_conflict_message(info, &conflict);
@@ -9343,6 +11197,8 @@ impl App {
                     "source": "app_state",
                     "target": session_info_debug_value(info),
                     "conflict": session_info_debug_value(&conflict),
+                    "target_key": agent_key_debug_value(&target_key),
+                    "conflict_key": agent_key_debug_value(&AgentKey::new(&conflict)),
                 }),
             );
             return true;
@@ -9355,6 +11211,8 @@ impl App {
                     "source": "runtime_meta",
                     "target": session_info_debug_value(info),
                     "conflict": session_info_debug_value(&conflict),
+                    "target_key": agent_key_debug_value(&target_key),
+                    "conflict_key": agent_key_debug_value(&AgentKey::new(&conflict)),
                 }),
             );
             return true;
@@ -9368,6 +11226,9 @@ impl App {
                         "source": "cwd_lock",
                         "target": session_info_debug_value(info),
                         "conflict": coding_agent_cwd_lock_debug_value(&conflict),
+                        "target_key": agent_key_debug_value(&target_key),
+                        "conflict_key": coding_agent_cwd_lock_key(&conflict).as_ref().map(agent_key_debug_value),
+                        "conflict_key_matches_target": coding_agent_cwd_lock_key(&conflict).as_ref() == Some(&target_key),
                     }),
                 );
                 true
@@ -9378,6 +11239,7 @@ impl App {
                     "agent_launch_cwd_conflict_check_failed",
                     serde_json::json!({
                         "target": session_info_debug_value(info),
+                        "target_key": agent_key_debug_value(&target_key),
                         "error": error.to_string(),
                     }),
                 );
@@ -9451,22 +11313,38 @@ impl App {
 
             self.agent_states
                 .insert(candidate_key.clone(), observed_state);
+            debug_log(
+                "agent_launch_observed_live_cwd_conflict",
+                serde_json::json!({
+                    "target": session_info_debug_value(target),
+                    "candidate": session_info_debug_value(&candidate),
+                    "target_key": agent_key_debug_value(&target_key),
+                    "candidate_key": agent_key_debug_value(&candidate_key),
+                    "cached_state": agent_list_state_debug_value(cached_state),
+                    "observed_state": agent_list_state_debug_value(observed_state),
+                }),
+            );
             return Some(candidate);
         }
         None
     }
 
     fn set_active_agent(&mut self, agent: AgentClient) {
+        if self.agent_aux.is_some() {
+            let _ = self.hide_auxiliary_agent("main_agent_replaced");
+        }
         if let Some(old_agent) = self.active_agent.take() {
             let old_info = old_agent.info.clone();
             let old_key = AgentKey::new(&old_info);
             let old_activity = old_agent.activity();
             self.remember_live_info_locally(&old_info);
+            self.remember_auxiliary_parent_info(&old_info);
             self.mark_agent_live_locally(old_key, old_activity);
             drop(old_agent);
         }
         let info = agent.info.clone();
         self.remember_live_info_locally(&info);
+        self.remember_auxiliary_parent_info(&info);
         self.active_agent = Some(agent);
     }
 
@@ -9477,6 +11355,9 @@ impl App {
             .chain(self.live_shells.iter())
             .filter(|info| {
                 let key = AgentKey::new(info);
+                if self.is_auxiliary_agent_key(&key) {
+                    return false;
+                }
                 if self.is_backing_key_for_new_agent(&key) {
                     return false;
                 }
@@ -9519,6 +11400,93 @@ impl App {
             }
         }
         candidates.into_iter().next()
+    }
+
+    fn live_agent_restore_candidate_entries_debug_value(
+        &self,
+        selected_key: Option<&AgentKey>,
+    ) -> Vec<serde_json::Value> {
+        let mut entries = Vec::new();
+        for (source, info) in self
+            .sessions
+            .iter()
+            .map(|info| ("sessions", info))
+            .chain(self.live_shells.iter().map(|info| ("live_shells", info)))
+        {
+            let key = AgentKey::new(info);
+            let state = self
+                .agent_states
+                .get(&key)
+                .copied()
+                .unwrap_or(AgentListState::Idle);
+            let is_auxiliary = self.is_auxiliary_agent_key(&key);
+            let is_new_agent_backing = self.is_backing_key_for_new_agent(&key);
+            let switchable = is_switchable_agent_state(state);
+            let persisted_auxiliary = self.persisted_agent_aux.get(&key);
+            entries.push(serde_json::json!({
+                "source": source,
+                "key": agent_key_debug_value(&key),
+                "selected": selected_key == Some(&key),
+                "state": agent_list_state_debug_value(state),
+                "switchable": switchable,
+                "persisted_auxiliary": persisted_auxiliary.map(persisted_agent_auxiliary_entry_debug_value),
+                "excluded_auxiliary": is_auxiliary,
+                "excluded_new_agent_backing": is_new_agent_backing,
+                "candidate": switchable && !is_auxiliary && !is_new_agent_backing,
+                "info": session_info_debug_value(info),
+            }));
+        }
+        entries
+    }
+
+    fn live_coding_agent_cwd_peer_entries_debug_value(
+        &self,
+        target: &SessionInfo,
+    ) -> Vec<serde_json::Value> {
+        let target_key = AgentKey::new(target);
+        self.sessions
+            .iter()
+            .map(|info| ("sessions", info))
+            .chain(self.live_shells.iter().map(|info| ("live_shells", info)))
+            .filter(|(_, candidate)| {
+                is_coding_agent_session_info(candidate)
+                    && session_cwd_same_folder(&target.cwd, &candidate.cwd)
+            })
+            .map(|(source, candidate)| {
+                let key = AgentKey::new(candidate);
+                let cached_state = self
+                    .agent_states
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(AgentListState::Idle);
+                serde_json::json!({
+                    "source": source,
+                    "key": agent_key_debug_value(&key),
+                    "target_key": key == target_key,
+                    "cached_state": agent_list_state_debug_value(cached_state),
+                    "switchable": is_switchable_agent_state(cached_state),
+                    "info": session_info_debug_value(candidate),
+                })
+            })
+            .collect()
+    }
+
+    fn is_auxiliary_agent_key(&self, key: &AgentKey) -> bool {
+        self.persisted_agent_aux.contains_key(key)
+            || self
+                .agent_aux
+                .as_ref()
+                .is_some_and(|aux| AgentKey::new(&aux.agent.info) == *key)
+            || self
+                .hidden_agent_aux
+                .iter()
+                .any(|aux| AgentKey::new(&aux.agent.info) == *key)
+            || self.attach_in_flight.as_ref().is_some_and(|attach| {
+                matches!(attach.target, AttachTarget::Auxiliary { .. }) && attach.key == *key
+            })
+            || self.queued_attach.as_ref().is_some_and(|job| {
+                matches!(job.ctx.target, AttachTarget::Auxiliary { .. }) && job.ctx.key == *key
+            })
     }
 
     fn synthetic_new_agent_for_backing_key(&self, backing_key: &AgentKey) -> Option<&SessionInfo> {
@@ -9567,6 +11535,9 @@ impl App {
             .filter(|info| {
                 let key = AgentKey::new(info);
                 if backing_keys.contains(&key) {
+                    return false;
+                }
+                if key != current_key && self.is_auxiliary_agent_key(&key) {
                     return false;
                 }
                 key == current_key
@@ -10101,52 +12072,112 @@ impl App {
     /// method no longer pulls from the socket; it only reacts to flags
     /// the channel-driven `process_agent_event` already set.
     fn poll_agent_sessions(&mut self) {
-        let Some(agent) = self.active_agent.as_mut() else {
-            return;
-        };
-        if let Some(exit_status) = agent.exited.clone() {
-            let provider = agent.info.provider;
-            let session_id = agent.info.session_id.clone();
-            let reader_id = agent.reader_id;
-            if agent.drain_pending_output(AGENT_CLIENT_OUTPUT_DRAIN_BYTES) {
-                self.schedule_agent_output_available(reader_id);
+        if let Some(agent) = self.active_agent.as_mut() {
+            if let Some(exit_status) = agent.exited.clone() {
+                let provider = agent.info.provider;
+                let session_id = agent.info.session_id.clone();
+                let reader_id = agent.reader_id;
+                if agent.drain_pending_output(AGENT_CLIENT_OUTPUT_DRAIN_BYTES) {
+                    self.schedule_agent_output_available(reader_id);
+                    return;
+                }
+                let exited_label = live_agent_status_label(&agent.info);
+                let cols = agent.pty_size.cols;
+                let rows = agent.pty_size.rows;
+                // Auto-switch to the next live agent only while the agent pane
+                // is the visible view, and never over a user-initiated attach
+                // already in flight or queued — a background exit must not
+                // steal where the user is navigating.
+                let next_info = if self.is_agent_view()
+                    && self.attach_in_flight.is_none()
+                    && self.queued_attach.is_none()
+                {
+                    self.next_agent_after_current()
+                } else {
+                    None
+                };
+                self.active_agent = None;
+                let exited_key = AgentKey {
+                    provider,
+                    session_id: session_id.clone(),
+                };
+                self.terminate_auxiliaries_for_parent(&exited_key, "main_agent_exit");
+                self.agent_states.remove(&exited_key);
+                self.live_shells
+                    .retain(|info| AgentKey::new(info) != exited_key);
+                self.agent_focus = AgentFocusPane::Main;
+                self.discard_pending_agent_runtime_refresh();
+                self.status = format!(
+                    "{} agent {} exited ({})",
+                    provider.as_str(),
+                    truncate_width(&session_id, 14),
+                    exit_status
+                );
+                self.request_session_refresh_preserving_status();
+                self.refresh_agent_runtime_states();
+                if let Some(next_info) = next_info {
+                    self.attach_after_agent_exit(
+                        next_info,
+                        cols,
+                        rows,
+                        provider,
+                        &session_id,
+                        &exited_label,
+                    );
+                }
                 return;
             }
-            let exited_label = live_agent_status_label(&agent.info);
-            let cols = agent.pty_size.cols;
-            let rows = agent.pty_size.rows;
-            // Auto-switch to the next live agent only while the agent pane
-            // is the visible view, and never over a user-initiated attach
-            // already in flight or queued — a background exit must not
-            // steal where the user is navigating.
-            let next_info = if self.is_agent_view()
-                && self.attach_in_flight.is_none()
-                && self.queued_attach.is_none()
-            {
-                self.next_agent_after_current()
-            } else {
-                None
-            };
-            self.active_agent = None;
-            self.discard_pending_agent_runtime_refresh();
-            self.status = format!(
-                "{} agent {} exited ({})",
-                provider.as_str(),
-                truncate_width(&session_id, 14),
-                exit_status
-            );
-            self.request_session_refresh_preserving_status();
-            self.refresh_agent_runtime_states();
-            if let Some(next_info) = next_info {
-                self.attach_after_agent_exit(
-                    next_info,
-                    cols,
-                    rows,
-                    provider,
-                    &session_id,
-                    &exited_label,
-                );
+        }
+
+        if let Some(aux) = self.agent_aux.as_mut() {
+            if let Some(exit_status) = aux.agent.exited.clone() {
+                let label = live_agent_status_label(&aux.agent.info);
+                let reader_id = aux.agent.reader_id;
+                if aux
+                    .agent
+                    .drain_pending_output(AGENT_CLIENT_OUTPUT_DRAIN_BYTES)
+                {
+                    self.schedule_agent_output_available(reader_id);
+                    return;
+                }
+                let key = AgentKey::new(&aux.agent.info);
+                self.agent_aux = None;
+                if self.agent_focus == AgentFocusPane::Auxiliary {
+                    self.agent_focus = AgentFocusPane::Main;
+                }
+                self.remove_persisted_agent_auxiliary(&key, "auxiliary_exited");
+                self.live_shells.retain(|info| AgentKey::new(info) != key);
+                self.agent_states.remove(&key);
+                self.status = format!("right {} exited ({})", label, exit_status);
+                self.refresh_agent_runtime_states();
             }
+        }
+
+        let mut exited_hidden = None;
+        for index in 0..self.hidden_agent_aux.len() {
+            if let Some(exit_status) = self.hidden_agent_aux[index].agent.exited.clone() {
+                let reader_id = self.hidden_agent_aux[index].agent.reader_id;
+                if self.hidden_agent_aux[index]
+                    .agent
+                    .drain_pending_output(AGENT_CLIENT_OUTPUT_DRAIN_BYTES)
+                {
+                    self.schedule_agent_output_available(reader_id);
+                    return;
+                }
+                let label = live_agent_status_label(&self.hidden_agent_aux[index].agent.info);
+                let key = AgentKey::new(&self.hidden_agent_aux[index].agent.info);
+                exited_hidden = Some((index, label, key, exit_status));
+                break;
+            }
+        }
+        if let Some((index, label, key, exit_status)) = exited_hidden {
+            let aux = self.hidden_agent_aux.remove(index);
+            drop(aux);
+            self.remove_persisted_agent_auxiliary(&key, "hidden_auxiliary_exited");
+            self.live_shells.retain(|info| AgentKey::new(info) != key);
+            self.agent_states.remove(&key);
+            self.status = format!("hidden right {} exited ({})", label, exit_status);
+            self.refresh_agent_runtime_states();
         }
     }
 
@@ -10172,17 +12203,39 @@ impl App {
         }
     }
 
+    fn agent_client_mut_by_reader_id(&mut self, reader_id: u64) -> Option<&mut AgentClient> {
+        if self
+            .active_agent
+            .as_ref()
+            .is_some_and(|agent| agent.reader_id == reader_id)
+        {
+            return self.active_agent.as_mut();
+        }
+        if self
+            .agent_aux
+            .as_ref()
+            .is_some_and(|aux| aux.agent.reader_id == reader_id)
+        {
+            return self.agent_aux.as_mut().map(|aux| &mut aux.agent);
+        }
+        if let Some(index) = self
+            .hidden_agent_aux
+            .iter()
+            .position(|aux| aux.agent.reader_id == reader_id)
+        {
+            return Some(&mut self.hidden_agent_aux[index].agent);
+        }
+        None
+    }
+
     /// Apply a `MainEvent::AgentEvent` to the active agent if it still
     /// matches `reader_id`. Late events from a replaced agent are silently
     /// dropped.
     fn on_agent_event(&mut self, reader_id: u64, event: AgentDaemonEvent) {
         let mut should_schedule_output = false;
-        let Some(agent) = self.active_agent.as_mut() else {
+        let Some(agent) = self.agent_client_mut_by_reader_id(reader_id) else {
             return;
         };
-        if agent.reader_id != reader_id {
-            return;
-        }
         let terminal_event = matches!(
             &event,
             AgentDaemonEvent::Exited { .. } | AgentDaemonEvent::Error { .. }
@@ -10198,12 +12251,9 @@ impl App {
 
     fn on_agent_output_available(&mut self, reader_id: u64) {
         let has_more = {
-            let Some(agent) = self.active_agent.as_mut() else {
+            let Some(agent) = self.agent_client_mut_by_reader_id(reader_id) else {
                 return;
             };
-            if agent.reader_id != reader_id {
-                return;
-            }
             agent.drain_pending_output(AGENT_CLIENT_OUTPUT_DRAIN_BYTES)
         };
         if has_more {
@@ -10214,12 +12264,9 @@ impl App {
     /// Apply a reader-thread exit signal. Treated like a daemon-disconnect.
     fn on_agent_reader_ended(&mut self, reader_id: u64, reason: String) {
         let mut should_schedule_output = false;
-        let Some(agent) = self.active_agent.as_mut() else {
+        let Some(agent) = self.agent_client_mut_by_reader_id(reader_id) else {
             return;
         };
-        if agent.reader_id != reader_id {
-            return;
-        }
         if agent.exited.is_none() {
             agent.exited = Some(format!("daemon connection ended: {}", reason));
             if agent.has_pending_output() {
@@ -10235,12 +12282,9 @@ impl App {
     /// matching attach; late writer exits from detached clients are ignored.
     fn on_agent_writer_ended(&mut self, reader_id: u64, reason: String) {
         let mut should_schedule_output = false;
-        let Some(agent) = self.active_agent.as_mut() else {
+        let Some(agent) = self.agent_client_mut_by_reader_id(reader_id) else {
             return;
         };
-        if agent.reader_id != reader_id {
-            return;
-        }
         if agent.exited.is_none() {
             agent.exited = Some(format!("daemon request writer ended: {}", reason));
             if agent.has_pending_output() {
@@ -10308,10 +12352,13 @@ impl App {
             settings: self.settings.clone(),
             ctx: AttachUiCtx {
                 key,
+                target: AttachTarget::MainAgent,
                 status_attached: format!("attached shell at {}", cwd_label),
                 status_started: format!("started shell at {}", cwd_label),
                 status_err_prefix: "shell open failed: ".to_string(),
                 status_prepare_err_prefix: "shell open failed: ".to_string(),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: false,
@@ -10499,6 +12546,35 @@ impl App {
     fn resolve_agent_launch(&mut self, info: SessionInfo, cols: u16, rows: u16, allow_defer: bool) {
         let runtime_info = self.runtime_info_for_selected_agent(&info);
         let key = AgentKey::new(&runtime_info);
+        let cached_state = self
+            .agent_states
+            .get(&key)
+            .copied()
+            .unwrap_or(AgentListState::Idle);
+        debug_log(
+            "agent_launch_resolve_start",
+            serde_json::json!({
+                "selected": session_info_debug_value(&info),
+                "runtime_info": session_info_debug_value(&runtime_info),
+                "runtime_key": agent_key_debug_value(&key),
+                "allow_defer": allow_defer,
+                "cols": cols,
+                "rows": rows,
+                "cached_state": agent_list_state_debug_value(cached_state),
+                "runtime_refresh_pending": self.runtime_refresh_pending,
+                "runtime_refresh_queued": self.runtime_refresh_queued,
+                "runtime_refresh_seq": self.runtime_refresh_seq,
+                "live_shell_discovery_pending": self.live_shell_discovery_pending,
+                "live_shell_discovery_seq": self.live_shell_discovery_seq,
+                "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                "agent_states": agent_state_entries_debug_value(&self.agent_states),
+                "live_shells": self.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
+                "new_agent_backing_aliases": agent_alias_entries_debug_value(&self.new_agent_backing_aliases),
+                "cwd_lock": coding_agent_cwd_lock_probe_debug_value(&runtime_info),
+                "meta_conflict_including_target_key": live_coding_agent_cwd_meta_conflict_including_target_key(&runtime_info).map(|info| session_info_debug_value(&info)),
+                "cwd_peers": self.live_coding_agent_cwd_peer_entries_debug_value(&runtime_info),
+            }),
+        );
         if self
             .active_agent
             .as_ref()
@@ -10518,12 +12594,7 @@ impl App {
             );
             return;
         }
-        match self
-            .agent_states
-            .get(&key)
-            .copied()
-            .unwrap_or(AgentListState::Idle)
-        {
+        match cached_state {
             AgentListState::Live { .. } | AgentListState::Attached { mine: true, .. } => {
                 self.attach_existing_live_agent(runtime_info, cols, rows, "agent_launch_live");
                 return;
@@ -10559,6 +12630,10 @@ impl App {
                 serde_json::json!({
                     "provider": key.provider.as_str(),
                     "session_id": &key.session_id,
+                    "cached_state": agent_list_state_debug_value(cached_state),
+                    "runtime_refresh_pending": self.runtime_refresh_pending,
+                    "runtime_refresh_queued": self.runtime_refresh_queued,
+                    "pending_runtime_action": pending_runtime_action_debug_value(self.pending_runtime_action.as_ref()),
                 }),
             );
             return;
@@ -10624,10 +12699,13 @@ impl App {
             settings: self.settings.clone(),
             ctx: AttachUiCtx {
                 key,
+                target: AttachTarget::MainAgent,
                 status_attached: format!("switched to live {}", label),
                 status_started: format!("switched to live {}", label),
                 status_err_prefix: format!("switch to live {} failed: ", label),
                 status_prepare_err_prefix: format!("switch to live {} failed: ", label),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: false,
@@ -10980,10 +13058,13 @@ impl App {
             settings: self.settings.clone(),
             ctx: AttachUiCtx {
                 key,
+                target: AttachTarget::MainAgent,
                 status_attached,
                 status_started,
                 status_err_prefix,
                 status_prepare_err_prefix,
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: is_cokacdir,
                 remove_dead_on_notfound: false,
@@ -11039,6 +13120,12 @@ impl App {
                 "cols": cols,
                 "rows": rows,
                 "agent_states": agent_state_entries_debug_value(&self.agent_states),
+                "live_shells": self.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
+                "runtime_refresh_pending": self.runtime_refresh_pending,
+                "runtime_refresh_queued": self.runtime_refresh_queued,
+                "runtime_refresh_seq": self.runtime_refresh_seq,
+                "live_shell_discovery_pending": self.live_shell_discovery_pending,
+                "pending_runtime_action": pending_runtime_action_debug_value(self.pending_runtime_action.as_ref()),
             }),
         );
         self.restore_live_agent(cols, rows);
@@ -11046,6 +13133,14 @@ impl App {
 
     fn restore_live_agent(&mut self, cols: u16, rows: u16) {
         if self.main_tx.is_none() {
+            debug_log(
+                "restore_live_agent_unavailable",
+                serde_json::json!({
+                    "reason": "main_tx_missing",
+                    "cols": cols,
+                    "rows": rows,
+                }),
+            );
             self.status =
                 "no active agent to switch to; press e/Enter to start selected agent".into();
             return;
@@ -11062,14 +13157,56 @@ impl App {
         rows: u16,
         allow_defer: bool,
     ) {
+        let runtime_in_flight = self.agent_runtime_refresh_in_flight();
+        let selected_info = selected_key.and_then(|selected_key| {
+            self.current()
+                .filter(|info| AgentKey::new(info) == *selected_key)
+        });
+        let restore_candidates =
+            self.live_agent_restore_candidate_entries_debug_value(selected_key);
         let Some(info) = self.live_agent_restore_candidate_for(selected_key) else {
-            if allow_defer && self.agent_runtime_refresh_in_flight() {
+            let will_defer = allow_defer && runtime_in_flight;
+            debug_log(
+                "restore_live_agent_no_candidate",
+                serde_json::json!({
+                    "selected_key": selected_key.map(agent_key_debug_value),
+                    "selected_info": selected_info.map(session_info_debug_value),
+                    "allow_defer": allow_defer,
+                    "will_defer": will_defer,
+                    "runtime_refresh_pending": self.runtime_refresh_pending,
+                    "runtime_refresh_queued": self.runtime_refresh_queued,
+                    "runtime_refresh_seq": self.runtime_refresh_seq,
+                    "runtime_refresh_applied_seq": self.runtime_refresh_applied_seq,
+                    "live_shell_discovery_pending": self.live_shell_discovery_pending,
+                    "live_shell_discovery_seq": self.live_shell_discovery_seq,
+                    "sessions_len": self.sessions.len(),
+                    "live_shells_len": self.live_shells.len(),
+                    "agent_states_len": self.agent_states.len(),
+                    "candidate_entries": restore_candidates,
+                    "selected_runtime_probe": selected_key.map(|key| agent_runtime_probe_debug_value(key, std::process::id())),
+                    "selected_cwd_lock": selected_info.map(coding_agent_cwd_lock_probe_debug_value),
+                    "live_shell_runtime_probes": self.live_shells.iter().map(|info| {
+                        agent_runtime_probe_debug_value(&AgentKey::new(info), std::process::id())
+                    }).collect::<Vec<_>>(),
+                    "pending_runtime_action": pending_runtime_action_debug_value(self.pending_runtime_action.as_ref()),
+                }),
+            );
+            if will_defer {
                 self.pending_runtime_action = Some(PendingRuntimeAction::RestoreLive {
                     selected_key: selected_key.cloned(),
                     cols,
                     rows,
                 });
                 self.status = "checking live agents...".into();
+                debug_log(
+                    "restore_live_agent_deferred_runtime_refresh",
+                    serde_json::json!({
+                        "selected_key": selected_key.map(agent_key_debug_value),
+                        "runtime_refresh_pending": self.runtime_refresh_pending,
+                        "runtime_refresh_queued": self.runtime_refresh_queued,
+                        "runtime_refresh_seq": self.runtime_refresh_seq,
+                    }),
+                );
                 return;
             }
             self.status =
@@ -11085,6 +13222,11 @@ impl App {
                 "provider": key.provider.as_str(),
                 "session_id": &key.session_id,
                 "kind": agent_info_kind(&info),
+                "selected_key": selected_key.map(agent_key_debug_value),
+                "allow_defer": allow_defer,
+                "runtime_refresh_pending": self.runtime_refresh_pending,
+                "runtime_refresh_queued": self.runtime_refresh_queued,
+                "state": optional_agent_list_state_debug_value(self.agent_states.get(&key).copied()),
             }),
         );
         self.request_attach(AttachJob {
@@ -11097,10 +13239,13 @@ impl App {
             settings: self.settings.clone(),
             ctx: AttachUiCtx {
                 key,
+                target: AttachTarget::MainAgent,
                 status_attached: format!("switched to live {}", label),
                 status_started: format!("switched to live {}", label),
                 status_err_prefix: format!("switch to live {} failed: ", label),
                 status_prepare_err_prefix: format!("switch to live {} failed: ", label),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -11117,6 +13262,9 @@ impl App {
             let provider = agent.info.provider;
             let session_id = agent.info.session_id.clone();
             drop(agent);
+            if self.agent_aux.is_some() {
+                let _ = self.hide_auxiliary_agent("main_agent_detached");
+            }
             self.discard_pending_agent_runtime_refresh();
             self.status = format!(
                 "detached {} agent {}",
@@ -11152,9 +13300,12 @@ impl App {
         };
         drop(agent);
         self.cancel_pending_attach("kill_active_agent");
+        let terminated_auxiliaries =
+            self.terminate_auxiliaries_for_parent(&key, "main_agent_killed");
 
         let result = terminate_agent_daemon_for_info(&key, &active_info);
         self.agent_states.remove(&key);
+        self.live_shells.retain(|info| AgentKey::new(info) != key);
         self.discard_pending_agent_runtime_refresh();
         self.refresh_agent_runtime_states();
 
@@ -11169,6 +13320,7 @@ impl App {
                         "daemon_pid": outcome.pid,
                         "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
+                        "terminated_auxiliaries": terminated_auxiliaries,
                         "has_next": next_info.is_some(),
                     }),
                 );
@@ -11248,6 +13400,19 @@ impl App {
         None
     }
 
+    fn pending_main_attach_key(&self) -> Option<AgentKey> {
+        self.queued_attach
+            .as_ref()
+            .filter(|job| job.ctx.target.is_main_agent())
+            .map(|job| job.ctx.key.clone())
+            .or_else(|| {
+                self.attach_in_flight
+                    .as_ref()
+                    .filter(|attach| attach.target.is_main_agent())
+                    .map(|attach| attach.key.clone())
+            })
+    }
+
     fn attach_after_agent_kill(
         &mut self,
         next_info: SessionInfo,
@@ -11281,6 +13446,7 @@ impl App {
             settings: self.settings.clone(),
             ctx: AttachUiCtx {
                 key: next_key,
+                target: AttachTarget::MainAgent,
                 status_attached: format!(
                     "killed {}; switched to live {}",
                     killed_label, next_label
@@ -11294,6 +13460,8 @@ impl App {
                     "killed {}; switch to live {} failed: ",
                     killed_label, next_label
                 ),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -11339,6 +13507,7 @@ impl App {
             settings: self.settings.clone(),
             ctx: AttachUiCtx {
                 key: next_key,
+                target: AttachTarget::MainAgent,
                 status_attached: format!(
                     "{} exited; switched to live {}",
                     exited_label, next_label
@@ -11352,6 +13521,8 @@ impl App {
                     "{} exited; switch to live {} failed: ",
                     exited_label, next_label
                 ),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -11370,9 +13541,14 @@ impl App {
         let selected_key = AgentKey::new(&info);
         let runtime_info = self.runtime_info_for_selected_agent(&info);
         let runtime_key = AgentKey::new(&runtime_info);
+        let terminated_auxiliaries =
+            self.terminate_auxiliaries_for_parent(&runtime_key, "selected_agent_killed");
         let result = terminate_agent_daemon_for_info(&runtime_key, &runtime_info);
         self.agent_states.remove(&selected_key);
         self.agent_states.remove(&runtime_key);
+        self.live_shells.retain(|info| {
+            AgentKey::new(info) != selected_key && AgentKey::new(info) != runtime_key
+        });
         self.discard_pending_agent_runtime_refresh();
         self.refresh_agent_runtime_states();
 
@@ -11408,6 +13584,7 @@ impl App {
                         "daemon_pid": outcome.pid,
                         "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
+                        "terminated_auxiliaries": terminated_auxiliaries,
                     }),
                 );
             }
@@ -11440,14 +13617,7 @@ impl App {
         // agent: attaches resolve asynchronously, so rapid presses must each
         // advance one candidate instead of collapsing onto the same target.
         let current_key = self
-            .queued_attach
-            .as_ref()
-            .map(|job| job.ctx.key.clone())
-            .or_else(|| {
-                self.attach_in_flight
-                    .as_ref()
-                    .map(|attach| attach.key.clone())
-            })
+            .pending_main_attach_key()
             .unwrap_or_else(|| AgentKey::new(&active_agent.info));
 
         self.refresh_agent_runtime_states();
@@ -11465,18 +13635,16 @@ impl App {
     ) {
         // The anchor is valid when it is the active agent OR the target of
         // an attach that is still in flight / queued (rapid stepping).
-        let anchor_valid = self
-            .active_agent
-            .as_ref()
-            .is_some_and(|agent| AgentKey::new(&agent.info) == current_key)
-            || self
-                .attach_in_flight
+        let anchor_valid =
+            self.active_agent
                 .as_ref()
-                .is_some_and(|attach| attach.key == current_key)
-            || self
-                .queued_attach
-                .as_ref()
-                .is_some_and(|job| job.ctx.key == current_key);
+                .is_some_and(|agent| AgentKey::new(&agent.info) == current_key)
+                || self.attach_in_flight.as_ref().is_some_and(|attach| {
+                    attach.target.is_main_agent() && attach.key == current_key
+                })
+                || self.queued_attach.as_ref().is_some_and(|job| {
+                    job.ctx.target.is_main_agent() && job.ctx.key == current_key
+                });
         if !anchor_valid {
             self.status = "active agent changed; switch cancelled.".into();
             return;
@@ -11542,10 +13710,13 @@ impl App {
             settings: self.settings.clone(),
             ctx: AttachUiCtx {
                 key: next_key,
+                target: AttachTarget::MainAgent,
                 status_attached: format!("switched to live {}", next_label),
                 status_started: format!("switched to live {}", next_label),
                 status_err_prefix: format!("switch to live {} failed: ", next_label),
                 status_prepare_err_prefix: format!("switch to live {} failed: ", next_label),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
                 // A NotFound connect error means the daemon's socket file is
@@ -11562,29 +13733,45 @@ impl App {
 
     fn send_key_to_active_agent(&mut self, key: KeyEvent) {
         if let Some(agent) = self.active_agent.as_mut() {
-            let overlay_before = agent.codex_transcript_overlay_assumed_open;
-            agent.send_key(key);
-            let overlay_after = codex_transcript_overlay_state_after_forwarded_key(agent, key);
-            agent.codex_transcript_overlay_assumed_open = overlay_after;
-            if overlay_before != agent.codex_transcript_overlay_assumed_open {
-                debug_log(
-                    "agent_codex_transcript_overlay_assumption",
-                    serde_json::json!({
-                        "provider": agent.info.provider.as_str(),
-                        "session_id": &agent.info.session_id,
-                        "reason": "forwarded_key",
-                        "key": debug_key_event_value(key),
-                        "before": overlay_before,
-                        "after": agent.codex_transcript_overlay_assumed_open,
-                    }),
-                );
+            send_key_to_agent_client(agent, key);
+        }
+    }
+
+    fn send_key_to_focused_agent(&mut self, key: KeyEvent) {
+        match self.agent_focus {
+            AgentFocusPane::Auxiliary => {
+                if let Some(aux) = self.agent_aux.as_mut() {
+                    send_key_to_agent_client(&mut aux.agent, key);
+                } else {
+                    self.status = "right panel is not open.".into();
+                }
             }
+            AgentFocusPane::Sidebar => {
+                self.status = "agents sidebar focused.".into();
+            }
+            AgentFocusPane::Main => self.send_key_to_active_agent(key),
         }
     }
 
     fn send_paste_to_active_agent(&mut self, text: &str) {
         if let Some(agent) = self.active_agent.as_mut() {
             agent.send_paste(text);
+        }
+    }
+
+    fn send_paste_to_focused_agent(&mut self, text: &str) {
+        match self.agent_focus {
+            AgentFocusPane::Auxiliary => {
+                if let Some(aux) = self.agent_aux.as_mut() {
+                    aux.agent.send_paste(text);
+                } else {
+                    self.status = "right panel is not open.".into();
+                }
+            }
+            AgentFocusPane::Sidebar => {
+                self.status = "agents sidebar focused.".into();
+            }
+            AgentFocusPane::Main => self.send_paste_to_active_agent(text),
         }
     }
 
@@ -11597,118 +13784,175 @@ impl App {
         let Some(agent) = self.active_agent.as_mut() else {
             return;
         };
-        if is_plain_pty_tool_session_info(&agent.info) {
-            let before = agent.scrollback_offset();
-            let render_source_before = agent_scroll_render_source(agent);
-            let after = agent.scroll_screen(action, page_rows);
-            let render_source_after = agent_scroll_render_source(agent);
-            let label = if is_cokacdir_session_info(&agent.info) {
-                "cokacdir"
-            } else {
-                "Terminal"
-            };
-            self.status = format!("{}: scrolled {}.", label, child_scroll_action_label(action));
-            debug_log(
-                "agent_pty_tool_parent_scroll",
-                serde_json::json!({
-                    "kind": agent_info_kind(&agent.info),
-                    "provider": agent.info.provider.as_str(),
-                    "session_id": &agent.info.session_id,
-                    "action": format!("{:?}", action),
-                    "label": child_scroll_action_label(action),
-                    "strategy": "parent_shell_scrollback",
-                    "original_key": debug_key_event_value(key),
-                    "page_rows": page_rows,
-                    "scrollback_before": before,
-                    "scrollback_after": after,
-                    "render_source_before": render_source_before,
-                    "render_source_after": render_source_after,
-                    "parser_scrollback": agent.parser.screen().scrollback(),
-                    "history_scroll_offset": agent.history_scroll_offset,
-                    "screen_history_lines": agent.screen_history.len(),
-                    "status": &self.status,
-                }),
-            );
-            return;
-        }
-        let provider = agent.info.provider;
-        let overlay_before = agent.codex_transcript_overlay_assumed_open;
-        let mut delegated_keys = Vec::new();
-        let strategy = if provider == Provider::Codex {
-            if let Some(keys) = codex_child_scroll_delegated_keys(action, key, overlay_before) {
-                delegated_keys = keys;
-                "codex_keymap_transcript_overlay"
-            } else {
-                delegated_keys.push(key);
-                "forward_original"
-            }
-        } else if provider == Provider::Claude {
-            if let Some(scroll_key) = claude_child_scroll_key(action) {
-                delegated_keys.push(scroll_key);
-                "claude_fullscreen_scroll"
-            } else {
-                delegated_keys.push(key);
-                "forward_original"
-            }
-        } else if provider == Provider::OpenCode {
-            if let Some(scroll_key) = opencode_child_scroll_key(action) {
-                delegated_keys.push(scroll_key);
-                "opencode_page_scroll"
-            } else {
-                delegated_keys.push(key);
-                "forward_original"
-            }
-        } else {
-            delegated_keys.push(key);
-            "forward_original"
-        };
+        let status = delegate_agent_scroll_to_child(agent, action, key, page_rows);
+        self.status = status;
+    }
 
-        let delegated_debug = delegated_keys
-            .iter()
-            .copied()
-            .map(debug_key_event_value)
-            .collect::<Vec<_>>();
-        for delegated_key in delegated_keys {
-            agent.send_key(delegated_key);
+    fn delegate_focused_agent_scroll_to_child(
+        &mut self,
+        action: AgentScrollAction,
+        key: KeyEvent,
+        page_rows: usize,
+    ) {
+        match self.agent_focus {
+            AgentFocusPane::Auxiliary => {
+                if let Some(aux) = self.agent_aux.as_mut() {
+                    self.status =
+                        delegate_agent_scroll_to_child(&mut aux.agent, action, key, page_rows);
+                } else {
+                    self.status = "right panel is not open.".into();
+                }
+            }
+            AgentFocusPane::Sidebar => {
+                self.status = "agents sidebar focused.".into();
+            }
+            AgentFocusPane::Main => {
+                self.delegate_active_agent_scroll_to_child(action, key, page_rows);
+            }
         }
-        if strategy == "codex_keymap_transcript_overlay" {
-            agent.codex_transcript_overlay_assumed_open = true;
-        } else {
-            let overlay_after = codex_transcript_overlay_state_after_forwarded_key(agent, key);
-            agent.codex_transcript_overlay_assumed_open = overlay_after;
-        }
-        self.status = if provider == Provider::Codex {
-            format!(
-                "Codex transcript: delegated {}.",
-                child_scroll_action_label(action)
-            )
-        } else if provider == Provider::Claude && strategy == "claude_fullscreen_scroll" {
-            format!(
-                "Claude fullscreen: delegated {}.",
-                child_scroll_action_label(action)
-            )
-        } else if provider == Provider::OpenCode && strategy == "opencode_page_scroll" {
-            format!("OpenCode: delegated {}.", child_scroll_action_label(action))
-        } else {
-            format!("{} scroll key forwarded to child.", provider.as_str())
-        };
+    }
+}
+
+fn send_key_to_agent_client(agent: &mut AgentClient, key: KeyEvent) {
+    let overlay_before = agent.codex_transcript_overlay_assumed_open;
+    agent.send_key(key);
+    let overlay_after = codex_transcript_overlay_state_after_forwarded_key(agent, key);
+    agent.codex_transcript_overlay_assumed_open = overlay_after;
+    if overlay_before != agent.codex_transcript_overlay_assumed_open {
         debug_log(
-            "agent_child_scroll_delegated",
+            "agent_codex_transcript_overlay_assumption",
             serde_json::json!({
-                "provider": provider.as_str(),
+                "provider": agent.info.provider.as_str(),
                 "session_id": &agent.info.session_id,
-                "action": format!("{:?}", action),
-                "label": child_scroll_action_label(action),
-                "strategy": strategy,
-                "original_key": debug_key_event_value(key),
-                "delegated_keys": delegated_debug,
-                "codex_overlay_assumed_open_before": overlay_before,
-                "codex_overlay_assumed_open_after": agent.codex_transcript_overlay_assumed_open,
-                "status": &self.status,
+                "reason": "forwarded_key",
+                "key": debug_key_event_value(key),
+                "before": overlay_before,
+                "after": agent.codex_transcript_overlay_assumed_open,
             }),
         );
     }
+}
 
+fn delegate_agent_scroll_to_child(
+    agent: &mut AgentClient,
+    action: AgentScrollAction,
+    key: KeyEvent,
+    page_rows: usize,
+) -> String {
+    if is_plain_pty_tool_session_info(&agent.info) {
+        let before = agent.scrollback_offset();
+        let render_source_before = agent_scroll_render_source(agent);
+        let after = agent.scroll_screen(action, page_rows);
+        let render_source_after = agent_scroll_render_source(agent);
+        let label = if is_cokacdir_session_info(&agent.info) {
+            "cokacdir"
+        } else {
+            "Terminal"
+        };
+        let status = format!("{}: scrolled {}.", label, child_scroll_action_label(action));
+        debug_log(
+            "agent_pty_tool_parent_scroll",
+            serde_json::json!({
+                "kind": agent_info_kind(&agent.info),
+                "provider": agent.info.provider.as_str(),
+                "session_id": &agent.info.session_id,
+                "action": format!("{:?}", action),
+                "label": child_scroll_action_label(action),
+                "strategy": "parent_shell_scrollback",
+                "original_key": debug_key_event_value(key),
+                "page_rows": page_rows,
+                "scrollback_before": before,
+                "scrollback_after": after,
+                "render_source_before": render_source_before,
+                "render_source_after": render_source_after,
+                "parser_scrollback": agent.parser.screen().scrollback(),
+                "history_scroll_offset": agent.history_scroll_offset,
+                "screen_history_lines": agent.screen_history.len(),
+                "status": &status,
+            }),
+        );
+        return status;
+    }
+    let provider = agent.info.provider;
+    let overlay_before = agent.codex_transcript_overlay_assumed_open;
+    let mut delegated_keys = Vec::new();
+    let strategy = if provider == Provider::Codex {
+        if let Some(keys) = codex_child_scroll_delegated_keys(action, key, overlay_before) {
+            delegated_keys = keys;
+            "codex_keymap_transcript_overlay"
+        } else {
+            delegated_keys.push(key);
+            "forward_original"
+        }
+    } else if provider == Provider::Claude {
+        if let Some(scroll_key) = claude_child_scroll_key(action) {
+            delegated_keys.push(scroll_key);
+            "claude_fullscreen_scroll"
+        } else {
+            delegated_keys.push(key);
+            "forward_original"
+        }
+    } else if provider == Provider::OpenCode {
+        if let Some(scroll_key) = opencode_child_scroll_key(action) {
+            delegated_keys.push(scroll_key);
+            "opencode_page_scroll"
+        } else {
+            delegated_keys.push(key);
+            "forward_original"
+        }
+    } else {
+        delegated_keys.push(key);
+        "forward_original"
+    };
+
+    let delegated_debug = delegated_keys
+        .iter()
+        .copied()
+        .map(debug_key_event_value)
+        .collect::<Vec<_>>();
+    for delegated_key in delegated_keys {
+        agent.send_key(delegated_key);
+    }
+    if strategy == "codex_keymap_transcript_overlay" {
+        agent.codex_transcript_overlay_assumed_open = true;
+    } else {
+        let overlay_after = codex_transcript_overlay_state_after_forwarded_key(agent, key);
+        agent.codex_transcript_overlay_assumed_open = overlay_after;
+    }
+    let status = if provider == Provider::Codex {
+        format!(
+            "Codex transcript: delegated {}.",
+            child_scroll_action_label(action)
+        )
+    } else if provider == Provider::Claude && strategy == "claude_fullscreen_scroll" {
+        format!(
+            "Claude fullscreen: delegated {}.",
+            child_scroll_action_label(action)
+        )
+    } else if provider == Provider::OpenCode && strategy == "opencode_page_scroll" {
+        format!("OpenCode: delegated {}.", child_scroll_action_label(action))
+    } else {
+        format!("{} scroll key forwarded to child.", provider.as_str())
+    };
+    debug_log(
+        "agent_child_scroll_delegated",
+        serde_json::json!({
+            "provider": provider.as_str(),
+            "session_id": &agent.info.session_id,
+            "action": format!("{:?}", action),
+            "label": child_scroll_action_label(action),
+            "strategy": strategy,
+            "original_key": debug_key_event_value(key),
+            "delegated_keys": delegated_debug,
+            "codex_overlay_assumed_open_before": overlay_before,
+            "codex_overlay_assumed_open_after": agent.codex_transcript_overlay_assumed_open,
+            "status": &status,
+        }),
+    );
+    status
+}
+
+impl App {
     fn begin_title_edit(&mut self) {
         let Some(info) = self.current().cloned() else {
             self.status = "no session selected.".into();
@@ -14523,6 +16767,7 @@ fn compute_agent_runtime_refresh(
 
     AgentRuntimeRefreshResult {
         seq: request.seq,
+        discover_live_shells: request.discover_live_shells,
         live_shells,
         agent_states: states,
         new_agent_backing_aliases: request.new_agent_backing_aliases,
@@ -14893,7 +17138,7 @@ fn print_help() {
          Esc/q/Ctrl+q quit\n  \
          ↑↓            navigate\n  \
          Alt+↑/↓ or Ctrl+Shift+↑/↓ select from sidebar/list\n  \
-         Alt+←/→ or Ctrl+Shift+←/→ resize panes (saved)\n  \
+         Alt+←/→ or Ctrl+Shift+←/→ resize focused side pane\n  \
          Agent: Shift+↑/↓ child transcript line, Shift+Alt+↑/↓ page, Shift/Alt+Home/End top/bottom\n  \
          PgUp / PgDn   jump 10\n  \
          g/Home / G/End top / bottom\n  \
@@ -15252,8 +17497,8 @@ fn handle_paste_input_event(app: &mut App, text: String) {
     }
     if app.is_agent_view() && matches!(app.input_mode, InputMode::Normal) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let _ = app.sync_active_agent_viewport(cols, rows);
-        app.send_paste_to_active_agent(&text);
+        let _ = app.sync_agent_viewports(cols, rows);
+        app.send_paste_to_focused_agent(&text);
         return;
     }
     if paste_text_into_input_mode(app, &text) {
@@ -16982,6 +19227,46 @@ fn coding_agent_cwd_lock_debug_value(lock: &CodingAgentCwdLock) -> serde_json::V
         "session_id": &lock.session_id,
         "cwd": &lock.cwd,
         "created_at_epoch_s": lock.created_at_epoch_s,
+    })
+}
+
+fn coding_agent_cwd_lock_probe_debug_value(info: &SessionInfo) -> serde_json::Value {
+    if !is_coding_agent_session_info(info) || info.cwd.trim().is_empty() {
+        return serde_json::json!({
+            "status": "not_applicable",
+        });
+    }
+    let target_key = AgentKey::new(info);
+    let path = match coding_agent_cwd_lock_path(info) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return serde_json::json!({
+                "status": "no_path",
+            });
+        }
+        Err(error) => {
+            return serde_json::json!({
+                "status": "path_failed",
+                "error": error.to_string(),
+            });
+        }
+    };
+    let Some(lock) = read_coding_agent_cwd_lock(&path) else {
+        return serde_json::json!({
+            "status": "missing_or_unreadable",
+            "path": path.display().to_string(),
+            "path_exists": path.exists(),
+        });
+    };
+    let lock_key = coding_agent_cwd_lock_key(&lock);
+    serde_json::json!({
+        "status": "present",
+        "path": path.display().to_string(),
+        "path_exists": path.exists(),
+        "live": coding_agent_cwd_lock_is_live(&lock),
+        "lock_key": lock_key.as_ref().map(agent_key_debug_value),
+        "lock_key_matches_target": lock_key.as_ref() == Some(&target_key),
+        "lock": coding_agent_cwd_lock_debug_value(&lock),
     })
 }
 
@@ -21446,8 +23731,28 @@ fn is_plain_pty_tool_session_info(info: &SessionInfo) -> bool {
     is_shell_session_info(info) || is_cokacdir_session_info(info)
 }
 
+fn auxiliary_kind_for_session_info(info: &SessionInfo) -> Option<AgentAuxKind> {
+    if is_shell_session_info(info) {
+        Some(AgentAuxKind::Terminal)
+    } else if is_cokacdir_session_info(info) {
+        Some(AgentAuxKind::Cokacdir)
+    } else {
+        None
+    }
+}
+
 fn is_coding_agent_session_info(info: &SessionInfo) -> bool {
     !is_plain_pty_tool_session_info(info)
+}
+
+fn coding_agent_auxiliary_parent_infos_match(left: &SessionInfo, right: &SessionInfo) -> bool {
+    if !is_coding_agent_session_info(left) || !is_coding_agent_session_info(right) {
+        return false;
+    }
+    if !is_new_agent_session_info(left) && !is_new_agent_session_info(right) {
+        return false;
+    }
+    !left.cwd.trim().is_empty() && left.provider == right.provider && left.cwd == right.cwd
 }
 
 fn shell_session_info_for_cwd(cwd: String) -> SessionInfo {
@@ -22706,10 +25011,8 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         return;
     }
     let keybindings = app.keybindings.clone();
-    let shift_shortcuts_disabled = agent_shift_shortcuts_disabled_for_active_info(
-        app.active_agent.as_ref().map(|agent| &agent.info),
-        key,
-    );
+    let shift_shortcuts_disabled =
+        agent_shift_shortcuts_disabled_for_active_info(app.focused_agent_info(), key);
     if !shift_shortcuts_disabled && keybindings.matches(KeyAction::GlobalQuit, key) {
         if app.request_quit("agent_global_quit", false) {
             debug_log_agent_key(key, "quit");
@@ -22722,11 +25025,14 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         return;
     }
     if matches!(app.input_mode, InputMode::NewSession { .. }) {
-        let viewport = agent_viewport_for_terminal(
+        let viewport = agent_viewports_for_terminal(
             total_width,
             terminal_rows,
             app.agent_sidebar_config_width(),
-        );
+            app.agent_aux.is_some(),
+            app.agent_aux_width,
+        )
+        .main;
         handle_new_session_key(app, key, viewport.pty_cols, viewport.pty_rows, &keybindings);
         return;
     }
@@ -22746,13 +25052,15 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         return;
     }
     if !shift_shortcuts_disabled
-        && !agent_kill_shortcut_disabled_for_active_info(
-            app.active_agent.as_ref().map(|agent| &agent.info),
-        )
+        && !agent_kill_shortcut_disabled_for_active_info(app.focused_agent_info())
         && keybindings.matches(KeyAction::AgentKill, key)
     {
         debug_log_agent_key(key, "kill");
-        app.kill_active_agent();
+        if app.agent_focus == AgentFocusPane::Auxiliary && app.agent_aux.is_some() {
+            let _ = app.close_auxiliary_agent("kill_shortcut", true);
+        } else {
+            app.kill_active_agent();
+        }
         return;
     }
     if !shift_shortcuts_disabled && keybindings.matches(KeyAction::AgentNewShell, key) {
@@ -22766,11 +25074,46 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
         return;
     }
+    if !shift_shortcuts_disabled && keybindings.matches(KeyAction::AgentToggleCokacdirPanel, key) {
+        debug_log_agent_key(key, "toggle_cokacdir_panel");
+        app.toggle_auxiliary_agent_panel(AgentAuxKind::Cokacdir, total_width, terminal_rows);
+        return;
+    }
+    if !shift_shortcuts_disabled && keybindings.matches(KeyAction::AgentToggleTerminalPanel, key) {
+        debug_log_agent_key(key, "toggle_terminal_panel");
+        app.toggle_auxiliary_agent_panel(AgentAuxKind::Terminal, total_width, terminal_rows);
+        return;
+    }
+    if !shift_shortcuts_disabled && keybindings.matches(KeyAction::AgentFocusSidebar, key) {
+        debug_log_agent_key(key, "focus_sidebar");
+        app.focus_agent_sidebar();
+        let _ = app.sync_agent_viewports(total_width, terminal_rows);
+        return;
+    }
+    if !shift_shortcuts_disabled && keybindings.matches(KeyAction::AgentFocusMain, key) {
+        debug_log_agent_key(key, "focus_main");
+        app.focus_main_agent();
+        let _ = app.sync_agent_viewports(total_width, terminal_rows);
+        return;
+    }
+    if !shift_shortcuts_disabled && keybindings.matches(KeyAction::AgentFocusAuxiliary, key) {
+        debug_log_agent_key(key, "focus_auxiliary");
+        app.focus_auxiliary_agent();
+        let _ = app.sync_agent_viewports(total_width, terminal_rows);
+        return;
+    }
     if !shift_shortcuts_disabled {
         if let Some(action) = agent_scrollback_key(&keybindings, key) {
             debug_log_agent_key(key, "delegate_scroll");
-            let viewport = app.sync_active_agent_viewport(total_width, terminal_rows);
-            let page_rows = viewport.page_rows;
+            let viewports = app.sync_agent_viewports(total_width, terminal_rows);
+            let page_rows = if app.agent_focus == AgentFocusPane::Auxiliary {
+                viewports
+                    .auxiliary
+                    .map(|viewport| viewport.page_rows)
+                    .unwrap_or(viewports.main.page_rows)
+            } else {
+                viewports.main.page_rows
+            };
             debug_log(
                 "agent_child_scroll_key_match",
                 serde_json::json!({
@@ -22781,13 +25124,18 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
                     "action": format!("{:?}", action),
                     "terminal_cols": total_width,
                     "terminal_rows": terminal_rows,
-                    "agent_area_cols": viewport.area_cols,
-                    "agent_area_rows": viewport.area_rows,
-                    "pty_cols": viewport.pty_cols,
-                    "pty_rows": viewport.pty_rows,
+                    "agent_area_cols": viewports.main.area_cols,
+                    "agent_area_rows": viewports.main.area_rows,
+                    "pty_cols": viewports.main.pty_cols,
+                    "pty_rows": viewports.main.pty_rows,
+                    "aux_area_cols": viewports.auxiliary.map(|viewport| viewport.area_cols),
+                    "aux_area_rows": viewports.auxiliary.map(|viewport| viewport.area_rows),
+                    "aux_pty_cols": viewports.auxiliary.map(|viewport| viewport.pty_cols),
+                    "aux_pty_rows": viewports.auxiliary.map(|viewport| viewport.pty_rows),
                     "page_rows": page_rows,
                     "total_width": total_width,
                     "sidebar_width": app.agent_sidebar_config_width(),
+                    "agent_focus": format!("{:?}", app.agent_focus),
                     "active_agent": app.active_agent.as_ref().map(|agent| serde_json::json!({
                         "provider": agent.info.provider.as_str(),
                         "session_id": &agent.info.session_id,
@@ -22800,26 +25148,29 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
                     })),
                 }),
             );
-            app.delegate_active_agent_scroll_to_child(action, key, page_rows);
+            app.delegate_focused_agent_scroll_to_child(action, key, page_rows);
             return;
         }
     }
     if !shift_shortcuts_disabled {
         if let Some(delta) = agent_pane_resize_key(&keybindings, key) {
             debug_log_agent_key(key, "resize");
-            app.adjust_agent_sidebar_width(delta, total_width);
-            let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
+            app.resize_focused_agent_pane(delta, total_width);
+            let _ = app.sync_agent_viewports(total_width, terminal_rows);
             return;
         }
     }
     if !shift_shortcuts_disabled {
         if let Some(delta) = agent_sidebar_select_key(&keybindings, key) {
             debug_log_agent_key(key, "select");
-            let viewport = agent_viewport_for_terminal(
+            let viewport = agent_viewports_for_terminal(
                 total_width,
                 terminal_rows,
                 app.agent_sidebar_config_width(),
-            );
+                app.agent_aux.is_some(),
+                app.agent_aux_width,
+            )
+            .main;
             app.switch_active_agent(delta, false, viewport.pty_cols, viewport.pty_rows);
             return;
         }
@@ -22827,11 +25178,14 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
     if !shift_shortcuts_disabled {
         if let Some(delta) = agent_switch_key(&keybindings, key) {
             debug_log_agent_key(key, "switch");
-            let viewport = agent_viewport_for_terminal(
+            let viewport = agent_viewports_for_terminal(
                 total_width,
                 terminal_rows,
                 app.agent_sidebar_config_width(),
-            );
+                app.agent_aux.is_some(),
+                app.agent_aux_width,
+            )
+            .main;
             app.switch_active_agent(delta, true, viewport.pty_cols, viewport.pty_rows);
             return;
         }
@@ -22839,8 +25193,8 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
     if should_log_agent_key(key) {
         debug_log_agent_key(key, "forward");
     }
-    let _ = app.sync_active_agent_viewport(total_width, terminal_rows);
-    app.send_key_to_active_agent(key);
+    let _ = app.sync_agent_viewports(total_width, terminal_rows);
+    app.send_key_to_focused_agent(key);
 }
 
 fn handle_ai_search_locked_key(app: &mut App, key: KeyEvent) -> bool {
@@ -23694,47 +26048,40 @@ fn render_agent_startup_spinner(
     );
 }
 
-fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
-    let area = f.area();
-    let main_area = Rect::new(
-        area.x,
-        area.y,
-        area.width,
-        area.height.saturating_sub(AGENT_STATUS_HEIGHT),
-    );
-    let status_area = Rect::new(
-        area.x,
-        area.y + main_area.height,
-        area.width,
-        AGENT_STATUS_HEIGHT.min(area.height),
-    );
+#[derive(Clone)]
+struct AgentRenderOutcome {
+    cursor: Option<(u16, u16)>,
+    scrollback_offset: usize,
+    command_line: String,
+    info: SessionInfo,
+}
 
-    let app_status = app.display_status();
-    let active_key = app
-        .active_agent
-        .as_ref()
-        .map(|agent| AgentKey::new(&agent.info));
-    let sidebar_width = app.agent_sidebar_width(main_area.width);
-    let (sidebar_area, agent_area) = if sidebar_width > 0 {
-        let output_width = main_area.width.saturating_sub(sidebar_width);
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(sidebar_width),
-                Constraint::Length(output_width),
-            ])
-            .split(main_area);
-        (Some(chunks[0]), chunks[1])
+fn render_agent_client_pane(
+    f: &mut ratatui::Frame,
+    agent: &mut AgentClient,
+    area: Rect,
+    frame_title: Option<&str>,
+    focused: bool,
+) -> AgentRenderOutcome {
+    let content_area = if let Some(title) = frame_title {
+        fill_area(f.buffer_mut(), area, Style::default().bg(AGENT_DEFAULT_BG));
+        let border_color = if focused {
+            THEME_BORDER_ACTIVE
+        } else {
+            THEME_BORDER
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color).bg(AGENT_DEFAULT_BG))
+            .style(Style::default().bg(AGENT_DEFAULT_BG))
+            .title(title.to_string());
+        f.render_widget(block, area);
+        pane_inner(area)
     } else {
-        (None, main_area)
+        area
     };
 
-    let Some(agent) = app.active_agent.as_mut() else {
-        f.render_widget(Clear, area);
-        return;
-    };
-
-    let (agent_screen_rows, agent_screen_cols) = agent_screen_size_for_area(agent_area);
+    let (agent_screen_rows, agent_screen_cols) = agent_screen_size_for_area(content_area);
     agent.resize(agent_screen_cols, agent_screen_rows);
     // Output is already in the parser — the reader thread pushed it via
     // process_agent_event before this draw was scheduled. No socket read
@@ -23748,8 +26095,8 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
                 "session_id": &agent.info.session_id,
                 "screen_rows": screen_size.0,
                 "screen_cols": screen_size.1,
-                "area_rows": agent_area.height,
-                "area_cols": agent_area.width,
+                "area_rows": content_area.height,
+                "area_cols": content_area.width,
                 "target_rows": agent_screen_rows,
                 "target_cols": agent_screen_cols,
             }),
@@ -23760,7 +26107,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             .set_size(agent_screen_rows, agent_screen_cols);
     }
 
-    let (agent_cursor, scrollback_offset, render_source) = {
+    let (cursor, scrollback_offset, render_source) = {
         let startup_spinner_started_at = agent.startup_spinner_started_at();
         let screen = agent.parser.screen();
         let history_scroll_offset = agent.history_scroll_offset;
@@ -23778,28 +26125,29 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         let cursor = if startup_spinner_started_at.is_some()
             || screen.hide_cursor()
             || scrollback_offset > 0
+            || !focused
         {
             None
         } else {
             let (row, col) = screen.cursor_position();
-            if row < agent_area.height && col < agent_area.width {
-                Some((agent_area.x + col, agent_area.y + row))
+            if row < content_area.height && col < content_area.width {
+                Some((content_area.x + col, content_area.y + row))
             } else {
                 None
             }
         };
         let buf = f.buffer_mut();
-        fill_area(buf, agent_area, Style::default().bg(AGENT_DEFAULT_BG));
+        fill_area(buf, content_area, Style::default().bg(AGENT_DEFAULT_BG));
         if render_source == "history" {
             let lines = agent
                 .screen_history
-                .visible_lines(history_scroll_offset, agent_area.height as usize);
-            render_plain_agent_history(buf, agent_area, &lines);
+                .visible_lines(history_scroll_offset, content_area.height as usize);
+            render_plain_agent_history(buf, content_area, &lines);
         } else {
-            render_vt100_screen(buf, screen, agent_area);
+            render_vt100_screen(buf, screen, content_area);
         }
         if let Some(started_at) = startup_spinner_started_at {
-            render_agent_startup_spinner(buf, agent_area, &agent.info, started_at);
+            render_agent_startup_spinner(buf, content_area, &agent.info, started_at);
         }
         (cursor, scrollback_offset, render_source)
     };
@@ -23807,7 +26155,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     if DEBUG_ENABLED.load(Ordering::Relaxed)
         && (scrollback_offset > 0 || TRACE_ENABLED.load(Ordering::Relaxed))
     {
-        let visible_rows = agent_area.height as usize;
+        let visible_rows = content_area.height as usize;
         let max_rows = visible_rows.max(1).min(120);
         let rendered_window = if render_source == "history" {
             debug_history_window_value(
@@ -23830,10 +26178,12 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             serde_json::json!({
                 "provider": agent.info.provider.as_str(),
                 "session_id": &agent.info.session_id,
-                "area_x": agent_area.x,
-                "area_y": agent_area.y,
-                "area_width": agent_area.width,
-                "area_height": agent_area.height,
+                "area_x": content_area.x,
+                "area_y": content_area.y,
+                "area_width": content_area.width,
+                "area_height": content_area.height,
+                "framed": frame_title.is_some(),
+                "focused": focused,
                 "render_source": render_source,
                 "scrollback_offset": scrollback_offset,
                 "rendered_window": rendered_window,
@@ -23842,24 +26192,120 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         );
     }
 
+    AgentRenderOutcome {
+        cursor,
+        scrollback_offset,
+        command_line: agent.command_line.clone(),
+        info: agent.info.clone(),
+    }
+}
+
+fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
+    let area = f.area();
+    let main_area = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        area.height.saturating_sub(AGENT_STATUS_HEIGHT),
+    );
+    let status_area = Rect::new(
+        area.x,
+        area.y + main_area.height,
+        area.width,
+        AGENT_STATUS_HEIGHT.min(area.height),
+    );
+
+    let app_status = app.display_status();
+    let active_key = app
+        .active_agent
+        .as_ref()
+        .map(|agent| AgentKey::new(&agent.info));
+    let layout = agent_pane_layout_for_area(
+        main_area,
+        app.agent_sidebar_config_width(),
+        app.agent_aux.is_some(),
+        app.agent_aux_width,
+    );
+
+    if app.active_agent.is_none() {
+        f.render_widget(Clear, area);
+        return;
+    }
+
+    let main_outcome = {
+        let agent = app
+            .active_agent
+            .as_mut()
+            .expect("active_agent checked above");
+        render_agent_client_pane(
+            f,
+            agent,
+            layout.main,
+            None,
+            app.agent_focus == AgentFocusPane::Main,
+        )
+    };
+
+    let auxiliary_outcome =
+        if let (Some(aux), Some(aux_area)) = (app.agent_aux.as_mut(), layout.auxiliary) {
+            Some(render_agent_client_pane(
+                f,
+                &mut aux.agent,
+                aux_area,
+                Some(aux.kind.title()),
+                app.agent_focus == AgentFocusPane::Auxiliary,
+            ))
+        } else {
+            None
+        };
+
+    let focused_outcome = if app.agent_focus == AgentFocusPane::Auxiliary {
+        auxiliary_outcome.as_ref().unwrap_or(&main_outcome)
+    } else {
+        &main_outcome
+    };
+
+    let focused_cursor = match app.agent_focus {
+        AgentFocusPane::Main => main_outcome.cursor,
+        AgentFocusPane::Auxiliary => auxiliary_outcome
+            .as_ref()
+            .and_then(|outcome| outcome.cursor),
+        AgentFocusPane::Sidebar => None,
+    };
+
     let buf = f.buffer_mut();
     fill_area(buf, status_area, theme_status_style());
     let agent_help_items = agent_help_items(&app.keybindings);
-    let agent_status_subject = if is_plain_pty_tool_session_info(&agent.info) {
-        live_agent_status_label(&agent.info)
+    let agent_status_subject = if is_plain_pty_tool_session_info(&focused_outcome.info) {
+        live_agent_status_label(&focused_outcome.info)
     } else {
         format!(
             "{} {}",
-            agent.info.provider.as_str(),
-            truncate_width(&agent.info.session_id, 18)
+            focused_outcome.info.provider.as_str(),
+            truncate_width(&focused_outcome.info.session_id, 18)
         )
     };
-    let mut status_parts = vec![agent_status_subject];
+    let focus_label = match app.agent_focus {
+        AgentFocusPane::Sidebar => "focus agents".to_string(),
+        AgentFocusPane::Main => "focus agent".to_string(),
+        AgentFocusPane::Auxiliary => app
+            .agent_aux
+            .as_ref()
+            .map(|aux| format!("focus right {}", aux.kind.label()))
+            .unwrap_or_else(|| "focus right".to_string()),
+    };
+    let mut status_parts = vec![agent_status_subject, focus_label];
+    if let Some(aux) = app.agent_aux.as_ref() {
+        status_parts.push(format!("right {}", aux.kind.label()));
+    }
     if !app_status.is_empty() {
         status_parts.push(app_status);
     }
-    if scrollback_offset > 0 {
-        status_parts.push(format!("scrollback {} up", scrollback_offset));
+    if focused_outcome.scrollback_offset > 0 {
+        status_parts.push(format!(
+            "scrollback {} up",
+            focused_outcome.scrollback_offset
+        ));
     }
     let mut status_spans = Vec::new();
     let mut used = 0usize;
@@ -23892,7 +26338,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         let _ = push_help_span(&mut status_spans, "  ", status_dim_style, &mut used, width);
         let _ = push_help_span(
             &mut status_spans,
-            &agent.command_line,
+            &focused_outcome.command_line,
             status_dim_style,
             &mut used,
             width,
@@ -23901,17 +26347,24 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(Line::from(status_spans), status_area);
 
     app.poll_agent_runtime_states();
-    if let (Some(sidebar_area), Some(active_key)) = (sidebar_area, active_key.as_ref()) {
+    if let (Some(sidebar_area), Some(active_key)) = (layout.sidebar, active_key.as_ref()) {
         let candidates = app.live_agent_switch_candidates();
         f.render_widget(Clear, sidebar_area);
-        draw_agent_sidebar(f, app, sidebar_area, &candidates, active_key);
+        draw_agent_sidebar(
+            f,
+            app,
+            sidebar_area,
+            &candidates,
+            active_key,
+            app.agent_focus == AgentFocusPane::Sidebar,
+        );
     }
 
     let modal_drawn = draw_input_modal(f, area, app);
     let ai_search_overlay_drawn =
         draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref());
     if !modal_drawn && !ai_search_overlay_drawn {
-        if let Some(cursor) = agent_cursor {
+        if let Some(cursor) = focused_cursor {
             f.set_cursor_position(cursor);
         }
     }
@@ -24180,21 +26633,152 @@ struct AgentViewport {
     page_rows: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentPaneLayout {
+    sidebar: Option<Rect>,
+    main: Rect,
+    auxiliary: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentViewports {
+    main: AgentViewport,
+    auxiliary: Option<AgentViewport>,
+}
+
 fn agent_viewport_for_terminal(
     total_width: u16,
     terminal_rows: u16,
     configured_sidebar_width: u16,
 ) -> AgentViewport {
+    agent_viewports_for_terminal(
+        total_width,
+        terminal_rows,
+        configured_sidebar_width,
+        false,
+        None,
+    )
+    .main
+}
+
+fn agent_viewports_for_terminal(
+    total_width: u16,
+    terminal_rows: u16,
+    configured_sidebar_width: u16,
+    auxiliary_visible: bool,
+    configured_auxiliary_width: Option<u16>,
+) -> AgentViewports {
     let area_rows = terminal_rows.saturating_sub(AGENT_STATUS_HEIGHT);
-    let area_cols = agent_terminal_width(total_width, configured_sidebar_width);
-    let (pty_rows, pty_cols) = agent_screen_size_for_area(Rect::new(0, 0, area_cols, area_rows));
+    let layout = agent_pane_layout_for_area(
+        Rect::new(0, 0, total_width, area_rows),
+        configured_sidebar_width,
+        auxiliary_visible,
+        configured_auxiliary_width,
+    );
+    AgentViewports {
+        main: agent_viewport_for_pane_area(layout.main, false),
+        auxiliary: layout
+            .auxiliary
+            .map(|area| agent_viewport_for_pane_area(area, true)),
+    }
+}
+
+fn agent_viewport_for_pane_area(area: Rect, framed: bool) -> AgentViewport {
+    let content = if framed { pane_inner(area) } else { area };
+    let (pty_rows, pty_cols) = agent_screen_size_for_area(content);
     AgentViewport {
-        area_cols,
-        area_rows,
+        area_cols: content.width,
+        area_rows: content.height,
         pty_cols,
         pty_rows,
-        page_rows: area_rows.max(1) as usize,
+        page_rows: content.height.max(1) as usize,
     }
+}
+
+fn agent_pane_layout_for_area(
+    area: Rect,
+    configured_sidebar_width: u16,
+    auxiliary_visible: bool,
+    configured_auxiliary_width: Option<u16>,
+) -> AgentPaneLayout {
+    let sidebar_width = agent_sidebar_width(area.width, configured_sidebar_width);
+    let (sidebar, content_area) = if sidebar_width > 0 {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(sidebar_width),
+                Constraint::Length(area.width.saturating_sub(sidebar_width)),
+            ])
+            .split(area);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, area)
+    };
+
+    if !auxiliary_visible || content_area.width <= 1 {
+        return AgentPaneLayout {
+            sidebar,
+            main: content_area,
+            auxiliary: None,
+        };
+    }
+
+    let auxiliary_width = agent_auxiliary_width(content_area.width, configured_auxiliary_width);
+    if auxiliary_width == 0 || auxiliary_width >= content_area.width {
+        return AgentPaneLayout {
+            sidebar,
+            main: content_area,
+            auxiliary: None,
+        };
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(content_area.width.saturating_sub(auxiliary_width)),
+            Constraint::Length(auxiliary_width),
+        ])
+        .split(content_area);
+    AgentPaneLayout {
+        sidebar,
+        main: chunks[0],
+        auxiliary: Some(chunks[1]),
+    }
+}
+
+fn agent_auxiliary_width(content_width: u16, configured_width: Option<u16>) -> u16 {
+    let (min_width, max_width) = agent_auxiliary_width_bounds(content_width);
+    if min_width == 0 || max_width == 0 {
+        return 0;
+    }
+    configured_width
+        .unwrap_or_else(|| default_agent_auxiliary_width(content_width))
+        .clamp(min_width, max_width)
+}
+
+fn default_agent_auxiliary_width(content_width: u16) -> u16 {
+    let (min_width, max_width) = agent_auxiliary_width_bounds(content_width);
+    if min_width == 0 || max_width == 0 {
+        return 0;
+    }
+    let proportional = ((u32::from(content_width) * 2) / 5) as u16;
+    proportional
+        .clamp(min_width, AGENT_AUX_PANE_TARGET_WIDTH.min(max_width))
+        .min(max_width)
+}
+
+fn agent_auxiliary_width_bounds(content_width: u16) -> (u16, u16) {
+    if content_width <= 1 {
+        return (0, 0);
+    }
+    if content_width <= AGENT_AUX_PANE_MIN_WIDTH.saturating_add(AGENT_MAIN_MIN_WIDTH_WITH_AUX) {
+        let split = content_width / 2;
+        return (split, split);
+    }
+    (
+        AGENT_AUX_PANE_MIN_WIDTH,
+        content_width.saturating_sub(AGENT_MAIN_MIN_WIDTH_WITH_AUX),
+    )
 }
 
 fn agent_pty_size(cols: u16, rows: u16) -> PtySize {
@@ -24397,18 +26981,39 @@ fn adjusted_agent_sidebar_width(
     )
 }
 
+fn adjusted_agent_auxiliary_width(
+    configured_width: Option<u16>,
+    content_width: u16,
+    delta: i16,
+) -> (u16, bool) {
+    let (min_width, max_width) = agent_auxiliary_width_bounds(content_width);
+    if min_width == 0 || max_width == 0 {
+        return (0, true);
+    }
+    let current = agent_auxiliary_width(content_width, configured_width);
+    let next = (i32::from(current) + i32::from(delta))
+        .clamp(i32::from(min_width), i32::from(max_width)) as u16;
+    (next, next == current)
+}
+
 fn draw_agent_sidebar(
     f: &mut ratatui::Frame,
     app: &App,
     area: Rect,
     candidates: &[SessionInfo],
     active_key: &AgentKey,
+    focused: bool,
 ) {
     let title = format!(" agents {} ", candidates.len());
     fill_area(f.buffer_mut(), area, theme_base_style());
+    let border_color = if focused {
+        THEME_BORDER_ACTIVE
+    } else {
+        THEME_BORDER
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(THEME_BORDER))
+        .border_style(Style::default().fg(border_color))
         .style(theme_base_style())
         .title(title);
     f.render_widget(block, area);
@@ -25749,6 +28354,13 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 "active_agent": app.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
                 "show_sessions_view_before": app.show_sessions_view,
                 "agent_states_before": agent_state_entries_debug_value(&app.agent_states),
+                "live_shells_before": app.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
+                "runtime_refresh_pending": app.runtime_refresh_pending,
+                "runtime_refresh_queued": app.runtime_refresh_queued,
+                "runtime_refresh_seq": app.runtime_refresh_seq,
+                "live_shell_discovery_pending": app.live_shell_discovery_pending,
+                "live_shell_discovery_seq": app.live_shell_discovery_seq,
+                "pending_runtime_action": pending_runtime_action_debug_value(app.pending_runtime_action.as_ref()),
                 "selected": app.current().map(session_info_debug_value),
             }),
         );
@@ -25759,6 +28371,13 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 "active_agent": app.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
                 "show_sessions_view_after": app.show_sessions_view,
                 "agent_states_after": agent_state_entries_debug_value(&app.agent_states),
+                "live_shells_after": app.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
+                "runtime_refresh_pending": app.runtime_refresh_pending,
+                "runtime_refresh_queued": app.runtime_refresh_queued,
+                "runtime_refresh_seq": app.runtime_refresh_seq,
+                "live_shell_discovery_pending": app.live_shell_discovery_pending,
+                "live_shell_discovery_seq": app.live_shell_discovery_seq,
+                "pending_runtime_action": pending_runtime_action_debug_value(app.pending_runtime_action.as_ref()),
                 "status": &app.status,
             }),
         );
@@ -28945,6 +31564,31 @@ fn agent_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
             "Ctrl+]",
             "sessions",
         ),
+        help_item(
+            keybindings,
+            KeyAction::AgentToggleCokacdirPanel,
+            "Ctrl+F",
+            "cokacdir",
+        ),
+        help_item(
+            keybindings,
+            KeyAction::AgentToggleTerminalPanel,
+            "Ctrl+T",
+            "terminal",
+        ),
+        help_item(
+            keybindings,
+            KeyAction::AgentFocusSidebar,
+            "Ctrl+1",
+            "agents",
+        ),
+        help_item(keybindings, KeyAction::AgentFocusMain, "Ctrl+2", "agent"),
+        help_item(
+            keybindings,
+            KeyAction::AgentFocusAuxiliary,
+            "Ctrl+3",
+            "right",
+        ),
         help_item(keybindings, KeyAction::AgentNewShell, "Ctrl+N", "new"),
         help_item(
             keybindings,
@@ -30367,6 +33011,23 @@ mod tests {
         info
     }
 
+    fn persisted_auxiliary_entry(
+        agent: &SessionInfo,
+        kind: AgentAuxKind,
+        parent: &SessionInfo,
+        updated_at_epoch_s: u64,
+    ) -> PersistedAgentAuxiliaryEntry {
+        PersistedAgentAuxiliaryEntry {
+            agent: AgentKey::new(agent),
+            kind,
+            parent: AgentKey::new(parent),
+            parent_provider: parent.provider,
+            parent_cwd: parent.cwd.clone(),
+            parent_source: parent.source.display().to_string(),
+            updated_at_epoch_s,
+        }
+    }
+
     struct LimitedWriter {
         accepted: Vec<u8>,
         budget: usize,
@@ -30694,8 +33355,15 @@ mod tests {
             preview_scroll: 0,
             preview_page_height: 10,
             focus: FocusPane::Sessions,
+            agent_focus: AgentFocusPane::Main,
             status: String::new(),
             active_agent: None,
+            agent_aux: None,
+            hidden_agent_aux: Vec::new(),
+            agent_aux_parent_infos: HashMap::new(),
+            persisted_agent_aux: HashMap::new(),
+            persist_agent_auxiliary_registry: false,
+            agent_aux_width: None,
             should_quit: false,
             main_tx: None,
             runtime_tx: None,
@@ -30764,6 +33432,14 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn ctrl_3_is_supported_and_ctrl_5_binding_is_rejected() {
+        assert!(KeyBinding::parse("ctrl+3").is_ok());
+        assert!(KeyBinding::parse("ctrl+5").is_err());
+        assert!(KeyBinding::parse("ctrl+]").is_ok());
+        assert!(KeyBinding::parse("ctrl+[").is_ok());
     }
 
     #[test]
@@ -30940,6 +33616,43 @@ mod tests {
             value["agent"]["scroll_page_down"],
             serde_json::json!(["shift+alt+down", "shift+alt+pagedown"])
         );
+        assert_eq!(
+            value["agent"]["toggle_cokacdir_panel"],
+            serde_json::json!(["ctrl+f"])
+        );
+        assert_eq!(
+            value["agent"]["toggle_terminal_panel"],
+            serde_json::json!(["ctrl+t"])
+        );
+        assert_eq!(
+            value["agent"]["focus_sidebar"],
+            serde_json::json!(["ctrl+1"])
+        );
+        assert_eq!(value["agent"]["focus_main"], serde_json::json!(["ctrl+2"]));
+        assert_eq!(
+            value["agent"]["focus_auxiliary"],
+            serde_json::json!(["ctrl+3"])
+        );
+        assert!(keybindings.matches(
+            KeyAction::AgentToggleCokacdirPanel,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        ));
+        assert!(keybindings.matches(
+            KeyAction::AgentToggleTerminalPanel,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
+        ));
+        assert!(keybindings.matches(
+            KeyAction::AgentFocusSidebar,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL)
+        ));
+        assert!(keybindings.matches(
+            KeyAction::AgentFocusMain,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL)
+        ));
+        assert!(keybindings.matches(
+            KeyAction::AgentFocusAuxiliary,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL)
+        ));
     }
 
     #[test]
@@ -31399,6 +34112,35 @@ mod tests {
         assert_eq!(
             value["agent"]["scroll_page_down"],
             serde_json::json!(["shift+alt+down", "shift+alt+pagedown"])
+        );
+    }
+
+    #[test]
+    fn generated_agent_focus_auxiliary_empty_binding_is_restored_to_ctrl_3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "agent": {
+    "focus_auxiliary": []
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        assert!(keybindings.matches(
+            KeyAction::AgentFocusAuxiliary,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL)
+        ));
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            value["agent"]["focus_auxiliary"],
+            serde_json::json!(["ctrl+3"])
         );
     }
 
@@ -36272,6 +39014,24 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn agent_auxiliary_viewport_uses_right_framed_content_area() {
+        let viewports = agent_viewports_for_terminal(140, 31, 30, true, None);
+        let auxiliary = viewports.auxiliary.expect("right panel should fit");
+
+        assert_eq!(viewports.main.area_cols, 66);
+        assert_eq!(viewports.main.area_rows, 30);
+        assert_eq!(auxiliary.area_cols, 42);
+        assert_eq!(auxiliary.area_rows, 28);
+        assert_eq!(auxiliary.pty_cols, 42);
+        assert_eq!(auxiliary.pty_rows, 28);
+        assert_eq!(auxiliary.page_rows, 28);
+
+        let without_aux = agent_viewports_for_terminal(140, 31, 30, false, None);
+        assert!(without_aux.auxiliary.is_none());
+        assert_eq!(without_aux.main.area_cols, 110);
+    }
+
+    #[test]
     fn sessions_pane_width_uses_saved_columns_or_fallback_percent() {
         assert_eq!(
             sessions_pane_width(100, None, DEFAULT_SESSIONS_PANE_PERCENT),
@@ -36517,6 +39277,11 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     #[test]
     fn agent_help_includes_sidebar_toggle() {
         let help = agent_help_text(&KeyBindings::default());
+        assert!(help.contains("Ctrl+f cokacdir"));
+        assert!(help.contains("Ctrl+t terminal"));
+        assert!(help.contains("Ctrl+1 agents"));
+        assert!(help.contains("Ctrl+2 agent"));
+        assert!(help.contains("Ctrl+3 right"));
         assert!(help.contains("Ctrl+b sidebar"));
         assert!(help.contains("Shift+Alt+↑"));
         assert!(help.contains("Shift+Alt+↓"));
@@ -37817,7 +40582,7 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn screen_toggle_key_accepts_encoded_control_forms() {
+    fn screen_toggle_key_rejects_ctrl_3_and_ctrl_5_aliases() {
         assert!(is_screen_toggle_key(KeyEvent::new(
             KeyCode::Char(']'),
             KeyModifiers::CONTROL
@@ -37826,15 +40591,15 @@ IF EXIST "%~dp0\node.exe" (
             KeyCode::Char('['),
             KeyModifiers::CONTROL
         )));
-        assert!(is_screen_toggle_key(KeyEvent::new(
+        assert!(!is_screen_toggle_key(KeyEvent::new(
             KeyCode::Char('3'),
             KeyModifiers::CONTROL
         )));
-        assert!(is_screen_toggle_key(KeyEvent::new(
+        assert!(!is_screen_toggle_key(KeyEvent::new(
             KeyCode::Char('\u{1d}'),
             KeyModifiers::NONE
         )));
-        assert!(is_screen_toggle_key(KeyEvent::new(
+        assert!(!is_screen_toggle_key(KeyEvent::new(
             KeyCode::Char('5'),
             KeyModifiers::CONTROL
         )));
@@ -37849,7 +40614,7 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn session_toggle_key_matches_screen_toggle_key() {
+    fn session_toggle_key_rejects_ctrl_3_and_ctrl_5_aliases() {
         assert!(is_session_toggle_key(KeyEvent::new(
             KeyCode::Char(']'),
             KeyModifiers::CONTROL
@@ -37858,15 +40623,15 @@ IF EXIST "%~dp0\node.exe" (
             KeyCode::Char('['),
             KeyModifiers::CONTROL
         )));
-        assert!(is_session_toggle_key(KeyEvent::new(
+        assert!(!is_session_toggle_key(KeyEvent::new(
             KeyCode::Char('3'),
             KeyModifiers::CONTROL
         )));
-        assert!(is_session_toggle_key(KeyEvent::new(
+        assert!(!is_session_toggle_key(KeyEvent::new(
             KeyCode::Char('\u{1d}'),
             KeyModifiers::NONE
         )));
-        assert!(is_session_toggle_key(KeyEvent::new(
+        assert!(!is_session_toggle_key(KeyEvent::new(
             KeyCode::Char('5'),
             KeyModifiers::CONTROL
         )));
@@ -38648,6 +41413,1486 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
+    fn agent_focus_shortcuts_select_sidebar_main_and_right() {
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.agent_sidebar_visible = false;
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("focus-main", 101));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: buffered_output_test_client("focus-aux", 102),
+        });
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+        assert_eq!(app.agent_focus, AgentFocusPane::Sidebar);
+        assert!(app.settings.cokacmux.agent_sidebar_visible);
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+        assert_eq!(app.agent_focus, AgentFocusPane::Auxiliary);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn focused_auxiliary_agent_receives_forwarded_input() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let (main, main_rx) = buffered_output_test_client_with_requests("input-main", 111);
+        let (aux, aux_rx) = buffered_output_test_client_with_requests("input-aux", 112);
+        app.set_active_agent(main);
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: aux,
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            120,
+            30,
+        );
+
+        let main_requests: Vec<_> = main_rx.try_iter().collect();
+        assert!(
+            main_requests
+                .iter()
+                .all(|request| !matches!(request.request, AgentDaemonRequest::Input { .. })),
+            "main panel should not receive forwarded input"
+        );
+        let aux_input = aux_rx
+            .try_iter()
+            .find_map(|request| match request.request {
+                AgentDaemonRequest::Input { data } => Some(data),
+                _ => None,
+            })
+            .expect("auxiliary panel should receive forwarded input");
+        assert_eq!(aux_input, b"x".to_vec());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auxiliary_toggle_hides_and_restores_existing_terminal() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("toggle-main", 161));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        let (aux, aux_rx) = buffered_output_test_client_with_requests("toggle-aux", 162);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent: parent.clone(),
+            agent: aux,
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+
+        assert!(app.agent_aux.is_none());
+        assert_eq!(app.hidden_agent_aux.len(), 1);
+        assert_eq!(app.hidden_agent_aux[0].kind, AgentAuxKind::Terminal);
+        assert_eq!(app.hidden_agent_aux[0].parent, parent);
+        assert_eq!(app.hidden_agent_aux[0].agent.reader_id, 162);
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+        assert!(
+            aux_rx
+                .try_iter()
+                .all(|request| !matches!(request.request, AgentDaemonRequest::Detach)),
+            "hiding a right panel must not detach or terminate the app"
+        );
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+
+        let restored = app.agent_aux.as_ref().expect("terminal should be shown");
+        assert_eq!(restored.kind, AgentAuxKind::Terminal);
+        assert_eq!(restored.agent.reader_id, 162);
+        assert!(app.hidden_agent_aux.is_empty());
+        assert_eq!(app.agent_focus, AgentFocusPane::Auxiliary);
+        assert!(
+            aux_rx
+                .try_iter()
+                .all(|request| !matches!(request.request, AgentDaemonRequest::Detach)),
+            "restoring a right panel must reuse the existing client"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auxiliary_toggle_hides_and_restores_existing_cokacdir() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("toggle-cokacdir-main", 164));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        let (aux, aux_rx) = buffered_output_test_client_with_requests("toggle-cokacdir-aux", 165);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Cokacdir,
+            parent: parent.clone(),
+            agent: aux,
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+
+        assert!(app.agent_aux.is_none());
+        assert_eq!(app.hidden_agent_aux.len(), 1);
+        assert_eq!(app.hidden_agent_aux[0].kind, AgentAuxKind::Cokacdir);
+        assert_eq!(app.hidden_agent_aux[0].parent, parent);
+        assert_eq!(app.hidden_agent_aux[0].agent.reader_id, 165);
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+        assert!(
+            aux_rx
+                .try_iter()
+                .all(|request| !matches!(request.request, AgentDaemonRequest::Detach)),
+            "hiding right cokacdir must not detach or terminate the app"
+        );
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+
+        let restored = app.agent_aux.as_ref().expect("cokacdir should be shown");
+        assert_eq!(restored.kind, AgentAuxKind::Cokacdir);
+        assert_eq!(restored.agent.reader_id, 165);
+        assert!(app.hidden_agent_aux.is_empty());
+        assert_eq!(app.agent_focus, AgentFocusPane::Auxiliary);
+        assert!(
+            aux_rx
+                .try_iter()
+                .all(|request| !matches!(request.request, AgentDaemonRequest::Detach)),
+            "restoring right cokacdir must reuse the existing client"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_auxiliary_keeps_processing_output_until_restored() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("hidden-output-main", 171));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        app.hidden_agent_aux.push(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: buffered_output_test_client("hidden-output-aux", 172),
+        });
+
+        app.on_agent_event(
+            172,
+            AgentDaemonEvent::Output {
+                data: b"HIDDENSTATE\r\n".to_vec(),
+            },
+        );
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+
+        let restored = app.agent_aux.as_mut().expect("terminal should be shown");
+        let text = parser_visible_plain_lines(&mut restored.agent.parser, 0).join("\n");
+        assert!(
+            text.contains("HIDDENSTATE"),
+            "hidden auxiliary output should be preserved: {:?}",
+            text
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_auxiliary_self_exit_removes_cached_panel() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("hidden-exit-main", 176));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        app.hidden_agent_aux.push(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: buffered_output_test_client("hidden-exit-aux", 177),
+        });
+
+        app.on_agent_event(
+            177,
+            AgentDaemonEvent::Exited {
+                status: "exit status: 0".into(),
+            },
+        );
+        app.poll_agent_sessions();
+
+        assert!(app.hidden_agent_aux.is_empty());
+        assert!(app.status.contains("hidden right"));
+        assert!(app.status.contains("exited"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn switching_auxiliary_kind_hides_previous_kind_and_restores_hidden_target() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("switch-aux-main", 181));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        let (cokacdir, cokacdir_rx) =
+            buffered_output_test_client_with_requests("switch-aux-cokacdir", 182);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Cokacdir,
+            parent: parent.clone(),
+            agent: cokacdir,
+        });
+        app.hidden_agent_aux.push(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent: parent.clone(),
+            agent: buffered_output_test_client("switch-aux-terminal", 183),
+        });
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+
+        let visible = app.agent_aux.as_ref().expect("terminal should be visible");
+        assert_eq!(visible.kind, AgentAuxKind::Terminal);
+        assert_eq!(visible.agent.reader_id, 183);
+        let visible_key = AgentKey::new(&visible.agent.info);
+        assert_eq!(app.hidden_agent_aux.len(), 1);
+        assert_eq!(app.hidden_agent_aux[0].kind, AgentAuxKind::Cokacdir);
+        assert_eq!(app.hidden_agent_aux[0].agent.reader_id, 182);
+        let hidden_key = AgentKey::new(&app.hidden_agent_aux[0].agent.info);
+        assert_eq!(app.persisted_agent_aux.len(), 2);
+        assert!(app.persisted_agent_aux.contains_key(&visible_key));
+        assert!(app.persisted_agent_aux.contains_key(&hidden_key));
+        assert!(
+            cokacdir_rx
+                .try_iter()
+                .all(|request| !matches!(request.request, AgentDaemonRequest::Detach)),
+            "switching right panel kind should keep the previous panel alive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn superseded_auxiliary_attach_is_hidden_when_main_switch_is_queued() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "new-superseded-active".into();
+        let mut active = buffered_output_test_client("superseded-active", 184);
+        active.info = active_info;
+        app.set_active_agent(active);
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+
+        let (mut aux, aux_rx) = buffered_output_test_client_with_requests("superseded-aux", 185);
+        aux.info = shell_session_info_for_cwd("/repo".into());
+        let aux_info = aux.info.clone();
+        let aux_key = AgentKey::new(&aux_info);
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 79,
+            key: aux_key.clone(),
+            target: AttachTarget::Auxiliary {
+                kind: AgentAuxKind::Terminal,
+                parent: parent.clone(),
+            },
+            started_at: Instant::now(),
+        });
+
+        let mut next_info = new_agent_info(Provider::Claude, "/other");
+        next_info.session_id = "new-superseded-next".into();
+        let next_key = AgentKey::new(&next_info);
+        app.queued_attach = Some(AttachJob {
+            info: next_info,
+            cols: 100,
+            rows: 28,
+            kind: AttachJobKind::Existing,
+            run_prechecks: false,
+            prompt_for_saved_data: false,
+            settings: app.settings.clone(),
+            ctx: AttachUiCtx {
+                key: next_key,
+                target: AttachTarget::MainAgent,
+                status_attached: "switched to queued agent".into(),
+                status_started: "switched to queued agent".into(),
+                status_err_prefix: "switch failed: ".into(),
+                status_prepare_err_prefix: "switch failed: ".into(),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: true,
+                log_origin: None,
+                ready_event: "agent_switch_ready",
+                failed_event: "agent_switch_failed",
+            },
+        });
+
+        app.on_attach_result(Box::new(AttachWorkerResult {
+            seq: 79,
+            info: aux_info,
+            cols: 52,
+            rows: 28,
+            ctx: AttachUiCtx {
+                key: aux_key,
+                target: AttachTarget::Auxiliary {
+                    kind: AgentAuxKind::Terminal,
+                    parent: parent.clone(),
+                },
+                status_attached: "attached right terminal".into(),
+                status_started: "started right terminal".into(),
+                status_err_prefix: "right terminal open failed: ".into(),
+                status_prepare_err_prefix: "right terminal prepare failed: ".into(),
+                focus_auxiliary_on_ready: true,
+                terminate_auxiliary_on_stale: true,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: false,
+                log_origin: Some("agent_auxiliary:terminal".into()),
+                ready_event: "agent_auxiliary_open_ready",
+                failed_event: "agent_auxiliary_open_failed",
+            },
+            outcome: AttachWorkOutcome::Attached {
+                agent: aux,
+                started: false,
+            },
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 0,
+        }));
+
+        assert!(app.agent_aux.is_none());
+        assert_eq!(app.hidden_agent_aux.len(), 1);
+        assert_eq!(app.hidden_agent_aux[0].kind, AgentAuxKind::Terminal);
+        assert_eq!(app.hidden_agent_aux[0].parent, parent);
+        assert_eq!(app.hidden_agent_aux[0].agent.reader_id, 185);
+        assert!(
+            aux_rx
+                .try_iter()
+                .all(|request| !matches!(request.request, AgentDaemonRequest::Detach)),
+            "superseded right panel attach should be hidden, not detached"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_agent_attach_restores_hidden_auxiliary_for_returned_agent() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let first = buffered_output_test_client("restore-return-main", 186);
+        let first_info = first.info.clone();
+        let first_key = AgentKey::new(&first_info);
+        app.set_active_agent(first);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent: first_key.clone(),
+            agent: buffered_output_test_client("restore-return-aux", 187),
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+
+        app.set_active_agent(buffered_output_test_client("restore-return-other", 188));
+
+        assert!(app.agent_aux.is_none());
+        assert_eq!(app.hidden_agent_aux.len(), 1);
+        assert_eq!(app.hidden_agent_aux[0].agent.reader_id, 187);
+
+        let mut returning = buffered_output_test_client("restore-return-main", 189);
+        returning.info = first_info.clone();
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 77,
+            key: first_key.clone(),
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+        app.on_attach_result(Box::new(AttachWorkerResult {
+            seq: 77,
+            info: first_info,
+            cols: 100,
+            rows: 28,
+            ctx: AttachUiCtx {
+                key: first_key,
+                target: AttachTarget::MainAgent,
+                status_attached: "switched to live restore-return-main".into(),
+                status_started: "switched to live restore-return-main".into(),
+                status_err_prefix: "switch failed: ".into(),
+                status_prepare_err_prefix: "switch failed: ".into(),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: true,
+                log_origin: None,
+                ready_event: "agent_switch_ready",
+                failed_event: "agent_switch_failed",
+            },
+            outcome: AttachWorkOutcome::Attached {
+                agent: returning,
+                started: false,
+            },
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 0,
+        }));
+
+        let restored = app
+            .agent_aux
+            .as_ref()
+            .expect("right panel should be restored");
+        assert_eq!(restored.kind, AgentAuxKind::Terminal);
+        assert_eq!(restored.agent.reader_id, 187);
+        assert!(app.hidden_agent_aux.is_empty());
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auxiliary_restore_matches_new_agent_parent_alias() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut active = buffered_output_test_client("alias-backing-main", 191);
+        active.info.session_id = "alias-backing-main".into();
+        app.set_active_agent(active);
+        let backing_key = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        let synthetic_key = AgentKey {
+            provider: backing_key.provider,
+            session_id: "alias-synthetic-main".into(),
+        };
+        app.new_agent_backing_aliases
+            .insert(synthetic_key.clone(), backing_key);
+        app.hidden_agent_aux.push(AgentAuxPane {
+            kind: AgentAuxKind::Cokacdir,
+            parent: synthetic_key,
+            agent: buffered_output_test_client("alias-cokacdir-aux", 192),
+        });
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+
+        let restored = app.agent_aux.as_ref().expect("cokacdir should be restored");
+        assert_eq!(restored.kind, AgentAuxKind::Cokacdir);
+        assert_eq!(restored.agent.reader_id, 192);
+        assert!(app.hidden_agent_aux.is_empty());
+        assert!(
+            app.attach_in_flight.is_none(),
+            "restoring an aliased right panel must not start a new attach"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_agent_attach_restores_hidden_auxiliary_for_new_agent_when_key_changes() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut first_info = new_agent_info(Provider::Codex, "/repo");
+        first_info.session_id = "new-restore-old".into();
+        let first_key = AgentKey::new(&first_info);
+        let mut first = buffered_output_test_client("restore-old", 193);
+        first.info = first_info.clone();
+        app.set_active_agent(first);
+        app.mark_agent_attached_locally(first_key.clone());
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent: first_key.clone(),
+            agent: buffered_output_test_client("restore-key-changed-aux", 194),
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+
+        let mut other_info = new_agent_info(Provider::Claude, "/other");
+        other_info.session_id = "new-restore-other".into();
+        let mut other = buffered_output_test_client("restore-other", 195);
+        other.info = other_info;
+        app.set_active_agent(other);
+
+        assert!(app.agent_aux.is_none());
+        assert_eq!(app.hidden_agent_aux.len(), 1);
+        assert_eq!(app.hidden_agent_aux[0].parent, first_key);
+
+        let mut returning_info = new_agent_info(Provider::Codex, "/repo");
+        returning_info.session_id = "new-restore-returned".into();
+        let returning_key = AgentKey::new(&returning_info);
+        let mut returning = buffered_output_test_client("restore-returned", 196);
+        returning.info = returning_info.clone();
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 78,
+            key: returning_key.clone(),
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+        app.on_attach_result(Box::new(AttachWorkerResult {
+            seq: 78,
+            info: returning_info,
+            cols: 100,
+            rows: 28,
+            ctx: AttachUiCtx {
+                key: returning_key.clone(),
+                target: AttachTarget::MainAgent,
+                status_attached: "switched to live changed-key agent".into(),
+                status_started: "switched to live changed-key agent".into(),
+                status_err_prefix: "switch failed: ".into(),
+                status_prepare_err_prefix: "switch failed: ".into(),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: true,
+                log_origin: None,
+                ready_event: "agent_switch_ready",
+                failed_event: "agent_switch_failed",
+            },
+            outcome: AttachWorkOutcome::Attached {
+                agent: returning,
+                started: false,
+            },
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 0,
+        }));
+
+        let restored = app
+            .agent_aux
+            .as_ref()
+            .expect("right panel should be restored even when parent key changes");
+        assert_eq!(restored.kind, AgentAuxKind::Terminal);
+        assert_eq!(restored.parent, returning_key);
+        assert_eq!(restored.agent.reader_id, 194);
+        assert!(app.hidden_agent_aux.is_empty());
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_main_agent_hides_auxiliary_panel() {
+        let mut app = app_for_key_tests();
+        app.set_active_agent(buffered_output_test_client("replace-main", 121));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Cokacdir,
+            parent: parent.clone(),
+            agent: buffered_output_test_client("replace-aux", 122),
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+
+        app.set_active_agent(buffered_output_test_client("replace-next", 123));
+
+        assert!(app.agent_aux.is_none());
+        assert_eq!(app.hidden_agent_aux.len(), 1);
+        assert_eq!(app.hidden_agent_aux[0].kind, AgentAuxKind::Cokacdir);
+        assert_eq!(app.hidden_agent_aux[0].parent, parent);
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auxiliary_focus_resizes_right_panel() {
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.agent_sidebar_visible = true;
+        app.settings.cokacmux.agent_sidebar_width = 30;
+        app.set_active_agent(buffered_output_test_client("resize-main", 131));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: buffered_output_test_client("resize-aux", 132),
+        });
+        app.agent_aux_width = Some(44);
+        app.agent_focus = AgentFocusPane::Auxiliary;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            140,
+            31,
+        );
+        assert_eq!(app.agent_aux_width, Some(46));
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            140,
+            31,
+        );
+        assert_eq!(app.agent_aux_width, Some(44));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_focus_blocks_resize_when_both_side_panels_are_open() {
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.agent_sidebar_visible = true;
+        app.settings.cokacmux.agent_sidebar_width = 30;
+        app.set_active_agent(buffered_output_test_client("resize-main-both", 141));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Cokacdir,
+            parent,
+            agent: buffered_output_test_client("resize-aux-both", 142),
+        });
+        app.agent_aux_width = Some(44);
+        app.agent_focus = AgentFocusPane::Main;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            140,
+            31,
+        );
+
+        assert_eq!(app.settings.cokacmux.agent_sidebar_width, 30);
+        assert_eq!(app.agent_aux_width, Some(44));
+        assert_eq!(app.status, "focus a side panel to resize.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_focus_resizes_only_open_side_panel() {
+        let mut right_only = app_for_key_tests();
+        right_only.settings.cokacmux.agent_sidebar_visible = false;
+        right_only.set_active_agent(buffered_output_test_client("resize-main-right", 151));
+        let parent = AgentKey::new(&right_only.active_agent.as_ref().unwrap().info);
+        right_only.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: buffered_output_test_client("resize-aux-right", 152),
+        });
+        right_only.agent_aux_width = Some(44);
+        right_only.agent_focus = AgentFocusPane::Main;
+
+        handle_agent_key(
+            &mut right_only,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            140,
+            31,
+        );
+        assert_eq!(right_only.agent_aux_width, Some(46));
+
+        let mut left_only = app_for_key_tests();
+        left_only.settings.cokacmux.agent_sidebar_visible = true;
+        left_only.settings.cokacmux.agent_sidebar_width = 30;
+        left_only.set_active_agent(buffered_output_test_client("resize-main-left", 153));
+        left_only.agent_focus = AgentFocusPane::Main;
+
+        handle_agent_key(
+            &mut left_only,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            140,
+            31,
+        );
+        assert_eq!(left_only.settings.cokacmux.agent_sidebar_width, 32);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_switch_candidates_exclude_visible_right_auxiliary_panel() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "new-active-with-visible-aux".into();
+        let active_key = AgentKey::new(&active_info);
+        let mut active = buffered_output_test_client("visible-aux-active", 201);
+        active.info = active_info;
+        app.set_active_agent(active);
+        app.mark_agent_attached_locally(active_key.clone());
+
+        let mut aux = buffered_output_test_client("visible-aux-shell", 202);
+        aux.info = shell_session_info_for_cwd("/repo".into());
+        let aux_info = aux.info.clone();
+        let aux_key = AgentKey::new(&aux_info);
+        app.live_shells.push(aux_info);
+        app.agent_states.insert(
+            aux_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent: active_key.clone(),
+            agent: aux,
+        });
+
+        let standalone = shell_session_info_for_cwd("/tmp".into());
+        let standalone_key = AgentKey::new(&standalone);
+        app.live_shells.push(standalone);
+        app.agent_states.insert(
+            standalone_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+
+        let candidates: Vec<AgentKey> = app
+            .live_agent_switch_candidates()
+            .iter()
+            .map(AgentKey::new)
+            .collect();
+
+        assert!(candidates.contains(&active_key));
+        assert!(candidates.contains(&standalone_key));
+        assert!(
+            !candidates.contains(&aux_key),
+            "right auxiliary panel must not become an Alt+Up/Down switch target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_restore_and_switch_candidates_exclude_hidden_right_auxiliary_panel() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "new-active-with-hidden-aux".into();
+        let active_key = AgentKey::new(&active_info);
+        let mut active = buffered_output_test_client("hidden-aux-active", 203);
+        active.info = active_info;
+        app.set_active_agent(active);
+        app.mark_agent_attached_locally(active_key.clone());
+
+        let mut aux = buffered_output_test_client("hidden-aux-shell", 204);
+        aux.info = shell_session_info_for_cwd("/repo".into());
+        let aux_info = aux.info.clone();
+        let aux_key = AgentKey::new(&aux_info);
+        app.live_shells.push(aux_info);
+        app.agent_states.insert(
+            aux_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.hidden_agent_aux.push(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent: active_key.clone(),
+            agent: aux,
+        });
+
+        let switch_candidates: Vec<AgentKey> = app
+            .live_agent_switch_candidates()
+            .iter()
+            .map(AgentKey::new)
+            .collect();
+        let restore_candidates: Vec<AgentKey> = app
+            .live_agent_restore_candidates()
+            .iter()
+            .map(AgentKey::new)
+            .collect();
+
+        assert!(switch_candidates.contains(&active_key));
+        assert!(!switch_candidates.contains(&aux_key));
+        assert!(!restore_candidates.contains(&aux_key));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_right_auxiliary_is_excluded_after_restart_but_restorable_for_parent() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "restart-parent".into();
+        let active_key = AgentKey::new(&active_info);
+        let mut active = buffered_output_test_client("restart-parent", 208);
+        active.info = active_info.clone();
+        app.set_active_agent(active);
+        app.mark_agent_attached_locally(active_key.clone());
+
+        let mut aux_info = shell_session_info_for_cwd("/repo".into());
+        aux_info.session_id = "shell-persisted-right".into();
+        aux_info.updated_at_epoch_s = 11;
+        let aux_key = AgentKey::new(&aux_info);
+        app.live_shells.push(aux_info.clone());
+        app.agent_states.insert(
+            aux_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.persisted_agent_aux.insert(
+            aux_key.clone(),
+            persisted_auxiliary_entry(&aux_info, AgentAuxKind::Terminal, &active_info, 99),
+        );
+
+        let switch_candidates: Vec<AgentKey> = app
+            .live_agent_switch_candidates()
+            .iter()
+            .map(AgentKey::new)
+            .collect();
+        let restore_candidates: Vec<AgentKey> = app
+            .live_agent_restore_candidates()
+            .iter()
+            .map(AgentKey::new)
+            .collect();
+        let (kind, restore_info) = app
+            .live_auxiliary_restore_candidate_for_active_agent(&active_info)
+            .expect("persisted right terminal should restore for its parent");
+
+        assert!(switch_candidates.contains(&active_key));
+        assert!(!switch_candidates.contains(&aux_key));
+        assert!(!restore_candidates.contains(&aux_key));
+        assert_eq!(kind, AgentAuxKind::Terminal);
+        assert_eq!(AgentKey::new(&restore_info), aux_key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_auxiliary_registry_keeps_one_panel_per_kind_for_parent() {
+        let mut app = app_for_key_tests();
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "registry-parent".into();
+        let parent = app.remember_auxiliary_parent_info(&active_info);
+
+        let mut terminal = shell_session_info_for_cwd("/repo".into());
+        terminal.session_id = "shell-registry-old".into();
+        let terminal_key = AgentKey::new(&terminal);
+        app.remember_persisted_agent_auxiliary(AgentAuxKind::Terminal, &parent, &terminal, "test");
+
+        let mut cokacdir = cokacdir_session_info_for_cwd("/repo".into());
+        cokacdir.session_id = "cokacdir-registry-current".into();
+        let cokacdir_key = AgentKey::new(&cokacdir);
+        app.remember_persisted_agent_auxiliary(AgentAuxKind::Cokacdir, &parent, &cokacdir, "test");
+
+        assert!(app.persisted_agent_aux.contains_key(&terminal_key));
+        assert_eq!(app.persisted_agent_aux.len(), 2);
+        assert_eq!(
+            app.persisted_agent_aux
+                .get(&cokacdir_key)
+                .map(|entry| entry.kind),
+            Some(AgentAuxKind::Cokacdir)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_auxiliary_registry_normalize_removes_older_entries_for_same_parent_and_kind() {
+        let mut app = app_for_key_tests();
+        let parent = session_info(Provider::Codex, "stored-normalize-parent", "/repo");
+
+        let mut older_terminal = shell_session_info_for_cwd("/repo".into());
+        older_terminal.session_id = "shell-normalize-older".into();
+        let older_key = AgentKey::new(&older_terminal);
+
+        let mut latest_terminal = shell_session_info_for_cwd("/repo".into());
+        latest_terminal.session_id = "shell-normalize-latest".into();
+        let latest_terminal_key = AgentKey::new(&latest_terminal);
+
+        let mut latest_cokacdir = cokacdir_session_info_for_cwd("/repo".into());
+        latest_cokacdir.session_id = "cokacdir-normalize-latest".into();
+        let latest_cokacdir_key = AgentKey::new(&latest_cokacdir);
+
+        app.live_shells.extend([
+            older_terminal.clone(),
+            latest_terminal.clone(),
+            latest_cokacdir.clone(),
+        ]);
+        app.persisted_agent_aux.insert(
+            older_key.clone(),
+            persisted_auxiliary_entry(&older_terminal, AgentAuxKind::Terminal, &parent, 10),
+        );
+        app.persisted_agent_aux.insert(
+            latest_terminal_key.clone(),
+            persisted_auxiliary_entry(&latest_terminal, AgentAuxKind::Terminal, &parent, 20),
+        );
+        app.persisted_agent_aux.insert(
+            latest_cokacdir_key.clone(),
+            persisted_auxiliary_entry(&latest_cokacdir, AgentAuxKind::Cokacdir, &parent, 20),
+        );
+
+        assert_eq!(
+            app.normalize_persisted_agent_auxiliaries("test_normalize"),
+            1
+        );
+
+        assert!(!app.persisted_agent_aux.contains_key(&older_key));
+        assert!(app.persisted_agent_aux.contains_key(&latest_terminal_key));
+        assert!(app.persisted_agent_aux.contains_key(&latest_cokacdir_key));
+        assert!(!app
+            .live_shells
+            .iter()
+            .any(|info| AgentKey::new(info) == older_key));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_auxiliary_parent_match_does_not_alias_stored_sessions_by_cwd() {
+        let app = app_for_key_tests();
+        let parent = session_info(Provider::Codex, "stored-parent-a", "/repo");
+        let other = session_info(Provider::Codex, "stored-parent-b", "/repo");
+        let aux = shell_session_info_for_cwd("/repo".into());
+        let entry = persisted_auxiliary_entry(&aux, AgentAuxKind::Terminal, &parent, 1);
+
+        assert!(!app.persisted_auxiliary_matches_active(&entry, &other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killing_parent_agent_terminates_visible_hidden_and_persisted_auxiliaries() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "kill-parent".into();
+        let active_key = AgentKey::new(&active_info);
+        let mut active = buffered_output_test_client("kill-parent", 209);
+        active.info = active_info.clone();
+        app.set_active_agent(active);
+        app.mark_agent_attached_locally(active_key.clone());
+
+        let mut visible = buffered_output_test_client("visible-right", 210);
+        visible.info = shell_session_info_for_cwd("/repo".into());
+        visible.info.session_id = "shell-visible-right".into();
+        let visible_key = AgentKey::new(&visible.info);
+        let parent = AgentKey::new(&active_info);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent: parent.clone(),
+            agent: visible,
+        });
+        app.persisted_agent_aux.insert(
+            visible_key.clone(),
+            persisted_auxiliary_entry(
+                &shell_session_info_for_cwd("/repo".into()),
+                AgentAuxKind::Terminal,
+                &active_info,
+                10,
+            ),
+        );
+
+        let mut hidden = buffered_output_test_client("hidden-right", 211);
+        hidden.info = cokacdir_session_info_for_cwd("/repo".into());
+        hidden.info.session_id = "cokacdir-hidden-right".into();
+        let hidden_key = AgentKey::new(&hidden.info);
+        app.hidden_agent_aux.push(AgentAuxPane {
+            kind: AgentAuxKind::Cokacdir,
+            parent: parent.clone(),
+            agent: hidden,
+        });
+        app.persisted_agent_aux.insert(
+            hidden_key.clone(),
+            persisted_auxiliary_entry(
+                &cokacdir_session_info_for_cwd("/repo".into()),
+                AgentAuxKind::Cokacdir,
+                &active_info,
+                11,
+            ),
+        );
+
+        let mut persisted = shell_session_info_for_cwd("/repo".into());
+        persisted.session_id = "shell-persisted-right".into();
+        let persisted_key = AgentKey::new(&persisted);
+        app.live_shells.push(persisted.clone());
+        app.agent_states.insert(
+            persisted_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.persisted_agent_aux.insert(
+            persisted_key.clone(),
+            persisted_auxiliary_entry(&persisted, AgentAuxKind::Terminal, &active_info, 12),
+        );
+
+        app.kill_active_agent();
+
+        assert!(app.active_agent.is_none());
+        assert!(app.agent_aux.is_none());
+        assert!(app.hidden_agent_aux.is_empty());
+        assert!(!app.persisted_agent_aux.contains_key(&visible_key));
+        assert!(!app.persisted_agent_aux.contains_key(&hidden_key));
+        assert!(!app.persisted_agent_aux.contains_key(&persisted_key));
+        assert!(!app.live_shells.iter().any(|info| {
+            let key = AgentKey::new(info);
+            key == visible_key || key == hidden_key || key == persisted_key
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_parent_exit_terminates_owned_auxiliaries() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "exit-parent".into();
+        let active_key = AgentKey::new(&active_info);
+        let mut active = buffered_output_test_client("exit-parent", 213);
+        active.info = active_info.clone();
+        app.set_active_agent(active);
+        app.mark_agent_attached_locally(active_key);
+
+        let parent = AgentKey::new(&active_info);
+        let mut visible = buffered_output_test_client("exit-visible-right", 214);
+        visible.info = shell_session_info_for_cwd("/repo".into());
+        visible.info.session_id = "shell-exit-visible-right".into();
+        let visible_key = AgentKey::new(&visible.info);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent: parent.clone(),
+            agent: visible,
+        });
+        app.persisted_agent_aux.insert(
+            visible_key.clone(),
+            persisted_auxiliary_entry(
+                &shell_session_info_for_cwd("/repo".into()),
+                AgentAuxKind::Terminal,
+                &active_info,
+                10,
+            ),
+        );
+
+        let mut hidden = buffered_output_test_client("exit-hidden-right", 215);
+        hidden.info = cokacdir_session_info_for_cwd("/repo".into());
+        hidden.info.session_id = "cokacdir-exit-hidden-right".into();
+        let hidden_key = AgentKey::new(&hidden.info);
+        app.hidden_agent_aux.push(AgentAuxPane {
+            kind: AgentAuxKind::Cokacdir,
+            parent,
+            agent: hidden,
+        });
+        app.persisted_agent_aux.insert(
+            hidden_key.clone(),
+            persisted_auxiliary_entry(
+                &cokacdir_session_info_for_cwd("/repo".into()),
+                AgentAuxKind::Cokacdir,
+                &active_info,
+                11,
+            ),
+        );
+
+        app.active_agent.as_mut().unwrap().exited = Some("exit status: 0".into());
+        app.poll_agent_sessions();
+
+        assert!(app.active_agent.is_none());
+        assert!(app.agent_aux.is_none());
+        assert!(app.hidden_agent_aux.is_empty());
+        assert!(!app.persisted_agent_aux.contains_key(&visible_key));
+        assert!(!app.persisted_agent_aux.contains_key(&hidden_key));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_restore_and_switch_candidates_exclude_pending_right_auxiliary_panel() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "new-active-with-pending-aux".into();
+        let active_key = AgentKey::new(&active_info);
+        let mut active = buffered_output_test_client("pending-aux-active", 206);
+        active.info = active_info;
+        app.set_active_agent(active);
+        app.mark_agent_attached_locally(active_key.clone());
+
+        let mut aux_info = shell_session_info_for_cwd("/repo".into());
+        aux_info.session_id = "shell-pending-right".into();
+        let aux_key = AgentKey::new(&aux_info);
+        app.live_shells.push(aux_info.clone());
+        app.agent_states.insert(
+            aux_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 91,
+            key: aux_key.clone(),
+            target: AttachTarget::Auxiliary {
+                kind: AgentAuxKind::Terminal,
+                parent: active_key.clone(),
+            },
+            started_at: Instant::now(),
+        });
+
+        let switch_candidates: Vec<AgentKey> = app
+            .live_agent_switch_candidates()
+            .iter()
+            .map(AgentKey::new)
+            .collect();
+        let restore_candidates: Vec<AgentKey> = app
+            .live_agent_restore_candidates()
+            .iter()
+            .map(AgentKey::new)
+            .collect();
+
+        assert!(switch_candidates.contains(&active_key));
+        assert!(!switch_candidates.contains(&aux_key));
+        assert!(!restore_candidates.contains(&aux_key));
+
+        app.attach_in_flight = None;
+        app.queued_attach = Some(AttachJob {
+            info: aux_info,
+            cols: 52,
+            rows: 28,
+            kind: AttachJobKind::Existing,
+            run_prechecks: false,
+            prompt_for_saved_data: false,
+            settings: app.settings.clone(),
+            ctx: AttachUiCtx {
+                key: aux_key.clone(),
+                target: AttachTarget::Auxiliary {
+                    kind: AgentAuxKind::Terminal,
+                    parent: active_key.clone(),
+                },
+                status_attached: "restored right terminal".into(),
+                status_started: "restored right terminal".into(),
+                status_err_prefix: "right terminal restore failed: ".into(),
+                status_prepare_err_prefix: "right terminal restore failed: ".into(),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: true,
+                log_origin: Some("agent_auxiliary_restore:terminal".into()),
+                ready_event: "agent_auxiliary_restore_live_ready",
+                failed_event: "agent_auxiliary_restore_live_failed",
+            },
+        });
+
+        let switch_candidates: Vec<AgentKey> = app
+            .live_agent_switch_candidates()
+            .iter()
+            .map(AgentKey::new)
+            .collect();
+        let restore_candidates: Vec<AgentKey> = app
+            .live_agent_restore_candidates()
+            .iter()
+            .map(AgentKey::new)
+            .collect();
+
+        assert!(switch_candidates.contains(&active_key));
+        assert!(!switch_candidates.contains(&aux_key));
+        assert!(!restore_candidates.contains(&aux_key));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_auxiliary_restore_candidate_matches_active_cwd_and_prefers_latest() {
+        let mut app = app_for_key_tests();
+        let active_info = new_agent_info(Provider::Codex, "/repo");
+
+        let mut older = shell_session_info_for_cwd("/repo".into());
+        older.session_id = "shell-older".into();
+        older.updated_at_epoch_s = 10;
+        let older_key = AgentKey::new(&older);
+
+        let mut newest = shell_session_info_for_cwd("/repo".into());
+        newest.session_id = "shell-newest".into();
+        newest.updated_at_epoch_s = 20;
+        let newest_key = AgentKey::new(&newest);
+
+        let mut other_cwd = shell_session_info_for_cwd("/tmp".into());
+        other_cwd.session_id = "shell-other-cwd".into();
+        other_cwd.updated_at_epoch_s = 30;
+        let other_key = AgentKey::new(&other_cwd);
+
+        for key in [&older_key, &newest_key, &other_key] {
+            app.agent_states.insert(
+                key.clone(),
+                AgentListState::Live {
+                    activity: AgentActivity::Quiet,
+                },
+            );
+        }
+        app.live_shells.extend([older, newest.clone(), other_cwd]);
+
+        let (kind, info) = app
+            .live_auxiliary_restore_candidate_for_active_agent(&active_info)
+            .expect("same-cwd live terminal should be a right-panel restore candidate");
+
+        assert_eq!(kind, AgentAuxKind::Terminal);
+        assert_eq!(AgentKey::new(&info), newest_key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_auxiliary_restore_prefers_latest_recorded_right_panel() {
+        let mut app = app_for_key_tests();
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "persisted-latest-parent".into();
+
+        let mut terminal = shell_session_info_for_cwd("/repo".into());
+        terminal.session_id = "shell-older-persisted".into();
+        terminal.updated_at_epoch_s = 100;
+        let terminal_key = AgentKey::new(&terminal);
+
+        let mut cokacdir = cokacdir_session_info_for_cwd("/repo".into());
+        cokacdir.session_id = "cokacdir-newer-persisted".into();
+        cokacdir.updated_at_epoch_s = 1;
+        let cokacdir_key = AgentKey::new(&cokacdir);
+
+        for key in [&terminal_key, &cokacdir_key] {
+            app.agent_states.insert(
+                key.clone(),
+                AgentListState::Live {
+                    activity: AgentActivity::Quiet,
+                },
+            );
+        }
+        app.live_shells.extend([terminal.clone(), cokacdir.clone()]);
+        app.persisted_agent_aux.insert(
+            terminal_key.clone(),
+            persisted_auxiliary_entry(&terminal, AgentAuxKind::Terminal, &active_info, 10),
+        );
+        app.persisted_agent_aux.insert(
+            cokacdir_key.clone(),
+            persisted_auxiliary_entry(&cokacdir, AgentAuxKind::Cokacdir, &active_info, 20),
+        );
+
+        let (kind, info) = app
+            .live_auxiliary_restore_candidate_for_active_agent(&active_info)
+            .expect("persisted right panel should restore");
+
+        assert_eq!(kind, AgentAuxKind::Cokacdir);
+        assert_eq!(AgentKey::new(&info), cokacdir_key);
+
+        let terminal_info = app
+            .live_auxiliary_restore_candidate_for_active_agent_kind(
+                &active_info,
+                AgentAuxKind::Terminal,
+            )
+            .expect("terminal right panel should be restorable by kind");
+        let cokacdir_info = app
+            .live_auxiliary_restore_candidate_for_active_agent_kind(
+                &active_info,
+                AgentAuxKind::Cokacdir,
+            )
+            .expect("cokacdir right panel should be restorable by kind");
+
+        assert_eq!(AgentKey::new(&terminal_info), terminal_key);
+        assert_eq!(AgentKey::new(&cokacdir_info), cokacdir_key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_auxiliary_restore_candidate_uses_registry_before_live_discovery() {
+        let mut app = app_for_key_tests();
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "persisted-before-discovery-parent".into();
+
+        let mut terminal = shell_session_info_for_cwd("/repo".into());
+        terminal.session_id = "shell-persisted-before-discovery".into();
+        let terminal_key = AgentKey::new(&terminal);
+        app.persisted_agent_aux.insert(
+            terminal_key.clone(),
+            persisted_auxiliary_entry(&terminal, AgentAuxKind::Terminal, &active_info, 77),
+        );
+
+        let (kind, info) = app
+            .live_auxiliary_restore_candidate_for_active_agent(&active_info)
+            .expect("persisted right panel should restore before live discovery completes");
+
+        assert_eq!(kind, AgentAuxKind::Terminal);
+        assert_eq!(AgentKey::new(&info), terminal_key);
+        assert_eq!(info.cwd, "/repo");
+        assert!(is_shell_session_info(&info));
+        assert_eq!(info.updated_at_epoch_s, 77);
+
+        let candidates = app.live_auxiliary_restore_candidate_entries_debug_value(&active_info);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["source"], "persisted_registry");
+        assert_eq!(candidates[0]["candidate"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_agent_attach_can_restore_live_auxiliary_after_restart() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "restart-active".into();
+        let active_key = AgentKey::new(&active_info);
+        let mut active = buffered_output_test_client("restart-active", 205);
+        active.info = active_info.clone();
+        app.set_active_agent(active);
+        app.mark_agent_attached_locally(active_key);
+
+        let mut aux_info = shell_session_info_for_cwd("/repo".into());
+        aux_info.session_id = "shell-after-restart".into();
+        aux_info.updated_at_epoch_s = 42;
+        let aux_key = AgentKey::new(&aux_info);
+        app.live_shells.push(aux_info);
+        app.agent_states.insert(
+            aux_key,
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+
+        assert!(app.hidden_agent_aux.is_empty());
+        assert!(app.restore_hidden_auxiliary_for_active_agent(160, 40, "test_restart"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_live_auxiliary_restore_attach_preserves_live_daemon() {
+        let mut app = app_for_key_tests();
+        let mut aux = buffered_output_test_client("stale-live-restore-aux", 207);
+        aux.info = shell_session_info_for_cwd("/repo".into());
+        aux.info.session_id = "shell-stale-live-restore".into();
+        let aux_info = aux.info.clone();
+        let aux_key = AgentKey::new(&aux_info);
+        let parent = AgentKey {
+            provider: Provider::Codex,
+            session_id: "stale-live-restore-parent".into(),
+        };
+        let parent_info = session_info(Provider::Codex, &parent.session_id, "/repo");
+        app.live_shells.push(parent_info);
+        app.agent_states.insert(
+            parent.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 92,
+            key: aux_key.clone(),
+            target: AttachTarget::Auxiliary {
+                kind: AgentAuxKind::Terminal,
+                parent: parent.clone(),
+            },
+            started_at: Instant::now(),
+        });
+        app.on_attach_result(Box::new(AttachWorkerResult {
+            seq: 91,
+            info: aux_info,
+            cols: 52,
+            rows: 28,
+            ctx: AttachUiCtx {
+                key: aux_key.clone(),
+                target: AttachTarget::Auxiliary {
+                    kind: AgentAuxKind::Terminal,
+                    parent,
+                },
+                status_attached: "restored right terminal".into(),
+                status_started: "restored right terminal".into(),
+                status_err_prefix: "right terminal restore failed: ".into(),
+                status_prepare_err_prefix: "right terminal restore failed: ".into(),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: true,
+                log_origin: Some("agent_auxiliary_restore:terminal".into()),
+                ready_event: "agent_auxiliary_restore_live_ready",
+                failed_event: "agent_auxiliary_restore_live_failed",
+            },
+            outcome: AttachWorkOutcome::Attached {
+                agent: aux,
+                started: false,
+            },
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 0,
+        }));
+
+        assert!(app
+            .live_shells
+            .iter()
+            .any(|info| AgentKey::new(info) == aux_key));
+        assert_eq!(
+            app.agent_states.get(&aux_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_live_auxiliary_restore_attach_is_discarded_when_parent_is_gone() {
+        let mut app = app_for_key_tests();
+        let mut aux = buffered_output_test_client("stale-orphan-restore-aux", 212);
+        aux.info = shell_session_info_for_cwd("/repo".into());
+        aux.info.session_id = "shell-stale-orphan-restore".into();
+        let aux_info = aux.info.clone();
+        let aux_key = AgentKey::new(&aux_info);
+        let parent = AgentKey {
+            provider: Provider::Codex,
+            session_id: "missing-stale-restore-parent".into(),
+        };
+
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 92,
+            key: aux_key.clone(),
+            target: AttachTarget::Auxiliary {
+                kind: AgentAuxKind::Terminal,
+                parent: parent.clone(),
+            },
+            started_at: Instant::now(),
+        });
+        app.on_attach_result(Box::new(AttachWorkerResult {
+            seq: 91,
+            info: aux_info,
+            cols: 52,
+            rows: 28,
+            ctx: AttachUiCtx {
+                key: aux_key.clone(),
+                target: AttachTarget::Auxiliary {
+                    kind: AgentAuxKind::Terminal,
+                    parent,
+                },
+                status_attached: "restored right terminal".into(),
+                status_started: "restored right terminal".into(),
+                status_err_prefix: "right terminal restore failed: ".into(),
+                status_prepare_err_prefix: "right terminal restore failed: ".into(),
+                focus_auxiliary_on_ready: false,
+                terminate_auxiliary_on_stale: false,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: true,
+                log_origin: Some("agent_auxiliary_restore:terminal".into()),
+                ready_event: "agent_auxiliary_restore_live_ready",
+                failed_event: "agent_auxiliary_restore_live_failed",
+            },
+            outcome: AttachWorkOutcome::Attached {
+                agent: aux,
+                started: false,
+            },
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 0,
+        }));
+
+        assert!(!app
+            .live_shells
+            .iter()
+            .any(|info| AgentKey::new(info) == aux_key));
+        assert!(!app.persisted_agent_aux.contains_key(&aux_key));
+        assert!(!app.agent_states.contains_key(&aux_key));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn replacing_active_agent_keeps_previous_new_agent_in_sidebar_candidates() {
         let mut app = app_for_key_tests();
         let mut previous_info = new_agent_info(Provider::Codex, "/repo");
@@ -38764,19 +43009,23 @@ IF EXIST "%~dp0\node.exe" (
 
         let mut updated = shell_session_info_for_cwd("/repo/sub".into());
         updated.session_id = key.session_id.clone();
-        app.apply_agent_runtime_refresh_result(AgentRuntimeRefreshResult {
-            seq: 3,
-            live_shells: vec![updated.clone()],
-            agent_states: HashMap::from([(
-                key.clone(),
-                AgentListState::Attached {
-                    mine: true,
-                    activity: AgentActivity::Quiet,
-                },
-            )]),
-            new_agent_backing_aliases: HashMap::new(),
-            new_agent_backing_probe_after: HashMap::new(),
-        });
+        app.apply_agent_runtime_refresh_result_with_pending(
+            AgentRuntimeRefreshResult {
+                seq: 3,
+                discover_live_shells: false,
+                live_shells: vec![updated.clone()],
+                agent_states: HashMap::from([(
+                    key.clone(),
+                    AgentListState::Attached {
+                        mine: true,
+                        activity: AgentActivity::Quiet,
+                    },
+                )]),
+                new_agent_backing_aliases: HashMap::new(),
+                new_agent_backing_probe_after: HashMap::new(),
+            },
+            true,
+        );
 
         assert_eq!(
             app.active_agent.as_ref().unwrap().info.cwd,
@@ -38790,6 +43039,41 @@ IF EXIST "%~dp0\node.exe" (
             .expect("active terminal should remain in agents sidebar candidates");
         assert_eq!(candidate.cwd, "/repo/sub");
         assert_eq!(live_agent_status_label(candidate), "shell at /repo/sub");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_runtime_refresh_does_not_clear_newer_live_discovery() {
+        let mut app = app_for_key_tests();
+        let live = shell_session_info_for_cwd("/repo".into());
+        let live_key = AgentKey::new(&live);
+        app.live_shells = vec![live.clone()];
+        app.pending_runtime_action = Some(PendingRuntimeAction::RestoreLive {
+            selected_key: Some(live_key.clone()),
+            cols: 100,
+            rows: 30,
+        });
+        app.runtime_refresh_pending = true;
+        app.runtime_refresh_queued = true;
+
+        app.on_runtime_state_result(AgentRuntimeRefreshResult {
+            seq: 4,
+            discover_live_shells: false,
+            live_shells: Vec::new(),
+            agent_states: HashMap::new(),
+            new_agent_backing_aliases: HashMap::new(),
+            new_agent_backing_probe_after: HashMap::new(),
+        });
+
+        assert_eq!(app.live_shells.len(), 1);
+        assert_eq!(AgentKey::new(&app.live_shells[0]), live_key);
+        assert!(
+            matches!(
+                app.pending_runtime_action,
+                Some(PendingRuntimeAction::RestoreLive { .. })
+            ),
+            "a queued refresh should run before consuming the restore action"
+        );
     }
 
     #[cfg(unix)]
