@@ -216,6 +216,12 @@ const APP_DIR_NAME: &str = ".cokacmux";
 const COKACDIR_PROGRAM_NAME: &str = "cokacdir";
 const COKACDIR_DIST_BASE_URL: &str = "https://raw.githubusercontent.com/kstost/cokacdir/main/dist";
 const SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e", "enter"];
+const SESSION_FILTER_DEFAULTS: &[&str] = &["ctrl+f"];
+const SESSION_AI_SEARCH_DEFAULTS: &[&str] = &[];
+const SESSION_AI_TITLE_SETTINGS_DEFAULTS: &[&str] = &["comma", "ctrl+t"];
+const PREVIOUS_SESSION_FILTER_DEFAULTS: &[&str] = &["/"];
+const PREVIOUS_SESSION_AI_SEARCH_DEFAULTS: &[&str] = &["ctrl+s"];
+const PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS: &[&str] = &["ctrl+t"];
 const PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e"];
 const PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS: &[&str] = &["enter"];
 const AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+up", "shift+alt+pageup"];
@@ -696,6 +702,12 @@ enum KeyAction {
     RestoreDataPrev,
     RestoreDataRestore,
     RestoreDataSkipChoice,
+    SearchChoiceCancel,
+    SearchChoiceConfirm,
+    SearchChoiceNext,
+    SearchChoicePrev,
+    SearchChoiceText,
+    SearchChoiceAi,
     FilterCancel,
     FilterApply,
     FilterMoveLeft,
@@ -805,11 +817,15 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     ),
     ("sessions.top", KeyAction::SessionTop, &["home", "g"]),
     ("sessions.bottom", KeyAction::SessionBottom, &["end", "G"]),
-    ("sessions.filter", KeyAction::SessionFilter, &["/"]),
+    (
+        "sessions.filter",
+        KeyAction::SessionFilter,
+        SESSION_FILTER_DEFAULTS,
+    ),
     (
         "sessions.ai_search",
         KeyAction::SessionAiSearch,
-        &["ctrl+s"],
+        SESSION_AI_SEARCH_DEFAULTS,
     ),
     ("sessions.toggle_view", KeyAction::SessionToggleView, &["v"]),
     ("sessions.refresh", KeyAction::SessionRefresh, &["r"]),
@@ -823,7 +839,7 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "sessions.ai_title_settings",
         KeyAction::SessionAiTitleSettings,
-        &["ctrl+t"],
+        SESSION_AI_TITLE_SETTINGS_DEFAULTS,
     ),
     (
         "sessions.launch_agent",
@@ -1017,6 +1033,20 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
         KeyAction::RestoreDataSkipChoice,
         &["2"],
     ),
+    ("search.cancel", KeyAction::SearchChoiceCancel, &["esc"]),
+    ("search.confirm", KeyAction::SearchChoiceConfirm, &["enter"]),
+    (
+        "search.next",
+        KeyAction::SearchChoiceNext,
+        &["down", "j", "tab"],
+    ),
+    (
+        "search.prev",
+        KeyAction::SearchChoicePrev,
+        &["up", "k", "backtab"],
+    ),
+    ("search.text", KeyAction::SearchChoiceText, &["1"]),
+    ("search.ai", KeyAction::SearchChoiceAi, &["2"]),
     (
         "clone_options.cancel",
         KeyAction::CloneOptionsCancel,
@@ -1558,6 +1588,36 @@ fn parse_keybinding_json_list(
 fn migrate_legacy_keybinding_defaults(root: &mut serde_json::Value) -> bool {
     let mut migrated = false;
     migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "sessions.filter"),
+        &[PREVIOUS_SESSION_FILTER_DEFAULTS],
+        SESSION_FILTER_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["sessions", "filter"]),
+        &[PREVIOUS_SESSION_FILTER_DEFAULTS],
+        SESSION_FILTER_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "sessions.ai_search"),
+        &[PREVIOUS_SESSION_AI_SEARCH_DEFAULTS],
+        SESSION_AI_SEARCH_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["sessions", "ai_search"]),
+        &[PREVIOUS_SESSION_AI_SEARCH_DEFAULTS],
+        SESSION_AI_SEARCH_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        flat_keybinding_json_value_mut(root, "sessions.ai_title_settings"),
+        &[PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS],
+        SESSION_AI_TITLE_SETTINGS_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
+        nested_keybinding_json_value_mut(root, &["sessions", "ai_title_settings"]),
+        &[PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS],
+        SESSION_AI_TITLE_SETTINGS_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_value(
         flat_keybinding_json_value_mut(root, "sessions.launch_agent"),
         &[PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS],
         SESSION_LAUNCH_AGENT_DEFAULTS,
@@ -2014,17 +2074,273 @@ impl AiTitleSettingsReturn {
                 draft,
                 cursor,
             },
-            AiTitleSettingsReturn::AiSearch { draft, cursor } => InputMode::AiSearch {
-                draft,
-                cursor,
-            },
+            AiTitleSettingsReturn::AiSearch { draft, cursor } => {
+                InputMode::AiSearch { draft, cursor }
+            }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    General,
+    Ai,
+    Agents,
+    Keybindings,
+    Data,
+}
+
+const SETTINGS_SECTIONS: [SettingsSection; 5] = [
+    SettingsSection::General,
+    SettingsSection::Ai,
+    SettingsSection::Agents,
+    SettingsSection::Keybindings,
+    SettingsSection::Data,
+];
+
+impl SettingsSection {
+    fn label(self) -> &'static str {
+        match self {
+            SettingsSection::General => "General",
+            SettingsSection::Ai => "AI",
+            SettingsSection::Agents => "Agents",
+            SettingsSection::Keybindings => "Keybindings",
+            SettingsSection::Data => "Data",
+        }
+    }
+
+    fn index(self) -> usize {
+        SETTINGS_SECTIONS
+            .iter()
+            .position(|section| *section == self)
+            .unwrap_or(0)
+    }
+
+    fn moved(self, delta: i32) -> Self {
+        let len = SETTINGS_SECTIONS.len() as i32;
+        let index = (self.index() as i32 + delta).rem_euclid(len) as usize;
+        SETTINGS_SECTIONS[index]
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SettingsState {
+    section: SettingsSection,
+    selected: usize,
+    draft: SettingsDraft,
+    editing: Option<SettingsEdit>,
+}
+
+impl SettingsState {
+    fn new(settings: &CokacmuxSettings) -> Self {
+        Self {
+            section: SettingsSection::Ai,
+            selected: 0,
+            draft: SettingsDraft::from_settings(settings),
+            editing: None,
+        }
+    }
+
+    fn move_section(&mut self, delta: i32) {
+        self.editing = None;
+        self.section = self.section.moved(delta);
+        self.selected = self
+            .selected
+            .min(settings_section_row_count(self.section).saturating_sub(1));
+    }
+
+    fn move_row(&mut self, delta: i32) {
+        self.editing = None;
+        let count = settings_section_row_count(self.section);
+        if count == 0 {
+            self.selected = 0;
+            return;
+        }
+        self.selected = (self.selected as i32 + delta).rem_euclid(count as i32) as usize;
+    }
+
+    fn selected_text_field(&self) -> Option<SettingsTextField> {
+        match (self.section, self.selected) {
+            (SettingsSection::Agents, SETTINGS_AGENTS_CODEX) => {
+                Some(SettingsTextField::AgentProgram(Provider::Codex))
+            }
+            (SettingsSection::Agents, SETTINGS_AGENTS_CLAUDE) => {
+                Some(SettingsTextField::AgentProgram(Provider::Claude))
+            }
+            (SettingsSection::Agents, SETTINGS_AGENTS_OPENCODE) => {
+                Some(SettingsTextField::AgentProgram(Provider::OpenCode))
+            }
+            (SettingsSection::Agents, SETTINGS_AGENTS_COKACDIR) => {
+                Some(SettingsTextField::CokacdirProgram)
+            }
+            _ => None,
+        }
+    }
+
+    fn begin_editing_selected_text(&mut self) -> bool {
+        let Some(field) = self.selected_text_field() else {
+            return false;
+        };
+        let cursor = self.draft.text_field_value(field).len();
+        self.editing = Some(SettingsEdit { field, cursor });
+        true
+    }
+
+    fn insert_char_in_selected_text(&mut self, ch: char) -> bool {
+        if !self.begin_editing_selected_text() {
+            return false;
+        }
+        let Some(mut edit) = self.editing else {
+            return false;
+        };
+        {
+            let value = self.draft.text_field_value_mut(edit.field);
+            insert_at_cursor(value, &mut edit.cursor, ch);
+        }
+        self.editing = Some(edit);
+        true
+    }
+
+    fn activate_selected(&mut self) -> &'static str {
+        match (self.section, self.selected) {
+            (SettingsSection::General, SETTINGS_GENERAL_SESSION_VIEW) => {
+                self.draft.session_view = self.draft.session_view.toggle();
+                "session view changed"
+            }
+            (SettingsSection::General, SETTINGS_GENERAL_AGENT_SIDEBAR_VISIBLE) => {
+                self.draft.agent_sidebar_visible = !self.draft.agent_sidebar_visible;
+                "agent sidebar visibility changed"
+            }
+            (SettingsSection::General, SETTINGS_GENERAL_SESSIONS_WIDTH_RESET) => {
+                self.draft.sessions_pane_width = None;
+                self.draft.sessions_pane_percent = DEFAULT_SESSIONS_PANE_PERCENT;
+                "sessions pane width reset"
+            }
+            (SettingsSection::General, SETTINGS_GENERAL_AGENT_SIDEBAR_WIDTH_RESET) => {
+                self.draft.agent_sidebar_width = DEFAULT_AGENT_SIDEBAR_WIDTH;
+                "agent sidebar width reset"
+            }
+            (SettingsSection::Ai, SETTINGS_AI_PROVIDER) => {
+                self.draft.ai_provider = ai_title_provider_at(move_ai_title_provider_index(
+                    ai_title_provider_index(self.draft.ai_provider),
+                    1,
+                ));
+                "AI agent changed"
+            }
+            _ => "no editable value on this row",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SettingsDraft {
+    ai_provider: Option<Provider>,
+    session_view: SessionViewMode,
+    agent_sidebar_visible: bool,
+    sessions_pane_width: Option<u16>,
+    sessions_pane_percent: u16,
+    agent_sidebar_width: u16,
+    agent_programs: AgentProgramSettings,
+    cokacdir_program: String,
+}
+
+impl SettingsDraft {
+    fn from_settings(settings: &CokacmuxSettings) -> Self {
+        Self {
+            ai_provider: settings.ai.provider,
+            session_view: settings.session_view,
+            agent_sidebar_visible: settings.agent_sidebar_visible,
+            sessions_pane_width: settings.sessions_pane_width,
+            sessions_pane_percent: settings.sessions_pane_percent,
+            agent_sidebar_width: settings.agent_sidebar_width,
+            agent_programs: settings.agent_programs.clone(),
+            cokacdir_program: settings.cokacdir_program.clone().unwrap_or_default(),
+        }
+    }
+
+    fn text_field_value(&self, field: SettingsTextField) -> &str {
+        match field {
+            SettingsTextField::AgentProgram(Provider::Codex) => {
+                self.agent_programs.codex.as_deref().unwrap_or("")
+            }
+            SettingsTextField::AgentProgram(Provider::Claude) => {
+                self.agent_programs.claude.as_deref().unwrap_or("")
+            }
+            SettingsTextField::AgentProgram(Provider::OpenCode) => {
+                self.agent_programs.opencode.as_deref().unwrap_or("")
+            }
+            SettingsTextField::CokacdirProgram => &self.cokacdir_program,
+        }
+    }
+
+    fn text_field_value_mut(&mut self, field: SettingsTextField) -> &mut String {
+        match field {
+            SettingsTextField::AgentProgram(Provider::Codex) => {
+                self.agent_programs.codex.get_or_insert_with(String::new)
+            }
+            SettingsTextField::AgentProgram(Provider::Claude) => {
+                self.agent_programs.claude.get_or_insert_with(String::new)
+            }
+            SettingsTextField::AgentProgram(Provider::OpenCode) => {
+                self.agent_programs.opencode.get_or_insert_with(String::new)
+            }
+            SettingsTextField::CokacdirProgram => &mut self.cokacdir_program,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsEdit {
+    field: SettingsTextField,
+    cursor: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsTextField {
+    AgentProgram(Provider),
+    CokacdirProgram,
+}
+
+const SETTINGS_GENERAL_SESSION_VIEW: usize = 0;
+const SETTINGS_GENERAL_AGENT_SIDEBAR_VISIBLE: usize = 1;
+const SETTINGS_GENERAL_SESSIONS_WIDTH_RESET: usize = 2;
+const SETTINGS_GENERAL_AGENT_SIDEBAR_WIDTH_RESET: usize = 3;
+const SETTINGS_GENERAL_ROW_COUNT: usize = 4;
+
+const SETTINGS_AI_PROVIDER: usize = 0;
+const SETTINGS_AI_ROW_COUNT: usize = 1;
+
+const SETTINGS_AGENTS_CODEX: usize = 0;
+const SETTINGS_AGENTS_CLAUDE: usize = 1;
+const SETTINGS_AGENTS_OPENCODE: usize = 2;
+const SETTINGS_AGENTS_COKACDIR: usize = 3;
+const SETTINGS_AGENTS_ROW_COUNT: usize = 4;
+
+const SETTINGS_KEYBINDINGS_FILE: usize = 0;
+const SETTINGS_KEYBINDINGS_RELOAD: usize = 1;
+const SETTINGS_KEYBINDINGS_ROW_COUNT: usize = 2;
+
+const SETTINGS_DATA_SETTINGS_FILE: usize = 0;
+const SETTINGS_DATA_KEYBINDING_FILE: usize = 1;
+const SETTINGS_DATA_AI_SEARCHDATA: usize = 2;
+const SETTINGS_DATA_ROW_COUNT: usize = 3;
+
+fn settings_section_row_count(section: SettingsSection) -> usize {
+    match section {
+        SettingsSection::General => SETTINGS_GENERAL_ROW_COUNT,
+        SettingsSection::Ai => SETTINGS_AI_ROW_COUNT,
+        SettingsSection::Agents => SETTINGS_AGENTS_ROW_COUNT,
+        SettingsSection::Keybindings => SETTINGS_KEYBINDINGS_ROW_COUNT,
+        SettingsSection::Data => SETTINGS_DATA_ROW_COUNT,
     }
 }
 
 #[derive(Debug, Clone)]
 enum InputMode {
     Normal,
+    SearchChoice {
+        selected: usize,
+    },
     Filter {
         draft: String,
         cursor: usize,
@@ -2079,14 +2395,42 @@ enum InputMode {
         draft: String,
         cursor: usize,
     },
-    AiTitleSettings {
-        selected: usize,
+    Settings {
+        state: SettingsState,
         return_to: AiTitleSettingsReturn,
     },
     Notice {
         title: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchChoice {
+    Text,
+    Ai,
+}
+
+const SEARCH_CHOICE_TEXT: usize = 0;
+const SEARCH_CHOICE_AI: usize = 1;
+const SEARCH_CHOICE_COUNT: usize = 2;
+
+fn search_choice_at(index: usize) -> SearchChoice {
+    match index % SEARCH_CHOICE_COUNT {
+        SEARCH_CHOICE_TEXT => SearchChoice::Text,
+        _ => SearchChoice::Ai,
+    }
+}
+
+fn move_search_choice_index(index: usize, delta: i32) -> usize {
+    (index as i32 + delta).rem_euclid(SEARCH_CHOICE_COUNT as i32) as usize
+}
+
+fn search_choice_label(choice: SearchChoice) -> &'static str {
+    match choice {
+        SearchChoice::Text => "Text search",
+        SearchChoice::Ai => "AI search",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2317,6 +2661,10 @@ struct SearchPending {
     seq: u64,
     query: String,
     started_at: Instant,
+    processed: usize,
+    total: usize,
+    hits: usize,
+    load_errors: usize,
     cancel: Arc<AtomicBool>,
 }
 
@@ -2324,6 +2672,17 @@ struct SearchWorkerResult {
     seq: u64,
     query: String,
     hits: std::result::Result<Vec<session::SearchHit>, String>,
+    queued_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SearchProgressEvent {
+    seq: u64,
+    query: String,
+    processed: usize,
+    total: usize,
+    hits: usize,
+    load_errors: usize,
     queued_at_epoch_ms: u64,
 }
 
@@ -5669,6 +6028,8 @@ enum MainEvent {
     SessionRefreshResult(SessionRefreshResult),
     /// Full-session search completed in the background.
     SearchResult(SearchWorkerResult),
+    /// Full-session search progress update.
+    SearchProgress(SearchProgressEvent),
     /// AI-assisted session search progress update.
     AiSearchProgress(AiSearchProgressEvent),
     /// AI-assisted session search completed in the background.
@@ -6166,39 +6527,69 @@ impl App {
         self.status = reload.status;
     }
 
-    fn begin_ai_title_settings(&mut self, return_to: AiTitleSettingsReturn) {
-        let selected = ai_title_provider_index(self.settings.cokacmux.ai.provider);
-        self.input_mode = InputMode::AiTitleSettings {
-            selected,
+    fn begin_settings(&mut self, return_to: AiTitleSettingsReturn) {
+        self.input_mode = InputMode::Settings {
+            state: SettingsState::new(&self.settings.cokacmux),
             return_to,
         };
-        self.status = "choose AI agent.".into();
+        self.status = "settings.".into();
         debug_log(
-            "ai_title_settings_open",
+            "settings_open",
             serde_json::json!({
                 "provider": ai_title_provider_label(self.settings.cokacmux.ai.provider),
             }),
         );
     }
 
-    fn save_ai_title_provider(&mut self, provider: Option<Provider>) {
-        self.settings.cokacmux.ai.provider = provider;
+    fn save_settings_draft(&mut self, draft: SettingsDraft) {
+        let selected_key = self.current().map(AgentKey::new);
+        let previous_session_view = self.session_view;
+        self.settings.cokacmux.ai.provider = draft.ai_provider;
+        self.settings.cokacmux.session_view = draft.session_view;
+        self.settings.cokacmux.agent_sidebar_visible = draft.agent_sidebar_visible;
+        self.settings.cokacmux.sessions_pane_width = draft.sessions_pane_width;
+        self.settings.cokacmux.sessions_pane_percent = draft.sessions_pane_percent.min(100);
+        self.settings.cokacmux.agent_sidebar_width = draft.agent_sidebar_width;
+        self.settings.cokacmux.agent_programs = draft.agent_programs;
+        self.settings.cokacmux.cokacdir_program = Some(draft.cokacdir_program);
+        self.settings
+            .cokacmux
+            .agent_programs
+            .normalize_placeholders();
+        normalize_program_placeholder(&mut self.settings.cokacmux.cokacdir_program);
+
+        self.session_view = self.settings.cokacmux.session_view;
+        if self.session_view != previous_session_view {
+            if let Some(key) = selected_key.as_ref() {
+                self.select_visible_session(key);
+                if self.list_state.selected().is_none() {
+                    self.select_first();
+                }
+            } else {
+                self.select_first();
+            }
+            self.preview_scroll = 0;
+            self.focus = FocusPane::Sessions;
+        }
+
         match self.settings.save() {
             Ok(()) => {
-                self.status = format!("AI agent saved: {}", ai_title_provider_label(provider));
+                self.status = "settings saved.".into();
                 debug_log(
-                    "ai_title_settings_saved",
+                    "settings_saved",
                     serde_json::json!({
-                        "provider": ai_title_provider_label(provider),
+                        "provider": ai_title_provider_label(self.settings.cokacmux.ai.provider),
+                        "session_view": self.session_view.label(),
+                        "agent_sidebar_visible": self.settings.cokacmux.agent_sidebar_visible,
                     }),
                 );
             }
             Err(e) => {
-                self.status = format!("AI title settings save failed: {}", e);
+                self.status = format!("settings save failed: {}", e);
                 debug_log(
-                    "ai_title_settings_save_failed",
+                    "settings_save_failed",
                     serde_json::json!({
-                        "provider": ai_title_provider_label(provider),
+                        "provider": ai_title_provider_label(self.settings.cokacmux.ai.provider),
                         "error": e.to_string(),
                     }),
                 );
@@ -6928,6 +7319,15 @@ impl App {
         );
     }
 
+    fn begin_search_choice(&mut self) {
+        self.input_mode = InputMode::SearchChoice {
+            selected: SEARCH_CHOICE_TEXT,
+        };
+        self.focus = FocusPane::Sessions;
+        self.status = "choose search mode".into();
+        debug_log("search_choice_begin", serde_json::json!({}));
+    }
+
     fn begin_ai_search(&mut self) {
         if self.ai_search_pending.is_some() {
             self.status = "AI search already running.".into();
@@ -7022,6 +7422,10 @@ impl App {
             seq,
             query: query.clone(),
             started_at: Instant::now(),
+            processed: 0,
+            total: 0,
+            hits: 0,
+            load_errors: 0,
             cancel: cancel.clone(),
         });
         self.focus = FocusPane::Sessions;
@@ -7049,8 +7453,25 @@ impl App {
         match thread::Builder::new()
             .name("cokacmux-search".to_string())
             .spawn(move || {
-                let hits = session::search_all_with_cancel(&worker_query, true, Some(&cancel))
-                    .map_err(|e| e.to_string());
+                let progress_query = worker_query.clone();
+                let mut report_progress = |progress: session::SearchProgress| {
+                    let _ = tx.send(MainEvent::SearchProgress(SearchProgressEvent {
+                        seq,
+                        query: progress_query.clone(),
+                        processed: progress.processed,
+                        total: progress.total,
+                        hits: progress.hits,
+                        load_errors: progress.load_errors,
+                        queued_at_epoch_ms: current_epoch_ms(),
+                    }));
+                };
+                let hits = session::search_all_with_cancel_and_progress(
+                    &worker_query,
+                    true,
+                    Some(&cancel),
+                    &mut report_progress,
+                )
+                .map_err(|e| e.to_string());
                 let _ = tx.send(MainEvent::SearchResult(SearchWorkerResult {
                     seq,
                     query: worker_query,
@@ -7114,6 +7535,34 @@ impl App {
                 );
             }
         }
+    }
+
+    fn on_search_progress(&mut self, event: SearchProgressEvent) {
+        let Some(pending) = self.search_pending.as_mut() else {
+            debug_log(
+                "filter_search_progress_ignored",
+                serde_json::json!({
+                    "seq": event.seq,
+                    "reason": "none_pending",
+                }),
+            );
+            return;
+        };
+        if pending.seq != event.seq || pending.query != event.query {
+            debug_log(
+                "filter_search_progress_ignored",
+                serde_json::json!({
+                    "seq": event.seq,
+                    "pending_seq": pending.seq,
+                    "reason": "stale",
+                }),
+            );
+            return;
+        }
+        pending.total = event.total;
+        pending.processed = event.processed.min(event.total);
+        pending.hits = event.hits;
+        pending.load_errors = event.load_errors;
     }
 
     fn finish_text_search(&mut self, query: String, hits: Vec<session::SearchHit>) {
@@ -7189,7 +7638,7 @@ impl App {
             return;
         }
         let Some(provider) = self.settings.cokacmux.ai.provider else {
-            self.status = "choose an AI agent first with Ctrl+T.".into();
+            self.status = "choose an AI agent first with , or Ctrl+T.".into();
             debug_log(
                 "ai_search_request_ignored",
                 serde_json::json!({
@@ -12062,9 +12511,7 @@ fn load_or_render_ai_search_preview(
     }
 }
 
-fn ensure_ai_search_preview_path_is_regular_file(
-    path: &Path,
-) -> std::result::Result<(), String> {
+fn ensure_ai_search_preview_path_is_regular_file(path: &Path) -> std::result::Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => Ok(()),
         Ok(_) => Err(format!(
@@ -12127,9 +12574,7 @@ fn ai_search_preview_is_current(text: &str, info: &SessionInfo) -> bool {
 }
 
 fn ai_search_preview_load_status_ok(text: &str) -> bool {
-    text.lines()
-        .take(16)
-        .any(|line| line == "load_status: ok")
+    text.lines().take(16).any(|line| line == "load_status: ok")
 }
 
 fn ai_search_preview_cache_key(info: &SessionInfo) -> String {
@@ -13007,54 +13452,75 @@ fn run_prompt_command_with_cancel(
             duration: started.elapsed(),
         });
     }
+    configure_prompt_command_process_group(&mut command);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn failed: {}", e))?;
+    let child_pid = child.id();
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "stdout pipe unavailable".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "stderr pipe unavailable".to_string())?;
+    let Some(stdout) = child.stdout.take() else {
+        terminate_process_group(child_pid);
+        let _ = child.wait();
+        return Err("stdout pipe unavailable".to_string());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_process_group(child_pid);
+        let _ = child.wait();
+        return Err("stderr pipe unavailable".to_string());
+    };
+    let Some(stdin) = child.stdin.take() else {
+        terminate_process_group(child_pid);
+        let _ = child.wait();
+        return Err("stdin pipe unavailable".to_string());
+    };
     let stdout_reader = spawn_pipe_reader(stdout);
     let stderr_reader = spawn_pipe_reader(stderr);
-
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(prompt.as_bytes()) {
-            if e.kind() != ErrorKind::BrokenPipe {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = join_pipe_reader(stdout_reader, "stdout");
-                let _ = join_pipe_reader(stderr_reader, "stderr");
-                return Err(format!("stdin write failed: {}", e));
-            }
-        }
-    }
+    let mut stdin_writer = Some(spawn_prompt_stdin_writer(stdin, prompt.as_bytes().to_vec()));
 
     let mut timed_out = false;
     let mut cancelled = false;
     let status = loop {
+        if stdin_writer
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            let handle = stdin_writer.take().expect("stdin writer checked above");
+            if let Err(e) = join_prompt_stdin_writer(handle) {
+                terminate_process_group(child_pid);
+                let _ = child.wait();
+                let _ = join_pipe_reader(stdout_reader, "stdout");
+                let _ = join_pipe_reader(stderr_reader, "stderr");
+                return Err(e);
+            }
+        }
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => {
+                if stdin_writer
+                    .as_ref()
+                    .is_some_and(|handle| !handle.is_finished())
+                    || !stdout_reader.is_finished()
+                    || !stderr_reader.is_finished()
+                {
+                    terminate_process_group(child_pid);
+                }
+                break Some(status);
+            }
             Ok(None) if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) => {
                 cancelled = true;
-                let _ = child.kill();
+                terminate_process_group(child_pid);
                 break child.wait().ok();
             }
             Ok(None) if started.elapsed() >= timeout => {
                 timed_out = true;
-                let _ = child.kill();
+                terminate_process_group(child_pid);
                 break child.wait().ok();
             }
             Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(e) => {
-                let _ = child.kill();
+                terminate_process_group(child_pid);
                 let _ = child.wait();
                 let _ = join_pipe_reader(stdout_reader, "stdout");
                 let _ = join_pipe_reader(stderr_reader, "stderr");
@@ -13063,6 +13529,13 @@ fn run_prompt_command_with_cancel(
         }
     };
 
+    if let Some(handle) = stdin_writer {
+        if let Err(e) = join_prompt_stdin_writer(handle) {
+            if !timed_out && !cancelled {
+                return Err(e);
+            }
+        }
+    }
     let stdout = String::from_utf8_lossy(&join_pipe_reader(stdout_reader, "stdout")?).to_string();
     let stderr = String::from_utf8_lossy(&join_pipe_reader(stderr_reader, "stderr")?).to_string();
     Ok(AiTitleCommandOutput {
@@ -13073,6 +13546,44 @@ fn run_prompt_command_with_cancel(
         timed_out,
         duration: started.elapsed(),
     })
+}
+
+#[cfg(unix)]
+fn configure_prompt_command_process_group(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+fn configure_prompt_command_process_group(command: &mut Command) {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+fn spawn_prompt_stdin_writer<W>(mut stdin: W, prompt: Vec<u8>) -> JoinHandle<io::Result<()>>
+where
+    W: Write + Send + 'static,
+{
+    thread::spawn(move || stdin.write_all(&prompt))
+}
+
+fn join_prompt_stdin_writer(handle: JoinHandle<io::Result<()>>) -> std::result::Result<(), String> {
+    match handle
+        .join()
+        .map_err(|_| "stdin writer panicked".to_string())?
+    {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(format!("stdin write failed: {}", e)),
+    }
 }
 
 fn spawn_pipe_reader<R>(mut reader: R) -> JoinHandle<io::Result<Vec<u8>>>
@@ -14121,9 +14632,10 @@ fn print_help() {
          PgUp / PgDn   jump 10\n  \
          g/Home / G/End top / bottom\n  \
          Tab / Esc     switch focus between session list and preview\n  \
-         /             open session-data search dialog\n  \
+         Ctrl+F        open search mode chooser\n  \
          v             toggle session list/tree view\n  \
          t             edit selected session title\n  \
+         , / Ctrl+T    configure AI agent; in title edit, Ctrl+T generates AI title\n  \
          r             refresh from disk\n  \
          c             clone selected session\n  \
          e / Enter     switch to live selected agent, or choose launch mode to start it\n  \
@@ -14216,6 +14728,7 @@ fn main_event_kind(event: &MainEvent) -> &'static str {
         MainEvent::LiveShellDiscoveryResult(_) => "live_shell_discovery_result",
         MainEvent::SessionRefreshResult(_) => "session_refresh_result",
         MainEvent::SearchResult(_) => "search_result",
+        MainEvent::SearchProgress(_) => "search_progress",
         MainEvent::AiSearchProgress(_) => "ai_search_progress",
         MainEvent::AiSearchResult(_) => "ai_search_result",
         MainEvent::DataTaskProgress(_) => "data_task_progress",
@@ -14255,6 +14768,7 @@ fn main_event_queued_at_epoch_ms(event: &MainEvent) -> Option<u64> {
         } => *queued_at_epoch_ms,
         MainEvent::SessionRefreshResult(result) => result.queued_at_epoch_ms,
         MainEvent::SearchResult(result) => result.queued_at_epoch_ms,
+        MainEvent::SearchProgress(result) => result.queued_at_epoch_ms,
         MainEvent::AiSearchProgress(result) => result.queued_at_epoch_ms,
         MainEvent::AiSearchResult(result) => result.queued_at_epoch_ms,
         MainEvent::AiTitleResult(result) => result.queued_at_epoch_ms,
@@ -14583,6 +15097,9 @@ fn handle_main_event(
         }
         MainEvent::SearchResult(result) => {
             app.on_search_result(result);
+        }
+        MainEvent::SearchProgress(progress) => {
+            app.on_search_progress(progress);
         }
         MainEvent::AiSearchProgress(progress) => {
             app.on_ai_search_progress(progress);
@@ -20199,9 +20716,11 @@ fn terminate_process_group(pid: u32) {
         let _ = libc::kill(pid, libc::SIGTERM);
     }
     thread::sleep(Duration::from_millis(150));
+    unsafe {
+        let _ = libc::kill(pgid, libc::SIGKILL);
+    }
     if process_is_alive(pid as u32) {
         unsafe {
-            let _ = libc::kill(pgid, libc::SIGKILL);
             let _ = libc::kill(pid, libc::SIGKILL);
         }
     }
@@ -22458,6 +22977,7 @@ fn debug_log_title_edit_cursor(source: &SessionInfo, draft: &str, cursor: usize,
 fn input_mode_label(mode: &InputMode) -> &'static str {
     match mode {
         InputMode::Normal => "normal",
+        InputMode::SearchChoice { .. } => "search_choice",
         InputMode::Filter { .. } => "filter",
         InputMode::AiSearch { .. } => "ai_search",
         InputMode::DeleteConfirm { .. } => "delete_confirm",
@@ -22467,7 +22987,7 @@ fn input_mode_label(mode: &InputMode) -> &'static str {
         InputMode::CloneOptions { .. } => "clone_options",
         InputMode::NewSession { .. } => "new_session",
         InputMode::TitleEdit { .. } => "title_edit",
-        InputMode::AiTitleSettings { .. } => "ai_title_settings",
+        InputMode::Settings { .. } => "settings",
         InputMode::Notice { .. } => "notice",
     }
 }
@@ -22809,12 +23329,31 @@ fn copy_stats_summary(stats: &session::data::CopyStats) -> String {
     )
 }
 
-fn ai_search_progress_percent(indexed: usize, total: usize) -> Option<u8> {
+fn progress_percent(processed: usize, total: usize) -> Option<u8> {
     if total == 0 {
         return None;
     }
-    let percent = indexed.saturating_mul(100).saturating_add(total / 2) / total;
+    let percent = processed.saturating_mul(100).saturating_add(total / 2) / total;
     Some(percent.min(100) as u8)
+}
+
+fn ai_search_progress_percent(indexed: usize, total: usize) -> Option<u8> {
+    progress_percent(indexed, total)
+}
+
+fn search_progress_summary(pending: &SearchPending) -> String {
+    if pending.total == 0 {
+        return "preparing session list".to_string();
+    }
+    let percent = progress_percent(pending.processed, pending.total).unwrap_or(0);
+    format!(
+        "{}/{} sessions  {}%  hits {}  errors {}",
+        pending.processed.min(pending.total),
+        pending.total,
+        percent,
+        pending.hits,
+        pending.load_errors,
+    )
 }
 
 fn ai_search_progress_summary(pending: &AiSearchPending) -> Option<String> {
@@ -23121,6 +23660,8 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
     } = &app.input_mode
     {
         draw_restore_data_confirm_modal(f, area, info, snapshot, *selected, &app.keybindings);
+    } else if let InputMode::SearchChoice { selected } = &app.input_mode {
+        draw_search_choice_modal(f, area, *selected, &app.keybindings);
     } else if let InputMode::Filter { draft, cursor } = &app.input_mode {
         draw_filter_modal(
             f,
@@ -23207,12 +23748,12 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
             ai_title_pending,
             &app.keybindings,
         );
-    } else if let InputMode::AiTitleSettings {
-        selected,
+    } else if let InputMode::Settings {
+        state,
         return_to: _,
     } = &app.input_mode
     {
-        draw_ai_title_settings_modal(f, area, *selected, &app.keybindings);
+        draw_settings_modal(f, area, state, &app.keybindings);
     } else if let InputMode::Notice { title, message } = &app.input_mode {
         draw_notice_modal(f, area, title, message);
     } else {
@@ -23785,6 +24326,65 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         return;
     }
 
+    // Search mode chooser
+    if let InputMode::SearchChoice { selected } = &mut app.input_mode {
+        let mut next_mode: Option<InputMode> = None;
+        let mut search_choice: Option<SearchChoice> = None;
+        if keybindings.matches(KeyAction::SearchChoiceCancel, key) {
+            next_mode = Some(InputMode::Normal);
+            app.status = "cancelled.".into();
+            debug_log_key_event(key, "search_choice_cancel");
+        } else if keybindings.matches(KeyAction::SearchChoiceConfirm, key) {
+            search_choice = Some(search_choice_at(*selected));
+            debug_log(
+                "search_choice_confirm",
+                serde_json::json!({
+                    "selected": *selected,
+                    "choice": search_choice_label(search_choice_at(*selected)),
+                }),
+            );
+        } else if keybindings.matches(KeyAction::SearchChoiceNext, key) {
+            *selected = move_search_choice_index(*selected, 1);
+            debug_log(
+                "search_choice_move",
+                serde_json::json!({
+                    "selected": *selected,
+                    "choice": search_choice_label(search_choice_at(*selected)),
+                }),
+            );
+        } else if keybindings.matches(KeyAction::SearchChoicePrev, key) {
+            *selected = move_search_choice_index(*selected, -1);
+            debug_log(
+                "search_choice_move",
+                serde_json::json!({
+                    "selected": *selected,
+                    "choice": search_choice_label(search_choice_at(*selected)),
+                }),
+            );
+        } else if keybindings.matches(KeyAction::SearchChoiceText, key) {
+            *selected = SEARCH_CHOICE_TEXT;
+            search_choice = Some(SearchChoice::Text);
+            debug_log_key_event(key, "search_choice_text");
+        } else if keybindings.matches(KeyAction::SearchChoiceAi, key) {
+            *selected = SEARCH_CHOICE_AI;
+            search_choice = Some(SearchChoice::Ai);
+            debug_log_key_event(key, "search_choice_ai");
+        } else {
+            debug_log_key_event(key, "search_choice_ignored");
+        }
+
+        if let Some(mode) = next_mode {
+            app.input_mode = mode;
+        }
+        if let Some(choice) = search_choice {
+            match choice {
+                SearchChoice::Text => app.begin_filter(),
+                SearchChoice::Ai => app.begin_ai_search(),
+            }
+        }
+        return;
+    }
+
     // Delete confirmation dialog
     if let InputMode::DeleteConfirm {
         info,
@@ -24247,62 +24847,134 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         }
         return;
     }
-    // AI title settings dialog
-    if let InputMode::AiTitleSettings {
-        selected,
-        return_to,
-    } = &mut app.input_mode
-    {
+    // Settings dialog
+    if let InputMode::Settings { state, return_to } = &mut app.input_mode {
         let mut next_mode: Option<InputMode> = None;
-        let mut save_provider: Option<Option<Provider>> = None;
-        if keybindings.matches(KeyAction::AiTitleSettingsCancel, key) {
+        let mut save_draft: Option<SettingsDraft> = None;
+        if let Some(mut edit) = state.editing {
+            let mut finish_editing = false;
+            if keybindings.matches(KeyAction::AiTitleSettingsCancel, key)
+                || keybindings.matches(KeyAction::AiTitleSettingsSave, key)
+            {
+                finish_editing = true;
+                app.status = "path edit done; Enter saves settings.".into();
+                debug_log_key_event(key, "settings_path_edit_done");
+            } else {
+                {
+                    let value = state.draft.text_field_value_mut(edit.field);
+                    match key.code {
+                        KeyCode::Left => {
+                            edit.cursor = prev_char_boundary(value, edit.cursor);
+                            debug_log_key_event(key, "settings_path_left");
+                        }
+                        KeyCode::Right => {
+                            edit.cursor = next_char_boundary(value, edit.cursor);
+                            debug_log_key_event(key, "settings_path_right");
+                        }
+                        KeyCode::Home => {
+                            edit.cursor = 0;
+                            debug_log_key_event(key, "settings_path_home");
+                        }
+                        KeyCode::End => {
+                            edit.cursor = value.len();
+                            debug_log_key_event(key, "settings_path_end");
+                        }
+                        KeyCode::Backspace => {
+                            delete_before_cursor(value, &mut edit.cursor);
+                            debug_log_key_event(key, "settings_path_backspace");
+                        }
+                        KeyCode::Delete => {
+                            delete_at_cursor(value, &mut edit.cursor);
+                            debug_log_key_event(key, "settings_path_delete");
+                        }
+                        KeyCode::Char(c)
+                            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                && !key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            insert_at_cursor(value, &mut edit.cursor, c);
+                            debug_log_key_event(key, "settings_path_insert");
+                        }
+                        _ => {
+                            debug_log_key_event(key, "settings_path_ignored");
+                        }
+                    }
+                }
+            }
+            state.editing = if finish_editing { None } else { Some(edit) };
+        } else if keybindings.matches(KeyAction::AiTitleSettingsCancel, key) {
             next_mode = Some(return_to.clone().into_input_mode());
             app.status = "cancelled.".into();
-            debug_log_key_event(key, "ai_title_settings_cancel");
+            debug_log_key_event(key, "settings_cancel");
         } else if keybindings.matches(KeyAction::AiTitleSettingsSave, key) {
-            let provider = ai_title_provider_at(*selected);
-            save_provider = Some(provider);
-            next_mode = Some(return_to.clone().into_input_mode());
-            debug_log(
-                "ai_title_settings_save",
-                serde_json::json!({
-                    "provider": ai_title_provider_label(provider),
-                }),
-            );
+            if state.begin_editing_selected_text() {
+                app.status = "editing path; Enter finishes edit, Esc cancels edit.".into();
+                debug_log_key_event(key, "settings_path_edit_begin");
+            } else {
+                save_draft = Some(state.draft.clone());
+                next_mode = Some(return_to.clone().into_input_mode());
+                debug_log(
+                    "settings_save",
+                    serde_json::json!({
+                        "section": state.section.label(),
+                        "provider": ai_title_provider_label(state.draft.ai_provider),
+                    }),
+                );
+            }
+        } else if key.code == KeyCode::Left {
+            state.move_section(-1);
+            app.status = format!("settings: {}", state.section.label());
+            debug_log_key_event(key, "settings_section_prev");
+        } else if key.code == KeyCode::Right {
+            state.move_section(1);
+            app.status = format!("settings: {}", state.section.label());
+            debug_log_key_event(key, "settings_section_next");
         } else if keybindings.matches(KeyAction::AiTitleSettingsNext, key) {
-            *selected = move_ai_title_provider_index(*selected, 1);
-            debug_log(
-                "ai_title_settings_move",
-                serde_json::json!({
-                    "selected": *selected,
-                    "provider": ai_title_provider_label(ai_title_provider_at(*selected)),
-                }),
-            );
+            state.move_row(1);
+            debug_log_key_event(key, "settings_row_next");
         } else if keybindings.matches(KeyAction::AiTitleSettingsPrev, key) {
-            *selected = move_ai_title_provider_index(*selected, -1);
-            debug_log(
-                "ai_title_settings_move",
-                serde_json::json!({
-                    "selected": *selected,
-                    "provider": ai_title_provider_label(ai_title_provider_at(*selected)),
-                }),
-            );
+            state.move_row(-1);
+            debug_log_key_event(key, "settings_row_prev");
         } else if keybindings.matches(KeyAction::AiTitleSettingsNone, key) {
-            *selected = ai_title_provider_index(None);
+            state.section = SettingsSection::Ai;
+            state.selected = SETTINGS_AI_PROVIDER;
+            state.draft.ai_provider = None;
+            app.status = "AI agent: none".into();
         } else if keybindings.matches(KeyAction::AiTitleSettingsClaude, key) {
-            *selected = ai_title_provider_index(Some(Provider::Claude));
+            state.section = SettingsSection::Ai;
+            state.selected = SETTINGS_AI_PROVIDER;
+            state.draft.ai_provider = Some(Provider::Claude);
+            app.status = "AI agent: claude".into();
         } else if keybindings.matches(KeyAction::AiTitleSettingsCodex, key) {
-            *selected = ai_title_provider_index(Some(Provider::Codex));
+            state.section = SettingsSection::Ai;
+            state.selected = SETTINGS_AI_PROVIDER;
+            state.draft.ai_provider = Some(Provider::Codex);
+            app.status = "AI agent: codex".into();
         } else if keybindings.matches(KeyAction::AiTitleSettingsOpenCode, key) {
-            *selected = ai_title_provider_index(Some(Provider::OpenCode));
+            state.section = SettingsSection::Ai;
+            state.selected = SETTINGS_AI_PROVIDER;
+            state.draft.ai_provider = Some(Provider::OpenCode);
+            app.status = "AI agent: opencode".into();
+        } else if matches!(key.code, KeyCode::Char(' ')) {
+            app.status = state.activate_selected().into();
+            debug_log_key_event(key, "settings_activate");
+        } else if let KeyCode::Char(c) = key.code {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && state.insert_char_in_selected_text(c)
+            {
+                app.status = "editing path; Enter finishes edit, Esc cancels edit.".into();
+                debug_log_key_event(key, "settings_path_edit_begin_insert");
+            } else {
+                debug_log_key_event(key, "settings_ignored");
+            }
         } else {
-            debug_log_key_event(key, "ai_title_settings_ignored");
+            debug_log_key_event(key, "settings_ignored");
         }
         if let Some(mode) = next_mode {
             app.input_mode = mode;
         }
-        if let Some(provider) = save_provider {
-            app.save_ai_title_provider(provider);
+        if let Some(draft) = save_draft {
+            app.save_settings_draft(draft);
         }
         return;
     }
@@ -24439,8 +25111,8 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 app.status = "AI title already running.".into();
                 debug_log_key_event(key, "title_ai_generate_pending");
             } else if app.settings.cokacmux.ai.provider.is_none() {
-                next_mode = Some(InputMode::AiTitleSettings {
-                    selected: ai_title_provider_index(app.settings.cokacmux.ai.provider),
+                next_mode = Some(InputMode::Settings {
+                    state: SettingsState::new(&app.settings.cokacmux),
                     return_to: AiTitleSettingsReturn::TitleEdit {
                         source: source.clone(),
                         draft: draft.clone(),
@@ -24514,8 +25186,8 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             debug_log_key_event(key, "ai_search_searching_ignored");
         } else if keybindings.matches(KeyAction::FilterApply, key) {
             if !draft.trim().is_empty() && app.settings.cokacmux.ai.provider.is_none() {
-                next_mode = Some(InputMode::AiTitleSettings {
-                    selected: ai_title_provider_index(app.settings.cokacmux.ai.provider),
+                next_mode = Some(InputMode::Settings {
+                    state: SettingsState::new(&app.settings.cokacmux),
                     return_to: AiTitleSettingsReturn::AiSearch {
                         draft: draft.clone(),
                         cursor: *cursor,
@@ -24848,7 +25520,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             app.select_last();
         }
     } else if keybindings.matches(KeyAction::SessionFilter, key) {
-        app.begin_filter();
+        app.begin_search_choice();
     } else if keybindings.matches(KeyAction::SessionAiSearch, key) {
         app.begin_ai_search();
     } else if keybindings.matches(KeyAction::SessionToggleView, key) {
@@ -24892,7 +25564,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     } else if keybindings.matches(KeyAction::SessionAiTitleSettings, key)
         && app.focus == FocusPane::Sessions
     {
-        app.begin_ai_title_settings(AiTitleSettingsReturn::Normal);
+        app.begin_settings(AiTitleSettingsReturn::Normal);
     } else if keybindings.matches(KeyAction::SessionEditTitle, key)
         && app.focus == FocusPane::Sessions
     {
@@ -25185,6 +25857,58 @@ fn confirm_prompt_line(value: &str, width: usize) -> String {
     truncate_width(sanitize_for_single_line(value).trim(), width)
 }
 
+fn draw_search_choice_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    selected: usize,
+    keybindings: &KeyBindings,
+) {
+    let help = search_choice_help_text(keybindings);
+    let lines = vec![
+        Line::from(Span::styled(
+            "Choose search mode",
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(""),
+        search_choice_option_line(SEARCH_CHOICE_TEXT, selected == SEARCH_CHOICE_TEXT),
+        search_choice_option_line(SEARCH_CHOICE_AI, selected == SEARCH_CHOICE_AI),
+        Line::from(""),
+        Line::from(Span::styled(
+            help,
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ];
+    let modal_area = modal_area_for_wrapped_lines(area, "Search", &lines, 42, 72, 8, 12);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Search");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    f.render_widget(p, modal_area);
+}
+
+fn search_choice_option_line(index: usize, selected: bool) -> Line<'static> {
+    let choice = search_choice_at(index);
+    let text = format!(
+        "{}{}. {}",
+        selection_marker(selected),
+        index + 1,
+        search_choice_label(choice)
+    );
+    let style = if selected {
+        theme_selected_style()
+    } else {
+        Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT)
+    };
+    Line::from(Span::styled(text, style))
+}
+
 #[cfg(test)]
 fn confirm_modal_lines(prompt: &str) -> Vec<Line<'static>> {
     prompt
@@ -25239,6 +25963,7 @@ fn draw_filter_modal(
     } else {
         filter_help_text(keybindings)
     };
+    let progress_summary = pending.map(search_progress_summary);
     let button_width = UnicodeWidthStr::width(search_label.as_str())
         .saturating_add(UnicodeWidthStr::width(cancel_label.as_str()))
         .saturating_add(8);
@@ -25246,12 +25971,27 @@ fn draw_filter_modal(
         .saturating_add(1)
         .max(UnicodeWidthStr::width("Query"))
         .max(button_width)
-        .max(UnicodeWidthStr::width(help.as_str()));
-    let provisional_area =
-        modal_area_from_content_rows(area, "Search sessions", desired_width, 4, 44, 84, 6, 12);
+        .max(UnicodeWidthStr::width(help.as_str()))
+        .max(
+            progress_summary
+                .as_deref()
+                .map(UnicodeWidthStr::width)
+                .unwrap_or(0),
+        );
+    let content_rows = if pending.is_some() { 6 } else { 4 };
+    let provisional_area = modal_area_from_content_rows(
+        area,
+        "Search sessions",
+        desired_width,
+        content_rows,
+        44,
+        84,
+        6,
+        12,
+    );
     let input_width = provisional_area.width.saturating_sub(4) as usize;
     let input = input_viewport(draft, cursor, input_width);
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             "Query",
             Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
@@ -25265,11 +26005,23 @@ fn draw_filter_modal(
             Span::raw("  "),
             modal_button_span(&cancel_label, false, true),
         ]),
-        Line::from(Span::styled(
-            help,
-            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-        )),
     ];
+    if let Some(pending) = pending {
+        lines.push(search_progress_bar_line(pending, input_width));
+        lines.push(Line::from(Span::styled(
+            truncate_width(
+                progress_summary
+                    .as_deref()
+                    .unwrap_or("preparing session list"),
+                input_width,
+            ),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        help,
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+    )));
     let modal_area = modal_area_for_wrapped_lines(area, "Search sessions", &lines, 44, 84, 6, 12);
     draw_fixed_modal_lines(f, modal_area, "Search sessions", lines);
     if pending.is_none() {
@@ -25491,17 +26243,25 @@ fn ai_search_pending_overlay_lines(
 }
 
 fn ai_search_progress_bar_line(pending: &AiSearchPending, content_width: usize) -> Line<'static> {
-    let percent = ai_search_progress_percent(pending.indexed, pending.total).unwrap_or(0);
+    progress_bar_line(pending.indexed, pending.total, content_width)
+}
+
+fn search_progress_bar_line(pending: &SearchPending, content_width: usize) -> Line<'static> {
+    progress_bar_line(pending.processed, pending.total, content_width)
+}
+
+fn progress_bar_line(processed: usize, total: usize, content_width: usize) -> Line<'static> {
+    let percent = progress_percent(processed, total).unwrap_or(0);
     let suffix = format!(" {:>3}%", percent);
     let suffix_width = UnicodeWidthStr::width(suffix.as_str());
     let bar_width = content_width.saturating_sub(suffix_width);
-    let filled = if pending.total == 0 {
+    let filled = if total == 0 {
         0
     } else {
         bar_width
-            .saturating_mul(pending.indexed.min(pending.total))
-            .saturating_add(pending.total / 2)
-            / pending.total
+            .saturating_mul(processed.min(total))
+            .saturating_add(total / 2)
+            / total
     }
     .min(bar_width);
     let empty = bar_width.saturating_sub(filled);
@@ -25601,52 +26361,362 @@ fn draw_title_edit_modal(
     }
 }
 
-fn draw_ai_title_settings_modal(
+fn draw_settings_modal(
     f: &mut ratatui::Frame,
     area: Rect,
-    selected: usize,
+    state: &SettingsState,
     keybindings: &KeyBindings,
 ) {
-    let help = ai_title_settings_help_text(keybindings);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "AI agent",
-            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
-        )),
-        Line::from(Span::styled(
-            format!(
-                "Current selection: {}",
-                ai_title_provider_label(ai_title_provider_at(selected))
-            ),
-            Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
-        )),
-        Line::from(""),
-    ];
-    for (index, provider) in AI_TITLE_PROVIDER_OPTIONS.iter().enumerate() {
-        lines.push(ai_title_provider_option_line(
-            index,
-            *provider,
-            selected == index,
-        ));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        help,
-        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
-    )));
-    let modal_area = modal_area_for_wrapped_lines(area, "AI agent settings", &lines, 42, 76, 9, 14);
+    let provisional_area = modal_area_from_content_rows(area, "Settings", 104, 15, 72, 120, 12, 22);
+    let inner_width = provisional_area.width.saturating_sub(2) as usize;
+    let (lines, cursor) = settings_modal_lines(state, keybindings, inner_width);
+    let modal_area =
+        modal_area_from_content_rows(area, "Settings", 104, lines.len(), 72, 120, 12, 22);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
         .style(theme_alt_style())
-        .title("AI agent settings");
+        .title("Settings");
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
         .wrap(Wrap { trim: false });
     f.render_widget(ratatui::widgets::Clear, modal_area);
     f.render_widget(p, modal_area);
+    if let Some((row, col)) = cursor {
+        set_modal_input_cursor(f, modal_area, row, col);
+    }
+}
+
+fn settings_modal_lines(
+    state: &SettingsState,
+    keybindings: &KeyBindings,
+    inner_width: usize,
+) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Configure cokacmux",
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        settings_tabs_line(state.section),
+        Line::from(""),
+    ];
+    let mut cursor = None;
+    match state.section {
+        SettingsSection::General => settings_general_lines(state, inner_width, &mut lines),
+        SettingsSection::Ai => settings_ai_lines(state, inner_width, &mut lines),
+        SettingsSection::Agents => {
+            cursor = settings_agents_lines(state, inner_width, &mut lines);
+        }
+        SettingsSection::Keybindings => settings_keybindings_lines(state, inner_width, &mut lines),
+        SettingsSection::Data => settings_data_lines(state, inner_width, &mut lines),
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        settings_help_text(state, keybindings),
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+    )));
+    (lines, cursor)
+}
+
+fn settings_tabs_line(active: SettingsSection) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, section) in SETTINGS_SECTIONS.iter().copied().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if section == active {
+            theme_selected_style()
+        } else {
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT)
+        };
+        spans.push(Span::styled(format!(" {} ", section.label()), style));
+    }
+    Line::from(spans)
+}
+
+fn settings_general_lines(
+    state: &SettingsState,
+    inner_width: usize,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let draft = &state.draft;
+    lines.push(settings_row_line(
+        state.selected == SETTINGS_GENERAL_SESSION_VIEW,
+        "Session view",
+        draft.session_view.label(),
+        inner_width,
+    ));
+    lines.push(settings_row_line(
+        state.selected == SETTINGS_GENERAL_AGENT_SIDEBAR_VISIBLE,
+        "Agent sidebar",
+        if draft.agent_sidebar_visible {
+            "shown"
+        } else {
+            "hidden"
+        },
+        inner_width,
+    ));
+    let sessions_width = match draft.sessions_pane_width {
+        Some(width) => format!("fixed {width} cols; Space resets to default percent"),
+        None => format!("{}% default", draft.sessions_pane_percent),
+    };
+    lines.push(settings_row_line(
+        state.selected == SETTINGS_GENERAL_SESSIONS_WIDTH_RESET,
+        "Sessions width",
+        &sessions_width,
+        inner_width,
+    ));
+    let agent_width = format!(
+        "{} cols; Space resets to {}",
+        draft.agent_sidebar_width, DEFAULT_AGENT_SIDEBAR_WIDTH
+    );
+    lines.push(settings_row_line(
+        state.selected == SETTINGS_GENERAL_AGENT_SIDEBAR_WIDTH_RESET,
+        "Agent sidebar width",
+        &agent_width,
+        inner_width,
+    ));
+}
+
+fn settings_ai_lines(state: &SettingsState, inner_width: usize, lines: &mut Vec<Line<'static>>) {
+    lines.push(settings_row_line(
+        state.selected == SETTINGS_AI_PROVIDER,
+        "AI agent",
+        ai_title_provider_label(state.draft.ai_provider),
+        inner_width,
+    ));
+    lines.push(Line::from(""));
+    for (index, provider) in AI_TITLE_PROVIDER_OPTIONS.iter().enumerate() {
+        lines.push(ai_title_provider_option_line(
+            index,
+            *provider,
+            state.draft.ai_provider == *provider,
+        ));
+    }
+}
+
+fn settings_agents_lines(
+    state: &SettingsState,
+    inner_width: usize,
+    lines: &mut Vec<Line<'static>>,
+) -> Option<(usize, usize)> {
+    let mut cursor = None;
+    for (row, label, field) in [
+        (
+            SETTINGS_AGENTS_CODEX,
+            "Codex program",
+            SettingsTextField::AgentProgram(Provider::Codex),
+        ),
+        (
+            SETTINGS_AGENTS_CLAUDE,
+            "Claude program",
+            SettingsTextField::AgentProgram(Provider::Claude),
+        ),
+        (
+            SETTINGS_AGENTS_OPENCODE,
+            "OpenCode program",
+            SettingsTextField::AgentProgram(Provider::OpenCode),
+        ),
+        (
+            SETTINGS_AGENTS_COKACDIR,
+            "cokacdir program",
+            SettingsTextField::CokacdirProgram,
+        ),
+    ] {
+        let line_index = lines.len();
+        let (line, row_cursor) = settings_text_row_line(
+            state,
+            row,
+            label,
+            field,
+            settings_text_status(&state.draft, field),
+            inner_width,
+        );
+        if let Some(col) = row_cursor {
+            cursor = Some((line_index, col));
+        }
+        lines.push(line);
+    }
+    cursor
+}
+
+fn settings_keybindings_lines(
+    state: &SettingsState,
+    inner_width: usize,
+    lines: &mut Vec<Line<'static>>,
+) {
+    lines.push(settings_row_line(
+        state.selected == SETTINGS_KEYBINDINGS_FILE,
+        "Keybinding file",
+        &optional_path_label(keybinding_path()),
+        inner_width,
+    ));
+    lines.push(settings_row_line(
+        state.selected == SETTINGS_KEYBINDINGS_RELOAD,
+        "Live reload",
+        "enabled; keybinding.json changes are watched",
+        inner_width,
+    ));
+}
+
+fn settings_data_lines(state: &SettingsState, inner_width: usize, lines: &mut Vec<Line<'static>>) {
+    lines.push(settings_row_line(
+        state.selected == SETTINGS_DATA_SETTINGS_FILE,
+        "Settings file",
+        &optional_path_label(settings_path()),
+        inner_width,
+    ));
+    lines.push(settings_row_line(
+        state.selected == SETTINGS_DATA_KEYBINDING_FILE,
+        "Keybinding file",
+        &optional_path_label(keybinding_path()),
+        inner_width,
+    ));
+    lines.push(settings_row_line(
+        state.selected == SETTINGS_DATA_AI_SEARCHDATA,
+        "AI searchdata",
+        &ai_search_data_dir().map_or_else(|e| e, |path| path.display().to_string()),
+        inner_width,
+    ));
+}
+
+fn settings_row_line(
+    selected: bool,
+    label: &str,
+    value: &str,
+    inner_width: usize,
+) -> Line<'static> {
+    let marker_width = UnicodeWidthStr::width(selection_marker(selected));
+    let label_width = 22.min(inner_width.saturating_sub(marker_width + 4));
+    let value_width = inner_width.saturating_sub(marker_width + label_width + 2);
+    let text = format!(
+        "{}{}  {}",
+        selection_marker(selected),
+        fit_width(label, label_width, Align::Left),
+        truncate_width(value, value_width)
+    );
+    let style = if selected {
+        theme_selected_style()
+    } else {
+        theme_alt_style()
+    };
+    Line::from(Span::styled(text, style))
+}
+
+fn settings_text_row_line(
+    state: &SettingsState,
+    row: usize,
+    label: &str,
+    field: SettingsTextField,
+    status: String,
+    inner_width: usize,
+) -> (Line<'static>, Option<usize>) {
+    let selected = state.selected == row;
+    let marker_width = UnicodeWidthStr::width(selection_marker(selected));
+    let label_width = 22.min(inner_width.saturating_sub(marker_width + 4));
+    let value_width = inner_width.saturating_sub(marker_width + label_width + 2);
+    let editing = state.editing.filter(|edit| edit.field == field);
+    let (value_text, cursor_col) = if let Some(edit) = editing {
+        let input = input_viewport(
+            state.draft.text_field_value(field),
+            edit.cursor,
+            value_width,
+        );
+        (
+            input.text,
+            Some(marker_width + label_width + 2 + input.cursor_col),
+        )
+    } else {
+        (
+            truncate_width(
+                &format!(
+                    "{}  [{}]",
+                    settings_text_display_value(&state.draft, field),
+                    status
+                ),
+                value_width,
+            ),
+            None,
+        )
+    };
+    let text = format!(
+        "{}{}  {}",
+        selection_marker(selected),
+        fit_width(label, label_width, Align::Left),
+        value_text
+    );
+    let style = if selected {
+        theme_selected_style()
+    } else {
+        theme_alt_style()
+    };
+    (Line::from(Span::styled(text, style)), cursor_col)
+}
+
+fn settings_text_display_value(draft: &SettingsDraft, field: SettingsTextField) -> String {
+    let value = draft.text_field_value(field).trim();
+    if value.is_empty() {
+        format!("(default: {})", settings_text_default_program(field))
+    } else {
+        value.to_string()
+    }
+}
+
+fn settings_text_default_program(field: SettingsTextField) -> &'static str {
+    match field {
+        SettingsTextField::AgentProgram(provider) => default_agent_program(provider),
+        SettingsTextField::CokacdirProgram => COKACDIR_PROGRAM_NAME,
+    }
+}
+
+fn settings_text_status(draft: &SettingsDraft, field: SettingsTextField) -> String {
+    match field {
+        SettingsTextField::AgentProgram(provider) => {
+            match resolve_agent_program_for_provider(provider, &draft.agent_programs) {
+                Some(path) => format!("ok: {}", path.display()),
+                None => "not found".to_string(),
+            }
+        }
+        SettingsTextField::CokacdirProgram => {
+            let mut settings = CokacmuxSettings::default();
+            settings.cokacdir_program = Some(draft.cokacdir_program.clone());
+            match resolve_cokacdir_program(&settings) {
+                Some(path) => format!("ok: {}", path.display()),
+                None if draft.cokacdir_program.trim().is_empty() => {
+                    "will auto-download if needed".to_string()
+                }
+                None => "not found".to_string(),
+            }
+        }
+    }
+}
+
+fn settings_help_text(state: &SettingsState, keybindings: &KeyBindings) -> String {
+    if state.editing.is_some() {
+        return format!(
+            "type path  Left/Right cursor  {} done  {} done",
+            keybindings.help(KeyAction::AiTitleSettingsSave, "Enter"),
+            keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc"),
+        );
+    }
+    format!(
+        "Left/Right section  {} move  Space change  {} save/edit path  {} cancel",
+        keybindings.help_pair(
+            KeyAction::AiTitleSettingsPrev,
+            KeyAction::AiTitleSettingsNext,
+            "Up",
+            "Down",
+        ),
+        keybindings.help(KeyAction::AiTitleSettingsSave, "Enter"),
+        keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc"),
+    )
+}
+
+fn optional_path_label(path: Option<PathBuf>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
 }
 
 fn ai_title_provider_option_line(
@@ -26106,17 +27176,19 @@ fn title_edit_help_text(keybindings: &KeyBindings) -> String {
     )
 }
 
-fn ai_title_settings_help_text(keybindings: &KeyBindings) -> String {
+fn search_choice_help_text(keybindings: &KeyBindings) -> String {
     format!(
-        "{} move  1/2/3/4 choose  {} save  {} cancel",
+        "{} choose  {} move  {}/{} select  {} cancel",
+        keybindings.help(KeyAction::SearchChoiceConfirm, "Enter"),
         keybindings.help_pair(
-            KeyAction::AiTitleSettingsPrev,
-            KeyAction::AiTitleSettingsNext,
+            KeyAction::SearchChoicePrev,
+            KeyAction::SearchChoiceNext,
             "Up",
             "Down",
         ),
-        keybindings.help(KeyAction::AiTitleSettingsSave, "Enter"),
-        keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc"),
+        keybindings.help(KeyAction::SearchChoiceText, "1"),
+        keybindings.help(KeyAction::SearchChoiceAi, "2"),
+        keybindings.help(KeyAction::SearchChoiceCancel, "Esc"),
     )
 }
 
@@ -26903,7 +27975,7 @@ fn draw_status(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> String {
     match focus {
         FocusPane::Sessions if width >= 104 => format!(
-            "{} preview  {} select  {} new  {} search  {} AI search  {} tree  {} title  {} AI  {} delete  {} launch  {}/{} quit",
+            "{} preview  {} select  {} new  {} search  {} tree  {} title  {} AI  {} delete  {} launch  {}/{} quit",
             keybindings.help(KeyAction::SessionToggleFocus, "Tab/Esc"),
             keybindings.help_pair(
                 KeyAction::SessionMovePrev,
@@ -26912,11 +27984,10 @@ fn help_text(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Strin
                 "Down",
             ),
             keybindings.help(KeyAction::SessionNewShell, "Ctrl+N"),
-            keybindings.help(KeyAction::SessionFilter, "/"),
-            keybindings.help(KeyAction::SessionAiSearch, "Ctrl+S"),
+            keybindings.help(KeyAction::SessionFilter, "Ctrl+F"),
             keybindings.help(KeyAction::SessionToggleView, "v"),
             keybindings.help(KeyAction::SessionEditTitle, "t"),
-            keybindings.help(KeyAction::SessionAiTitleSettings, "Ctrl+T"),
+            keybindings.help(KeyAction::SessionAiTitleSettings, ",/Ctrl+T"),
             keybindings.help(KeyAction::SessionDelete, "Delete/d"),
             keybindings.help(KeyAction::SessionLaunchAgent, "e"),
             keybindings.help(KeyAction::SessionQuit, "q"),
@@ -28177,19 +29248,16 @@ mod tests {
         );
 
         match &app.input_mode {
-            InputMode::AiTitleSettings {
-                selected,
-                return_to:
-                    AiTitleSettingsReturn::AiSearch {
-                        draft,
-                        cursor,
-                    },
+            InputMode::Settings {
+                state,
+                return_to: AiTitleSettingsReturn::AiSearch { draft, cursor },
             } => {
-                assert_eq!(*selected, ai_title_provider_index(None));
+                assert_eq!(state.section, SettingsSection::Ai);
+                assert_eq!(state.draft.ai_provider, None);
                 assert_eq!(draft, "release issue");
                 assert_eq!(*cursor, "release issue".len());
             }
-            other => panic!("expected AI settings mode, got {:?}", other),
+            other => panic!("expected settings mode, got {:?}", other),
         }
         assert!(app.status.contains("choose AI agent"));
 
@@ -28871,6 +29939,26 @@ mod tests {
             KeyAction::SessionDelete,
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
         ));
+        assert!(keybindings.matches(
+            KeyAction::SessionFilter,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::SessionFilter,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::SessionAiSearch,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        ));
+        assert!(keybindings.matches(
+            KeyAction::SessionAiTitleSettings,
+            KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)
+        ));
+        assert!(keybindings.matches(
+            KeyAction::SessionAiTitleSettings,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
+        ));
         let content = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
@@ -28880,6 +29968,16 @@ mod tests {
         assert_eq!(
             value["sessions"]["delete"],
             serde_json::json!(["delete", "d"])
+        );
+        assert_eq!(value["sessions"]["filter"], serde_json::json!(["ctrl+f"]));
+        assert_eq!(value["sessions"]["ai_search"], serde_json::json!([]));
+        assert_eq!(
+            value["sessions"]["ai_title_settings"],
+            serde_json::json!(["comma", "ctrl+t"])
+        );
+        assert_eq!(
+            value["search"]["next"],
+            serde_json::json!(["down", "j", "tab"])
         );
         assert_eq!(value["sessions"]["toggle_preview"], serde_json::json!([]));
         assert!(!keybindings.matches(
@@ -28893,6 +29991,77 @@ mod tests {
         assert_eq!(
             value["agent"]["scroll_page_down"],
             serde_json::json!(["shift+alt+down", "shift+alt+pagedown"])
+        );
+    }
+
+    #[test]
+    fn legacy_generated_search_bindings_are_migrated_to_search_chooser() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "sessions": {
+    "filter": ["/"],
+    "ai_search": ["ctrl+s"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        assert!(keybindings.matches(
+            KeyAction::SessionFilter,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::SessionFilter,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)
+        ));
+        assert!(!keybindings.matches(
+            KeyAction::SessionAiSearch,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        ));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["sessions"]["filter"], serde_json::json!(["ctrl+f"]));
+        assert_eq!(value["sessions"]["ai_search"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn legacy_generated_ai_settings_binding_adds_comma() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "sessions": {
+    "ai_title_settings": ["ctrl+t"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+
+        assert!(keybindings.matches(
+            KeyAction::SessionAiTitleSettings,
+            KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)
+        ));
+        assert!(keybindings.matches(
+            KeyAction::SessionAiTitleSettings,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
+        ));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            value["sessions"]["ai_title_settings"],
+            serde_json::json!(["comma", "ctrl+t"])
         );
     }
 
@@ -29587,6 +30756,33 @@ mod tests {
                 .unwrap();
             terminal
                 .draw(|f| {
+                    let pending = SearchPending {
+                        seq: 1,
+                        query: "long search query".to_string(),
+                        started_at: Instant::now(),
+                        processed: 3,
+                        total: 8,
+                        hits: 2,
+                        load_errors: 1,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    };
+                    draw_filter_modal(
+                        f,
+                        f.area(),
+                        "long search query that should stay inside the dialog",
+                        18,
+                        Some(&pending),
+                        &keybindings,
+                    );
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    draw_search_choice_modal(f, f.area(), SEARCH_CHOICE_AI, &keybindings);
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
                     let pending = ai_search_pending_for_test(Arc::new(AtomicBool::new(false)));
                     assert!(draw_ai_search_pending_overlay(f, f.area(), Some(&pending)));
                 })
@@ -29625,12 +30821,9 @@ mod tests {
                 .unwrap();
             terminal
                 .draw(|f| {
-                    draw_ai_title_settings_modal(
-                        f,
-                        f.area(),
-                        ai_title_provider_index(Some(Provider::Codex)),
-                        &keybindings,
-                    );
+                    let mut state = SettingsState::new(&CokacmuxSettings::default());
+                    state.draft.ai_provider = Some(Provider::Codex);
+                    draw_settings_modal(f, f.area(), &state, &keybindings);
                 })
                 .unwrap();
             terminal
@@ -29695,6 +30888,35 @@ mod tests {
         buffer_text(terminal.backend().buffer())
     }
 
+    fn rendered_pending_filter_modal(cols: u16, rows: u16, draft: &str) -> String {
+        let keybindings = KeyBindings::default();
+        let backend = ratatui::backend::TestBackend::new(cols, rows);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let pending = SearchPending {
+            seq: 7,
+            query: draft.to_string(),
+            started_at: Instant::now(),
+            processed: 3,
+            total: 8,
+            hits: 2,
+            load_errors: 1,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        terminal
+            .draw(|f| {
+                draw_filter_modal(
+                    f,
+                    f.area(),
+                    draft,
+                    draft.len(),
+                    Some(&pending),
+                    &keybindings,
+                );
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
     fn rendered_ai_search_modal(cols: u16, rows: u16, draft: &str) -> String {
         let keybindings = KeyBindings::default();
         let backend = ratatui::backend::TestBackend::new(cols, rows);
@@ -29738,6 +30960,16 @@ mod tests {
                 assert!(screen.contains("Esc"), "{screen}");
             }
         }
+    }
+
+    #[test]
+    fn pending_filter_modal_shows_search_progress() {
+        let screen = rendered_pending_filter_modal(80, 24, "needle");
+        assert!(screen.contains("Searching"), "{screen}");
+        assert!(screen.contains("3/8 sessions"), "{screen}");
+        assert!(screen.contains("38%"), "{screen}");
+        assert!(screen.contains("hits 2"), "{screen}");
+        assert!(screen.contains("errors 1"), "{screen}");
     }
 
     #[test]
@@ -30151,7 +31383,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_opens_ai_title_settings_from_sessions() {
+    fn ctrl_t_opens_settings_from_sessions() {
         let mut app = app_for_key_tests();
 
         handle_key(
@@ -30163,19 +31395,46 @@ mod tests {
         );
 
         match app.input_mode {
-            InputMode::AiTitleSettings {
-                selected,
+            InputMode::Settings {
+                state,
                 return_to: AiTitleSettingsReturn::Normal,
-            } => assert_eq!(selected, ai_title_provider_index(None)),
-            other => panic!("expected AI title settings mode, got {:?}", other),
+            } => {
+                assert_eq!(state.section, SettingsSection::Ai);
+                assert_eq!(state.draft.ai_provider, None);
+            }
+            other => panic!("expected settings mode, got {:?}", other),
         }
     }
 
     #[test]
-    fn ai_title_settings_save_persists_selected_provider() {
+    fn comma_opens_settings_from_sessions() {
         let mut app = app_for_key_tests();
-        app.input_mode = InputMode::AiTitleSettings {
-            selected: ai_title_provider_index(None),
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match app.input_mode {
+            InputMode::Settings {
+                state,
+                return_to: AiTitleSettingsReturn::Normal,
+            } => {
+                assert_eq!(state.section, SettingsSection::Ai);
+                assert_eq!(state.draft.ai_provider, None);
+            }
+            other => panic!("expected settings mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn settings_save_persists_selected_ai_provider() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::Settings {
+            state: SettingsState::new(&app.settings.cokacmux),
             return_to: AiTitleSettingsReturn::Normal,
         };
 
@@ -30195,15 +31454,12 @@ mod tests {
         );
 
         assert!(matches!(app.input_mode, InputMode::Normal));
-        assert_eq!(
-            app.settings.cokacmux.ai.provider,
-            Some(Provider::Codex)
-        );
-        assert!(app.status.contains("codex"));
+        assert_eq!(app.settings.cokacmux.ai.provider, Some(Provider::Codex));
+        assert!(app.status.contains("settings saved"));
     }
 
     #[test]
-    fn title_ctrl_t_without_agent_opens_ai_title_settings_and_returns_to_title_edit() {
+    fn title_ctrl_t_without_agent_opens_settings_and_returns_to_title_edit() {
         let source = session_info(Provider::Claude, "s1", "/tmp/project");
         let mut app = app_for_key_tests();
         app.input_mode = InputMode::TitleEdit {
@@ -30222,7 +31478,7 @@ mod tests {
 
         assert!(matches!(
             app.input_mode,
-            InputMode::AiTitleSettings {
+            InputMode::Settings {
                 return_to: AiTitleSettingsReturn::TitleEdit { .. },
                 ..
             }
@@ -30546,6 +31802,109 @@ mod tests {
         assert!(error.contains("error: request too large"));
         assert!(!error.contains("OpenAI Codex v0.0.0"));
         assert!(!error.contains("workdir: /shared/cokacmux"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_command_timeout_does_not_block_on_large_stdin_write() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        let mut command = Command::new(shell);
+        command.args(["-c", "trap '' TERM; while :; do sleep 1; done"]);
+        let started = Instant::now();
+
+        let output =
+            run_prompt_command(command, &"x".repeat(2_000_000), Duration::from_millis(200))
+                .unwrap();
+
+        assert!(output.timed_out);
+        assert!(!output.cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout was delayed by a blocking stdin write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_command_cancel_does_not_block_on_large_stdin_write() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = {
+            let cancel = cancel.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(150));
+                cancel.store(true, Ordering::Relaxed);
+            })
+        };
+        let mut command = Command::new(shell);
+        command.args(["-c", "trap '' TERM; while :; do sleep 1; done"]);
+        let started = Instant::now();
+
+        let output = run_prompt_command_with_cancel(
+            command,
+            &"x".repeat(2_000_000),
+            Duration::from_secs(30),
+            Some(&cancel),
+        )
+        .unwrap();
+        let _ = cancel_thread.join();
+
+        assert!(output.cancelled);
+        assert!(!output.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "cancel was delayed by a blocking stdin write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_command_timeout_kills_descendant_holding_output_pipe() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        let mut command = Command::new(shell);
+        command.args(["-c", "(trap '' TERM; while :; do sleep 1; done) & wait"]);
+        let started = Instant::now();
+
+        let output = run_prompt_command(command, "", Duration::from_millis(200)).unwrap();
+
+        assert!(output.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout was delayed by a descendant holding stdout/stderr open"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_command_completed_child_kills_descendant_holding_output_pipe() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        let mut command = Command::new(shell);
+        command.args(["-c", "(trap '' TERM; while :; do sleep 1; done) & exit 0"]);
+        let started = Instant::now();
+
+        let output = run_prompt_command(command, "", Duration::from_secs(30)).unwrap();
+
+        assert!(!output.timed_out);
+        assert!(
+            output.status.is_some_and(|status| status.success()),
+            "expected shell to exit successfully"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "completion was delayed by a descendant holding stdout/stderr open"
+        );
     }
 
     #[cfg(unix)]
@@ -30891,7 +32250,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
-    fn slash_opens_search_dialog_without_live_filtering() {
+    fn ctrl_f_opens_search_choice_without_live_filtering() {
         let mut app = app_for_key_tests();
         app.text_filter = "old".to_string();
         app.sessions
@@ -30902,7 +32261,22 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
 
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::SearchChoice { selected } => {
+                assert_eq!(*selected, SEARCH_CHOICE_TEXT);
+            }
+            other => panic!("expected search choice mode, got {:?}", other),
+        }
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             100,
             80,
             20,
@@ -30928,6 +32302,34 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         match &app.input_mode {
             InputMode::Filter { draft, .. } => assert_eq!(draft, "oldx"),
             other => panic!("expected filter mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn search_choice_can_open_ai_search_prompt() {
+        let mut app = app_for_key_tests();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::AiSearch { draft, cursor } => {
+                assert_eq!(draft, "");
+                assert_eq!(*cursor, 0);
+            }
+            other => panic!("expected AI search prompt mode, got {:?}", other),
         }
     }
 
@@ -30979,6 +32381,10 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             seq: 7,
             query: "needle".to_string(),
             started_at: Instant::now(),
+            processed: 0,
+            total: 0,
+            hits: 0,
+            load_errors: 0,
             cancel: Arc::new(AtomicBool::new(false)),
         });
 
@@ -30997,6 +32403,51 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(app.search_pending.is_none());
         assert_eq!(app.text_filter, "needle");
         assert!(app.text_filter_matches.contains(&AgentKey::new(&info)));
+    }
+
+    #[test]
+    fn search_progress_updates_matching_pending_search() {
+        let mut app = app_for_key_tests();
+        app.search_pending = Some(SearchPending {
+            seq: 7,
+            query: "needle".to_string(),
+            started_at: Instant::now(),
+            processed: 0,
+            total: 0,
+            hits: 0,
+            load_errors: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+
+        app.on_search_progress(SearchProgressEvent {
+            seq: 7,
+            query: "needle".to_string(),
+            processed: 3,
+            total: 8,
+            hits: 2,
+            load_errors: 1,
+            queued_at_epoch_ms: current_epoch_ms(),
+        });
+
+        let pending = app.search_pending.as_ref().unwrap();
+        assert_eq!(pending.processed, 3);
+        assert_eq!(pending.total, 8);
+        assert_eq!(pending.hits, 2);
+        assert_eq!(pending.load_errors, 1);
+
+        app.on_search_progress(SearchProgressEvent {
+            seq: 8,
+            query: "needle".to_string(),
+            processed: 8,
+            total: 8,
+            hits: 8,
+            load_errors: 0,
+            queued_at_epoch_ms: current_epoch_ms(),
+        });
+
+        let pending = app.search_pending.as_ref().unwrap();
+        assert_eq!(pending.processed, 3);
+        assert_eq!(pending.hits, 2);
     }
 
     #[test]
@@ -31091,6 +32542,10 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             seq: 7,
             query: "needle".to_string(),
             started_at: Instant::now(),
+            processed: 0,
+            total: 0,
+            hits: 0,
+            load_errors: 0,
             cancel: Arc::new(AtomicBool::new(false)),
         });
         app.input_mode = InputMode::Filter {
@@ -31129,6 +32584,10 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             seq: 7,
             query: "needle".to_string(),
             started_at: Instant::now(),
+            processed: 0,
+            total: 0,
+            hits: 0,
+            load_errors: 0,
             cancel: cancel.clone(),
         });
         app.input_mode = InputMode::Filter {

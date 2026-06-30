@@ -38,9 +38,13 @@ cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다
 
 액션을 설정하면 기본값에 추가되는 것이 아니라 그 액션의 기본 단축키 전체를 대체합니다. 예를 들어 `"sessions.quit": ["ctrl+q"]`만 쓰면 `q` 종료는 꺼지고 `ctrl+q`만 남습니다.
 
-현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`이고, `sessions.toggle_preview`는 빈 배열입니다.
+현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma", "ctrl+t"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다.
 
 구버전에서 자동 생성된 `sessions.launch_agent: ["e"]` + `sessions.toggle_preview: ["enter"]` 조합은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+
+구버전에서 자동 생성된 `sessions.filter: ["/"]`와 `sessions.ai_search: ["ctrl+s"]` 값도 새 검색 선택창 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+
+구버전에서 자동 생성된 `sessions.ai_title_settings: ["ctrl+t"]` 값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 
 구버전에서 자동 생성된 `agent.scroll_page_up` / `agent.scroll_page_down` 값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 
@@ -160,20 +164,33 @@ G
 | `sessions.page_prev` | `pageup` | 10행 위 또는 미리보기 한 페이지 위 |
 | `sessions.top` | `home`, `g` | 처음으로 이동 |
 | `sessions.bottom` | `end`, `G` | 끝으로 이동 |
-| `sessions.filter` | `/` | 검색창 열기 |
-| `sessions.ai_search` | `ctrl+s` | AI 검색 프롬프트 열기 |
+| `sessions.filter` | `ctrl+f` | 검색 방식 선택창 열기 |
+| `sessions.ai_search` | 없음 | AI 검색 프롬프트 직접 열기. 기본값에서는 검색 선택창을 사용 |
 | `sessions.toggle_view` | `v` | tree/list 보기 전환 |
 | `sessions.refresh` | `r` | 세션 다시 읽기 |
 | `sessions.delete` | `delete`, `d` | 선택 세션 삭제 확인 열기 |
 | `sessions.clone` | `c` | 선택 세션 복제 |
 | `sessions.edit_title` | `t` | 선택 세션 제목 편집 |
-| `sessions.ai_title_settings` | `ctrl+t` | AI 기능용 agent 설정 열기 |
+| `sessions.ai_title_settings` | `comma`, `ctrl+t` | 설정 화면 열기 |
 | `sessions.launch_agent` | `e`, `enter` | agent launch 모드 선택 열기 또는 live agent 연결 |
 | `sessions.refresh_preview` | `space` | 미리보기 캐시 무시하고 다시 그리기 |
 | `sessions.resize_left` | `alt+left`, `ctrl+shift+left` | 세션 패널 좁히기 |
 | `sessions.resize_right` | `alt+right`, `ctrl+shift+right` | 세션 패널 넓히기 |
 | `sessions.sidebar_prev` | `alt+up`, `ctrl+shift+up` | 세션 목록 선택 위로 이동 |
 | `sessions.sidebar_next` | `alt+down`, `ctrl+shift+down` | 세션 목록 선택 아래로 이동 |
+
+### search
+
+`sessions.filter`로 열리는 검색 방식 선택 모달에서 쓰는 액션입니다.
+
+| 액션 | 기본 키 | 설명 |
+|---|---|---|
+| `search.cancel` | `esc` | 취소 |
+| `search.confirm` | `enter` | 선택한 검색 방식 열기 |
+| `search.next` | `down`, `j`, `tab` | 다음 검색 방식 |
+| `search.prev` | `up`, `k`, `backtab` | 이전 검색 방식 |
+| `search.text` | `1` | 일반 검색 선택 |
+| `search.ai` | `2` | AI 검색 선택 |
 
 ### agent
 
@@ -270,18 +287,20 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 
 ### ai_title_settings
 
-AI 제목 생성과 AI 검색에 사용할 agent를 고르는 설정 모달에서 쓰는 액션입니다. 기본 설정은 없음입니다.
+설정 화면에서 쓰는 액션입니다. 액션 이름은 기존 설정과의 호환을 위해 `ai_title_settings`로 남아 있습니다. 기본 AI agent 설정은 없음입니다.
 
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
-| `ai_title_settings.cancel` | `esc` | 변경하지 않고 닫기 |
-| `ai_title_settings.save` | `enter` | 선택한 agent 저장 |
-| `ai_title_settings.next` | `down`, `j`, `tab` | 다음 선택지 |
-| `ai_title_settings.prev` | `up`, `k`, `backtab` | 이전 선택지 |
+| `ai_title_settings.cancel` | `esc` | 변경하지 않고 닫기. 실행 파일 경로 편집 중에는 편집 종료 |
+| `ai_title_settings.save` | `enter` | 설정 저장. 실행 파일 경로 행에서는 편집 시작/완료 |
+| `ai_title_settings.next` | `down`, `j`, `tab` | 다음 행 |
+| `ai_title_settings.prev` | `up`, `k`, `backtab` | 이전 행 |
 | `ai_title_settings.none` | `1` | 설정 없음 선택 |
 | `ai_title_settings.claude` | `2` | Claude 선택 |
 | `ai_title_settings.codex` | `3` | Codex 선택 |
 | `ai_title_settings.opencode` | `4` | OpenCode 선택 |
+
+설정 화면의 섹션 이동은 `Left` / `Right`입니다. `Space`는 현재 행의 값을 바꾸거나 reset합니다.
 
 ### agent_launch
 

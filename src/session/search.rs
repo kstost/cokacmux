@@ -16,6 +16,14 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchProgress {
+    pub processed: usize,
+    pub total: usize,
+    pub hits: usize,
+    pub load_errors: usize,
+}
+
 /// Search across all enabled providers for sessions whose rendered full
 /// session data contains `query`.
 pub fn search_all(query: &str, case_insensitive: bool) -> Result<Vec<SearchHit>> {
@@ -26,6 +34,24 @@ pub fn search_all_with_cancel(
     query: &str,
     case_insensitive: bool,
     cancel: Option<&AtomicBool>,
+) -> Result<Vec<SearchHit>> {
+    search_all_impl(query, case_insensitive, cancel, None)
+}
+
+pub fn search_all_with_cancel_and_progress(
+    query: &str,
+    case_insensitive: bool,
+    cancel: Option<&AtomicBool>,
+    mut progress: impl FnMut(SearchProgress),
+) -> Result<Vec<SearchHit>> {
+    search_all_impl(query, case_insensitive, cancel, Some(&mut progress))
+}
+
+fn search_all_impl(
+    query: &str,
+    case_insensitive: bool,
+    cancel: Option<&AtomicBool>,
+    mut progress: Option<&mut dyn FnMut(SearchProgress)>,
 ) -> Result<Vec<SearchHit>> {
     crate::debug::log(
         "search_library_start",
@@ -51,7 +77,17 @@ pub fn search_all_with_cancel(
         }),
     );
     let mut hits: Vec<SearchHit> = Vec::new();
+    let mut processed = 0usize;
     let mut load_errors = 0usize;
+    let total = infos.len();
+    if let Some(progress) = progress.as_deref_mut() {
+        progress(SearchProgress {
+            processed: 0,
+            total,
+            hits: 0,
+            load_errors,
+        });
+    }
     for info in infos {
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             crate::debug::log(
@@ -75,6 +111,15 @@ pub fn search_all_with_cancel(
                         "error": error.to_string(),
                     }),
                 );
+                processed = processed.saturating_add(1);
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress(SearchProgress {
+                        processed,
+                        total,
+                        hits: hits.len(),
+                        load_errors,
+                    });
+                }
                 continue;
             }
         };
@@ -110,6 +155,15 @@ pub fn search_all_with_cancel(
                 info,
                 matches: count,
                 snippet: snippet_for(&text, query, case_insensitive),
+            });
+        }
+        processed = processed.saturating_add(1);
+        if let Some(progress) = progress.as_deref_mut() {
+            progress(SearchProgress {
+                processed,
+                total,
+                hits: hits.len(),
+                load_errors,
             });
         }
     }

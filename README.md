@@ -155,7 +155,7 @@ cokacmux
 |---|---|
 | 세션 선택 이동 | `↑`/`↓` 또는 `j`/`k` |
 | 오른쪽 미리보기로 포커스 이동 | `Tab` |
-| 검색 | `/` |
+| 검색 | `Ctrl+F` |
 | 선택한 세션 이어 실행 | `e` 또는 `Enter` |
 | 미리보기 강제 새로고침 | `Space` |
 | 새 터미널/cokacdir/새 코딩 에이전트 시작 | `Ctrl+N` |
@@ -625,13 +625,13 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 
 저장 위치는 `~/.cokacmux/titles.json`입니다. 원본 에이전트의 대화 파일을 직접 수정하지 않고, cokacmux가 보여줄 표시 이름만 저장합니다.
 
-AI 제목 생성과 AI 검색에 사용할 agent는 세션 목록에서 `Ctrl+T` 설정창으로 고릅니다. 기본값은 설정 없음입니다. 제목 편집창에서 `Ctrl+T`를 누르면 선택한 agent가 현재 세션 전체 내용을 읽고 한 문장 제목을 draft에 채웁니다. 처리 중에는 제목 편집창 안에 진행 상태가 표시되고 입력이 잠시 잠깁니다. 설정이 없으면 먼저 agent 설정창이 열립니다.
+AI 제목 생성과 AI 검색에 사용할 agent는 세션 목록에서 `,` 또는 `Ctrl+T` 설정 화면으로 고릅니다. 기본값은 설정 없음입니다. 제목 편집창에서 `Ctrl+T`를 누르면 선택한 agent가 현재 세션 전체 내용을 읽고 한 문장 제목을 draft에 채웁니다. 처리 중에는 제목 편집창 안에 진행 상태가 표시되고 입력이 잠시 잠깁니다. 설정이 없으면 먼저 설정 화면이 열립니다.
 
 세션 원문이 너무 크면 agent CLI의 입력 한계를 피하기 위해 전체 세션 summary 렌더러를 사용합니다.
 
 Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 `title` 필드를 받습니다. OpenCode는 `opencode run --format json`의 JSON 이벤트에서 최종 답변을 꺼낸 뒤, 그 답변 안의 `title` JSON 필드를 제목으로 사용합니다. 긴 세션에서 OS argv 길이 제한에 걸리지 않도록 agent prompt는 stdin으로 전달합니다. AI 제목 생성을 위해 별도로 실행한 agent 세션은 남기지 않습니다. Codex는 ephemeral 실행, Claude는 session persistence 비활성화 실행을 사용하고, OpenCode는 생성된 helper session id를 확인해 완료 후 삭제합니다.
 
-세션 목록에서 `Ctrl+S`를 누르면 AI 검색 프롬프트가 열립니다. 검색을 시작하면 모든 세션의 summary preview를 `~/.cokacmux/searchdata`에 최신 파일로 준비한 뒤, 선택한 agent에게 그 폴더를 직접 탐색하라고 요청합니다. 검색 중에는 중앙 오버레이에 스피너, preview 인덱싱 진행률, 현재 단계가 표시되고 `Esc` 취소 외 입력은 잠깁니다. 결과 목록은 AI 점수 순서로 표시되고 title 칼럼에는 짧은 match label이 함께 나옵니다.
+세션 목록에서 `Ctrl+F`를 누르면 검색 방식 선택창이 열립니다. 일반 검색을 고르면 세션 ID, 작업 폴더, 제목과 세션 본문 전체를 로컬에서 검색합니다. AI 검색을 고르면 모든 세션의 summary preview를 `~/.cokacmux/searchdata`에 최신 파일로 준비한 뒤, 선택한 agent에게 그 폴더를 직접 탐색하라고 요청합니다. 검색 중에는 중앙 오버레이에 스피너, preview 인덱싱 진행률, 현재 단계가 표시되고 `Esc` 취소 외 입력은 잠깁니다. AI 검색 결과 목록은 AI 점수 순서로 표시되고 title 칼럼에는 짧은 match label이 함께 나옵니다.
 
 ### 6-11. 세션 삭제하기
 
@@ -674,11 +674,10 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | `Home`/`g`, `End`/`G` | 맨 위 / 맨 아래 |
 | `Tab` / `Esc` | 세션 목록과 미리보기 포커스 전환 |
 | `Space` | 미리보기 강제 새로고침 |
-| `/` | 검색창 열기 |
-| `Ctrl+S` | AI 검색 프롬프트 열기 |
+| `Ctrl+F` | 검색 방식 선택창 열기 |
 | `v` | 트리 보기 / 목록 보기 전환 |
 | `t` | 제목 편집 |
-| `Ctrl+T` | AI 기능에 사용할 agent 설정 |
+| `,` / `Ctrl+T` | 설정 화면 열기 |
 | `r` | 세션 목록 새로고침 |
 | `c` | 복제 옵션 열기. 같은 provider는 native clone, 다른 provider는 2-message context handoff. 폴더 데이터 포함 시 전용 cwd 생성 |
 | `Delete` / `d` | 세션 삭제 확인창 열기 |
@@ -849,7 +848,7 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 
 ## 9. 설정 파일
 
-설정 파일은 `~/.cokacmux/settings.json`입니다. 처음 실행할 때 파일이 없으면 기본 파일이 자동으로 생성됩니다.
+설정 파일은 `~/.cokacmux/settings.json`입니다. 처음 실행할 때 파일이 없으면 기본 파일이 자동으로 생성됩니다. 세션 목록에서 `,` 또는 `Ctrl+T`를 누르면 설정 화면이 열리고, 여기서 AI agent, 세션 보기 방식, 일부 layout reset, agent 실행 파일 경로, `cokacdir` 실행 파일 경로를 저장할 수 있습니다. Keybindings와 Data 섹션은 현재 경로와 동작 상태를 보여주는 읽기 전용 섹션입니다.
 
 기본 생성 예:
 
@@ -884,7 +883,7 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 | `agent_sidebar_visible` | 에이전트 사이드바를 처음에 보일지 정합니다. |
 | `session_view` | `"tree"` 또는 `"list"`입니다. `v` 키로도 바뀝니다. |
 | `agent_programs` | 현재 지원 provider의 실행 파일 경로를 직접 지정하는 곳입니다. |
-| `ai.provider` | AI 제목 생성과 AI 검색에 사용할 agent입니다. 기본값은 `null`이며, 세션 목록의 `Ctrl+T` 설정창으로 직접 선택해야 합니다. |
+| `ai.provider` | AI 제목 생성과 AI 검색에 사용할 agent입니다. 기본값은 `null`이며, 세션 목록의 `,` 또는 `Ctrl+T` 설정 화면으로 직접 선택해야 합니다. |
 | `cokacdir_program` | `cokacdir` 실행 파일 경로를 직접 지정하는 곳입니다. |
 
 `agent_programs`와 `cokacdir_program`의 빈 문자열은 placeholder입니다. 비워 두면 기존처럼 PATH에서 기본 명령 이름을 찾습니다. `cokacdir`은 PATH에서 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용하고, 그 파일도 없을 때 자동 다운로드합니다.
@@ -911,7 +910,7 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 - `cokacdir_program`이 비어 있고 PATH에서도 `cokacdir`을 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용합니다. 그 파일이 없으면 `~/.cokacmux/bin`에 자동 다운로드한 바이너리를 실행합니다.
 - 이미 실행 중인 백그라운드 에이전트나 `cokacdir`에는 변경된 경로가 적용되지 않습니다. 새 경로로 실행하려면 기존 실행 대상을 `Ctrl+K` 또는 `cokacmux killall`로 종료한 뒤 다시 시작하세요.
 
-`settings.json`은 앱 시작 시 읽습니다. 파일을 직접 고친 뒤에는 cokacmux를 재시작하는 편이 가장 명확합니다. 단축키 파일인 `keybinding.json`만 실행 중 백그라운드 감시 스레드가 자동으로 다시 읽습니다.
+설정 화면에서 저장한 값은 바로 `settings.json`에 쓰입니다. 다만 이미 실행 중인 백그라운드 에이전트나 `cokacdir`에는 실행 파일 경로 변경이 적용되지 않습니다. 파일을 직접 고친 뒤에는 cokacmux를 재시작하는 편이 가장 명확합니다. 단축키 파일인 `keybinding.json`만 실행 중 백그라운드 감시 스레드가 자동으로 다시 읽습니다.
 
 ---
 
@@ -952,8 +951,10 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 - 파일에 없는 액션은 기본값을 그대로 씁니다.
 - 빈 배열 `[]` 또는 `null`을 넣으면 해당 액션이 비활성화됩니다.
 - 점 표기(`"sessions.launch_agent": ["x"]`)도 사용할 수 있습니다.
-- 현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`이고, `sessions.toggle_preview`는 빈 배열입니다.
+- 현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma", "ctrl+t"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다.
 - 구버전에서 자동 생성된 `sessions.launch_agent: ["e"]` + `sessions.toggle_preview: ["enter"]` 조합은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+- 구버전에서 자동 생성된 `sessions.filter: ["/"]`와 `sessions.ai_search: ["ctrl+s"]` 값도 새 검색 선택창 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+- 구버전에서 자동 생성된 `sessions.ai_title_settings: ["ctrl+t"]` 값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 - 구버전에서 자동 생성된 agent page scroll 기본값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
 
 키 표기 예:
