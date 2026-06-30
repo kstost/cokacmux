@@ -291,8 +291,8 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
-| `ai_title_settings.cancel` | `esc` | 변경하지 않고 닫기. 실행 파일 경로 편집 중에는 편집 종료 |
-| `ai_title_settings.save` | `enter` | 설정 저장. 실행 파일 경로 행에서는 편집 시작/완료 |
+| `ai_title_settings.cancel` | `esc` | 변경하지 않고 닫기. 실행 파일 경로 편집 중에는 편집 내용을 버리고 편집 종료 |
+| `ai_title_settings.save` | `enter` | 설정 저장. 실행 파일 경로 행에서는 편집 시작/완료. 편집 완료 직후 다시 누르면 저장 |
 | `ai_title_settings.next` | `down`, `j`, `tab` | 다음 행 |
 | `ai_title_settings.prev` | `up`, `k`, `backtab` | 이전 행 |
 | `ai_title_settings.none` | `1` | 설정 없음 선택 |
@@ -300,7 +300,7 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 | `ai_title_settings.codex` | `3` | Codex 선택 |
 | `ai_title_settings.opencode` | `4` | OpenCode 선택 |
 
-설정 화면의 섹션 이동은 `Left` / `Right`입니다. `Space`는 현재 행의 값을 바꾸거나 reset합니다.
+설정 화면의 섹션 이동은 `Left` / `Right`입니다. `Space`는 현재 행의 값을 바꾸거나 reset합니다. Keybindings와 Data 섹션은 읽기 전용이며, 저장 전 변경사항은 설정 화면 상단에 표시됩니다.
 
 ### agent_launch
 

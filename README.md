@@ -850,7 +850,7 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 
 ## 9. 설정 파일
 
-설정 파일은 `~/.cokacmux/settings.json`입니다. 처음 실행할 때 파일이 없으면 기본 파일이 자동으로 생성됩니다. 세션 목록에서 `,` 또는 `Ctrl+T`를 누르면 설정 화면이 열리고, 여기서 AI agent, 세션 보기 방식, 일부 layout reset, agent 실행 파일 경로, `cokacdir` 실행 파일 경로를 저장할 수 있습니다. Keybindings와 Data 섹션은 현재 경로와 동작 상태를 보여주는 읽기 전용 섹션입니다.
+설정 파일은 `~/.cokacmux/settings.json`입니다. 처음 실행할 때 파일이 없으면 기본 파일이 자동으로 생성됩니다. 세션 목록에서 `,` 또는 `Ctrl+T`를 누르면 설정 화면이 열리고, 여기서 AI agent, 세션 보기 방식, 일부 layout reset, agent 실행 파일 경로, `cokacdir` 실행 파일 경로를 저장할 수 있습니다. 저장 전 변경사항은 설정 화면 상단에 표시됩니다. Keybindings와 Data 섹션은 현재 경로와 동작 상태를 보여주는 읽기 전용 섹션입니다.
 
 기본 생성 예:
 

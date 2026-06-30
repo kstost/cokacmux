@@ -302,6 +302,8 @@ const THEME_SELECTED_TEXT: Color = Color::Indexed(255);
 const THEME_ACCENT: Color = Color::Indexed(109);
 const THEME_SHORTCUT: Color = Color::Indexed(109);
 const THEME_POSITIVE: Color = Color::Indexed(108);
+const THEME_WARNING: Color = Color::Indexed(214);
+const THEME_ERROR: Color = Color::Indexed(203);
 const THEME_BORDER: Color = Color::Indexed(240);
 const THEME_BORDER_ACTIVE: Color = Color::Indexed(110);
 const THEME_PROVIDER_CLAUDE: Color = Color::Indexed(139);
@@ -330,6 +332,7 @@ const STARTUP_SPINNER_TICK_MS: u128 = 180;
 const DATA_TASK_PROGRESS_THROTTLE_MS: u64 = 100;
 const UI_SELECTED_MARKER: &str = "› ";
 const UI_UNSELECTED_MARKER: &str = "  ";
+const UI_CURRENT_MARKER: &str = "● ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Settings {
@@ -2127,22 +2130,28 @@ impl SettingsSection {
 struct SettingsState {
     section: SettingsSection,
     selected: usize,
+    original: SettingsDraft,
     draft: SettingsDraft,
     editing: Option<SettingsEdit>,
+    edit_finished: bool,
 }
 
 impl SettingsState {
     fn new(settings: &CokacmuxSettings) -> Self {
+        let draft = SettingsDraft::from_settings(settings);
         Self {
             section: SettingsSection::Ai,
             selected: 0,
-            draft: SettingsDraft::from_settings(settings),
+            original: draft.clone(),
+            draft,
             editing: None,
+            edit_finished: false,
         }
     }
 
     fn move_section(&mut self, delta: i32) {
         self.editing = None;
+        self.edit_finished = false;
         self.section = self.section.moved(delta);
         self.selected = self
             .selected
@@ -2151,6 +2160,7 @@ impl SettingsState {
 
     fn move_row(&mut self, delta: i32) {
         self.editing = None;
+        self.edit_finished = false;
         let count = settings_section_row_count(self.section);
         if count == 0 {
             self.selected = 0;
@@ -2177,20 +2187,57 @@ impl SettingsState {
         }
     }
 
+    fn selected_row_kind(&self) -> SettingsRowKind {
+        match (self.section, self.selected) {
+            (SettingsSection::General, SETTINGS_GENERAL_SESSION_VIEW)
+            | (SettingsSection::General, SETTINGS_GENERAL_AGENT_SIDEBAR_VISIBLE)
+            | (SettingsSection::Ai, SETTINGS_AI_PROVIDER) => SettingsRowKind::Change,
+            (SettingsSection::General, SETTINGS_GENERAL_SESSIONS_WIDTH_RESET)
+            | (SettingsSection::General, SETTINGS_GENERAL_AGENT_SIDEBAR_WIDTH_RESET) => {
+                SettingsRowKind::Reset
+            }
+            (SettingsSection::Agents, SETTINGS_AGENTS_CODEX)
+            | (SettingsSection::Agents, SETTINGS_AGENTS_CLAUDE)
+            | (SettingsSection::Agents, SETTINGS_AGENTS_OPENCODE)
+            | (SettingsSection::Agents, SETTINGS_AGENTS_COKACDIR) => SettingsRowKind::Text,
+            _ => SettingsRowKind::ReadOnly,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.draft != self.original
+    }
+
     fn begin_editing_selected_text(&mut self) -> bool {
         let Some(field) = self.selected_text_field() else {
             return false;
         };
         let cursor = self.draft.text_field_value(field).len();
-        self.editing = Some(SettingsEdit { field, cursor });
+        self.editing = Some(SettingsEdit {
+            field,
+            cursor,
+            original: self.draft.text_field_value(field).to_string(),
+        });
+        self.edit_finished = false;
         true
+    }
+
+    fn finish_editing_selected_text(&mut self) {
+        self.editing = None;
+        self.edit_finished = true;
+    }
+
+    fn cancel_editing_selected_text(&mut self, edit: SettingsEdit) {
+        *self.draft.text_field_value_mut(edit.field) = edit.original;
+        self.editing = None;
+        self.edit_finished = false;
     }
 
     fn insert_char_in_selected_text(&mut self, ch: char) -> bool {
         if !self.begin_editing_selected_text() {
             return false;
         }
-        let Some(mut edit) = self.editing else {
+        let Some(mut edit) = self.editing.take() else {
             return false;
         };
         {
@@ -2202,6 +2249,7 @@ impl SettingsState {
     }
 
     fn activate_selected(&mut self) -> &'static str {
+        self.edit_finished = false;
         match (self.section, self.selected) {
             (SettingsSection::General, SETTINGS_GENERAL_SESSION_VIEW) => {
                 self.draft.session_view = self.draft.session_view.toggle();
@@ -2232,7 +2280,7 @@ impl SettingsState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct SettingsDraft {
     ai_provider: Option<Provider>,
     session_view: SessionViewMode,
@@ -2289,16 +2337,25 @@ impl SettingsDraft {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsEdit {
     field: SettingsTextField,
     cursor: usize,
+    original: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTextField {
     AgentProgram(Provider),
     CokacdirProgram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsRowKind {
+    Change,
+    Reset,
+    Text,
+    ReadOnly,
 }
 
 const SETTINGS_GENERAL_SESSION_VIEW: usize = 0;
@@ -6541,9 +6598,10 @@ impl App {
         );
     }
 
-    fn save_settings_draft(&mut self, draft: SettingsDraft) {
-        let selected_key = self.current().map(AgentKey::new);
+    fn save_settings_draft(&mut self, draft: SettingsDraft) -> bool {
+        let previous_settings = self.settings.clone();
         let previous_session_view = self.session_view;
+        let selected_key = self.current().map(AgentKey::new);
         self.settings.cokacmux.ai.provider = draft.ai_provider;
         self.settings.cokacmux.session_view = draft.session_view;
         self.settings.cokacmux.agent_sidebar_visible = draft.agent_sidebar_visible;
@@ -6558,22 +6616,21 @@ impl App {
             .normalize_placeholders();
         normalize_program_placeholder(&mut self.settings.cokacmux.cokacdir_program);
 
-        self.session_view = self.settings.cokacmux.session_view;
-        if self.session_view != previous_session_view {
-            if let Some(key) = selected_key.as_ref() {
-                self.select_visible_session(key);
-                if self.list_state.selected().is_none() {
-                    self.select_first();
-                }
-            } else {
-                self.select_first();
-            }
-            self.preview_scroll = 0;
-            self.focus = FocusPane::Sessions;
-        }
-
         match self.settings.save() {
             Ok(()) => {
+                self.session_view = self.settings.cokacmux.session_view;
+                if self.session_view != previous_session_view {
+                    if let Some(key) = selected_key.as_ref() {
+                        self.select_visible_session(key);
+                        if self.list_state.selected().is_none() {
+                            self.select_first();
+                        }
+                    } else {
+                        self.select_first();
+                    }
+                    self.preview_scroll = 0;
+                    self.focus = FocusPane::Sessions;
+                }
                 self.status = "settings saved.".into();
                 debug_log(
                     "settings_saved",
@@ -6583,8 +6640,11 @@ impl App {
                         "agent_sidebar_visible": self.settings.cokacmux.agent_sidebar_visible,
                     }),
                 );
+                true
             }
             Err(e) => {
+                self.settings = previous_settings;
+                self.session_view = previous_session_view;
                 self.status = format!("settings save failed: {}", e);
                 debug_log(
                     "settings_save_failed",
@@ -6593,6 +6653,7 @@ impl App {
                         "error": e.to_string(),
                     }),
                 );
+                false
             }
         }
     }
@@ -24850,13 +24911,14 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     // Settings dialog
     if let InputMode::Settings { state, return_to } = &mut app.input_mode {
         let mut next_mode: Option<InputMode> = None;
-        let mut save_draft: Option<SettingsDraft> = None;
-        if let Some(mut edit) = state.editing {
-            let mut finish_editing = false;
-            if keybindings.matches(KeyAction::AiTitleSettingsCancel, key)
-                || keybindings.matches(KeyAction::AiTitleSettingsSave, key)
-            {
-                finish_editing = true;
+        let mut save_request: Option<(SettingsDraft, AiTitleSettingsReturn)> = None;
+        if let Some(mut edit) = state.editing.take() {
+            if keybindings.matches(KeyAction::AiTitleSettingsCancel, key) {
+                state.cancel_editing_selected_text(edit);
+                app.status = "path edit cancelled.".into();
+                debug_log_key_event(key, "settings_path_edit_cancel");
+            } else if keybindings.matches(KeyAction::AiTitleSettingsSave, key) {
+                state.finish_editing_selected_text();
                 app.status = "path edit done; Enter saves settings.".into();
                 debug_log_key_event(key, "settings_path_edit_done");
             } else {
@@ -24899,19 +24961,19 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                         }
                     }
                 }
+                state.editing = Some(edit);
             }
-            state.editing = if finish_editing { None } else { Some(edit) };
         } else if keybindings.matches(KeyAction::AiTitleSettingsCancel, key) {
             next_mode = Some(return_to.clone().into_input_mode());
             app.status = "cancelled.".into();
             debug_log_key_event(key, "settings_cancel");
         } else if keybindings.matches(KeyAction::AiTitleSettingsSave, key) {
-            if state.begin_editing_selected_text() {
+            if state.selected_text_field().is_some() && !state.edit_finished {
+                state.begin_editing_selected_text();
                 app.status = "editing path; Enter finishes edit, Esc cancels edit.".into();
                 debug_log_key_event(key, "settings_path_edit_begin");
             } else {
-                save_draft = Some(state.draft.clone());
-                next_mode = Some(return_to.clone().into_input_mode());
+                save_request = Some((state.draft.clone(), return_to.clone()));
                 debug_log(
                     "settings_save",
                     serde_json::json!({
@@ -24938,21 +25000,25 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             state.section = SettingsSection::Ai;
             state.selected = SETTINGS_AI_PROVIDER;
             state.draft.ai_provider = None;
+            state.edit_finished = false;
             app.status = "AI agent: none".into();
         } else if keybindings.matches(KeyAction::AiTitleSettingsClaude, key) {
             state.section = SettingsSection::Ai;
             state.selected = SETTINGS_AI_PROVIDER;
             state.draft.ai_provider = Some(Provider::Claude);
+            state.edit_finished = false;
             app.status = "AI agent: claude".into();
         } else if keybindings.matches(KeyAction::AiTitleSettingsCodex, key) {
             state.section = SettingsSection::Ai;
             state.selected = SETTINGS_AI_PROVIDER;
             state.draft.ai_provider = Some(Provider::Codex);
+            state.edit_finished = false;
             app.status = "AI agent: codex".into();
         } else if keybindings.matches(KeyAction::AiTitleSettingsOpenCode, key) {
             state.section = SettingsSection::Ai;
             state.selected = SETTINGS_AI_PROVIDER;
             state.draft.ai_provider = Some(Provider::OpenCode);
+            state.edit_finished = false;
             app.status = "AI agent: opencode".into();
         } else if matches!(key.code, KeyCode::Char(' ')) {
             app.status = state.activate_selected().into();
@@ -24973,8 +25039,10 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         if let Some(mode) = next_mode {
             app.input_mode = mode;
         }
-        if let Some(draft) = save_draft {
-            app.save_settings_draft(draft);
+        if let Some((draft, return_to)) = save_request {
+            if app.save_settings_draft(draft) {
+                app.input_mode = return_to.into_input_mode();
+            }
         }
         return;
     }
@@ -26395,10 +26463,7 @@ fn settings_modal_lines(
     inner_width: usize,
 ) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
     let mut lines = vec![
-        Line::from(Span::styled(
-            "Configure cokacmux",
-            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
-        )),
+        settings_title_line(state),
         settings_tabs_line(state.section),
         Line::from(""),
     ];
@@ -26436,6 +26501,20 @@ fn settings_tabs_line(active: SettingsSection) -> Line<'static> {
     Line::from(spans)
 }
 
+fn settings_title_line(state: &SettingsState) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        "Configure cokacmux",
+        Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+    )];
+    if state.is_dirty() {
+        spans.push(Span::styled(
+            "  ! unsaved",
+            Style::default().fg(THEME_WARNING).bg(THEME_BG_ALT),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn settings_general_lines(
     state: &SettingsState,
     inner_width: usize,
@@ -26444,12 +26523,14 @@ fn settings_general_lines(
     let draft = &state.draft;
     lines.push(settings_row_line(
         state.selected == SETTINGS_GENERAL_SESSION_VIEW,
+        SettingsRowKind::Change,
         "Session view",
         draft.session_view.label(),
         inner_width,
     ));
     lines.push(settings_row_line(
         state.selected == SETTINGS_GENERAL_AGENT_SIDEBAR_VISIBLE,
+        SettingsRowKind::Change,
         "Agent sidebar",
         if draft.agent_sidebar_visible {
             "shown"
@@ -26464,6 +26545,7 @@ fn settings_general_lines(
     };
     lines.push(settings_row_line(
         state.selected == SETTINGS_GENERAL_SESSIONS_WIDTH_RESET,
+        SettingsRowKind::Reset,
         "Sessions width",
         &sessions_width,
         inner_width,
@@ -26474,6 +26556,7 @@ fn settings_general_lines(
     );
     lines.push(settings_row_line(
         state.selected == SETTINGS_GENERAL_AGENT_SIDEBAR_WIDTH_RESET,
+        SettingsRowKind::Reset,
         "Agent sidebar width",
         &agent_width,
         inner_width,
@@ -26483,6 +26566,7 @@ fn settings_general_lines(
 fn settings_ai_lines(state: &SettingsState, inner_width: usize, lines: &mut Vec<Line<'static>>) {
     lines.push(settings_row_line(
         state.selected == SETTINGS_AI_PROVIDER,
+        SettingsRowKind::Change,
         "AI agent",
         ai_title_provider_label(state.draft.ai_provider),
         inner_width,
@@ -26549,12 +26633,14 @@ fn settings_keybindings_lines(
 ) {
     lines.push(settings_row_line(
         state.selected == SETTINGS_KEYBINDINGS_FILE,
+        SettingsRowKind::ReadOnly,
         "Keybinding file",
         &optional_path_label(keybinding_path()),
         inner_width,
     ));
     lines.push(settings_row_line(
         state.selected == SETTINGS_KEYBINDINGS_RELOAD,
+        SettingsRowKind::ReadOnly,
         "Live reload",
         "enabled; keybinding.json changes are watched",
         inner_width,
@@ -26564,18 +26650,21 @@ fn settings_keybindings_lines(
 fn settings_data_lines(state: &SettingsState, inner_width: usize, lines: &mut Vec<Line<'static>>) {
     lines.push(settings_row_line(
         state.selected == SETTINGS_DATA_SETTINGS_FILE,
+        SettingsRowKind::ReadOnly,
         "Settings file",
         &optional_path_label(settings_path()),
         inner_width,
     ));
     lines.push(settings_row_line(
         state.selected == SETTINGS_DATA_KEYBINDING_FILE,
+        SettingsRowKind::ReadOnly,
         "Keybinding file",
         &optional_path_label(keybinding_path()),
         inner_width,
     ));
     lines.push(settings_row_line(
         state.selected == SETTINGS_DATA_AI_SEARCHDATA,
+        SettingsRowKind::ReadOnly,
         "AI searchdata",
         &ai_search_data_dir().map_or_else(|e| e, |path| path.display().to_string()),
         inner_width,
@@ -26584,6 +26673,7 @@ fn settings_data_lines(state: &SettingsState, inner_width: usize, lines: &mut Ve
 
 fn settings_row_line(
     selected: bool,
+    kind: SettingsRowKind,
     label: &str,
     value: &str,
     inner_width: usize,
@@ -26597,12 +26687,34 @@ fn settings_row_line(
         fit_width(label, label_width, Align::Left),
         truncate_width(value, value_width)
     );
-    let style = if selected {
-        theme_selected_style()
-    } else {
-        theme_alt_style()
-    };
+    let style = settings_row_style(selected, kind);
     Line::from(Span::styled(text, style))
+}
+
+fn settings_row_style(selected: bool, kind: SettingsRowKind) -> Style {
+    match (selected, kind) {
+        (true, SettingsRowKind::ReadOnly) => Style::default()
+            .fg(THEME_FG_DIM)
+            .bg(THEME_STATUS_BG)
+            .add_modifier(Modifier::BOLD),
+        (true, _) => theme_selected_style(),
+        (false, SettingsRowKind::ReadOnly) => Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        (false, _) => theme_alt_style(),
+    }
+}
+
+fn settings_status_style(level: SettingsStatusLevel, selected: bool) -> Style {
+    let bg = if selected {
+        THEME_SELECTED_BG
+    } else {
+        THEME_BG_ALT
+    };
+    let fg = match level {
+        SettingsStatusLevel::Ok => THEME_POSITIVE,
+        SettingsStatusLevel::Warning => THEME_WARNING,
+        SettingsStatusLevel::Error => THEME_ERROR,
+    };
+    Style::default().fg(fg).bg(bg)
 }
 
 fn settings_text_row_line(
@@ -26610,14 +26722,17 @@ fn settings_text_row_line(
     row: usize,
     label: &str,
     field: SettingsTextField,
-    status: String,
+    status: SettingsTextStatus,
     inner_width: usize,
 ) -> (Line<'static>, Option<usize>) {
     let selected = state.selected == row;
     let marker_width = UnicodeWidthStr::width(selection_marker(selected));
     let label_width = 22.min(inner_width.saturating_sub(marker_width + 4));
-    let value_width = inner_width.saturating_sub(marker_width + label_width + 2);
-    let editing = state.editing.filter(|edit| edit.field == field);
+    let status_width = 28.min(inner_width.saturating_sub(marker_width + label_width + 4) / 2);
+    let value_width = inner_width
+        .saturating_sub(marker_width + label_width + status_width + 4)
+        .max(1);
+    let editing = state.editing.as_ref().filter(|edit| edit.field == field);
     let (value_text, cursor_col) = if let Some(edit) = editing {
         let input = input_viewport(
             state.draft.text_field_value(field),
@@ -26631,28 +26746,30 @@ fn settings_text_row_line(
     } else {
         (
             truncate_width(
-                &format!(
-                    "{}  [{}]",
-                    settings_text_display_value(&state.draft, field),
-                    status
-                ),
+                &settings_text_display_value(&state.draft, field),
                 value_width,
             ),
             None,
         )
     };
-    let text = format!(
-        "{}{}  {}",
-        selection_marker(selected),
-        fit_width(label, label_width, Align::Left),
-        value_text
-    );
-    let style = if selected {
-        theme_selected_style()
-    } else {
-        theme_alt_style()
-    };
-    (Line::from(Span::styled(text, style)), cursor_col)
+    let row_style = settings_row_style(selected, SettingsRowKind::Text);
+    let mut spans = vec![Span::styled(
+        format!(
+            "{}{}  {}",
+            selection_marker(selected),
+            fit_width(label, label_width, Align::Left),
+            value_text
+        ),
+        row_style,
+    )];
+    if editing.is_none() && status_width > 0 {
+        spans.push(Span::styled("  ", row_style));
+        spans.push(Span::styled(
+            fit_width(&status.text, status_width, Align::Left),
+            settings_status_style(status.level, selected),
+        ));
+    }
+    (Line::from(spans), cursor_col)
 }
 
 fn settings_text_display_value(draft: &SettingsDraft, field: SettingsTextField) -> String {
@@ -26671,23 +26788,59 @@ fn settings_text_default_program(field: SettingsTextField) -> &'static str {
     }
 }
 
-fn settings_text_status(draft: &SettingsDraft, field: SettingsTextField) -> String {
+#[derive(Debug, Clone)]
+struct SettingsTextStatus {
+    text: String,
+    level: SettingsStatusLevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsStatusLevel {
+    Ok,
+    Warning,
+    Error,
+}
+
+impl SettingsTextStatus {
+    fn ok(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            level: SettingsStatusLevel::Ok,
+        }
+    }
+
+    fn warning(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            level: SettingsStatusLevel::Warning,
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            level: SettingsStatusLevel::Error,
+        }
+    }
+}
+
+fn settings_text_status(draft: &SettingsDraft, field: SettingsTextField) -> SettingsTextStatus {
     match field {
         SettingsTextField::AgentProgram(provider) => {
             match resolve_agent_program_for_provider(provider, &draft.agent_programs) {
-                Some(path) => format!("ok: {}", path.display()),
-                None => "not found".to_string(),
+                Some(path) => SettingsTextStatus::ok(format!("ok: {}", path.display())),
+                None => SettingsTextStatus::error("not found"),
             }
         }
         SettingsTextField::CokacdirProgram => {
             let mut settings = CokacmuxSettings::default();
             settings.cokacdir_program = Some(draft.cokacdir_program.clone());
             match resolve_cokacdir_program(&settings) {
-                Some(path) => format!("ok: {}", path.display()),
+                Some(path) => SettingsTextStatus::ok(format!("ok: {}", path.display())),
                 None if draft.cokacdir_program.trim().is_empty() => {
-                    "will auto-download if needed".to_string()
+                    SettingsTextStatus::warning("auto-download")
                 }
-                None => "not found".to_string(),
+                None => SettingsTextStatus::error("not found"),
             }
         }
     }
@@ -26696,22 +26849,42 @@ fn settings_text_status(draft: &SettingsDraft, field: SettingsTextField) -> Stri
 fn settings_help_text(state: &SettingsState, keybindings: &KeyBindings) -> String {
     if state.editing.is_some() {
         return format!(
-            "type path  Left/Right cursor  {} done  {} done",
+            "type path  Left/Right cursor  {} keep edit  {} discard edit",
             keybindings.help(KeyAction::AiTitleSettingsSave, "Enter"),
             keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc"),
         );
     }
-    format!(
-        "Left/Right section  {} move  Space change  {} save/edit path  {} cancel",
-        keybindings.help_pair(
-            KeyAction::AiTitleSettingsPrev,
-            KeyAction::AiTitleSettingsNext,
-            "Up",
-            "Down",
+    let move_help = keybindings.help_pair(
+        KeyAction::AiTitleSettingsPrev,
+        KeyAction::AiTitleSettingsNext,
+        "Up",
+        "Down",
+    );
+    let save_key = keybindings.help(KeyAction::AiTitleSettingsSave, "Enter");
+    let cancel_key = keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc");
+    let dirty = if state.is_dirty() { "  ! unsaved" } else { "" };
+    match state.selected_row_kind() {
+        SettingsRowKind::Text if state.edit_finished => format!(
+            "Left/Right section  {} move  {} save  type edit again  {} cancel{}",
+            move_help, save_key, cancel_key, dirty
         ),
-        keybindings.help(KeyAction::AiTitleSettingsSave, "Enter"),
-        keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc"),
-    )
+        SettingsRowKind::Text => format!(
+            "Left/Right section  {} move  {} edit path  {} cancel{}",
+            move_help, save_key, cancel_key, dirty
+        ),
+        SettingsRowKind::ReadOnly => format!(
+            "Left/Right section  {} move  read-only  {} save  {} cancel{}",
+            move_help, save_key, cancel_key, dirty
+        ),
+        SettingsRowKind::Reset => format!(
+            "Left/Right section  {} move  Space reset  {} save  {} cancel{}",
+            move_help, save_key, cancel_key, dirty
+        ),
+        SettingsRowKind::Change => format!(
+            "Left/Right section  {} move  Space change  {} save  {} cancel{}",
+            move_help, save_key, cancel_key, dirty
+        ),
+    }
 }
 
 fn optional_path_label(path: Option<PathBuf>) -> String {
@@ -26728,9 +26901,18 @@ fn ai_title_provider_option_line(
         Some(provider) => provider.as_str().to_string(),
         None => "None (disabled)".to_string(),
     };
-    let text = format!("{}{} {}", selection_marker(selected), index + 1, label);
+    let marker = if selected {
+        UI_CURRENT_MARKER
+    } else {
+        UI_UNSELECTED_MARKER
+    };
+    let current = if selected { " current" } else { "" };
+    let text = format!("{}{} {}{}", marker, index + 1, label, current);
     let style = if selected {
-        theme_selected_style()
+        Style::default()
+            .fg(provider.map(provider_color).unwrap_or(THEME_POSITIVE))
+            .bg(THEME_BG_ALT)
+            .add_modifier(Modifier::BOLD)
     } else {
         let fg = provider.map(provider_color).unwrap_or(THEME_FG_STRONG);
         Style::default().fg(fg).bg(THEME_BG_ALT)
@@ -30929,6 +31111,18 @@ mod tests {
         buffer_text(terminal.backend().buffer())
     }
 
+    fn rendered_settings_modal(cols: u16, rows: u16, state: &SettingsState) -> String {
+        let keybindings = KeyBindings::default();
+        let backend = ratatui::backend::TestBackend::new(cols, rows);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_settings_modal(f, f.area(), state, &keybindings);
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         let area = *buffer.area();
         let mut text = String::new();
@@ -31456,6 +31650,136 @@ mod tests {
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert_eq!(app.settings.cokacmux.ai.provider, Some(Provider::Codex));
         assert!(app.status.contains("settings saved"));
+    }
+
+    #[test]
+    fn settings_path_edit_esc_discards_draft_change() {
+        let mut app = app_for_key_tests();
+        let mut state = SettingsState::new(&app.settings.cokacmux);
+        state.section = SettingsSection::Agents;
+        state.selected = SETTINGS_AGENTS_CODEX;
+        app.input_mode = InputMode::Settings {
+            state,
+            return_to: AiTitleSettingsReturn::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::Settings { state, .. } => {
+                assert!(state.editing.is_none());
+                assert_eq!(
+                    state
+                        .draft
+                        .text_field_value(SettingsTextField::AgentProgram(Provider::Codex)),
+                    ""
+                );
+                assert!(!state.is_dirty());
+                assert!(app.status.contains("cancelled"));
+            }
+            other => panic!("expected settings mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn settings_path_edit_enter_then_enter_saves() {
+        let mut app = app_for_key_tests();
+        let mut state = SettingsState::new(&app.settings.cokacmux);
+        state.section = SettingsSection::Agents;
+        state.selected = SETTINGS_AGENTS_CODEX;
+        app.input_mode = InputMode::Settings {
+            state,
+            return_to: AiTitleSettingsReturn::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::Settings { state, .. } => {
+                assert!(state.editing.is_none());
+                assert!(state.edit_finished);
+                assert!(state.is_dirty());
+                assert!(app.status.contains("Enter saves settings"));
+            }
+            other => panic!("expected settings mode, got {:?}", other),
+        }
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert_eq!(
+            app.settings.cokacmux.agent_programs.codex.as_deref(),
+            Some("x")
+        );
+        assert!(app.status.contains("settings saved"));
+    }
+
+    #[test]
+    fn settings_modal_marks_unsaved_current_and_read_only_states() {
+        let mut state = SettingsState::new(&CokacmuxSettings::default());
+        state.draft.ai_provider = Some(Provider::Codex);
+
+        let ai = rendered_settings_modal(80, 24, &state);
+        assert!(ai.contains("! unsaved"));
+        assert!(ai.contains("codex current"));
+
+        state.section = SettingsSection::Keybindings;
+        state.selected = SETTINGS_KEYBINDINGS_FILE;
+        let keybindings = rendered_settings_modal(80, 24, &state);
+        assert!(keybindings.contains("read-only"));
+        assert!(!keybindings.contains("Space change"));
+    }
+
+    #[test]
+    fn settings_agents_status_uses_status_column_not_brackets() {
+        let mut state = SettingsState::new(&CokacmuxSettings::default());
+        state.section = SettingsSection::Agents;
+        state.selected = SETTINGS_AGENTS_CODEX;
+        state.draft.agent_programs.codex = Some("/definitely/missing/codex".to_string());
+
+        let rendered = rendered_settings_modal(100, 24, &state);
+        assert!(rendered.contains("not found"));
+        assert!(!rendered.contains("[not found]"));
+        assert!(!rendered.contains("[ok:"));
     }
 
     #[test]
@@ -34276,6 +34600,8 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             THEME_ACCENT,
             THEME_SHORTCUT,
             THEME_POSITIVE,
+            THEME_WARNING,
+            THEME_ERROR,
             THEME_BORDER,
             THEME_BORDER_ACTIVE,
             THEME_PROVIDER_CLAUDE,
@@ -34306,6 +34632,8 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert_eq!(THEME_BG, Color::Indexed(234));
         assert_eq!(THEME_SELECTED_BG, Color::Indexed(66));
         assert_eq!(THEME_POSITIVE, Color::Indexed(108));
+        assert_eq!(THEME_WARNING, Color::Indexed(214));
+        assert_eq!(THEME_ERROR, Color::Indexed(203));
         assert_eq!(THEME_ACCENT, Color::Indexed(109));
     }
 
