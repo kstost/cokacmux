@@ -46,7 +46,7 @@
 | 에이전트 | 실제로 실행 중인 코딩 에이전트 CLI 프로세스입니다. |
 | 프로세스 | 컴퓨터 안에서 실행 중인 프로그램 하나를 뜻합니다. cokacmux를 실행하면 cokacmux 프로세스가 생기고, 에이전트를 시작하면 에이전트 프로세스도 생깁니다. |
 | provider | cokacmux가 지원하는 에이전트 종류입니다. 현재는 Claude Code, Codex, OpenCode입니다. |
-| 백그라운드 에이전트 | `Ctrl+]`로 목록 화면에 돌아와도 종료되지 않고 계속 살아있는 에이전트입니다. |
+| 백그라운드 실행 대상 | `Ctrl+]`로 목록 화면에 돌아와도 종료되지 않고 계속 살아있는 코딩 에이전트, 터미널, `cokacdir`입니다. |
 | 작업 폴더 | 에이전트를 시작할 폴더입니다. 코딩 작업의 기준 디렉터리입니다. |
 | cwd | current working directory의 줄임말입니다. 여기서는 작업 폴더와 같은 뜻으로 보면 됩니다. |
 | 홈 폴더 | 사용자 개인 파일이 들어가는 기본 폴더입니다. macOS/Linux에서는 보통 `/home/이름` 또는 `/Users/이름`, Windows에서는 보통 `C:\Users\이름`입니다. |
@@ -63,7 +63,7 @@
 중요한 차이가 하나 있습니다.
 
 - `Delete` 또는 `d`: 저장된 세션 기록을 삭제합니다.
-- `Ctrl+K`: 실행 중인 백그라운드 프로세스를 종료합니다.
+- `Ctrl+K`: 실행 중인 백그라운드 실행 대상을 종료합니다. `cokacdir` 화면에서는 자식 앱에 전달됩니다.
 
 기록을 지우는 것과 실행 중인 프로세스를 끄는 것은 다릅니다.
 
@@ -323,7 +323,7 @@ cokacmux
 
 왼쪽은 세션 목록이고, 오른쪽은 선택한 세션의 미리보기입니다. 화면 아래에는 현재 쓸 수 있는 주요 단축키가 짧게 표시됩니다.
 
-에이전트를 실행하면 화면이 에이전트 터미널로 바뀝니다. 이때 왼쪽에는 실행 중인 에이전트/셸 사이드바가 보일 수 있습니다. `Ctrl+B`로 숨기거나 다시 보일 수 있습니다.
+에이전트를 실행하면 화면이 에이전트 터미널로 바뀝니다. 이때 왼쪽에는 실행 중인 에이전트/터미널/`cokacdir` 사이드바가 보일 수 있습니다. `Ctrl+B`로 숨기거나 다시 보일 수 있습니다.
 
 #### 세션 목록의 각 칸이 뜻하는 것
 
@@ -528,7 +528,7 @@ AI search는 먼저 세션 summary preview 인덱스를 `~/.cokacmux/searchdata`
 
 모달에서 `↑`/`↓`로 선택하고 `Enter`로 시작합니다. `1`은 Normal, `2`는 Skip permissions로 선택을 옮깁니다. `Esc`는 취소입니다.
 
-이미 같은 세션의 백그라운드 에이전트가 살아 있으면 새로 실행하지 않고 바로 다시 연결하므로 launch mode 선택을 거치지 않습니다. 다른 cokacmux 프로세스가 이미 붙어 있는 세션은 자동으로 뺏어오지 않습니다. 같은 작업 폴더를 쓰는 다른 live 코딩에이전트가 있으면 새 실행은 차단됩니다. 터미널과 `cokacdir` 같은 일반 PTY 도구는 이 제한에서 제외됩니다.
+이미 같은 세션의 백그라운드 코딩 에이전트가 살아 있으면 새로 실행하지 않고 바로 다시 연결하므로 launch mode 선택을 거치지 않습니다. 다른 cokacmux 프로세스가 이미 붙어 있는 세션은 자동으로 뺏어오지 않습니다. 같은 작업 폴더를 쓰는 다른 live 코딩에이전트가 있으면 새 실행은 차단됩니다. 터미널과 `cokacdir` 같은 일반 PTY 도구는 이 제한에서 제외됩니다.
 
 Skip permissions를 선택하면 이어 실행할 때 다음 형태가 됩니다.
 
@@ -660,7 +660,7 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | 디스크에서 세션 목록 다시 읽기 | `r` |
 | 종료 | `q`, `Ctrl+Q`, `Ctrl+C` |
 
-`q`나 `Ctrl+Q`로 TUI를 종료해도 백그라운드 에이전트는 사용자가 명시적으로 종료하지 않는 한 계속 살아 있습니다. 현재 실행 중인 대상을 정리하려면 `Ctrl+K`, 모두 정리하려면 `cokacmux killall`을 사용하세요.
+`q`나 `Ctrl+Q`로 TUI를 종료해도 백그라운드 실행 대상은 사용자가 명시적으로 종료하지 않는 한 계속 살아 있습니다. 현재 실행 중인 대상을 정리하려면 `Ctrl+K`, 모두 정리하려면 `cokacmux killall`을 사용하세요.
 
 ---
 
@@ -819,8 +819,9 @@ TUI를 띄우지 않고 쓸 수 있는 명령도 있습니다.
 | `cokacmux --check` | TUI 없이 세션 탐색이 되는지 확인 |
 | `cokacmux --debug` | 디버그 로그를 켜고 TUI 실행 |
 | `cokacmux --trace` | 훨씬 많은 로그를 남기며 TUI 실행. 문제 분석용입니다. |
-| `cokacmux killall` | cokacmux가 띄운 백그라운드 에이전트/셸 데몬 종료 |
+| `cokacmux killall` | cokacmux 프로세스 종료, `~/.cokacmux/agents`와 `~/.cokacmux/debug` 정리 |
 | `cokacmux agents killall` | `cokacmux killall`과 같은 별칭 |
+| `cokacmux reset` | cokacmux 프로세스 종료 후 `~/.cokacmux` 전체 삭제 |
 | `cokacmux --version` 또는 `cokacmux -V` | 버전 출력 |
 | `cokacmux --help` 또는 `cokacmux -h` | 도움말 출력 |
 
@@ -842,7 +843,7 @@ cokacmux --check ok: 12 sessions discovered (status: 12 sessions)
 
 ### `killall`
 
-cokacmux가 띄운 백그라운드 에이전트/셸 데몬을 한 번에 종료합니다.
+cokacmux 관련 프로세스를 한 번에 종료하고 런타임/디버그 파일을 정리합니다.
 
 ```bash
 cokacmux killall
@@ -851,10 +852,28 @@ cokacmux killall
 출력 예:
 
 ```text
-killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
+killall cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_removed=0 pty_logs_deleted=2 cwd_locks_removed=1 untracked_daemons_scanned=0 untracked_daemons_terminated=0 untracked_daemons_skipped_self=0 untracked_daemons_skipped_unverified=0 clients_scanned=1 clients_terminated=1 clients_skipped_self=0 clients_skipped_unverified=0 errors=0 agents_removed=true debug_removed=true
 ```
 
-`killall`은 cokacmux가 관리하는 런타임 메타데이터를 확인한 뒤 대상만 종료합니다. 일반적으로 사용자가 별도 터미널에서 직접 실행한 `claude`, `codex`, `opencode`까지 무작정 죽이는 용도가 아닙니다.
+`killall`은 `reset`과 같은 범위로 cokacmux 데몬과 클라이언트 프로세스를 종료합니다. 파일 삭제 범위만 더 좁습니다. `~/.cokacmux` 아래에서는 `agents/`와 `debug/`만 삭제하고, `settings.json`, `keybinding.json`, `titles.json`, `clone_tree.json`, `agent_auxiliary.json`, `data/`, `searchdata/`, `bin/`은 남깁니다.
+
+별도 터미널에서 직접 실행한 `claude`, `codex`, `opencode`는 cokacmux 프로세스나 그 자식 프로세스가 아니면 종료 대상이 아닙니다.
+
+### `reset`
+
+cokacmux 관련 프로세스를 종료한 뒤 `~/.cokacmux` 전체를 삭제합니다.
+
+```bash
+cokacmux reset
+```
+
+출력 예:
+
+```text
+reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_removed=0 pty_logs_deleted=2 cwd_locks_removed=1 untracked_daemons_scanned=0 untracked_daemons_terminated=0 untracked_daemons_skipped_self=0 untracked_daemons_skipped_unverified=0 clients_scanned=1 clients_terminated=1 clients_skipped_self=0 clients_skipped_unverified=0 errors=0 removed=true
+```
+
+`reset`은 `settings.json`, `keybinding.json`, `titles.json`, `clone_tree.json`, `agent_auxiliary.json`, `data/`, `searchdata/`, `bin/`, `agents/`, `debug/`를 포함한 `~/.cokacmux` 디렉터리 전체를 지웁니다. Claude Code, Codex, OpenCode가 각자 저장하는 원본 세션 데이터는 `~/.cokacmux` 밖에 있으므로 삭제하지 않습니다.
 
 ---
 
@@ -920,9 +939,9 @@ killed 2 agent daemon(s); stale=0 skipped_self=0 errors=0 pty_logs_deleted=2
 - `codex-beta`처럼 명령 이름이면 PATH에서 다시 찾습니다.
 - Windows에서는 `.exe`, `.cmd`, `.bat`, `.ps1` 경로를 사용할 수 있습니다.
 - `cokacdir_program`이 비어 있고 PATH에서도 `cokacdir`을 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용합니다. 그 파일이 없으면 `~/.cokacmux/bin`에 자동 다운로드한 바이너리를 실행합니다.
-- 이미 실행 중인 백그라운드 에이전트나 `cokacdir`에는 변경된 경로가 적용되지 않습니다. 새 경로로 실행하려면 기존 실행 대상을 `Ctrl+K` 또는 `cokacmux killall`로 종료한 뒤 다시 시작하세요.
+- 이미 실행 중인 백그라운드 실행 대상에는 변경된 경로가 적용되지 않습니다. 새 경로로 실행하려면 기존 실행 대상을 `Ctrl+K` 또는 `cokacmux killall`로 종료한 뒤 다시 시작하세요.
 
-설정 화면에서 저장한 값은 바로 `settings.json`에 쓰입니다. 다만 이미 실행 중인 백그라운드 에이전트나 `cokacdir`에는 실행 파일 경로 변경이 적용되지 않습니다. 파일을 직접 고친 뒤에는 cokacmux를 재시작하는 편이 가장 명확합니다. 단축키 파일인 `keybinding.json`만 실행 중 백그라운드 감시 스레드가 자동으로 다시 읽습니다.
+설정 화면에서 저장한 값은 바로 `settings.json`에 쓰입니다. 다만 이미 실행 중인 백그라운드 실행 대상에는 실행 파일 경로 변경이 적용되지 않습니다. 파일을 직접 고친 뒤에는 cokacmux를 재시작하는 편이 가장 명확합니다. 단축키 파일인 `keybinding.json`만 실행 중 백그라운드 감시 스레드가 자동으로 다시 읽습니다.
 
 ---
 
@@ -1000,9 +1019,12 @@ cokacmux가 직접 만드는 파일은 홈 폴더 안의 `.cokacmux/` 디렉터�
 | `~/.cokacmux/keybinding.json` | 단축키 설정 |
 | `~/.cokacmux/titles.json` | 사용자가 붙인 세션 표시 이름 |
 | `~/.cokacmux/clone_tree.json` | 복제한 세션의 parent/child 관계 |
+| `~/.cokacmux/agent_auxiliary.json` | 에이전트별 오른쪽 terminal/`cokacdir` 보조 패널 복원 정보 |
 | `~/.cokacmux/data/` | 복제 세션과 짝지어 저장한 작업 폴더 스냅샷 |
-| `~/.cokacmux/agents/` | 실행 중인 백그라운드 에이전트/셸 메타데이터와 통신용 소켓 |
-| `~/.cokacmux/agents/scrollback/*.ptylog` | 실행 중인 에이전트/셸 PTY 출력 복원용 보조 기록 |
+| `~/.cokacmux/searchdata/` | AI search가 agent에게 넘기는 세션 summary preview 인덱스 |
+| `~/.cokacmux/bin/cokacdir` | PATH에서 `cokacdir`을 찾지 못할 때 자동 다운로드한 실행 파일 |
+| `~/.cokacmux/agents/` | 실행 중인 백그라운드 실행 대상의 메타데이터와 통신용 소켓 |
+| `~/.cokacmux/agents/scrollback/*.ptylog` | 실행 중인 에이전트/터미널/`cokacdir` PTY 출력 복원용 보조 기록 |
 | `~/.cokacmux/debug/cokacmux.log` | `--debug` 또는 `--trace`로 실행했을 때 기록되는 런타임 로그 |
 | `~/.cokacmux/debug/cokacmux-stalls.log` | UI stall 진단 로그. debug가 꺼져 있어도 제한적으로 기록될 수 있습니다. |
 
@@ -1082,7 +1104,7 @@ Get-Command opencode
 
 일부 터미널은 `Ctrl+[`를 `Esc`로 보내거나, 특정 Ctrl 조합을 가로챌 수 있습니다. 이 경우 `Ctrl+]`를 먼저 써 보세요. 그래도 어렵다면 `keybinding.json`에서 `sessions.toggle_agent`와 `agent.toggle_sessions`를 다른 키로 바꾸면 됩니다.
 
-### 백그라운드 에이전트는 언제 종료되나요?
+### 백그라운드 실행 대상은 언제 종료되나요?
 
 사용자가 명시적으로 종료하기 전까지 계속 살아 있습니다.
 
@@ -1094,7 +1116,7 @@ Get-Command opencode
 
 `cokacdir` 화면에서는 `Ctrl+K`가 `cokacdir`에 전달되므로, cokacmux 쪽에서 종료하려면 세션 목록에서 해당 실행 항목을 선택하고 `Ctrl+K`를 누르세요.
 
-`q`나 `Ctrl+Q`로 TUI를 종료해도 백그라운드 에이전트는 자동 종료하지 않습니다.
+`q`나 `Ctrl+Q`로 TUI를 종료해도 백그라운드 실행 대상은 자동 종료하지 않습니다.
 
 ### `Delete`와 `Ctrl+K`는 왜 둘 다 있나요?
 
@@ -1103,7 +1125,7 @@ Get-Command opencode
 | 키 | 대상 | 결과 |
 |---|---|---|
 | `Delete` / `d` | 저장된 세션 기록 | 실제 세션 데이터 삭제 |
-| `Ctrl+K` | 실행 중인 백그라운드 프로세스 | 코딩 에이전트/일반 터미널 종료. `cokacdir`은 세션 목록에서 종료 |
+| `Ctrl+K` | 실행 중인 백그라운드 실행 대상 | 코딩 에이전트/일반 터미널 종료. `cokacdir`은 세션 목록에서 종료 |
 
 ### 검색이 느릴 수 있나요?
 
@@ -1165,7 +1187,7 @@ cokacmux --trace
 
 `--trace`는 `--debug`보다 훨씬 많은 내용을 기록합니다. 로그 파일이 빨리 커질 수 있으므로, 평소 사용보다는 문제를 재현할 때만 쓰는 편이 좋습니다.
 
-각 줄에는 시간, 프로세스 ID, 스레드 정보, 이벤트 이름, 세부 JSON이 함께 들어갑니다. 백그라운드 에이전트처럼 별도 프로세스에서 발생한 로그도 같은 파일에 append됩니다.
+각 줄에는 시간, 프로세스 ID, 스레드 정보, 이벤트 이름, 세부 JSON이 함께 들어갑니다. 백그라운드 실행 대상처럼 별도 프로세스에서 발생한 로그도 같은 파일에 append됩니다.
 
 UI stall 진단은 `~/.cokacmux/debug/cokacmux-stalls.log`에 따로 남습니다. 이 파일은 문제 재현에 필요한 최소 증거를 남기기 위해 `--debug` 없이도 제한적으로 기록될 수 있습니다.
 
@@ -1267,7 +1289,7 @@ cokacmux는 이 데이터를 읽어 공통 모델로 표현합니다. 그래서 
 
 에이전트를 실행할 때는 자체 AI 엔진을 쓰지 않습니다. 사용자의 시스템에 설치된 `claude`, `codex`, `opencode` CLI를 PTY 안에서 실행하고, TUI가 그 화면에 붙었다 떨어졌다 하는 방식입니다.
 
-백그라운드 에이전트 정보는 `~/.cokacmux/agents/`에 저장됩니다. 이 정보 덕분에 세션 목록으로 돌아와도 에이전트가 계속 살아 있고, 나중에 다시 연결할 수 있습니다.
+백그라운드 실행 대상 정보는 `~/.cokacmux/agents/`에 저장됩니다. 이 정보 덕분에 세션 목록으로 돌아와도 코딩 에이전트, 터미널, `cokacdir`이 계속 살아 있고, 나중에 다시 연결할 수 있습니다.
 
 ---
 

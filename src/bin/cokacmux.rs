@@ -19923,6 +19923,44 @@ fn cokacmux_main() -> Result<()> {
         );
         return Ok(());
     }
+    if matches!(command_args.as_slice(), ["killall"] | ["agents", "killall"]) {
+        let report = killall_cokacmux()?;
+        println!(
+            "killall cokacmux: killed={} stale={} child_processes_terminated={} runtime_files_removed={} pty_logs_deleted={} cwd_locks_removed={} untracked_daemons_scanned={} untracked_daemons_terminated={} untracked_daemons_skipped_self={} untracked_daemons_skipped_unverified={} clients_scanned={} clients_terminated={} clients_skipped_self={} clients_skipped_unverified={} errors={} agents_removed={}{} debug_removed={}{}",
+            report.killall.killed,
+            report.killall.stale,
+            report.killall.child_processes_terminated,
+            report.killall.runtime_files_removed,
+            report.killall.pty_logs_deleted,
+            report.killall.cwd_locks_removed,
+            report.untracked_daemon_processes_scanned,
+            report.untracked_daemon_processes_terminated,
+            report.untracked_daemon_processes_skipped_self,
+            report.untracked_daemon_processes_skipped_unverified,
+            report.client_processes_scanned,
+            report.client_processes_terminated,
+            report.client_processes_skipped_self,
+            report.client_processes_skipped_unverified,
+            report
+                .killall
+                .errors
+                .saturating_add(report.client_process_errors)
+                .saturating_add(report.untracked_daemon_process_errors),
+            report.agents_removed,
+            if report.agents_missing {
+                " agents_already_missing"
+            } else {
+                ""
+            },
+            report.debug_removed,
+            if report.debug_missing {
+                " debug_already_missing"
+            } else {
+                ""
+            }
+        );
+        return Ok(());
+    }
     init_debug_from_cli(debug_enabled, trace_enabled);
     install_vt100_panic_filter();
     // Headless smoke-test mode — doesn't enter raw mode / alternate screen.
@@ -19951,55 +19989,6 @@ fn cokacmux_main() -> Result<()> {
             }),
         );
         return result;
-    }
-    if matches!(command_args.as_slice(), ["killall"] | ["agents", "killall"]) {
-        debug_log("main_dispatch_killall", serde_json::json!({}));
-        let report = kill_all_agent_daemons()?;
-        debug_log(
-            "main_killall_done",
-            serde_json::json!({
-                "scanned": report.scanned,
-                "killed": report.killed,
-                "stale": report.stale,
-                "skipped_self": report.skipped_self,
-                "errors": report.errors,
-                "child_processes_terminated": report.child_processes_terminated,
-                "runtime_files_removed": report.runtime_files_removed,
-                "pty_logs_deleted": report.pty_logs_deleted,
-                "cwd_locks_removed": report.cwd_locks_removed,
-            }),
-        );
-        println!(
-            "killed {} agent daemon(s); stale={} skipped_self={} errors={}{}{}{}{}",
-            report.killed,
-            report.stale,
-            report.skipped_self,
-            report.errors,
-            if report.child_processes_terminated > 0 {
-                format!(
-                    " child_processes_terminated={}",
-                    report.child_processes_terminated
-                )
-            } else {
-                String::new()
-            },
-            if report.runtime_files_removed > 0 {
-                format!(" runtime_files_removed={}", report.runtime_files_removed)
-            } else {
-                String::new()
-            },
-            if report.pty_logs_deleted > 0 {
-                format!(" pty_logs_deleted={}", report.pty_logs_deleted)
-            } else {
-                String::new()
-            },
-            if report.cwd_locks_removed > 0 {
-                format!(" cwd_locks_removed={}", report.cwd_locks_removed)
-            } else {
-                String::new()
-            }
-        );
-        return Ok(());
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         debug_log("main_dispatch_version", serde_json::json!({}));
@@ -20049,7 +20038,7 @@ fn print_help() {
          cokacmux --debug      launch with debug logs enabled\n  \
          cokacmux --trace      launch with high-volume trace logs enabled\n  \
          cokacmux --check      headless sanity check (no TTY needed)\n  \
-         cokacmux killall      terminate all cokacmux agent daemons\n  \
+         cokacmux killall      terminate cokacmux processes and remove ~/.cokacmux/{{agents,debug}}\n  \
          cokacmux reset        terminate cokacmux processes and remove ~/.cokacmux\n  \
          cokacmux --version    print version\n\n\
          CONFIG:\n  ~/.cokacmux/settings.json\n  ~/.cokacmux/keybinding.json\n\n\
@@ -26158,11 +26147,52 @@ struct ResetReport {
     config_missing: bool,
 }
 
-fn reset_cokacmux() -> Result<ResetReport> {
-    let Some(config_dir) = app_config_dir() else {
-        anyhow::bail!("cannot resolve home directory");
-    };
-    let current_pid = std::process::id();
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct KillAllCokacmuxReport {
+    killall: KillAllAgentsReport,
+    client_processes_scanned: usize,
+    client_processes_terminated: usize,
+    client_process_errors: usize,
+    client_processes_skipped_self: usize,
+    client_processes_skipped_unverified: usize,
+    untracked_daemon_processes_scanned: usize,
+    untracked_daemon_processes_terminated: usize,
+    untracked_daemon_process_errors: usize,
+    untracked_daemon_processes_skipped_self: usize,
+    untracked_daemon_processes_skipped_unverified: usize,
+    agents_removed: bool,
+    agents_missing: bool,
+    debug_removed: bool,
+    debug_missing: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct KillAllConfigRemovalReport {
+    agents_removed: bool,
+    agents_missing: bool,
+    debug_removed: bool,
+    debug_missing: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CokacmuxProcessTerminationReport {
+    killall: KillAllAgentsReport,
+    client_processes_scanned: usize,
+    client_processes_terminated: usize,
+    client_process_errors: usize,
+    client_processes_skipped_self: usize,
+    client_processes_skipped_unverified: usize,
+    untracked_daemon_processes_scanned: usize,
+    untracked_daemon_processes_terminated: usize,
+    untracked_daemon_process_errors: usize,
+    untracked_daemon_processes_skipped_self: usize,
+    untracked_daemon_processes_skipped_unverified: usize,
+}
+
+fn terminate_cokacmux_processes_at(
+    config_dir: &Path,
+    current_pid: u32,
+) -> CokacmuxProcessTerminationReport {
     let runtime_dir = config_dir.join("agents");
     let client_pids = cokacmux_client_pids_for_reset(&runtime_dir, current_pid);
     let killall = kill_all_agent_daemons_at(&runtime_dir, current_pid);
@@ -26172,13 +26202,7 @@ fn reset_cokacmux() -> Result<ResetReport> {
     );
     let client_report = terminate_cokacmux_client_pids_for_reset(client_pids, current_pid);
 
-    // Give just-killed clients and daemon log writers a brief chance to drop
-    // file handles before removing the config tree, especially on Windows.
-    thread::sleep(Duration::from_millis(200));
-    let config_removal = remove_cokacmux_config_dir_for_reset(&config_dir)
-        .map_err(|e| anyhow::anyhow!("remove {} failed: {}", config_dir.display(), e))?;
-
-    Ok(ResetReport {
+    CokacmuxProcessTerminationReport {
         killall,
         client_processes_scanned: client_report.scanned,
         client_processes_terminated: client_report.terminated,
@@ -26190,8 +26214,89 @@ fn reset_cokacmux() -> Result<ResetReport> {
         untracked_daemon_process_errors: untracked_daemon_report.errors,
         untracked_daemon_processes_skipped_self: untracked_daemon_report.skipped_self,
         untracked_daemon_processes_skipped_unverified: untracked_daemon_report.skipped_unverified,
+    }
+}
+
+fn reset_cokacmux() -> Result<ResetReport> {
+    let Some(config_dir) = app_config_dir() else {
+        anyhow::bail!("cannot resolve home directory");
+    };
+    let process_report = terminate_cokacmux_processes_at(&config_dir, std::process::id());
+
+    // Give just-killed clients and daemon log writers a brief chance to drop
+    // file handles before removing the config tree, especially on Windows.
+    thread::sleep(Duration::from_millis(200));
+    let config_removal = remove_cokacmux_path_for_cleanup(&config_dir)
+        .map_err(|e| anyhow::anyhow!("remove {} failed: {}", config_dir.display(), e))?;
+
+    Ok(ResetReport {
+        killall: process_report.killall,
+        client_processes_scanned: process_report.client_processes_scanned,
+        client_processes_terminated: process_report.client_processes_terminated,
+        client_process_errors: process_report.client_process_errors,
+        client_processes_skipped_self: process_report.client_processes_skipped_self,
+        client_processes_skipped_unverified: process_report.client_processes_skipped_unverified,
+        untracked_daemon_processes_scanned: process_report.untracked_daemon_processes_scanned,
+        untracked_daemon_processes_terminated: process_report.untracked_daemon_processes_terminated,
+        untracked_daemon_process_errors: process_report.untracked_daemon_process_errors,
+        untracked_daemon_processes_skipped_self: process_report
+            .untracked_daemon_processes_skipped_self,
+        untracked_daemon_processes_skipped_unverified: process_report
+            .untracked_daemon_processes_skipped_unverified,
         config_removed: config_removal.removed,
         config_missing: config_removal.missing,
+    })
+}
+
+fn killall_cokacmux() -> Result<KillAllCokacmuxReport> {
+    let Some(config_dir) = app_config_dir() else {
+        anyhow::bail!("cannot resolve home directory");
+    };
+    killall_cokacmux_at(&config_dir, std::process::id())
+}
+
+fn killall_cokacmux_at(config_dir: &Path, current_pid: u32) -> Result<KillAllCokacmuxReport> {
+    let process_report = terminate_cokacmux_processes_at(config_dir, current_pid);
+
+    // Give just-killed clients and daemon log writers a brief chance to drop
+    // file handles before removing runtime/debug trees, especially on Windows.
+    thread::sleep(Duration::from_millis(200));
+    let removal_report = remove_killall_config_dirs_at(config_dir)?;
+
+    Ok(KillAllCokacmuxReport {
+        killall: process_report.killall,
+        client_processes_scanned: process_report.client_processes_scanned,
+        client_processes_terminated: process_report.client_processes_terminated,
+        client_process_errors: process_report.client_process_errors,
+        client_processes_skipped_self: process_report.client_processes_skipped_self,
+        client_processes_skipped_unverified: process_report.client_processes_skipped_unverified,
+        untracked_daemon_processes_scanned: process_report.untracked_daemon_processes_scanned,
+        untracked_daemon_processes_terminated: process_report.untracked_daemon_processes_terminated,
+        untracked_daemon_process_errors: process_report.untracked_daemon_process_errors,
+        untracked_daemon_processes_skipped_self: process_report
+            .untracked_daemon_processes_skipped_self,
+        untracked_daemon_processes_skipped_unverified: process_report
+            .untracked_daemon_processes_skipped_unverified,
+        agents_removed: removal_report.agents_removed,
+        agents_missing: removal_report.agents_missing,
+        debug_removed: removal_report.debug_removed,
+        debug_missing: removal_report.debug_missing,
+    })
+}
+
+fn remove_killall_config_dirs_at(config_dir: &Path) -> Result<KillAllConfigRemovalReport> {
+    let agents_dir = config_dir.join("agents");
+    let debug_dir = config_dir.join("debug");
+    let agents_removal = remove_cokacmux_path_for_cleanup(&agents_dir)
+        .map_err(|e| anyhow::anyhow!("remove {} failed: {}", agents_dir.display(), e))?;
+    let debug_removal = remove_cokacmux_path_for_cleanup(&debug_dir)
+        .map_err(|e| anyhow::anyhow!("remove {} failed: {}", debug_dir.display(), e))?;
+
+    Ok(KillAllConfigRemovalReport {
+        agents_removed: agents_removal.removed,
+        agents_missing: agents_removal.missing,
+        debug_removed: debug_removal.removed,
+        debug_missing: debug_removal.missing,
     })
 }
 
@@ -26433,12 +26538,12 @@ struct ResetConfigRemoval {
     missing: bool,
 }
 
-fn remove_cokacmux_config_dir_for_reset(path: &Path) -> io::Result<ResetConfigRemoval> {
-    match remove_cokacmux_config_dir_once(path) {
+fn remove_cokacmux_path_for_cleanup(path: &Path) -> io::Result<ResetConfigRemoval> {
+    match remove_cokacmux_path_once(path) {
         Ok(result) => Ok(result),
         Err(first_error) => {
             thread::sleep(Duration::from_millis(300));
-            remove_cokacmux_config_dir_once(path).map_err(|second_error| {
+            remove_cokacmux_path_once(path).map_err(|second_error| {
                 io::Error::new(
                     second_error.kind(),
                     format!("{}; retry failed: {}", first_error, second_error),
@@ -26448,7 +26553,7 @@ fn remove_cokacmux_config_dir_for_reset(path: &Path) -> io::Result<ResetConfigRe
     }
 }
 
-fn remove_cokacmux_config_dir_once(path: &Path) -> io::Result<ResetConfigRemoval> {
+fn remove_cokacmux_path_once(path: &Path) -> io::Result<ResetConfigRemoval> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -26469,11 +26574,6 @@ fn remove_cokacmux_config_dir_once(path: &Path) -> io::Result<ResetConfigRemoval
         removed: true,
         missing: false,
     })
-}
-
-fn kill_all_agent_daemons() -> Result<KillAllAgentsReport> {
-    let runtime_dir = agent_runtime_dir()?;
-    Ok(kill_all_agent_daemons_at(&runtime_dir, std::process::id()))
 }
 
 fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAgentsReport {
@@ -49652,6 +49752,53 @@ IF EXIST "%~dp0\node.exe" (
         assert_eq!(report.stale, 1);
         assert_eq!(report.killed, 0);
         assert!(!meta.exists());
+    }
+
+    #[test]
+    fn killall_config_cleanup_removes_only_agents_and_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        let debug = dir.path().join("debug");
+        let data = dir.path().join("data");
+        fs::create_dir_all(agents.join("scrollback")).unwrap();
+        fs::create_dir_all(&debug).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::write(agents.join("orphan.sock"), b"socket").unwrap();
+        fs::write(agents.join("scrollback").join("orphan.ptylog"), b"log").unwrap();
+        fs::write(debug.join("cokacmux.log"), b"debug").unwrap();
+        fs::write(dir.path().join("settings.json"), b"{}").unwrap();
+        fs::write(dir.path().join("keybinding.json"), b"{}").unwrap();
+        fs::write(dir.path().join("titles.json"), b"{}").unwrap();
+        fs::write(dir.path().join("clone_tree.json"), b"{}").unwrap();
+        fs::write(data.join("snapshot.txt"), b"snapshot").unwrap();
+
+        let report = remove_killall_config_dirs_at(dir.path()).unwrap();
+
+        assert!(report.agents_removed);
+        assert!(!report.agents_missing);
+        assert!(report.debug_removed);
+        assert!(!report.debug_missing);
+        assert!(!agents.exists());
+        assert!(!debug.exists());
+        assert!(dir.path().join("settings.json").exists());
+        assert!(dir.path().join("keybinding.json").exists());
+        assert!(dir.path().join("titles.json").exists());
+        assert!(dir.path().join("clone_tree.json").exists());
+        assert!(data.join("snapshot.txt").exists());
+    }
+
+    #[test]
+    fn killall_config_cleanup_reports_missing_agents_and_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("settings.json"), b"{}").unwrap();
+
+        let report = remove_killall_config_dirs_at(dir.path()).unwrap();
+
+        assert!(!report.agents_removed);
+        assert!(report.agents_missing);
+        assert!(!report.debug_removed);
+        assert!(report.debug_missing);
+        assert!(dir.path().join("settings.json").exists());
     }
 
     #[test]
