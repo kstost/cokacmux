@@ -5,6 +5,8 @@ set -e
 
 app="cokacmux"
 base="${COKACMUX_BASE_URL:-https://raw.githubusercontent.com/kstost/cokacmux/refs/heads/main/dist_beta}"
+cokacdir_app="cokacdir"
+cokacdir_base="${COKACDIR_BASE_URL:-https://raw.githubusercontent.com/kstost/cokacdir/main/dist}"
 
 case "${1:-install}" in
     install|update) ;;
@@ -24,21 +26,37 @@ case "$(uname -m)" in
     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-tmp="$(mktemp)"
-trap "rm -f '$tmp'" EXIT
-
-url="$base/$app-$os-$arch"
-echo "Downloading $app ($os-$arch)..."
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$tmp"
-elif command -v wget >/dev/null 2>&1; then
-    wget -q "$url" -O "$tmp"
-else
-    echo "curl or wget is required" >&2
+if [ -z "${HOME:-}" ]; then
+    echo "HOME is not set. Cannot choose cokacdir install directory." >&2
     exit 1
 fi
 
-[ -s "$tmp" ] || { echo "Download produced an empty file" >&2; exit 1; }
+tmp="$(mktemp)"
+cokacdir_tmp="$(mktemp)"
+trap "rm -f '$tmp' '$cokacdir_tmp'" EXIT
+
+download_binary() {
+    name="$1"
+    url="$2"
+    output="$3"
+
+    echo "Downloading $name..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$output"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q "$url" -O "$output"
+    else
+        echo "curl or wget is required" >&2
+        exit 1
+    fi
+
+    [ -s "$output" ] || { echo "$name download produced an empty file" >&2; exit 1; }
+}
+
+url="$base/$app-$os-$arch"
+cokacdir_url="$cokacdir_base/$cokacdir_app-$os-$arch"
+download_binary "$app ($os-$arch)" "$url" "$tmp"
+download_binary "$cokacdir_app ($os-$arch)" "$cokacdir_url" "$cokacdir_tmp"
 
 if [ -n "${COKACMUX_INSTALL_DIR:-}" ]; then
     dir="$COKACMUX_INSTALL_DIR"
@@ -48,19 +66,51 @@ else
     dir="$HOME/.local/bin"
 fi
 
-mkdir -p "$dir" 2>/dev/null || true
-dest="$dir/$app"
-
-if [ -w "$dir" ]; then
-    install -m 0755 "$tmp" "$dest"
-elif command -v sudo >/dev/null 2>&1; then
-    sudo install -m 0755 "$tmp" "$dest"
-else
-    echo "Cannot write to $dir" >&2
+ensure_install_dir() {
+    target_dir="$1"
+    if [ -d "$target_dir" ]; then
+        return 0
+    fi
+    if mkdir -p "$target_dir" 2>/dev/null; then
+        return 0
+    fi
+    if command -v sudo >/dev/null 2>&1; then
+        sudo mkdir -p "$target_dir"
+        return 0
+    fi
+    echo "Cannot create $target_dir" >&2
     exit 1
-fi
+}
+
+ensure_install_dir "$dir"
+
+cokacdir_dir="$HOME/.cokacmux/bin"
+mkdir -p "$cokacdir_dir"
+chmod 700 "$cokacdir_dir" 2>/dev/null || true
+
+dest="$dir/$app"
+cokacdir_dest="$cokacdir_dir/$cokacdir_app"
+
+install_binary() {
+    src="$1"
+    target="$2"
+    target_dir="$(dirname "$target")"
+
+    if [ -w "$target_dir" ]; then
+        install -m 0755 "$src" "$target"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo install -m 0755 "$src" "$target"
+    else
+        echo "Cannot write to $target_dir" >&2
+        exit 1
+    fi
+}
+
+install_binary "$tmp" "$dest"
+install_binary "$cokacdir_tmp" "$cokacdir_dest"
 
 "$dest" --version >/dev/null 2>&1 || { echo "Installed file did not run" >&2; exit 1; }
+[ -x "$cokacdir_dest" ] || { echo "Installed cokacdir is not executable" >&2; exit 1; }
 
 if [ "$dir" = "$HOME/.local/bin" ]; then
     rc=""
@@ -77,5 +127,6 @@ if [ "$dir" = "$HOME/.local/bin" ]; then
     case ":$PATH:" in *":$dir:"*) ;; *) echo "Open a new terminal so PATH changes take effect." ;; esac
 fi
 
-echo "Installed to $dest"
+echo "Installed $app to $dest"
+echo "Installed $cokacdir_app to $cokacdir_dest"
 echo "Run 'cokacmux' to start."
