@@ -15,8 +15,8 @@ cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다
     "quit": ["q", "ctrl+q"]
   },
   "agent": {
-    "scroll_page_up": ["shift+alt+up", "shift+alt+pageup"],
-    "scroll_page_down": ["shift+alt+down", "shift+alt+pagedown"],
+    "scroll_page_up": ["shift+alt+up", "shift+alt+pageup", "alt+pageup"],
+    "scroll_page_down": ["shift+alt+down", "shift+alt+pagedown", "alt+pagedown"],
     "switch_prev": ["ctrl+,"],
     "switch_next": ["ctrl+."]
   },
@@ -213,8 +213,8 @@ G
 | `agent.focus_auxiliary` | `ctrl+3` | 오른쪽 보조 패널로 포커스 이동 |
 | `agent.scroll_line_up` | `shift+up` | transcript/scrollback 한 줄 위 |
 | `agent.scroll_line_down` | `shift+down` | transcript/scrollback 한 줄 아래 |
-| `agent.scroll_page_up` | `shift+alt+up`, `shift+alt+pageup` | transcript/scrollback 한 페이지 위 |
-| `agent.scroll_page_down` | `shift+alt+down`, `shift+alt+pagedown` | transcript/scrollback 한 페이지 아래 |
+| `agent.scroll_page_up` | `shift+alt+up`, `shift+alt+pageup`, `alt+pageup` | transcript/scrollback 한 페이지 위 |
+| `agent.scroll_page_down` | `shift+alt+down`, `shift+alt+pagedown`, `alt+pagedown` | transcript/scrollback 한 페이지 아래 |
 | `agent.scroll_top` | `shift+home`, `alt+home` | transcript/scrollback 맨 위 |
 | `agent.scroll_bottom` | `shift+end`, `alt+end` | transcript/scrollback 맨 아래 |
 | `agent.resize_left` | `alt+left`, `ctrl+shift+left` | 포커스된 side panel 경계 왼쪽 이동. 중앙 포커스에서 양쪽이 모두 열려 있으면 동작하지 않음 |
@@ -372,6 +372,6 @@ clone 실행 전에 세션만 복제할지, 저장 가능한 폴더 데이터도
 | `fn+left` | `home` |
 | `fn+right` | `end` |
 
-에이전트 page scroll 기본값은 전용 Page 키가 없어도 쓸 수 있도록 `shift+alt+up/down`을 먼저 제공합니다. 외장 키보드나 `fn+up/down`을 선호하는 환경에서는 `shift+alt+pageup/pagedown`도 같은 동작입니다.
+에이전트 page scroll 기본값은 전용 Page 키가 없어도 쓸 수 있도록 `shift+alt+up/down`을 먼저 제공합니다. 외장 키보드나 `fn+up/down`을 선호하는 환경에서는 `shift+alt+pageup/pagedown`도 같은 동작입니다. Windows Terminal에서 `shift+alt+up/down`이 pane resize로 잡히면 `alt+pageup/pagedown`을 사용하세요.
 
 터미널이나 macOS 단축키 설정에 따라 `ctrl+fn+up/down` 같은 조합이 앱까지 전달되지 않을 수 있습니다. 그런 경우 `agent.switch_prev`, `agent.switch_next`, `agent.scroll_page_up`, `agent.scroll_page_down`을 다른 키로 지정하세요.

@@ -612,7 +612,7 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 | 동작 | 키 |
 |---|---|
 | transcript/scrollback 한 줄 위/아래 | `Shift+↑` / `Shift+↓` |
-| transcript/scrollback 한 화면 위/아래 | `Shift+Alt+↑` / `Shift+Alt+↓` 또는 `Shift+Alt+PageUp` / `Shift+Alt+PageDown` |
+| transcript/scrollback 한 화면 위/아래 | `Shift+Alt+↑` / `Shift+Alt+↓` 또는 `Shift+Alt+PageUp` / `Shift+Alt+PageDown` 또는 `Alt+PageUp` / `Alt+PageDown` |
 | transcript/scrollback 맨 위/아래 | `Shift+Home` / `Shift+End` 또는 `Alt+Home` / `Alt+End` |
 
 ### 6-9. 세션 복제하기
@@ -744,6 +744,7 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | `Shift+↑` / `Shift+↓` | transcript/scrollback 한 줄 위/아래 |
 | `Shift+Alt+↑` / `Shift+Alt+↓` | transcript/scrollback 한 화면 위/아래 |
 | `Shift+Alt+PageUp` / `Shift+Alt+PageDown` | transcript/scrollback 한 화면 위/아래 |
+| `Alt+PageUp` / `Alt+PageDown` | transcript/scrollback 한 화면 위/아래. Windows Terminal에서 `Shift+Alt+↑` / `Shift+Alt+↓`가 pane resize로 잡힐 때 사용 |
 | `Shift+Home` / `Shift+End` | transcript/scrollback 맨 위/아래 |
 | `Alt+Home` / `Alt+End` | transcript/scrollback 맨 위/아래 |
 | `Alt+↑` / `Alt+↓` | 에이전트 사이드바 선택 이동 |
@@ -968,8 +969,8 @@ reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_remo
     "prev": ["up", "backtab"]
   },
   "agent": {
-    "scroll_page_up": ["shift+alt+up", "shift+alt+pageup"],
-    "scroll_page_down": ["shift+alt+down", "shift+alt+pagedown"],
+    "scroll_page_up": ["shift+alt+up", "shift+alt+pageup", "alt+pageup"],
+    "scroll_page_down": ["shift+alt+down", "shift+alt+pagedown", "alt+pagedown"],
     "switch_prev": ["ctrl+,"],
     "switch_next": ["ctrl+."]
   }
@@ -1134,6 +1135,10 @@ Get-Command opencode
 ### 맥북에 PageUp/PageDown 키가 없어요.
 
 에이전트 화면 page scroll은 기본적으로 `Shift+Alt+↑`, `Shift+Alt+↓`도 지원하므로 전용 Page 키가 없어도 사용할 수 있습니다. `fn+↑`, `fn+↓`가 PageUp/PageDown으로 동작하는 터미널에서는 `Shift+Alt+PageUp`, `Shift+Alt+PageDown`도 같은 동작입니다. 터미널이 이 키를 전달하지 않으면 `keybinding.json`에서 다른 키를 지정하세요. 예를 들어 에이전트 스크롤을 `alt+u`, `alt+d`로 바꿀 수 있습니다.
+
+### Windows Terminal에서 `Shift+Alt+↑` / `Shift+Alt+↓`가 스크롤되지 않아요.
+
+Windows Terminal은 이 조합을 pane resize 기본 단축키로 사용할 수 있습니다. 이 경우 키가 앱까지 전달되지 않으므로 `Alt+PageUp` / `Alt+PageDown`을 사용하거나 Windows Terminal의 해당 action을 해제하세요.
 
 ### Windows에서 한글이나 박스 문자가 깨져요.
 
