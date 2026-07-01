@@ -3260,7 +3260,13 @@ struct PersistedAgentAuxiliaryEntry {
     parent_provider: Provider,
     parent_cwd: String,
     parent_source: String,
+    #[serde(default = "default_agent_auxiliary_visible")]
+    visible: bool,
     updated_at_epoch_s: u64,
+}
+
+fn default_agent_auxiliary_visible() -> bool {
+    true
 }
 
 impl PersistedAgentAuxiliaryEntry {
@@ -3465,6 +3471,7 @@ fn persisted_agent_auxiliary_entry_debug_value(
         "parent_provider": entry.parent_provider.as_str(),
         "parent_cwd": &entry.parent_cwd,
         "parent_source": &entry.parent_source,
+        "visible": entry.visible,
         "updated_at_epoch_s": entry.updated_at_epoch_s,
     })
 }
@@ -3636,6 +3643,7 @@ fn pending_runtime_action_debug_value(action: Option<&PendingRuntimeAction>) -> 
             wrap,
             cols,
             rows,
+            focus_override,
         }) => serde_json::json!({
             "kind": "switch_active",
             "current_key": agent_key_debug_value(current_key),
@@ -3643,6 +3651,9 @@ fn pending_runtime_action_debug_value(action: Option<&PendingRuntimeAction>) -> 
             "wrap": wrap,
             "cols": cols,
             "rows": rows,
+            "focus_override": focus_override
+                .as_ref()
+                .map(|focus| format!("{:?}", focus)),
         }),
         None => serde_json::Value::Null,
     }
@@ -6616,6 +6627,9 @@ struct AttachUiCtx {
     status_err_prefix: String,
     status_prepare_err_prefix: String,
     focus_auxiliary_on_ready: bool,
+    /// Main-agent switches normally restore that agent's remembered focus.
+    /// Sidebar-driven navigation overrides it so list focus can stay put.
+    main_focus_override_on_ready: Option<AgentFocusPane>,
     terminate_auxiliary_on_stale: bool,
     select_visible: bool,
     cokacdir_dialog_on_error: bool,
@@ -6833,6 +6847,7 @@ enum PendingRuntimeAction {
         wrap: bool,
         cols: u16,
         rows: u16,
+        focus_override: Option<AgentFocusPane>,
     },
 }
 
@@ -6879,6 +6894,7 @@ struct App {
     preview_page_height: u16,
     focus: FocusPane,
     agent_focus: AgentFocusPane,
+    agent_focus_by_agent: HashMap<AgentKey, AgentFocusPane>,
     status: String,
     active_agent: Option<AgentClient>,
     agent_aux: Option<AgentAuxPane>,
@@ -7031,6 +7047,7 @@ impl App {
             preview_page_height: 10,
             focus: FocusPane::Sessions,
             agent_focus: AgentFocusPane::Main,
+            agent_focus_by_agent: HashMap::new(),
             status: String::from("loading…"),
             active_agent: None,
             agent_aux: None,
@@ -7423,7 +7440,7 @@ impl App {
         let next = !self.settings.cokacmux.agent_sidebar_visible;
         self.settings.cokacmux.agent_sidebar_visible = next;
         if !next && self.agent_focus == AgentFocusPane::Sidebar {
-            self.agent_focus = AgentFocusPane::Main;
+            self.set_agent_focus(AgentFocusPane::Main);
         }
         self.status = if next {
             "agents sidebar: shown".into()
@@ -7445,6 +7462,63 @@ impl App {
         );
     }
 
+    fn current_active_agent_key(&self) -> Option<AgentKey> {
+        self.active_agent
+            .as_ref()
+            .map(|agent| AgentKey::new(&agent.info))
+    }
+
+    fn remember_current_agent_focus(&mut self) {
+        let Some(key) = self.current_active_agent_key() else {
+            return;
+        };
+        self.agent_focus_by_agent.insert(key, self.agent_focus);
+    }
+
+    fn set_agent_focus(&mut self, focus: AgentFocusPane) {
+        self.agent_focus = focus;
+        self.remember_current_agent_focus();
+    }
+
+    fn ensure_agent_sidebar_visible_for_focus(&mut self, reason: &'static str) {
+        if self.settings.cokacmux.agent_sidebar_visible {
+            return;
+        }
+        self.settings.cokacmux.agent_sidebar_visible = true;
+        if let Err(e) = self.settings.save() {
+            debug_log(
+                "settings_save_failed",
+                serde_json::json!({
+                    "field": "agent_sidebar_visible",
+                    "reason": reason,
+                    "error": e.to_string(),
+                }),
+            );
+        }
+    }
+
+    fn valid_agent_focus_for_current(&self, focus: AgentFocusPane) -> AgentFocusPane {
+        match focus {
+            AgentFocusPane::Auxiliary if self.agent_aux.is_none() => AgentFocusPane::Main,
+            other => other,
+        }
+    }
+
+    fn restore_agent_focus_for_active_agent(&mut self, fallback: AgentFocusPane) {
+        let requested = self
+            .current_active_agent_key()
+            .and_then(|key| self.agent_focus_by_agent.get(&key).copied())
+            .unwrap_or(fallback);
+        let focus = self.valid_agent_focus_for_current(requested);
+        if focus == AgentFocusPane::Sidebar {
+            self.ensure_agent_sidebar_visible_for_focus("agent_focus_restore");
+        }
+        self.agent_focus = focus;
+        if requested == focus || requested != AgentFocusPane::Auxiliary {
+            self.remember_current_agent_focus();
+        }
+    }
+
     fn focus_agent_sidebar(&mut self) {
         if !self.settings.cokacmux.agent_sidebar_visible {
             self.settings.cokacmux.agent_sidebar_visible = true;
@@ -7461,20 +7535,38 @@ impl App {
         } else {
             self.status = "focus: agents sidebar".into();
         }
-        self.agent_focus = AgentFocusPane::Sidebar;
+        self.set_agent_focus(AgentFocusPane::Sidebar);
     }
 
     fn focus_main_agent(&mut self) {
-        self.agent_focus = AgentFocusPane::Main;
+        self.set_agent_focus(AgentFocusPane::Main);
         self.status = "focus: agent".into();
     }
 
     fn focus_auxiliary_agent(&mut self) {
         if let Some(aux) = self.agent_aux.as_ref() {
-            self.agent_focus = AgentFocusPane::Auxiliary;
-            self.status = format!("focus: right {}", aux.kind.label());
+            let label = aux.kind.label();
+            self.set_agent_focus(AgentFocusPane::Auxiliary);
+            self.status = format!("focus: right {}", label);
         } else {
             self.status = "right panel is not open.".into();
+        }
+    }
+
+    fn cycle_agent_focus_pane(&mut self, delta: i32) {
+        let mut panes = vec![AgentFocusPane::Sidebar, AgentFocusPane::Main];
+        if self.agent_aux.is_some() {
+            panes.push(AgentFocusPane::Auxiliary);
+        }
+        let current_index = panes
+            .iter()
+            .position(|pane| *pane == self.agent_focus)
+            .unwrap_or(1.min(panes.len().saturating_sub(1)));
+        let next_index = next_agent_candidate_index(panes.len(), current_index, delta, true);
+        match panes[next_index] {
+            AgentFocusPane::Sidebar => self.focus_agent_sidebar(),
+            AgentFocusPane::Main => self.focus_main_agent(),
+            AgentFocusPane::Auxiliary => self.focus_auxiliary_agent(),
         }
     }
 
@@ -7495,7 +7587,7 @@ impl App {
 
     fn close_auxiliary_agent(&mut self, reason: &'static str, terminate: bool) -> Option<AgentKey> {
         let aux = self.agent_aux.take()?;
-        self.close_auxiliary_pane(aux, reason, terminate)
+        self.close_auxiliary_pane(aux, reason, terminate, true)
     }
 
     fn close_auxiliary_pane(
@@ -7503,14 +7595,15 @@ impl App {
         mut aux: AgentAuxPane,
         reason: &'static str,
         terminate: bool,
+        update_focus: bool,
     ) -> Option<AgentKey> {
         let key = AgentKey::new(&aux.agent.info);
         let label = live_agent_status_label(&aux.agent.info);
         let info = aux.agent.info.clone();
         let kind = aux.kind;
         let parent = aux.parent.clone();
-        if self.agent_focus == AgentFocusPane::Auxiliary {
-            self.agent_focus = AgentFocusPane::Main;
+        if update_focus && self.agent_focus == AgentFocusPane::Auxiliary {
+            self.set_agent_focus(AgentFocusPane::Main);
         }
         if terminate {
             self.remove_persisted_agent_auxiliary(&key, reason);
@@ -7531,7 +7624,7 @@ impl App {
             }
             drop(aux);
         } else {
-            self.remember_persisted_agent_auxiliary(kind, &parent, &info, reason);
+            self.remember_persisted_agent_auxiliary(kind, &parent, &info, false, reason);
             drop(aux);
             self.status = format!("right {} hidden", label);
         }
@@ -7553,7 +7646,11 @@ impl App {
         Some(key)
     }
 
-    fn hide_auxiliary_agent(&mut self, reason: &'static str) -> Option<AgentKey> {
+    fn hide_auxiliary_agent(
+        &mut self,
+        reason: &'static str,
+        visible_on_parent_restore: bool,
+    ) -> Option<AgentKey> {
         let aux = self.agent_aux.take()?;
         let key = AgentKey::new(&aux.agent.info);
         let label = live_agent_status_label(&aux.agent.info);
@@ -7561,10 +7658,16 @@ impl App {
         let parent = aux.parent.clone();
         self.remember_active_auxiliary_parent_info(&parent);
         if self.agent_focus == AgentFocusPane::Auxiliary {
-            self.agent_focus = AgentFocusPane::Main;
+            self.set_agent_focus(AgentFocusPane::Main);
         }
         self.remove_hidden_auxiliary_for_parent(kind, &parent);
-        self.remember_persisted_agent_auxiliary(kind, &parent, &aux.agent.info, reason);
+        self.remember_persisted_agent_auxiliary(
+            kind,
+            &parent,
+            &aux.agent.info,
+            visible_on_parent_restore,
+            reason,
+        );
         self.hidden_agent_aux.push(aux);
         self.status = format!("right {} hidden", label);
         debug_log(
@@ -7598,12 +7701,30 @@ impl App {
         Some(self.hidden_agent_aux.remove(index))
     }
 
+    fn hidden_auxiliary_visible_on_parent_restore(&self, aux: &AgentAuxPane) -> bool {
+        let key = AgentKey::new(&aux.agent.info);
+        self.persisted_agent_aux
+            .get(&key)
+            .map_or(true, |entry| entry.visible)
+    }
+
+    fn take_latest_visible_hidden_auxiliary_agent(
+        &mut self,
+        parent: &AgentKey,
+    ) -> Option<AgentAuxPane> {
+        let index = self.hidden_agent_aux.iter().rposition(|aux| {
+            self.agent_aux_parent_matches(&aux.parent, parent)
+                && self.hidden_auxiliary_visible_on_parent_restore(aux)
+        })?;
+        Some(self.hidden_agent_aux.remove(index))
+    }
+
     fn remove_hidden_auxiliary_for_parent(&mut self, kind: AgentAuxKind, parent: &AgentKey) {
         let hidden = std::mem::take(&mut self.hidden_agent_aux);
         let mut kept = Vec::new();
         for aux in hidden {
             if aux.kind == kind && self.agent_aux_parent_matches(&aux.parent, parent) {
-                let _ = self.close_auxiliary_pane(aux, "hidden_replaced", true);
+                let _ = self.close_auxiliary_pane(aux, "hidden_replaced", true, false);
             } else {
                 kept.push(aux);
             }
@@ -7622,7 +7743,7 @@ impl App {
         for aux in hidden {
             if self.agent_aux_parent_matches(&aux.parent, parent) {
                 terminated = terminated.saturating_add(1);
-                let _ = self.close_auxiliary_pane(aux, reason, true);
+                let _ = self.close_auxiliary_pane(aux, reason, true, false);
             } else {
                 kept.push(aux);
             }
@@ -7676,6 +7797,7 @@ impl App {
         kind: AgentAuxKind,
         parent: &AgentKey,
         info: &SessionInfo,
+        visible: bool,
         reason: &'static str,
     ) {
         let key = AgentKey::new(info);
@@ -7702,6 +7824,7 @@ impl App {
                 .as_ref()
                 .map(|info| info.source.display().to_string())
                 .unwrap_or_default(),
+            visible,
             updated_at_epoch_s: current_epoch_s(),
         };
         self.persisted_agent_aux.insert(key.clone(), entry.clone());
@@ -7798,7 +7921,7 @@ impl App {
         {
             if let Some(mut aux) = self.agent_aux.take() {
                 if self.agent_focus == AgentFocusPane::Auxiliary {
-                    self.agent_focus = AgentFocusPane::Main;
+                    self.set_agent_focus(AgentFocusPane::Main);
                 }
                 aux.agent.exited = Some(format!("terminated right panel: {}", reason));
                 drop(aux);
@@ -7855,7 +7978,7 @@ impl App {
         {
             if let Some(aux) = self.agent_aux.take() {
                 terminated = terminated.saturating_add(1);
-                let _ = self.close_auxiliary_pane(aux, reason, true);
+                let _ = self.close_auxiliary_pane(aux, reason, true, true);
             }
         }
         terminated =
@@ -8153,6 +8276,7 @@ impl App {
                         .agent_info_for_auxiliary_parent_key(&aux.parent)
                         .map(session_info_debug_value),
                     "agent": session_info_debug_value(&aux.agent.info),
+                    "visible": self.hidden_auxiliary_visible_on_parent_restore(aux),
                     "reader_id": aux.agent.reader_id,
                 })
             })
@@ -8192,6 +8316,7 @@ impl App {
                     "state": agent_list_state_debug_value(state),
                     "same_cwd": same_cwd,
                     "persisted_auxiliary": persisted_auxiliary.map(persisted_agent_auxiliary_entry_debug_value),
+                    "visible_on_parent_restore": persisted_auxiliary.map_or(true, |entry| entry.visible),
                     "persisted_matches_active": persisted_matches_active,
                     "excluded_auxiliary": is_auxiliary,
                     "candidate": switchable && (persisted_matches_active || (same_cwd && !is_auxiliary)),
@@ -8213,6 +8338,7 @@ impl App {
                         "state": "not_discovered",
                         "same_cwd": session_cwd_same_folder(&active_info.cwd, &info.cwd),
                         "persisted_auxiliary": persisted_agent_auxiliary_entry_debug_value(entry),
+                        "visible_on_parent_restore": entry.visible,
                         "persisted_matches_active": true,
                         "excluded_auxiliary": true,
                         "candidate": true,
@@ -8228,7 +8354,7 @@ impl App {
         &self,
         active_info: &SessionInfo,
     ) -> Option<(AgentAuxKind, SessionInfo)> {
-        self.live_auxiliary_restore_candidate_for_active_agent_matching(active_info, None)
+        self.live_auxiliary_restore_candidate_for_active_agent_matching(active_info, None, false)
     }
 
     fn live_auxiliary_restore_candidate_for_active_agent_kind(
@@ -8239,6 +8365,7 @@ impl App {
         self.live_auxiliary_restore_candidate_for_active_agent_matching(
             active_info,
             Some(desired_kind),
+            false,
         )
         .map(|(_, info)| info)
     }
@@ -8247,6 +8374,7 @@ impl App {
         &self,
         active_info: &SessionInfo,
         desired_kind: Option<AgentAuxKind>,
+        visible_on_parent_restore_only: bool,
     ) -> Option<(AgentAuxKind, SessionInfo)> {
         let live_keys = self
             .live_shells
@@ -8260,6 +8388,11 @@ impl App {
             }
             let key = AgentKey::new(info);
             let persisted_auxiliary = self.persisted_agent_aux.get(&key);
+            if visible_on_parent_restore_only
+                && persisted_auxiliary.is_some_and(|entry| !entry.visible)
+            {
+                return None;
+            }
             let persisted_matches_active = persisted_auxiliary.is_some_and(|entry| {
                 entry.kind == kind && self.persisted_auxiliary_matches_active(entry, active_info)
             });
@@ -8292,6 +8425,7 @@ impl App {
         let persisted_candidates = self
             .persisted_agent_aux
             .values()
+            .filter(|entry| !visible_on_parent_restore_only || entry.visible)
             .filter(|entry| !live_keys.contains(&entry.agent))
             .filter(|entry| desired_kind.map_or(true, |desired_kind| desired_kind == entry.kind))
             .filter(|entry| self.persisted_auxiliary_matches_active(entry, active_info))
@@ -8353,9 +8487,9 @@ impl App {
         aux.agent.resize(viewport.pty_cols, viewport.pty_rows);
         self.remember_active_auxiliary_parent_info(&parent);
         self.remember_live_info_locally(&aux.agent.info.clone());
-        self.remember_persisted_agent_auxiliary(kind, &parent, &aux.agent.info, reason);
+        self.remember_persisted_agent_auxiliary(kind, &parent, &aux.agent.info, true, reason);
         self.agent_aux = Some(aux);
-        self.agent_focus = AgentFocusPane::Auxiliary;
+        self.set_agent_focus(AgentFocusPane::Auxiliary);
         self.status = format!("right {} shown", label);
         debug_log(
             "agent_auxiliary_shown",
@@ -8400,8 +8534,8 @@ impl App {
             );
             return false;
         };
-        let Some(mut aux) = self.take_latest_hidden_auxiliary_agent(&parent) else {
-            if self.restore_live_auxiliary_for_active_agent(
+        let Some(mut aux) = self.take_latest_visible_hidden_auxiliary_agent(&parent) else {
+            if self.restore_visible_live_auxiliary_for_active_agent(
                 &active_info,
                 &parent,
                 aux_viewport,
@@ -8426,6 +8560,13 @@ impl App {
         let kind = aux.kind;
         let previous_parent = aux.parent.clone();
         aux.parent = parent.clone();
+        if previous_parent != parent {
+            if let Some(focus) = self.agent_focus_by_agent.get(&previous_parent).copied() {
+                self.agent_focus_by_agent
+                    .entry(parent.clone())
+                    .or_insert(focus);
+            }
+        }
         aux.agent
             .resize(aux_viewport.pty_cols, aux_viewport.pty_rows);
         self.remember_live_info_locally(&aux.agent.info.clone());
@@ -8456,6 +8597,24 @@ impl App {
             aux_viewport,
             reason,
             None,
+            false,
+        )
+    }
+
+    fn restore_visible_live_auxiliary_for_active_agent(
+        &mut self,
+        active_info: &SessionInfo,
+        parent: &AgentKey,
+        aux_viewport: AgentViewport,
+        reason: &'static str,
+    ) -> bool {
+        self.restore_live_auxiliary_for_active_agent_matching(
+            active_info,
+            parent,
+            aux_viewport,
+            reason,
+            None,
+            true,
         )
     }
 
@@ -8473,6 +8632,7 @@ impl App {
             aux_viewport,
             reason,
             Some(kind),
+            false,
         )
     }
 
@@ -8483,9 +8643,14 @@ impl App {
         aux_viewport: AgentViewport,
         reason: &'static str,
         desired_kind: Option<AgentAuxKind>,
+        visible_on_parent_restore_only: bool,
     ) -> bool {
         let Some((kind, info)) = self
-            .live_auxiliary_restore_candidate_for_active_agent_matching(active_info, desired_kind)
+            .live_auxiliary_restore_candidate_for_active_agent_matching(
+                active_info,
+                desired_kind,
+                visible_on_parent_restore_only,
+            )
         else {
             return false;
         };
@@ -8523,6 +8688,7 @@ impl App {
                 status_err_prefix: format!("right {} restore failed: ", kind.label()),
                 status_prepare_err_prefix: format!("right {} restore failed: ", kind.label()),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
@@ -8542,7 +8708,7 @@ impl App {
             .as_ref()
             .is_some_and(|aux| AgentKey::new(&aux.agent.info) != key)
         {
-            let _ = self.hide_auxiliary_agent("replace_attached");
+            let _ = self.hide_auxiliary_agent("replace_attached", false);
         } else if self.agent_aux.is_some() {
             let _ = self.agent_aux.take();
         }
@@ -8550,13 +8716,12 @@ impl App {
         let info = agent.info.clone();
         self.remember_live_info_locally(&info);
         self.remove_hidden_auxiliary_for_parent(kind, &parent);
-        self.remember_persisted_agent_auxiliary(kind, &parent, &info, "set_attached");
+        self.remember_persisted_agent_auxiliary(kind, &parent, &info, true, "set_attached");
         self.agent_aux = Some(AgentAuxPane {
             kind,
             parent,
             agent,
         });
-        self.agent_focus = AgentFocusPane::Auxiliary;
     }
 
     fn toggle_auxiliary_agent_panel(
@@ -8581,7 +8746,7 @@ impl App {
             aux.kind == kind && self.agent_aux_parent_matches(&aux.parent, &parent)
         });
         if visible_same_panel {
-            let _ = self.hide_auxiliary_agent("toggle");
+            let _ = self.hide_auxiliary_agent("toggle", false);
             return;
         }
 
@@ -8598,7 +8763,7 @@ impl App {
         };
         if let Some(aux) = self.take_hidden_auxiliary_agent(kind, &parent) {
             if self.agent_aux.is_some() {
-                let _ = self.hide_auxiliary_agent("switch");
+                let _ = self.hide_auxiliary_agent("switch", false);
             }
             self.show_auxiliary_agent(aux, aux_viewport, "toggle_restore");
             return;
@@ -8612,7 +8777,7 @@ impl App {
             "toggle_restore_live",
         ) {
             if self.agent_aux.is_some() {
-                let _ = self.hide_auxiliary_agent("switch");
+                let _ = self.hide_auxiliary_agent("switch", false);
             }
             return;
         }
@@ -8622,7 +8787,7 @@ impl App {
             return;
         };
         if self.agent_aux.is_some() {
-            let _ = self.hide_auxiliary_agent("switch");
+            let _ = self.hide_auxiliary_agent("switch", false);
         }
 
         let info = match kind {
@@ -8659,6 +8824,7 @@ impl App {
                 status_err_prefix: format!("right {} open failed: ", kind.label()),
                 status_prepare_err_prefix: format!("right {} prepare failed: ", kind.label()),
                 focus_auxiliary_on_ready: true,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: true,
                 select_visible: false,
                 cokacdir_dialog_on_error: kind == AgentAuxKind::Cokacdir,
@@ -10678,8 +10844,8 @@ impl App {
                 self.show_sessions_view = false;
                 match ctx.target {
                     AttachTarget::MainAgent => {
+                        let fallback_focus = self.valid_agent_focus_for_current(self.agent_focus);
                         self.set_active_agent(agent);
-                        self.agent_focus = AgentFocusPane::Main;
                         self.mark_agent_attached_locally(ctx.key.clone());
                         self.discard_pending_agent_runtime_refresh();
                         if ctx.select_visible {
@@ -10696,6 +10862,17 @@ impl App {
                             terminal_rows,
                             "main_agent_attached",
                         );
+                        if let Some(focus_override) = ctx.main_focus_override_on_ready {
+                            let focus = self.valid_agent_focus_for_current(focus_override);
+                            if focus == AgentFocusPane::Sidebar {
+                                self.ensure_agent_sidebar_visible_for_focus(
+                                    "agent_focus_override",
+                                );
+                            }
+                            self.set_agent_focus(focus);
+                        } else {
+                            self.restore_agent_focus_for_active_agent(fallback_focus);
+                        }
                     }
                     AttachTarget::Auxiliary { kind, parent } => {
                         let active_parent = self
@@ -10706,8 +10883,10 @@ impl App {
                             && self.active_main_agent_is_coding()
                         {
                             self.set_auxiliary_agent(kind, parent, agent);
-                            if !ctx.focus_auxiliary_on_ready {
-                                self.agent_focus = AgentFocusPane::Main;
+                            if ctx.focus_auxiliary_on_ready {
+                                self.set_agent_focus(AgentFocusPane::Auxiliary);
+                            } else {
+                                self.restore_agent_focus_for_active_agent(AgentFocusPane::Main);
                             }
                             self.mark_agent_attached_locally(ctx.key.clone());
                             self.discard_pending_agent_runtime_refresh();
@@ -10721,6 +10900,7 @@ impl App {
                                     kind,
                                     &parent,
                                     &stale_info,
+                                    true,
                                     "stale_preserved",
                                 );
                                 self.remember_live_info_locally(&stale_info);
@@ -10852,7 +11032,7 @@ impl App {
             result.ctx.terminate_auxiliary_on_stale || !self.auxiliary_parent_is_live(parent);
         if !terminate_stale {
             let activity = agent.activity();
-            self.remember_persisted_agent_auxiliary(*kind, parent, &info, reason);
+            self.remember_persisted_agent_auxiliary(*kind, parent, &info, true, reason);
             self.remember_live_info_locally(&info);
             self.mark_agent_live_locally(key.clone(), activity);
             self.discard_pending_agent_runtime_refresh();
@@ -10907,7 +11087,7 @@ impl App {
         self.remember_active_auxiliary_parent_info(&parent);
         self.remember_live_info_locally(&info);
         self.terminate_hidden_auxiliaries_for_parent(&parent, reason);
-        self.remember_persisted_agent_auxiliary(kind, &parent, &info, reason);
+        self.remember_persisted_agent_auxiliary(kind, &parent, &info, true, reason);
         self.hidden_agent_aux.push(AgentAuxPane {
             kind,
             parent: parent.clone(),
@@ -11131,8 +11311,17 @@ impl App {
                 wrap,
                 cols,
                 rows,
+                focus_override,
             } => {
-                self.resolve_switch_active_agent(current_key, delta, wrap, cols, rows, false);
+                self.resolve_switch_active_agent(
+                    current_key,
+                    delta,
+                    wrap,
+                    cols,
+                    rows,
+                    false,
+                    focus_override,
+                );
             }
         }
     }
@@ -11421,8 +11610,14 @@ impl App {
     }
 
     fn set_active_agent(&mut self, agent: AgentClient) {
+        let previous_focus = self.agent_focus;
+        let previous_key = self.current_active_agent_key();
+        self.remember_current_agent_focus();
         if self.agent_aux.is_some() {
-            let _ = self.hide_auxiliary_agent("main_agent_replaced");
+            let _ = self.hide_auxiliary_agent("main_agent_replaced", true);
+        }
+        if let Some(key) = previous_key {
+            self.agent_focus_by_agent.insert(key, previous_focus);
         }
         if let Some(old_agent) = self.active_agent.take() {
             let old_info = old_agent.info.clone();
@@ -12196,6 +12391,7 @@ impl App {
                 self.agent_states.remove(&exited_key);
                 self.live_shells
                     .retain(|info| AgentKey::new(info) != exited_key);
+                self.agent_focus_by_agent.remove(&exited_key);
                 self.agent_focus = AgentFocusPane::Main;
                 self.discard_pending_agent_runtime_refresh();
                 self.status = format!(
@@ -12234,7 +12430,7 @@ impl App {
                 let key = AgentKey::new(&aux.agent.info);
                 self.agent_aux = None;
                 if self.agent_focus == AgentFocusPane::Auxiliary {
-                    self.agent_focus = AgentFocusPane::Main;
+                    self.set_agent_focus(AgentFocusPane::Main);
                 }
                 self.remove_persisted_agent_auxiliary(&key, "auxiliary_exited");
                 self.live_shells.retain(|info| AgentKey::new(info) != key);
@@ -12449,6 +12645,7 @@ impl App {
                 status_err_prefix: "shell open failed: ".to_string(),
                 status_prepare_err_prefix: "shell open failed: ".to_string(),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
@@ -12796,6 +12993,7 @@ impl App {
                 status_err_prefix: format!("switch to live {} failed: ", label),
                 status_prepare_err_prefix: format!("switch to live {} failed: ", label),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
@@ -13155,6 +13353,7 @@ impl App {
                 status_err_prefix,
                 status_prepare_err_prefix,
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: is_cokacdir,
@@ -13336,6 +13535,7 @@ impl App {
                 status_err_prefix: format!("switch to live {} failed: ", label),
                 status_prepare_err_prefix: format!("switch to live {} failed: ", label),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
@@ -13354,7 +13554,7 @@ impl App {
             let session_id = agent.info.session_id.clone();
             drop(agent);
             if self.agent_aux.is_some() {
-                let _ = self.hide_auxiliary_agent("main_agent_detached");
+                let _ = self.hide_auxiliary_agent("main_agent_detached", true);
             }
             self.discard_pending_agent_runtime_refresh();
             self.status = format!(
@@ -13552,6 +13752,7 @@ impl App {
                     killed_label, next_label
                 ),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
@@ -13613,6 +13814,7 @@ impl App {
                     exited_label, next_label
                 ),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
@@ -13701,6 +13903,17 @@ impl App {
     }
 
     fn switch_active_agent(&mut self, delta: i32, wrap: bool, cols: u16, rows: u16) {
+        self.switch_active_agent_with_focus(delta, wrap, cols, rows, None);
+    }
+
+    fn switch_active_agent_with_focus(
+        &mut self,
+        delta: i32,
+        wrap: bool,
+        cols: u16,
+        rows: u16,
+        focus_override: Option<AgentFocusPane>,
+    ) {
         let Some(active_agent) = self.active_agent.as_ref() else {
             return;
         };
@@ -13712,7 +13925,15 @@ impl App {
             .unwrap_or_else(|| AgentKey::new(&active_agent.info));
 
         self.refresh_agent_runtime_states();
-        self.resolve_switch_active_agent(current_key, delta, wrap, cols, rows, true);
+        self.resolve_switch_active_agent(
+            current_key,
+            delta,
+            wrap,
+            cols,
+            rows,
+            true,
+            focus_override,
+        );
     }
 
     fn resolve_switch_active_agent(
@@ -13723,6 +13944,7 @@ impl App {
         cols: u16,
         rows: u16,
         allow_defer: bool,
+        focus_override: Option<AgentFocusPane>,
     ) {
         // The anchor is valid when it is the active agent OR the target of
         // an attach that is still in flight / queued (rapid stepping).
@@ -13749,6 +13971,7 @@ impl App {
                     wrap,
                     cols,
                     rows,
+                    focus_override,
                 });
                 self.status = "checking live agents...".into();
                 return;
@@ -13807,6 +14030,7 @@ impl App {
                 status_err_prefix: format!("switch to live {} failed: ", next_label),
                 status_prepare_err_prefix: format!("switch to live {} failed: ", next_label),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: focus_override,
                 terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
@@ -25194,6 +25418,35 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         return;
     }
     if !shift_shortcuts_disabled {
+        if let Some(delta) = agent_focus_cycle_key(key) {
+            debug_log_agent_key(key, "focus_cycle");
+            app.cycle_agent_focus_pane(delta);
+            let _ = app.sync_agent_viewports(total_width, terminal_rows);
+            return;
+        }
+    }
+    if !shift_shortcuts_disabled && app.agent_focus == AgentFocusPane::Sidebar {
+        if let Some(delta) = focused_agent_sidebar_select_key(key) {
+            debug_log_agent_key(key, "select");
+            let viewport = agent_viewports_for_terminal(
+                total_width,
+                terminal_rows,
+                app.agent_sidebar_config_width(),
+                false,
+                app.agent_aux_width,
+            )
+            .main;
+            app.switch_active_agent_with_focus(
+                delta,
+                false,
+                viewport.pty_cols,
+                viewport.pty_rows,
+                Some(AgentFocusPane::Sidebar),
+            );
+            return;
+        }
+    }
+    if !shift_shortcuts_disabled {
         if let Some(action) = agent_scrollback_key(&keybindings, key) {
             debug_log_agent_key(key, "delegate_scroll");
             let viewports = app.sync_agent_viewports(total_width, terminal_rows);
@@ -25254,26 +25507,42 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
     if !shift_shortcuts_disabled {
         if let Some(delta) = agent_sidebar_select_key(&keybindings, key) {
             debug_log_agent_key(key, "select");
+            // Main-agent switches hide the current agent's right panel before
+            // rendering the target. Attach the target at full main width; if
+            // that target has its own right panel, restore will resize it.
             let viewport = agent_viewports_for_terminal(
                 total_width,
                 terminal_rows,
                 app.agent_sidebar_config_width(),
-                app.agent_aux.is_some(),
+                false,
                 app.agent_aux_width,
             )
             .main;
-            app.switch_active_agent(delta, false, viewport.pty_cols, viewport.pty_rows);
+            // Alt+Up/Down changes the active agent, not the active pane.
+            // Keep the pane the user was working in instead of restoring the
+            // target agent's older remembered focus.
+            let focus_override = Some(app.agent_focus);
+            app.switch_active_agent_with_focus(
+                delta,
+                false,
+                viewport.pty_cols,
+                viewport.pty_rows,
+                focus_override,
+            );
             return;
         }
     }
     if !shift_shortcuts_disabled {
         if let Some(delta) = agent_switch_key(&keybindings, key) {
             debug_log_agent_key(key, "switch");
+            // Main-agent switches hide the current agent's right panel before
+            // rendering the target. Attach the target at full main width; if
+            // that target has its own right panel, restore will resize it.
             let viewport = agent_viewports_for_terminal(
                 total_width,
                 terminal_rows,
                 app.agent_sidebar_config_width(),
-                app.agent_aux.is_some(),
+                false,
                 app.agent_aux_width,
             )
             .main;
@@ -25528,6 +25797,33 @@ fn agent_sidebar_select_key(bindings: &KeyBindings, key: KeyEvent) -> Option<i32
         Some(1)
     } else {
         None
+    }
+}
+
+fn focused_agent_sidebar_select_key(key: KeyEvent) -> Option<i32> {
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Up => Some(-1),
+        KeyCode::Down => Some(1),
+        _ => None,
+    }
+}
+
+fn agent_focus_cycle_key(key: KeyEvent) -> Option<i32> {
+    match key.modifiers {
+        KeyModifiers::CONTROL => match key.code {
+            KeyCode::Left | KeyCode::Char('.') => Some(-1),
+            KeyCode::Right | KeyCode::Char('/') | KeyCode::Char('_') => Some(1),
+            _ => None,
+        },
+        KeyModifiers::SHIFT => match key.code {
+            KeyCode::Left => Some(-1),
+            KeyCode::Right => Some(1),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -26291,6 +26587,61 @@ fn render_agent_client_pane(
     }
 }
 
+fn main_agent_content_area(area: Rect) -> Rect {
+    if area.height == 0 {
+        return area;
+    }
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    )
+}
+
+fn main_agent_title(info: &SessionInfo) -> String {
+    if is_plain_pty_tool_session_info(info) {
+        return live_agent_status_label(info);
+    }
+    info.title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .map(|title| title.to_string())
+        .unwrap_or_else(|| live_agent_status_label(info))
+}
+
+fn render_main_agent_title_bar(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    info: &SessionInfo,
+    focused: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let bar_area = Rect::new(area.x, area.y, area.width, 1);
+    let style = if focused {
+        Style::default()
+            .fg(THEME_FG_STRONG)
+            .bg(THEME_SELECTED_BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(THEME_FG_DIM).bg(THEME_STATUS_BG)
+    };
+    fill_area(f.buffer_mut(), bar_area, style);
+    let title = truncate_width(
+        &main_agent_title(info),
+        area.width.saturating_sub(2) as usize,
+    );
+    f.buffer_mut().set_stringn(
+        area.x.saturating_add(1),
+        area.y,
+        title,
+        area.width.saturating_sub(1) as usize,
+        style,
+    );
+}
+
 fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
     let main_area = Rect::new(
@@ -26328,12 +26679,14 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             .active_agent
             .as_mut()
             .expect("active_agent checked above");
+        let main_focused = app.agent_focus == AgentFocusPane::Main;
+        render_main_agent_title_bar(f, layout.main, &agent.info, main_focused);
         render_agent_client_pane(
             f,
             agent,
-            layout.main,
+            main_agent_content_area(layout.main),
             None,
-            app.agent_focus == AgentFocusPane::Main,
+            main_focused,
         )
     };
 
@@ -26767,7 +27120,7 @@ fn agent_viewports_for_terminal(
         configured_auxiliary_width,
     );
     AgentViewports {
-        main: agent_viewport_for_pane_area(layout.main, false),
+        main: agent_viewport_for_pane_area(main_agent_content_area(layout.main), false),
         auxiliary: layout
             .auxiliary
             .map(|area| agent_viewport_for_pane_area(area, true)),
@@ -31680,6 +32033,7 @@ fn agent_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
             "Ctrl+3",
             "right",
         ),
+        direct_help_item("Ctrl/Shift+←/→ Ctrl+./", "focus"),
         help_item(keybindings, KeyAction::AgentNewShell, "Ctrl+N", "new"),
         help_item(
             keybindings,
@@ -33115,6 +33469,7 @@ mod tests {
             parent_provider: parent.provider,
             parent_cwd: parent.cwd.clone(),
             parent_source: parent.source.display().to_string(),
+            visible: true,
             updated_at_epoch_s,
         }
     }
@@ -33447,6 +33802,7 @@ mod tests {
             preview_page_height: 10,
             focus: FocusPane::Sessions,
             agent_focus: AgentFocusPane::Main,
+            agent_focus_by_agent: HashMap::new(),
             status: String::new(),
             active_agent: None,
             agent_aux: None,
@@ -39091,10 +39447,10 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     fn agent_viewport_uses_rendered_agent_area_for_pty_and_page_rows() {
         let viewport = agent_viewport_for_terminal(120, 31, 40);
         assert_eq!(viewport.area_cols, 80);
-        assert_eq!(viewport.area_rows, 30);
+        assert_eq!(viewport.area_rows, 29);
         assert_eq!(viewport.pty_cols, 80);
-        assert_eq!(viewport.pty_rows, 30);
-        assert_eq!(viewport.page_rows, 30);
+        assert_eq!(viewport.pty_rows, 29);
+        assert_eq!(viewport.page_rows, 29);
 
         let tiny = agent_viewport_for_terminal(10, 1, u16::MAX);
         assert_eq!(tiny.area_cols, 0);
@@ -39110,7 +39466,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         let auxiliary = viewports.auxiliary.expect("right panel should fit");
 
         assert_eq!(viewports.main.area_cols, 66);
-        assert_eq!(viewports.main.area_rows, 30);
+        assert_eq!(viewports.main.area_rows, 29);
         assert_eq!(auxiliary.area_cols, 42);
         assert_eq!(auxiliary.area_rows, 28);
         assert_eq!(auxiliary.pty_cols, 42);
@@ -40932,7 +41288,7 @@ IF EXIST "%~dp0\node.exe" (
 
     #[test]
     fn agent_scroll_page_rows_match_visible_agent_area() {
-        assert_eq!(agent_scroll_page_rows(24), 23);
+        assert_eq!(agent_scroll_page_rows(24), 22);
         assert_eq!(agent_scroll_page_rows(2), 1);
         assert_eq!(agent_scroll_page_rows(1), 1);
         assert_eq!(agent_scroll_page_rows(0), 1);
@@ -41845,6 +42201,7 @@ IF EXIST "%~dp0\node.exe" (
                 status_err_prefix: "switch failed: ".into(),
                 status_prepare_err_prefix: "switch failed: ".into(),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
@@ -41871,6 +42228,7 @@ IF EXIST "%~dp0\node.exe" (
                 status_err_prefix: "right terminal open failed: ".into(),
                 status_prepare_err_prefix: "right terminal prepare failed: ".into(),
                 focus_auxiliary_on_ready: true,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: true,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
@@ -41943,6 +42301,7 @@ IF EXIST "%~dp0\node.exe" (
                 status_err_prefix: "switch failed: ".into(),
                 status_prepare_err_prefix: "switch failed: ".into(),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
@@ -41966,6 +42325,85 @@ IF EXIST "%~dp0\node.exe" (
         assert_eq!(restored.kind, AgentAuxKind::Terminal);
         assert_eq!(restored.agent.reader_id, 187);
         assert!(app.hidden_agent_aux.is_empty());
+        assert_eq!(app.agent_focus, AgentFocusPane::Auxiliary);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_agent_attach_keeps_user_hidden_auxiliary_hidden_for_returned_agent() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let first = buffered_output_test_client("user-hidden-return-main", 286);
+        let first_info = first.info.clone();
+        let first_key = AgentKey::new(&first_info);
+        app.set_active_agent(first);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent: first_key.clone(),
+            agent: buffered_output_test_client("user-hidden-return-aux", 287),
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+
+        assert!(app.agent_aux.is_none());
+        assert_eq!(app.hidden_agent_aux.len(), 1);
+        let aux_key = AgentKey::new(&app.hidden_agent_aux[0].agent.info);
+        assert_eq!(
+            app.persisted_agent_aux
+                .get(&aux_key)
+                .map(|entry| entry.visible),
+            Some(false)
+        );
+
+        app.set_active_agent(buffered_output_test_client("user-hidden-return-other", 288));
+
+        let mut returning = buffered_output_test_client("user-hidden-return-main", 289);
+        returning.info = first_info.clone();
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 87,
+            key: first_key.clone(),
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+        app.on_attach_result(Box::new(AttachWorkerResult {
+            seq: 87,
+            info: first_info,
+            cols: 100,
+            rows: 28,
+            ctx: AttachUiCtx {
+                key: first_key,
+                target: AttachTarget::MainAgent,
+                status_attached: "switched to live user-hidden-return-main".into(),
+                status_started: "switched to live user-hidden-return-main".into(),
+                status_err_prefix: "switch failed: ".into(),
+                status_prepare_err_prefix: "switch failed: ".into(),
+                focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
+                terminate_auxiliary_on_stale: false,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: true,
+                log_origin: None,
+                ready_event: "agent_switch_ready",
+                failed_event: "agent_switch_failed",
+            },
+            outcome: AttachWorkOutcome::Attached {
+                agent: returning,
+                started: false,
+            },
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 0,
+        }));
+
+        assert!(app.agent_aux.is_none());
+        assert_eq!(app.hidden_agent_aux.len(), 1);
+        assert_eq!(app.hidden_agent_aux[0].agent.reader_id, 287);
         assert_eq!(app.agent_focus, AgentFocusPane::Main);
     }
 
@@ -42060,6 +42498,7 @@ IF EXIST "%~dp0\node.exe" (
                 status_err_prefix: "switch failed: ".into(),
                 status_prepare_err_prefix: "switch failed: ".into(),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
@@ -42084,7 +42523,7 @@ IF EXIST "%~dp0\node.exe" (
         assert_eq!(restored.parent, returning_key);
         assert_eq!(restored.agent.reader_id, 194);
         assert!(app.hidden_agent_aux.is_empty());
-        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+        assert_eq!(app.agent_focus, AgentFocusPane::Auxiliary);
     }
 
     #[cfg(unix)]
@@ -42369,12 +42808,24 @@ IF EXIST "%~dp0\node.exe" (
         let mut terminal = shell_session_info_for_cwd("/repo".into());
         terminal.session_id = "shell-registry-old".into();
         let terminal_key = AgentKey::new(&terminal);
-        app.remember_persisted_agent_auxiliary(AgentAuxKind::Terminal, &parent, &terminal, "test");
+        app.remember_persisted_agent_auxiliary(
+            AgentAuxKind::Terminal,
+            &parent,
+            &terminal,
+            true,
+            "test",
+        );
 
         let mut cokacdir = cokacdir_session_info_for_cwd("/repo".into());
         cokacdir.session_id = "cokacdir-registry-current".into();
         let cokacdir_key = AgentKey::new(&cokacdir);
-        app.remember_persisted_agent_auxiliary(AgentAuxKind::Cokacdir, &parent, &cokacdir, "test");
+        app.remember_persisted_agent_auxiliary(
+            AgentAuxKind::Cokacdir,
+            &parent,
+            &cokacdir,
+            true,
+            "test",
+        );
 
         assert!(app.persisted_agent_aux.contains_key(&terminal_key));
         assert_eq!(app.persisted_agent_aux.len(), 2);
@@ -42837,6 +43288,7 @@ IF EXIST "%~dp0\node.exe" (
                 status_err_prefix: "right terminal restore failed: ".into(),
                 status_prepare_err_prefix: "right terminal restore failed: ".into(),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
@@ -42994,6 +43446,44 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
+    fn user_hidden_persisted_auxiliary_is_not_auto_restore_candidate() {
+        let mut app = app_for_key_tests();
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "persisted-hidden-parent".into();
+
+        let mut terminal = shell_session_info_for_cwd("/repo".into());
+        terminal.session_id = "shell-hidden-persisted".into();
+        let terminal_key = AgentKey::new(&terminal);
+        app.live_shells.push(terminal.clone());
+        app.agent_states.insert(
+            terminal_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        let mut entry =
+            persisted_auxiliary_entry(&terminal, AgentAuxKind::Terminal, &active_info, 77);
+        entry.visible = false;
+        app.persisted_agent_aux.insert(terminal_key.clone(), entry);
+
+        assert!(
+            app.live_auxiliary_restore_candidate_for_active_agent_matching(
+                &active_info,
+                None,
+                true,
+            )
+            .is_none(),
+            "auto restore must not show a user-hidden right panel"
+        );
+        let (kind, info) = app
+            .live_auxiliary_restore_candidate_for_active_agent(&active_info)
+            .expect("manual toggle restore should still find the hidden right panel");
+        assert_eq!(kind, AgentAuxKind::Terminal);
+        assert_eq!(AgentKey::new(&info), terminal_key);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn main_agent_attach_can_restore_live_auxiliary_after_restart() {
         let mut app = app_for_key_tests();
         app.show_sessions_view = false;
@@ -43069,6 +43559,7 @@ IF EXIST "%~dp0\node.exe" (
                 status_err_prefix: "right terminal restore failed: ".into(),
                 status_prepare_err_prefix: "right terminal restore failed: ".into(),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
@@ -43136,6 +43627,7 @@ IF EXIST "%~dp0\node.exe" (
                 status_err_prefix: "right terminal restore failed: ".into(),
                 status_prepare_err_prefix: "right terminal restore failed: ".into(),
                 focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
                 terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
