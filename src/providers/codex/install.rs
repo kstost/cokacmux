@@ -164,7 +164,7 @@ fn rollout_filename(ts: DateTime<Utc>, sid: &str) -> String {
 
 #[cfg(feature = "discovery")]
 fn default_codex_home() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".codex"))
+    crate::providers::discovery::configured_home_dir().map(|h| h.join(".codex"))
 }
 #[cfg(not(feature = "discovery"))]
 fn default_codex_home() -> Option<PathBuf> {

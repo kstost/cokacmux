@@ -184,6 +184,8 @@ const DAEMON_CLIENT_OUTBOUND_RESYNC_BYTES: usize = 16 * 1024;
 /// this long before cleaning up its runtime files; a peer that cannot
 /// drain by then learns of the exit from the socket EOF instead.
 const DAEMON_EXIT_FLUSH_TIMEOUT_MS: u64 = 2_000;
+#[cfg(windows)]
+const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS: u64 = 2_000;
 const AGENT_DETACH_WRITE_TIMEOUT_MS: u64 = 300;
 const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
 const LIVE_SHELL_DISCOVERY_INTERVAL_MS: u64 = 10_000;
@@ -606,11 +608,11 @@ fn option_string_is_blank_or_none(value: &Option<String>) -> bool {
 
 fn expand_configured_program_path(value: &str) -> String {
     if value == "~" {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = configured_home_dir() {
             return home.display().to_string();
         }
     } else if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = configured_home_dir() {
             return home.join(rest).display().to_string();
         }
     }
@@ -688,7 +690,14 @@ fn agent_auxiliary_registry_path() -> Option<PathBuf> {
 }
 
 fn app_config_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(APP_DIR_NAME))
+    std::env::var_os("COKACMUX_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| configured_home_dir().map(|home| home.join(APP_DIR_NAME)))
+}
+
+fn configured_home_dir() -> Option<PathBuf> {
+    cokacmux::providers::discovery::configured_home_dir()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -10427,7 +10436,7 @@ impl App {
             return false;
         };
         let key = AgentKey::new(&info);
-        let cwd_label = truncate_width(&info.cwd, 40);
+        let cwd_label = truncate_width(&display_cwd_str(&info.cwd), 40);
         self.status = format!("restoring right {} at {}...", kind.label(), cwd_label);
         debug_log(
             "agent_auxiliary_restore_live_start",
@@ -10652,7 +10661,7 @@ impl App {
             AgentAuxKind::Terminal => shell_session_info_for_cwd(cwd.clone()),
         };
         let key = AgentKey::new(&info);
-        let cwd_label = truncate_width(&cwd, 40);
+        let cwd_label = truncate_width(&display_cwd_str(&cwd), 40);
         self.status = format!("opening right {} at {}...", kind.label(), cwd_label);
         debug_log(
             "agent_auxiliary_open_start",
@@ -15005,7 +15014,7 @@ impl App {
                 "origin": origin_tag,
             }),
         );
-        let cwd_label = truncate_width(&cwd, 40);
+        let cwd_label = truncate_width(&display_cwd_str(&cwd), 40);
         self.request_attach(AttachJob {
             info,
             cols,
@@ -15395,7 +15404,7 @@ impl App {
         let key = AgentKey::new(&info);
         self.status = format!(
             "launch folder missing: {}",
-            truncate_width(&path.display().to_string(), 48)
+            truncate_width(&display_cwd_path(&path), 48)
         );
         self.input_mode = InputMode::CreateFolderConfirm {
             info,
@@ -15467,7 +15476,10 @@ impl App {
         let key = AgentKey::new(&info);
         let original_cwd = snapshot.original_cwd.clone();
         let snapshot_path = snapshot.snapshot_path.display().to_string();
-        self.status = format!("saved folder data found: {}", truncate_width(&info.cwd, 48));
+        self.status = format!(
+            "saved folder data found: {}",
+            truncate_width(&display_cwd_str(&info.cwd), 48)
+        );
         self.input_mode = InputMode::RestoreDataConfirm {
             info,
             snapshot,
@@ -15584,7 +15596,7 @@ impl App {
                 let restore_status = match report.backup_path.as_ref() {
                     Some(backup) => format!(
                         "restored folder data; previous folder backed up to {}",
-                        truncate_width(&backup.display().to_string(), 48)
+                        truncate_width(&display_cwd_path(backup), 48)
                     ),
                     None => "restored folder data".to_string(),
                 };
@@ -17138,7 +17150,7 @@ impl App {
                 if let Some(stats) = data_stats.as_ref() {
                     status.push_str(&format!(
                         " + folder data at {} ({} files, {} bytes)",
-                        truncate_width(&report.new_cwd, 48),
+                        truncate_width(&display_cwd_str(&report.new_cwd), 48),
                         stats.files,
                         stats.bytes
                     ));
@@ -17618,7 +17630,7 @@ fn run_restore_worker(
             anyhow::bail!(
                 "{} already uses {}; refusing to restore folder data while a coding agent is live",
                 live_agent_status_label(&conflict),
-                truncate_width(&info.cwd, 72)
+                truncate_width(&display_cwd_str(&info.cwd), 72)
             );
         }
         let _cwd_lock = acquire_coding_agent_cwd_restore_lock(&info)?;
@@ -21350,7 +21362,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
         anyhow::bail!(
             "{} already uses {}; refusing to start another coding agent in the same folder",
             live_agent_status_label(&conflict),
-            truncate_width(&info.cwd, 72)
+            truncate_width(&display_cwd_str(&info.cwd), 72)
         );
     }
     let _cwd_lock = acquire_coding_agent_cwd_lock(&info)?;
@@ -22529,10 +22541,11 @@ fn read_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
 
 fn live_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
     read_agent_meta_snapshot(key).filter(|meta| {
-        meta.pid > 0
+            meta.pid > 0
             && process_is_alive(meta.pid)
             && agent_key_from_meta(meta).as_ref() == Some(key)
-            && agent_daemon_process_identity(meta.pid, key) != AgentDaemonProcessIdentity::Other
+            && agent_daemon_process_identity(meta.pid, key)
+                == AgentDaemonProcessIdentity::CokacmuxDaemon
     })
 }
 
@@ -22546,7 +22559,7 @@ fn agent_runtime_meta_has_live_daemon_for_stem(meta: &AgentMetaSnapshot, stem: &
     if agent_file_stem(&key) != stem {
         return false;
     }
-    agent_daemon_process_identity(meta.pid, &key) != AgentDaemonProcessIdentity::Other
+    agent_daemon_process_identity(meta.pid, &key) == AgentDaemonProcessIdentity::CokacmuxDaemon
 }
 
 fn agent_meta_child_pid_matches(meta: &AgentMetaSnapshot) -> bool {
@@ -22753,7 +22766,9 @@ fn live_coding_agent_cwd_meta_conflict_inner(
         let Some(key) = agent_key_from_meta(&meta) else {
             continue;
         };
-        if agent_daemon_process_identity(meta.pid, &key) == AgentDaemonProcessIdentity::Other {
+        if agent_daemon_process_identity(meta.pid, &key)
+            != AgentDaemonProcessIdentity::CokacmuxDaemon
+        {
             continue;
         }
         let Some(candidate) = session_info_from_agent_meta_snapshot(&meta) else {
@@ -22855,7 +22870,7 @@ fn acquire_coding_agent_cwd_lock_for_owner(
                         "{} {} already uses {}",
                         coding_agent_cwd_lock_owner_label(&existing),
                         truncate_width(&existing.session_id, 14),
-                        truncate_width(&info.cwd, 72)
+                        truncate_width(&display_cwd_str(&info.cwd), 72)
                     ));
                 }
                 let _ = remove_agent_runtime_file_logged(
@@ -22871,7 +22886,7 @@ fn acquire_coding_agent_cwd_lock_for_owner(
     }
     Err(anyhow::anyhow!(
         "cannot acquire coding-agent cwd lock for {}",
-        truncate_width(&info.cwd, 72)
+        truncate_width(&display_cwd_str(&info.cwd), 72)
     ))
 }
 
@@ -23263,9 +23278,9 @@ fn coding_agent_cwd_lock_is_live(lock: &CodingAgentCwdLock) -> bool {
         if lock.pid == std::process::id() {
             return true;
         }
-        return agent_client_process_identity(lock.pid) != AgentClientProcessIdentity::Other;
+        return agent_client_process_identity(lock.pid) == AgentClientProcessIdentity::CokacmuxClient;
     }
-    agent_daemon_process_identity(lock.pid, &key) != AgentDaemonProcessIdentity::Other
+    agent_daemon_process_identity(lock.pid, &key) == AgentDaemonProcessIdentity::CokacmuxDaemon
 }
 
 fn coding_agent_cwd_lock_pid_matches(lock: &CodingAgentCwdLock) -> bool {
@@ -23391,7 +23406,7 @@ fn codex_new_agent_backing_session(meta: &AgentMetaSnapshot) -> Option<NewAgentB
 fn claude_new_agent_backing_session(meta: &AgentMetaSnapshot) -> Option<NewAgentBackingSession> {
     let session_uuid = new_agent_session_uuid(meta.session_id.as_deref()?)?;
     let cwd = meta.cwd.as_deref().filter(|cwd| !cwd.is_empty())?;
-    let projects_root = dirs::home_dir()?.join(".claude").join("projects");
+    let projects_root = configured_home_dir()?.join(".claude").join("projects");
     claude_new_agent_backing_session_in_root(&projects_root, cwd, session_uuid)
 }
 
@@ -23475,7 +23490,7 @@ impl AgentMetaSnapshot {
             }
             if current_client_instance_id.is_some()
                 && agent_client_process_identity(attached_client_pid)
-                    == AgentClientProcessIdentity::Other
+                    != AgentClientProcessIdentity::CokacmuxClient
             {
                 return AgentListState::Live { activity };
             }
@@ -23834,7 +23849,7 @@ fn read_agent_runtime_state_at_for_key(
         let meta_key = agent_key_from_meta(&meta);
         let daemon_identity = agent_daemon_process_identity(meta.pid, expected_key);
         let identity_mismatch = meta_key.as_ref() != Some(expected_key)
-            || daemon_identity == AgentDaemonProcessIdentity::Other;
+            || daemon_identity != AgentDaemonProcessIdentity::CokacmuxDaemon;
         if identity_mismatch {
             let child_process_terminated = (meta_key.as_ref() == Some(expected_key))
                 .then(|| {
@@ -23971,7 +23986,12 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
     after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    windows_process_creation_filetime(pid)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
@@ -23987,7 +24007,16 @@ fn process_start_epoch_s(pid: u32) -> Option<u64> {
     Some(boot_time_epoch_s.saturating_add(ticks / ticks_per_second as u64))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn process_start_epoch_s(pid: u32) -> Option<u64> {
+    const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
+    const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
+
+    let filetime = windows_process_creation_filetime(pid)?;
+    (filetime / WINDOWS_TICKS_PER_SECOND).checked_sub(WINDOWS_TO_UNIX_EPOCH_SECONDS)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn process_start_epoch_s(_pid: u32) -> Option<u64> {
     None
 }
@@ -23999,6 +24028,59 @@ fn linux_boot_time_epoch_s() -> Option<u64> {
         .lines()
         .find_map(|line| line.strip_prefix("btime "))
         .and_then(|raw| raw.trim().parse().ok())
+}
+
+#[cfg(windows)]
+fn windows_process_creation_filetime(pid: u32) -> Option<u64> {
+    use std::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FileTime {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut c_void;
+        fn GetProcessTimes(
+            hProcess: *mut c_void,
+            lpCreationTime: *mut FileTime,
+            lpExitTime: *mut FileTime,
+            lpKernelTime: *mut FileTime,
+            lpUserTime: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(hObject: *mut c_void) -> i32;
+    }
+
+    if pid == 0 {
+        return None;
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+
+        let mut creation = FileTime {
+            dw_low_date_time: 0,
+            dw_high_date_time: 0,
+        };
+        let mut exit = creation;
+        let mut kernel = creation;
+        let mut user = creation;
+        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        let _ = CloseHandle(handle);
+
+        if ok == 0 {
+            return None;
+        }
+        Some(((creation.dw_high_date_time as u64) << 32) | creation.dw_low_date_time as u64)
+    }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -25912,7 +25994,7 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
         return Err(anyhow::anyhow!(
             "{} already uses {}; refusing to start another coding agent in the same folder",
             live_agent_status_label(&conflict),
-            truncate_width(&info.cwd, 72)
+            truncate_width(&display_cwd_str(&info.cwd), 72)
         ));
     }
     if let Some(conflict) = live_coding_agent_cwd_lock_conflict(info)? {
@@ -25920,7 +26002,7 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
             "{} {} already uses {}; refusing to start another coding agent in the same folder",
             coding_agent_cwd_lock_owner_label(&conflict),
             truncate_width(&conflict.session_id, 14),
-            truncate_width(&info.cwd, 72)
+            truncate_width(&display_cwd_str(&info.cwd), 72)
         ));
     }
     let meta_path = agent_meta_path(&key)?;
@@ -26051,8 +26133,8 @@ fn spawn_agent_daemon_process(
 #[cfg(windows)]
 fn spawn_agent_daemon_process(
     mut command: Command,
-    _current_exe: &Path,
-    _info: &SessionInfo,
+    current_exe: &Path,
+    info: &SessionInfo,
     launch_mode: AgentLaunchMode,
     key: &AgentKey,
 ) -> io::Result<(std::process::Child, bool)> {
@@ -26069,7 +26151,35 @@ fn spawn_agent_daemon_process(
                     "error": e.to_string(),
                 }),
             );
-            Err(e)
+            let breakaway_error = e;
+            let mut fallback = build_agent_daemon_command(current_exe, info, launch_mode);
+            configure_daemon_command(&mut fallback, false);
+            match fallback.spawn() {
+                Ok(child) => {
+                    debug_log(
+                        "daemon_spawn_without_breakaway",
+                        serde_json::json!({
+                            "key": agent_key_debug_value(key),
+                            "launch_mode": launch_mode.as_str(),
+                        }),
+                    );
+                    Ok((child, false))
+                }
+                Err(fallback_error) => {
+                    debug_log(
+                        "daemon_spawn_without_breakaway_failed",
+                        serde_json::json!({
+                            "key": agent_key_debug_value(key),
+                            "launch_mode": launch_mode.as_str(),
+                            "breakaway_error_kind": format!("{:?}", breakaway_error.kind()),
+                            "breakaway_error": breakaway_error.to_string(),
+                            "error_kind": format!("{:?}", fallback_error.kind()),
+                            "error": fallback_error.to_string(),
+                        }),
+                    );
+                    Err(fallback_error)
+                }
+            }
         }
     }
 }
@@ -26325,7 +26435,7 @@ fn terminate_cokacmux_client_pids_for_reset(
         if !process_is_alive(pid) {
             continue;
         }
-        if agent_client_process_identity(pid) == AgentClientProcessIdentity::Other {
+        if agent_client_process_identity(pid) != AgentClientProcessIdentity::CokacmuxClient {
             report.skipped_unverified = report.skipped_unverified.saturating_add(1);
             continue;
         }
@@ -26403,7 +26513,7 @@ fn attached_cokacmux_client_pids_from_runtime_meta(
             if pid == current_pid || !process_is_alive(pid) {
                 return None;
             }
-            (agent_client_process_identity(pid) != AgentClientProcessIdentity::Other)
+            (agent_client_process_identity(pid) == AgentClientProcessIdentity::CokacmuxClient)
                 .then_some(pid)
         })
         .collect()
@@ -26449,25 +26559,14 @@ fn os_cokacmux_client_pids_for_reset(current_pid: u32) -> Vec<u32> {
 
 #[cfg(windows)]
 fn os_cokacmux_client_pids_for_reset(current_pid: u32) -> Vec<u32> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId }",
-        ])
-        .stdin(Stdio::null())
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .filter(|pid| *pid != current_pid)
-        .filter(|pid| agent_client_process_identity(*pid) == AgentClientProcessIdentity::CokacmuxClient)
+    windows_process_command_lines_for_reset()
+        .into_iter()
+        .filter(|(pid, _)| *pid != current_pid)
+        .filter(|(_, command_line)| {
+            process_command_string_agent_client_identity(command_line)
+                == AgentClientProcessIdentity::CokacmuxClient
+        })
+        .map(|(pid, _)| pid)
         .collect()
 }
 
@@ -26510,27 +26609,68 @@ fn os_cokacmux_daemon_pids_for_reset(current_pid: u32) -> Vec<u32> {
 
 #[cfg(windows)]
 fn os_cokacmux_daemon_pids_for_reset(current_pid: u32) -> Vec<u32> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId }",
-        ])
-        .stdin(Stdio::null())
-        .output();
-    let Ok(output) = output else {
+    windows_process_command_lines_for_reset()
+        .into_iter()
+        .filter(|(pid, _)| *pid != current_pid)
+        .filter(|(_, command_line)| {
+            windows_command_line_to_args(command_line)
+                .is_some_and(|args| agent_daemon_args_have_agent_arg(&args))
+        })
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_process_command_lines_for_reset() -> Vec<(u32, String)> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct WindowsProcessInfo {
+        process_id: u32,
+        #[serde(default)]
+        command_line: Option<String>,
+    }
+
+    let command =
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress -Depth 2";
+    let Some(output) = windows_powershell_output(command, "windows_process_scan") else {
         return Vec::new();
     };
     if !output.status.success() {
+        debug_log(
+            "windows_process_scan_failed",
+            serde_json::json!({
+                "status": output.status.to_string(),
+                "stderr": truncate_width(&String::from_utf8_lossy(&output.stderr), 512),
+            }),
+        );
         return Vec::new();
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .filter(|pid| *pid != current_pid)
-        .filter(|pid| agent_daemon_process_has_agent_arg(*pid))
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = match serde_json::from_str::<serde_json::Value>(text.trim()) {
+        Ok(value) => value,
+        Err(e) => {
+            debug_log(
+                "windows_process_scan_parse_failed",
+                serde_json::json!({
+                    "error": e.to_string(),
+                    "stdout_len": output.stdout.len(),
+                    "stdout_sample": truncate_width(&text, 512),
+                }),
+            );
+            return Vec::new();
+        }
+    };
+    let values = match value {
+        serde_json::Value::Array(values) => values,
+        serde_json::Value::Object(_) => vec![value],
+        _ => Vec::new(),
+    };
+    values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<WindowsProcessInfo>(value).ok())
+        .filter_map(|info| info.command_line.map(|command_line| (info.process_id, command_line)))
         .collect()
-}
+    }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ResetConfigRemoval {
@@ -27129,22 +27269,89 @@ fn agent_client_process_identity(pid: u32) -> AgentClientProcessIdentity {
 }
 
 #[cfg(windows)]
-fn agent_client_process_identity(pid: u32) -> AgentClientProcessIdentity {
+fn command_output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> io::Result<Option<std::process::Output>> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(Some);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(windows)]
+fn windows_powershell_output(command: &str, event: &'static str) -> Option<std::process::Output> {
+    let mut powershell = Command::new("powershell");
+    powershell.args(["-NoProfile", "-Command", command]);
+    match command_output_with_timeout(
+        powershell,
+        Duration::from_millis(WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS),
+    ) {
+        Ok(Some(output)) => Some(output),
+        Ok(None) => {
+            debug_log(
+                "windows_powershell_probe_timeout",
+                serde_json::json!({
+                    "event": event,
+                    "timeout_ms": WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS,
+                    "command": truncate_width(command, 512),
+                }),
+            );
+            None
+        }
+        Err(e) => {
+            debug_log(
+                "windows_powershell_probe_failed",
+                serde_json::json!({
+                    "event": event,
+                    "error": e.to_string(),
+                    "command": truncate_width(command, 512),
+                }),
+            );
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_command_line(pid: u32, event: &'static str) -> Option<String> {
     let command = format!(
         "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {}\"; if ($p) {{ $p.CommandLine }}",
         pid
     );
-    Command::new("powershell")
-        .args(["-NoProfile", "-Command", &command])
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            process_command_string_agent_client_identity(
-                String::from_utf8_lossy(&output.stdout).trim(),
-            )
-        })
+    let output = windows_powershell_output(&command, event)?;
+    if !output.status.success() {
+        debug_log(
+            "windows_process_command_line_probe_failed",
+            serde_json::json!({
+                "event": event,
+                "pid": pid,
+                "status": output.status.to_string(),
+                "stderr": truncate_width(&String::from_utf8_lossy(&output.stderr), 512),
+            }),
+        );
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(windows)]
+fn agent_client_process_identity(pid: u32) -> AgentClientProcessIdentity {
+    windows_process_command_line(pid, "agent_client_process_identity")
+        .map(|command_line| process_command_string_agent_client_identity(&command_line))
         .unwrap_or(AgentClientProcessIdentity::Unknown)
 }
 
@@ -27177,19 +27384,8 @@ fn agent_daemon_process_has_agent_arg(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn agent_daemon_process_has_agent_arg(pid: u32) -> bool {
-    let command = format!(
-        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {}\"; if ($p) {{ $p.CommandLine }}",
-        pid
-    );
-    Command::new("powershell")
-        .args(["-NoProfile", "-Command", &command])
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            windows_command_line_to_args(String::from_utf8_lossy(&output.stdout).trim())
-        })
+    windows_process_command_line(pid, "agent_daemon_process_has_agent_arg")
+        .and_then(|command_line| windows_command_line_to_args(&command_line))
         .is_some_and(|args| agent_daemon_args_have_agent_arg(&args))
 }
 
@@ -27225,43 +27421,24 @@ fn agent_daemon_process_identity(pid: u32, key: &AgentKey) -> AgentDaemonProcess
 
 #[cfg(windows)]
 fn agent_daemon_process_identity(pid: u32, key: &AgentKey) -> AgentDaemonProcessIdentity {
-    let command = format!(
-        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {}\"; if ($p) {{ $p.CommandLine }}",
-        pid
-    );
-    let output = match Command::new("powershell")
-        .args(["-NoProfile", "-Command", &command])
-        .stdin(Stdio::null())
-        .output()
-    {
-        Ok(output) => output,
-        Err(e) => {
-            debug_log(
-                "agent_daemon_identity_cmdline_probe_failed",
-                serde_json::json!({
-                    "pid": pid,
-                    "key": agent_key_debug_value(key),
-                    "error": e.to_string(),
-                }),
-            );
-            return AgentDaemonProcessIdentity::Unknown;
-        }
+    let Some(command_line) = windows_process_command_line(pid, "agent_daemon_process_identity") else {
+        debug_log(
+            "agent_daemon_identity_cmdline_probe_failed",
+            serde_json::json!({
+                "pid": pid,
+                "key": agent_key_debug_value(key),
+                "error": "command_line_unavailable",
+            }),
+        );
+        return AgentDaemonProcessIdentity::Unknown;
     };
-    let command_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let identity = if output.status.success() {
-        process_command_string_agent_daemon_identity(&command_line, key)
-    } else {
-        AgentDaemonProcessIdentity::Unknown
-    };
+    let identity = process_command_string_agent_daemon_identity(&command_line, key);
     debug_log(
         "agent_daemon_identity_cmdline_probe",
         serde_json::json!({
             "pid": pid,
             "key": agent_key_debug_value(key),
-            "status": output.status.to_string(),
-            "stdout_len": output.stdout.len(),
-            "stderr": truncate_width(&stderr, 512),
+            "stdout_len": command_line.len(),
             "command_line": truncate_width(&command_line, 512),
             "identity": format!("{:?}", identity),
         }),
@@ -28285,11 +28462,23 @@ fn strip_windows_namespace_prefix(path: String) -> String {
     let lower = path.to_ascii_lowercase();
     if lower.starts_with("\\\\?\\unc\\") {
         format!("\\\\{}", &path[8..])
+    } else if lower.starts_with("//?/unc/") {
+        format!("\\\\{}", path[8..].replace('/', "\\"))
     } else if lower.starts_with("\\\\?\\") || lower.starts_with("\\\\.\\") {
         path[4..].to_string()
+    } else if lower.starts_with("//?/") || lower.starts_with("//./") {
+        path[4..].replace('/', "\\")
     } else {
         path
     }
+}
+
+fn display_cwd_path(path: &Path) -> String {
+    display_cwd_str(&path.display().to_string())
+}
+
+fn display_cwd_str(cwd: &str) -> String {
+    strip_windows_namespace_prefix(cwd.to_string())
 }
 
 fn is_windows_cwd_syntax(path: &str) -> bool {
@@ -28402,11 +28591,11 @@ fn create_agent_launch_cwd(path: &Path) -> Result<()> {
 
 fn expand_home_path(raw: &str) -> PathBuf {
     if raw == "~" {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = configured_home_dir() {
             return home;
         }
     } else if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = configured_home_dir() {
             return home.join(rest);
         }
     }
@@ -28433,13 +28622,13 @@ fn live_agent_status_label(info: &SessionInfo) -> String {
         if info.cwd.is_empty() {
             "shell".into()
         } else {
-            format!("shell at {}", truncate_width(&info.cwd, 40))
+            format!("shell at {}", truncate_width(&display_cwd_str(&info.cwd), 40))
         }
     } else if is_cokacdir_session_info(info) {
         if info.cwd.is_empty() {
             "cokacdir".into()
         } else {
-            format!("cokacdir at {}", truncate_width(&info.cwd, 40))
+            format!("cokacdir at {}", truncate_width(&display_cwd_str(&info.cwd), 40))
         }
     } else if is_new_agent_session_info(info) {
         if info.cwd.is_empty() {
@@ -28448,7 +28637,7 @@ fn live_agent_status_label(info: &SessionInfo) -> String {
             format!(
                 "new {} agent at {}",
                 info.provider.as_str(),
-                truncate_width(&info.cwd, 40)
+                truncate_width(&display_cwd_str(&info.cwd), 40)
             )
         }
     } else {
@@ -28474,7 +28663,7 @@ fn coding_agent_cwd_conflict_message(target: &SessionInfo, conflict: &SessionInf
     format!(
         "blocked: {} already uses {}; use a separate folder/worktree",
         live_agent_status_label(conflict),
-        truncate_width(&target.cwd, 48)
+        truncate_width(&display_cwd_str(&target.cwd), 48)
     )
 }
 
@@ -28486,7 +28675,7 @@ fn coding_agent_cwd_lock_conflict_message(
         "blocked: {} {} already uses {}; use a separate folder/worktree",
         coding_agent_cwd_lock_owner_label(conflict),
         truncate_width(&conflict.session_id, 14),
-        truncate_width(&target.cwd, 48)
+        truncate_width(&display_cwd_str(&target.cwd), 48)
     )
 }
 
@@ -28861,7 +29050,7 @@ fn resolve_unix_agent_program(program: &str) -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn resolve_unix_opencode_default_install() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+    let home = configured_home_dir()?;
     opencode_unix_default_install_candidates(&home)
         .into_iter()
         .find(|path| unix_runnable_file(path))
@@ -31777,7 +31966,7 @@ fn draw_agent_sidebar(
                 let cwd_label = if info.cwd.is_empty() {
                     "(no cwd)".to_string()
                 } else {
-                    truncate_width(&info.cwd, id_width)
+                    truncate_width(&display_cwd_str(&info.cwd), id_width)
                 };
                 let badge = if is_cokacdir_session_info(info) {
                     cokacdir_badge_span()
@@ -33414,7 +33603,7 @@ fn create_folder_confirm_lines(
         Line::from(Span::styled(
             format!(
                 "Folder: {}",
-                confirm_prompt_line(&path.display().to_string(), 72)
+                confirm_prompt_line(&display_cwd_path(path), 72)
             ),
             Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
         )),
@@ -33487,12 +33676,12 @@ fn restore_data_confirm_lines(
         Line::from(Span::styled(
             format!(
                 "Snapshot: {}",
-                confirm_prompt_line(&snapshot.snapshot_path.display().to_string(), 72)
+                confirm_prompt_line(&display_cwd_path(&snapshot.snapshot_path), 72)
             ),
             Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
         )),
         Line::from(Span::styled(
-            format!("Target: {}", confirm_prompt_line(&info.cwd, 72)),
+            format!("Target: {}", confirm_prompt_line(&display_cwd_str(&info.cwd), 72)),
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
         )),
         Line::from(Span::styled(
@@ -34276,7 +34465,7 @@ fn settings_data_lines(state: &SettingsState, inner_width: usize, lines: &mut Ve
         state.selected == SETTINGS_DATA_AI_SEARCHDATA,
         SettingsRowKind::ReadOnly,
         "AI searchdata",
-        &ai_search_data_dir().map_or_else(|e| e, |path| path.display().to_string()),
+        &ai_search_data_dir().map_or_else(|e| e, |path| display_cwd_path(&path)),
         inner_width,
     ));
 }
@@ -34445,7 +34634,7 @@ fn settings_text_status(draft: &SettingsDraft, field: SettingsTextField) -> Sett
     match field {
         SettingsTextField::AgentProgram(provider) => {
             match resolve_agent_program_for_provider(provider, &draft.agent_programs) {
-                Some(path) => SettingsTextStatus::ok(format!("ok: {}", path.display())),
+                Some(path) => SettingsTextStatus::ok(format!("ok: {}", display_cwd_path(&path))),
                 None => SettingsTextStatus::error("not found"),
             }
         }
@@ -34453,7 +34642,7 @@ fn settings_text_status(draft: &SettingsDraft, field: SettingsTextField) -> Sett
             let mut settings = CokacmuxSettings::default();
             settings.cokacdir_program = Some(draft.cokacdir_program.clone());
             match resolve_cokacdir_program(&settings) {
-                Some(path) => SettingsTextStatus::ok(format!("ok: {}", path.display())),
+                Some(path) => SettingsTextStatus::ok(format!("ok: {}", display_cwd_path(&path))),
                 None if draft.cokacdir_program.trim().is_empty() => {
                     SettingsTextStatus::warning("auto-download")
                 }
@@ -34552,7 +34741,7 @@ fn settings_help_items(state: &SettingsState, keybindings: &KeyBindings) -> Vec<
 }
 
 fn optional_path_label(path: Option<PathBuf>) -> String {
-    path.map(|path| path.display().to_string())
+    path.map(|path| display_cwd_path(&path))
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
@@ -34734,7 +34923,7 @@ fn clone_options_data_line(folder_data: &CloneFolderDataAvailability) -> String 
         CloneFolderDataAvailability::Available(path) => {
             format!(
                 "Folder data: {}",
-                truncate_width(&path.display().to_string(), 72)
+                truncate_width(&display_cwd_path(path), 72)
             )
         }
         CloneFolderDataAvailability::Unavailable(reason) => {
@@ -39052,7 +39241,10 @@ mod tests {
                 assert!(target_options.contains(&Provider::Claude));
                 assert!(target_options.contains(&Provider::Codex));
                 assert_eq!(selected, CLONE_OPTION_SESSION_ONLY);
-                assert_eq!(path, dir.path());
+                assert!(session_cwd_eq(
+                    &path.display().to_string(),
+                    &dir.path().display().to_string()
+                ));
             }
             other => panic!("expected clone options with folder data, got {:?}", other),
         }
@@ -39091,7 +39283,7 @@ mod tests {
                 assert!(target_options.contains(&Provider::Claude));
                 assert!(target_options.contains(&Provider::Codex));
                 assert_eq!(selected, CLONE_OPTION_SESSION_ONLY);
-                assert!(reason.contains("No such file") || reason.contains("not found"));
+                assert!(reason.contains(&missing.display().to_string()));
             }
             other => panic!(
                 "expected clone options without folder data, got {:?}",
@@ -42170,7 +42362,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(!is_live);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn cwd_lock_rejects_pid_start_tick_mismatch() {
         let current_pid = std::process::id();
@@ -42179,7 +42371,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             coding_agent_cwd_lock_for_info(&info, current_pid, CODING_AGENT_CWD_LOCK_OWNER_RESTORE);
         let actual_start_ticks = lock
             .pid_start_ticks
-            .expect("linux lock should include process start ticks");
+            .expect("lock should include process start ticks");
         assert!(coding_agent_cwd_lock_pid_matches(&lock));
 
         let mut mismatched = lock.clone();
@@ -42187,6 +42379,41 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
 
         assert!(!coding_agent_cwd_lock_pid_matches(&mismatched));
         assert!(!coding_agent_cwd_lock_is_live(&mismatched));
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn agent_meta_child_rejects_pid_start_tick_mismatch() {
+        let current_pid = std::process::id();
+        let actual_start_ticks =
+            process_start_ticks(current_pid).expect("process start ticks should be available");
+        let meta = AgentMetaSnapshot {
+            child_pid: Some(current_pid),
+            child_pid_start_ticks: Some(actual_start_ticks),
+            ..AgentMetaSnapshot::default()
+        };
+        assert!(agent_meta_child_pid_matches(&meta));
+
+        let mismatched = AgentMetaSnapshot {
+            child_pid: Some(current_pid),
+            child_pid_start_ticks: Some(actual_start_ticks.saturating_add(1)),
+            ..AgentMetaSnapshot::default()
+        };
+        assert!(!agent_meta_child_pid_matches(&mismatched));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_output_timeout_kills_slow_probe() {
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 5"]);
+
+        let started = Instant::now();
+        let output = command_output_with_timeout(command, Duration::from_millis(100))
+            .expect("timeout probe should run");
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
@@ -42211,12 +42438,11 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn legacy_restore_cwd_lock_rejects_pid_started_after_lock() {
         let current_pid = std::process::id();
-        let started_at_epoch_s =
-            process_start_epoch_s(current_pid).expect("linux process start epoch");
+        let started_at_epoch_s = process_start_epoch_s(current_pid).expect("process start epoch");
         let stale_created_at = started_at_epoch_s.saturating_sub(2);
         let lock = CodingAgentCwdLock {
             version: CODING_AGENT_CWD_LOCK_VERSION,
@@ -42576,7 +42802,6 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(app.show_sessions_view);
         assert!(!missing.exists());
         assert!(app.status.contains("launch folder missing:"));
-        assert!(app.status.contains("deleted-project"));
     }
 
     #[test]
@@ -44806,6 +45031,23 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn display_cwd_str_hides_windows_extended_prefix() {
+        assert_eq!(
+            display_cwd_str("\\\\?\\C:\\Users\\kst\\repo"),
+            "C:\\Users\\kst\\repo"
+        );
+        assert_eq!(
+            display_cwd_str("//?/C:/Users/kst/repo"),
+            "C:\\Users\\kst\\repo"
+        );
+        assert_eq!(
+            display_cwd_str("\\\\?\\UNC\\SERVER\\Share\\repo"),
+            "\\\\SERVER\\Share\\repo"
+        );
+        assert_eq!(display_cwd_str("/tmp/repo"), "/tmp/repo");
+    }
+
+    #[test]
     fn agent_activity_uses_recent_screen_output_or_input_timestamps() {
         let now = 10_000;
         assert_eq!(
@@ -45046,7 +45288,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
 
     #[test]
     fn configured_agent_program_paths_expand_home_prefix() {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = configured_home_dir() else {
             return;
         };
         let agent_programs = AgentProgramSettings {

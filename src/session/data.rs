@@ -594,14 +594,26 @@ pub fn snapshot_source_dir(info: &SessionInfo) -> Result<PathBuf> {
         return Err(ConvertError::MissingField("session.cwd"));
     }
     let path = PathBuf::from(&info.cwd);
-    let metadata = fs::metadata(&path)?;
+    let metadata = fs::metadata(&path).map_err(|err| {
+        ConvertError::Other(format!(
+            "cannot read session cwd {}: {}",
+            path.display(),
+            err
+        ))
+    })?;
     if !metadata.is_dir() {
         return Err(ConvertError::Other(format!(
             "session cwd is not a directory: {}",
             path.display()
         )));
     }
-    path.canonicalize().map_err(Into::into)
+    path.canonicalize().map_err(|err| {
+        ConvertError::Other(format!(
+            "cannot resolve session cwd {}: {}",
+            path.display(),
+            err
+        ))
+    })
 }
 
 fn ensure_data_root(data_root: &Path) -> Result<()> {
@@ -1748,7 +1760,10 @@ mod tests {
 
         let target = clone_target_cwd_for_session(&source, Provider::Codex, "clone/id").unwrap();
 
-        assert_eq!(target.parent(), project.parent());
+        assert_eq!(
+            target.parent().map(canonical_or_existing_parent),
+            project.parent().map(canonical_or_existing_parent)
+        );
         assert!(target
             .file_name()
             .and_then(|name| name.to_str())

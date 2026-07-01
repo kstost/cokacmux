@@ -68,7 +68,14 @@ pub fn latest_for_cwd(provider: Provider, cwd: &Path) -> Result<UniversalSession
 }
 
 pub fn home_dir() -> Result<PathBuf> {
-    dirs::home_dir().ok_or_else(|| ConvertError::Other("cannot resolve home dir".into()))
+    configured_home_dir().ok_or_else(|| ConvertError::Other("cannot resolve home dir".into()))
+}
+
+pub fn configured_home_dir() -> Option<PathBuf> {
+    std::env::var_os("COKACMUX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
 }
 
 pub fn list_all(provider: Provider) -> Result<Vec<SessionInfo>> {

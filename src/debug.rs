@@ -269,13 +269,21 @@ fn log_dir() -> Option<PathBuf> {
 }
 
 fn app_config_dir() -> Option<PathBuf> {
-    home_dir().map(|home| home.join(APP_DIR_NAME))
+    std::env::var_os("COKACMUX_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(APP_DIR_NAME)))
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+    std::env::var_os("COKACMUX_HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from)
+        })
         .or_else(|| {
             std::env::var_os("USERPROFILE")
                 .filter(|home| !home.is_empty())

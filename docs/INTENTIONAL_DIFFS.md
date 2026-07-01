@@ -58,7 +58,7 @@ resume/list 가 동작하기 위해 구조적으로 필요한 line은 합성한�
 특히 OpenCode `evt_…`는 globally primary-keyed 이므로 원본 재사용 시
 `INSERT OR REPLACE` 가 원본 row를 덮어쓴다. clone 경로는 반드시
 `crate::ids::opencode_event_id()` 로 새 id를 발급한다. (강제 회귀 테스트:
-`tests/install.rs`)
+`tests/provider_layout.rs`)
 
 ## 3. Claude resume-safe content block 필터 (§5.1, §11 #8)
 
@@ -150,7 +150,7 @@ preserving이다. 의도적 손실로 분류한다.
 - `INSERT OR REPLACE` 가 원본 row를 덮어씀
 
 위 항목 중 §9의 모든 케이스는 `src/session/native_validate.rs` 와
-`tests/install.rs`, `tests/live_acceptance.rs` 의 회귀 게이트에 잠겨 있다.
+`tests/provider_layout.rs`, `tests/live_acceptance.rs` 의 회귀 게이트에 잠겨 있다.
 
 ---
 

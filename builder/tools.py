@@ -20,12 +20,17 @@ from .logger import Logger
 WINDOWS_IMPORT_DLLS: Dict[str, str] = {
     "advapi32": "advapi32.dll",
     "cfgmgr32": "cfgmgr32.dll",
+    "dbghelp": "dbghelp.dll",
     "gdi32": "gdi32.dll",
     "msimg32": "msimg32.dll",
     "ole32": "ole32.dll",
     "oleaut32": "oleaut32.dll",
     "opengl32": "opengl32.dll",
+    "shell32": "shell32.dll",
+    "user32": "user32.dll",
+    "userenv": "userenv.dll",
     "winspool": "winspool.drv",
+    "ws2_32": "ws2_32.dll",
 }
 
 WINDOWS_STUB_IMPORT_DLLS: Dict[str, str] = {
@@ -153,13 +158,10 @@ class ToolInstaller:
             rustup_init_path = self.tools_dir / "rustup-init.sh"
 
         try:
-            self.logger.info("Downloading rustup installer...")
-            ctx = ssl.create_default_context()
-
-            with urllib.request.urlopen(rustup_init_url, context=ctx) as response:
-                script_content = response.read()
-                with open(rustup_init_path, "wb") as f:
-                    f.write(script_content)
+            if not self.download_file(
+                rustup_init_url, rustup_init_path, "rustup installer"
+            ):
+                return False
 
             if os.name != "nt":
                 rustup_init_path.chmod(0o755)
@@ -889,7 +891,64 @@ class ToolInstaller:
                 return True
 
         except Exception as e:
+            if os.name == "nt" and self._download_file_with_powershell(url, dest, desc, e):
+                return True
             self.logger.error(f"Failed to download {desc}: {e}")
+            if dest.exists():
+                dest.unlink()
+            return False
+
+    def _download_file_with_powershell(
+        self, url: str, dest: Path, desc: str, original_error: Exception
+    ) -> bool:
+        """Fallback for Windows Python installs without a usable CA bundle."""
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not powershell:
+            return False
+        self.logger.warning(
+            f"Python download failed ({original_error}); retrying with PowerShell"
+        )
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            command = (
+                "$ProgressPreference='SilentlyContinue'; "
+                "try { "
+                "[Net.ServicePointManager]::SecurityProtocol = "
+                "[Net.ServicePointManager]::SecurityProtocol -bor "
+                "[Net.SecurityProtocolType]::Tls12 "
+                "} catch {}; "
+                "Invoke-WebRequest -Uri $args[0] -OutFile $args[1] -UseBasicParsing"
+            )
+            result = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                    url,
+                    str(dest),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                self.logger.error(
+                    f"PowerShell download failed: {result.stderr.strip()}"
+                )
+                if dest.exists():
+                    dest.unlink()
+                return False
+            if not dest.exists() or dest.stat().st_size <= 0:
+                self.logger.error("PowerShell download produced an empty file")
+                if dest.exists():
+                    dest.unlink()
+                return False
+            self.logger.success(f"Downloaded {desc}")
+            return True
+        except Exception as e:
+            self.logger.error(f"PowerShell download failed: {e}")
             if dest.exists():
                 dest.unlink()
             return False

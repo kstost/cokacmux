@@ -100,7 +100,7 @@ fn default_db_path() -> Option<PathBuf> {
                 .join("opencode.db"),
         );
     }
-    dirs::home_dir().map(|h| {
+    crate::providers::discovery::configured_home_dir().map(|h| {
         h.join(".local")
             .join("share")
             .join("opencode")

@@ -32,7 +32,7 @@ Feature gating verified: `claude,codex` alone does NOT pull in `rusqlite`
 ```text
 running 61 tests          (unit)                                   ok
 running 213 tests         (bin)                                    ok
-running 12 tests          (tests/install.rs)                       ok
+running 15 tests          (tests/provider_layout.rs)               ok
 running 3 tests           (tests/live_acceptance.rs)               3 ignored
 running 22 tests          (tests/pivot.rs)                         ok
 running 30 tests          (tests/roundtrip.rs)                     ok

@@ -780,7 +780,7 @@ fn infer_codex_home_from_rollout(path: &Path) -> Option<PathBuf> {
 
 #[cfg(feature = "discovery")]
 fn default_claude_home() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".claude"))
+    crate::providers::discovery::configured_home_dir().map(|home| home.join(".claude"))
 }
 
 #[cfg(not(feature = "discovery"))]
@@ -790,7 +790,7 @@ fn default_claude_home() -> Option<PathBuf> {
 
 #[cfg(feature = "discovery")]
 fn default_codex_home() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".codex"))
+    crate::providers::discovery::configured_home_dir().map(|home| home.join(".codex"))
 }
 
 #[cfg(not(feature = "discovery"))]

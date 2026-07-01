@@ -94,7 +94,7 @@ pub fn install_to_user_dir(
 
 #[cfg(feature = "discovery")]
 fn default_claude_home() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude"))
+    crate::providers::discovery::configured_home_dir().map(|h| h.join(".claude"))
 }
 #[cfg(not(feature = "discovery"))]
 fn default_claude_home() -> Option<PathBuf> {

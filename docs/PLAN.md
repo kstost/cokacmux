@@ -523,7 +523,7 @@ transcript 합성이 아니라 2-message context-wrapper handoff이다.
 
 ### Phase 3 (옵션)
 - [ ] `src/providers/<X>/install.rs`
-- [ ] `tests/install.rs` (격리된 tempdir 사용)
+- [ ] `tests/provider_layout.rs` (격리된 tempdir 사용)
 
 ---
 

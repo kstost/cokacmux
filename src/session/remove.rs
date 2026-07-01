@@ -84,7 +84,9 @@ fn remove_codex(info: &SessionInfo) -> Result<RemoveReport> {
     // rollout's own home so temp/test homes and non-default installs roll
     // back correctly.
     let state_5 = infer_codex_home_from_rollout(p)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .or_else(|| {
+            crate::providers::discovery::configured_home_dir().map(|home| home.join(".codex"))
+        })
         .map(|home| home.join("state_5.sqlite"));
     if let Some(state_5) = state_5.filter(|path| path.exists()) {
         let conn = rusqlite::Connection::open(&state_5)?;
