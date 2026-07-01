@@ -7797,6 +7797,9 @@ impl App {
             .is_some_and(|aux| AgentKey::new(&aux.agent.info) == *key)
         {
             if let Some(mut aux) = self.agent_aux.take() {
+                if self.agent_focus == AgentFocusPane::Auxiliary {
+                    self.agent_focus = AgentFocusPane::Main;
+                }
                 aux.agent.exited = Some(format!("terminated right panel: {}", reason));
                 drop(aux);
             }
@@ -8010,6 +8013,86 @@ impl App {
         if terminated > 0 {
             debug_log(
                 "agent_auxiliary_orphans_terminated",
+                serde_json::json!({
+                    "reason": reason,
+                    "count": terminated,
+                }),
+            );
+        }
+        terminated
+    }
+
+    fn persisted_auxiliary_parent_has_live_runtime(
+        &self,
+        entry: &PersistedAgentAuxiliaryEntry,
+    ) -> bool {
+        if let Some(agent) = self.active_agent.as_ref() {
+            if self.agent_keys_match_or_alias(&entry.parent, &AgentKey::new(&agent.info))
+                || (self.persisted_auxiliary_can_match_parent_info(entry, &agent.info)
+                    && entry.matches_parent_info(&agent.info))
+            {
+                return agent.exited.is_none();
+            }
+        }
+        self.live_shells.iter().any(|info| {
+            if !is_coding_agent_session_info(info) {
+                return false;
+            }
+            let key = AgentKey::new(info);
+            (self.agent_keys_match_or_alias(&entry.parent, &key)
+                || (self.persisted_auxiliary_can_match_parent_info(entry, info)
+                    && entry.matches_parent_info(info)))
+                && self
+                    .agent_states
+                    .get(&key)
+                    .copied()
+                    .map_or(true, |state| state != AgentListState::Idle)
+        })
+    }
+
+    fn persisted_auxiliary_parent_runtime_is_known(
+        &self,
+        entry: &PersistedAgentAuxiliaryEntry,
+    ) -> bool {
+        if self.active_agent.as_ref().is_some_and(|agent| {
+            self.agent_keys_match_or_alias(&entry.parent, &AgentKey::new(&agent.info))
+                || (self.persisted_auxiliary_can_match_parent_info(entry, &agent.info)
+                    && entry.matches_parent_info(&agent.info))
+        }) {
+            return true;
+        }
+        self.live_shells.iter().any(|info| {
+            if !is_coding_agent_session_info(info) {
+                return false;
+            }
+            let key = AgentKey::new(info);
+            self.agent_keys_match_or_alias(&entry.parent, &key)
+                || (self.persisted_auxiliary_can_match_parent_info(entry, info)
+                    && entry.matches_parent_info(info))
+        })
+    }
+
+    fn terminate_orphan_persisted_auxiliaries_without_live_runtime(
+        &mut self,
+        reason: &'static str,
+    ) -> usize {
+        let keys = self
+            .persisted_agent_aux
+            .iter()
+            .filter(|(_, entry)| {
+                self.persisted_auxiliary_parent_runtime_is_known(entry)
+                    && !self.persisted_auxiliary_parent_has_live_runtime(entry)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut terminated = 0usize;
+        for key in keys {
+            terminated = terminated.saturating_add(1);
+            self.terminate_persisted_auxiliary_key(&key, reason);
+        }
+        if terminated > 0 {
+            debug_log(
+                "agent_auxiliary_runtime_orphans_terminated",
                 serde_json::json!({
                     "reason": reason,
                     "count": terminated,
@@ -10913,6 +10996,13 @@ impl App {
             &self.new_agent_backing_aliases,
             &mut self.agent_states,
         );
+        let orphaned_auxiliaries = if self.active_agent.is_some() || !self.live_shells.is_empty() {
+            self.terminate_orphan_persisted_auxiliaries_without_live_runtime(
+                "orphan_parent_runtime_missing",
+            )
+        } else {
+            0
+        };
         if self.pending_runtime_action.is_none()
             && (self.status == "checking live agents..."
                 || self.status.starts_with("checking live state for "))
@@ -10935,6 +11025,7 @@ impl App {
                     "live_shells_preserved": live_shells_preserved,
                     "live_shells_len": self.live_shells.len(),
                     "agent_states_len": self.agent_states.len(),
+                    "orphaned_auxiliaries_terminated": orphaned_auxiliaries,
                     "live_shells": self.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
                     "agent_states": agent_state_entries_debug_value(&self.agent_states),
                     "new_agent_backing_aliases": agent_alias_entries_debug_value(&self.new_agent_backing_aliases),
@@ -42355,6 +42446,184 @@ IF EXIST "%~dp0\node.exe" (
         let entry = persisted_auxiliary_entry(&aux, AgentAuxKind::Terminal, &parent, 1);
 
         assert!(!app.persisted_auxiliary_matches_active(&entry, &other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_runtime_refresh_keeps_persisted_auxiliary_before_live_discovery() {
+        let mut app = app_for_key_tests();
+        let mut parent = new_agent_info(Provider::Codex, "/repo");
+        parent.session_id = "startup-parent-before-discovery".into();
+        let mut aux = shell_session_info_for_cwd("/repo".into());
+        aux.session_id = "shell-startup-before-discovery".into();
+        let aux_key = AgentKey::new(&aux);
+        app.persisted_agent_aux.insert(
+            aux_key.clone(),
+            persisted_auxiliary_entry(&aux, AgentAuxKind::Terminal, &parent, 1),
+        );
+
+        app.apply_agent_runtime_refresh_result_with_pending(
+            AgentRuntimeRefreshResult {
+                seq: 1,
+                discover_live_shells: false,
+                live_shells: Vec::new(),
+                agent_states: HashMap::new(),
+                new_agent_backing_aliases: HashMap::new(),
+                new_agent_backing_probe_after: HashMap::new(),
+            },
+            true,
+        );
+
+        assert!(
+            app.persisted_agent_aux.contains_key(&aux_key),
+            "startup runtime refresh runs before live discovery and must not erase restorable panels"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_refresh_keeps_persisted_auxiliary_when_parent_is_foreign_attached() {
+        let mut app = app_for_key_tests();
+        let mut parent = new_agent_info(Provider::Codex, "/repo");
+        parent.session_id = "foreign-attached-parent".into();
+        let parent_key = AgentKey::new(&parent);
+        let mut aux = shell_session_info_for_cwd("/repo".into());
+        aux.session_id = "shell-foreign-attached-parent".into();
+        let aux_key = AgentKey::new(&aux);
+        app.live_shells.extend([parent.clone(), aux.clone()]);
+        app.persisted_agent_aux.insert(
+            aux_key.clone(),
+            persisted_auxiliary_entry(&aux, AgentAuxKind::Terminal, &parent, 1),
+        );
+
+        app.apply_agent_runtime_refresh_result_with_pending(
+            AgentRuntimeRefreshResult {
+                seq: 2,
+                discover_live_shells: false,
+                live_shells: Vec::new(),
+                agent_states: HashMap::from([(
+                    parent_key,
+                    AgentListState::Attached {
+                        mine: false,
+                        activity: AgentActivity::Quiet,
+                    },
+                )]),
+                new_agent_backing_aliases: HashMap::new(),
+                new_agent_backing_probe_after: HashMap::new(),
+            },
+            true,
+        );
+
+        assert!(
+            app.persisted_agent_aux.contains_key(&aux_key),
+            "a live but foreign-attached parent is not switchable, but its right panel must survive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_refresh_keeps_persisted_auxiliary_for_parent_not_yet_discovered() {
+        let mut app = app_for_key_tests();
+        let mut undiscovered_parent = new_agent_info(Provider::Codex, "/repo-a");
+        undiscovered_parent.session_id = "undiscovered-parent".into();
+        let mut active_info = new_agent_info(Provider::Claude, "/repo-b");
+        active_info.session_id = "known-active-parent".into();
+        let active_key = AgentKey::new(&active_info);
+        let mut active = buffered_output_test_client("known-active-parent", 215);
+        active.info = active_info.clone();
+        app.set_active_agent(active);
+        app.mark_agent_attached_locally(active_key.clone());
+
+        let mut aux = shell_session_info_for_cwd("/repo-a".into());
+        aux.session_id = "shell-undiscovered-parent".into();
+        let aux_key = AgentKey::new(&aux);
+        app.persisted_agent_aux.insert(
+            aux_key.clone(),
+            persisted_auxiliary_entry(&aux, AgentAuxKind::Terminal, &undiscovered_parent, 1),
+        );
+
+        app.apply_agent_runtime_refresh_result_with_pending(
+            AgentRuntimeRefreshResult {
+                seq: 3,
+                discover_live_shells: false,
+                live_shells: Vec::new(),
+                agent_states: HashMap::from([(
+                    active_key,
+                    AgentListState::Attached {
+                        mine: true,
+                        activity: AgentActivity::Quiet,
+                    },
+                )]),
+                new_agent_backing_aliases: HashMap::new(),
+                new_agent_backing_probe_after: HashMap::new(),
+            },
+            true,
+        );
+
+        assert!(
+            app.persisted_agent_aux.contains_key(&aux_key),
+            "another known live parent must not cause an undiscovered parent's right panel to be deleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_refresh_keeps_persisted_auxiliary_when_live_parent_state_is_missing() {
+        let mut app = app_for_key_tests();
+        let mut parent = new_agent_info(Provider::Codex, "/repo");
+        parent.session_id = "runtime-state-pending-parent".into();
+        let parent_key = AgentKey::new(&parent);
+        let mut aux = shell_session_info_for_cwd("/repo".into());
+        aux.session_id = "shell-runtime-state-pending".into();
+        let aux_key = AgentKey::new(&aux);
+        app.live_shells.extend([parent.clone(), aux.clone()]);
+        app.agent_states.insert(
+            parent_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.agent_states.insert(
+            aux_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.persisted_agent_aux.insert(
+            aux_key.clone(),
+            persisted_auxiliary_entry(&aux, AgentAuxKind::Terminal, &parent, 1),
+        );
+        let mut visible_aux = buffered_output_test_client("visible-runtime-orphan", 216);
+        visible_aux.info = aux.clone();
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent: parent_key,
+            agent: visible_aux,
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+
+        app.apply_agent_runtime_refresh_result_with_pending(
+            AgentRuntimeRefreshResult {
+                seq: 2,
+                discover_live_shells: false,
+                live_shells: Vec::new(),
+                agent_states: HashMap::new(),
+                new_agent_backing_aliases: HashMap::new(),
+                new_agent_backing_probe_after: HashMap::new(),
+            },
+            true,
+        );
+
+        assert!(
+            app.persisted_agent_aux.contains_key(&aux_key),
+            "a live-discovered parent with a pending runtime state refresh must not lose its right panel"
+        );
+        assert!(app
+            .live_shells
+            .iter()
+            .any(|info| AgentKey::new(info) == aux_key));
+        assert!(app.agent_aux.is_some());
+        assert_eq!(app.agent_focus, AgentFocusPane::Auxiliary);
     }
 
     #[cfg(unix)]
