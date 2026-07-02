@@ -176,7 +176,7 @@ cokacmux
 curl -fsSL https://cokacmux.cokac.com/manage.sh | bash
 ```
 
-설치 스크립트는 운영체제와 CPU 종류에 맞는 바이너리를 내려받아 `/usr/local/bin` 또는 `~/.local/bin`에 설치합니다. 설치 후 새 터미널에서 `cokacmux` 명령을 사용할 수 있습니다.
+설치 스크립트는 운영체제와 CPU 종류에 맞는 `cokacmux` 바이너리를 내려받아 `/usr/local/bin` 또는 `~/.local/bin`에 설치합니다. 같은 OS/CPU용 `cokacdir`도 `~/.cokacmux/bin/`에 함께 내려받습니다. 설치 후 새 터미널에서 `cokacmux` 명령을 사용할 수 있습니다.
 
 ### Windows
 
@@ -186,7 +186,7 @@ PowerShell을 열고 다음 명령을 실행하세요. 관리자 권한은 필�
 irm https://cokacmux.cokac.com/manage.ps1 | iex
 ```
 
-기본 설치 위치는 `%LOCALAPPDATA%\cokacmux\`입니다. PATH가 갱신되므로 설치 후 PowerShell을 한 번 닫았다가 다시 여는 편이 안전합니다.
+기본 설치 위치는 `%LOCALAPPDATA%\cokacmux\`입니다. 설치 스크립트는 `cokacmux.exe`를 그곳에 넣고, `cokacdir.exe`는 `%USERPROFILE%\.cokacmux\bin\`에 함께 내려받습니다. PATH가 갱신되므로 설치 후 PowerShell을 한 번 닫았다가 다시 여는 편이 안전합니다.
 
 ### 잘 설치됐는지 확인
 
@@ -570,7 +570,7 @@ Codex 실행에는 cokacmux의 에이전트 화면 스크롤과 Codex transcript
 
 Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`을 선택하면 해당 폴더에서 `cokacdir`을 엽니다. Coding agent를 선택하면 해당 폴더에서 지원 provider의 새 세션을 시작합니다. 같은 폴더에서 이미 live 코딩에이전트가 있으면 새 Coding agent 시작은 차단됩니다.
 
-`cokacdir` 실행 파일은 설정된 `cokacdir_program`이 있으면 먼저 그 경로를 쓰고, 비어 있으면 PATH의 `cokacdir`을 찾습니다. PATH에서도 찾지 못하면 이미 내려받아 둔 `~/.cokacmux/bin/cokacdir`을 사용합니다. 그 파일도 없을 때만 현재 운영체제와 CPU에 맞는 단일 바이너리를 GitHub에서 내려받아 `~/.cokacmux/bin/cokacdir`에 저장한 뒤 실행합니다. Windows에서는 `~/.cokacmux/bin/cokacdir.exe`에 저장합니다.
+`cokacdir` 실행 파일은 설정된 `cokacdir_program`이 있으면 먼저 그 경로를 쓰고, 비어 있으면 PATH의 `cokacdir`을 찾습니다. PATH에서도 찾지 못하면 `~/.cokacmux/bin/cokacdir`을 사용합니다. 설치 스크립트를 썼다면 보통 이 파일이 이미 있습니다. 파일이 없을 때만 현재 운영체제와 CPU에 맞는 단일 바이너리를 GitHub에서 내려받아 `~/.cokacmux/bin/cokacdir`에 저장한 뒤 실행합니다. Windows에서는 `~/.cokacmux/bin/cokacdir.exe`에 저장합니다.
 
 새 코딩 에이전트를 Skip permissions로 시작하면 다음 형태가 됩니다.
 
@@ -597,7 +597,9 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 | 사이드바 선택 이동 | `Alt+↑` / `Alt+↓` 또는 `Ctrl+Shift+↑` / `Ctrl+Shift+↓` |
 | 포커스된 side panel 폭 조절 | `Alt+←` / `Alt+→` 또는 `Ctrl+Shift+←` / `Ctrl+Shift+→` |
 
-사이드바를 숨긴 상태에서 왼쪽 패널 resize 대상에 `Alt+→` / `Ctrl+Shift+→`를 누르면 이전 폭을 복원하지 않고 0폭에서 한 단계만 펼칩니다. 중앙 agent에 포커스가 있고 양쪽 side panel이 모두 열려 있으면 resize는 동작하지 않습니다. 오른쪽 `cokacdir`와 terminal 패널은 한 번에 하나만 보이며, 숨겨져 있는 동안에도 자식 앱은 계속 실행됩니다.
+사이드바를 숨긴 상태에서 왼쪽 패널 resize 대상에 `Alt+→` / `Ctrl+Shift+→`를 누르면 이전 폭을 복원하지 않고 0폭에서 한 단계만 펼칩니다. 중앙 agent에 포커스가 있고 양쪽 side panel이 모두 열려 있으면 resize는 동작하지 않습니다. 오른쪽 `cokacdir`와 terminal 패널은 한 번에 하나만 보이며, 숨겨져 있는 동안에도 자식 앱은 계속 실행됩니다. 오른쪽 패널 폭을 조절하면 `settings.json`의 `agent_aux_width`에 저장되어 다음 실행에도 유지됩니다.
+
+오른쪽 보조 패널은 부모 코딩 에이전트별로 기억됩니다. 다른 에이전트로 전환하면서 숨겨진 오른쪽 패널은 원래 부모 에이전트로 돌아왔을 때 자동으로 복원될 수 있고, 사용자가 `Ctrl+F` 또는 `Ctrl+T`로 직접 숨긴 패널은 자동으로 튀어나오지 않지만 같은 키로 다시 표시하면 기존 프로세스와 화면 상태를 재사용합니다. 이 복원 정보는 `~/.cokacmux/agent_auxiliary.json`에 저장됩니다.
 
 `cokacdir` 화면에서는 `Ctrl+K`를 cokacmux가 종료 단축키로 잡지 않고 `cokacdir`에 전달합니다. `cokacdir`을 cokacmux 쪽에서 종료하려면 세션 목록 화면으로 돌아간 뒤 실행 중인 항목을 선택하고 `Ctrl+K`를 누르세요.
 
@@ -818,7 +820,7 @@ TUI를 띄우지 않고 쓸 수 있는 명령도 있습니다.
 |---|---|
 | `cokacmux` | TUI 실행 |
 | `cokacmux --check` | TUI 없이 세션 탐색이 되는지 확인 |
-| `cokacmux --debug` | 디버그 로그를 켜고 TUI 실행 |
+| `cokacmux --debug` | 디버그 로그를 명시적으로 켜고 TUI 실행. 기본 로그는 보통 자동으로 켜집니다. |
 | `cokacmux --trace` | 훨씬 많은 로그를 남기며 TUI 실행. 문제 분석용입니다. |
 | `cokacmux killall` | cokacmux 프로세스 종료, `~/.cokacmux/agents`와 `~/.cokacmux/debug` 정리 |
 | `cokacmux agents killall` | `cokacmux killall`과 같은 별칭 |
@@ -857,6 +859,8 @@ killall cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_re
 ```
 
 `killall`은 `reset`과 같은 범위로 cokacmux 데몬과 클라이언트 프로세스를 종료합니다. 파일 삭제 범위만 더 좁습니다. `~/.cokacmux` 아래에서는 `agents/`와 `debug/`만 삭제하고, `settings.json`, `keybinding.json`, `titles.json`, `clone_tree.json`, `agent_auxiliary.json`, `data/`, `searchdata/`, `bin/`은 남깁니다.
+
+정리 대상은 `~/.cokacmux/agents/`의 런타임 메타데이터와 운영체제 프로세스 목록을 함께 보고 찾습니다. 확인된 agent daemon, 연결된 cokacmux 클라이언트, daemon이 남긴 자식 PTY 프로세스, 오래된 cwd lock과 orphan ptylog를 정리합니다. Windows에서는 프로세스 command line을 스캔해 런타임 파일이 사라진 daemon도 찾되, 현재 프로세스이거나 cokacmux agent/client로 확인되지 않는 PID는 건너뜁니다.
 
 별도 터미널에서 직접 실행한 `claude`, `codex`, `opencode`는 cokacmux 프로세스나 그 자식 프로세스가 아니면 종료 대상이 아닙니다.
 
@@ -920,7 +924,7 @@ reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_remo
 | `ai.provider` | AI 제목 생성과 AI 검색에 사용할 agent입니다. 기본값은 `null`이며, 세션 목록의 `,` 설정 화면으로 직접 선택해야 합니다. |
 | `cokacdir_program` | `cokacdir` 실행 파일 경로를 직접 지정하는 곳입니다. |
 
-`agent_programs`와 `cokacdir_program`의 빈 문자열은 placeholder입니다. 비워 두면 기존처럼 PATH에서 기본 명령 이름을 찾습니다. `cokacdir`은 PATH에서 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용하고, 그 파일도 없을 때 자동 다운로드합니다.
+`agent_programs`와 `cokacdir_program`의 빈 문자열은 placeholder입니다. 비워 두면 기존처럼 PATH에서 기본 명령 이름을 찾습니다. `cokacdir`은 PATH에서 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용합니다. 설치 스크립트는 이 파일을 미리 내려받고, 직접 설치하지 않았거나 파일을 지운 경우에만 실행 시 자동 다운로드합니다.
 
 `ai.provider`는 `null`, `"claude"`, `"codex"`, `"opencode"` 중 하나입니다. `null`이면 AI 기능용 agent가 설정되지 않은 상태입니다.
 
@@ -941,7 +945,7 @@ reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_remo
 - `/usr/bin/codex`처럼 경로이면 그 파일을 실행합니다.
 - `codex-beta`처럼 명령 이름이면 PATH에서 다시 찾습니다.
 - Windows에서는 `.exe`, `.cmd`, `.bat`, `.ps1` 경로를 사용할 수 있습니다.
-- `cokacdir_program`이 비어 있고 PATH에서도 `cokacdir`을 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용합니다. 그 파일이 없으면 `~/.cokacmux/bin`에 자동 다운로드한 바이너리를 실행합니다.
+- `cokacdir_program`이 비어 있고 PATH에서도 `cokacdir`을 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용합니다. 설치 스크립트가 보통 이 파일을 준비하며, 파일이 없으면 `~/.cokacmux/bin`에 자동 다운로드한 바이너리를 실행합니다.
 - 이미 실행 중인 백그라운드 실행 대상에는 변경된 경로가 적용되지 않습니다. 새 경로로 실행하려면 기존 실행 대상을 `Ctrl+K` 또는 `cokacmux killall`로 종료한 뒤 다시 시작하세요.
 
 설정 화면에서 저장한 값은 바로 `settings.json`에 쓰입니다. 다만 이미 실행 중인 백그라운드 실행 대상에는 실행 파일 경로 변경이 적용되지 않습니다. 파일을 직접 고친 뒤에는 cokacmux를 재시작하는 편이 가장 명확합니다. 단축키 파일인 `keybinding.json`만 실행 중 백그라운드 감시 스레드가 자동으로 다시 읽습니다.
@@ -1025,10 +1029,10 @@ cokacmux가 직접 만드는 파일은 홈 폴더 안의 `.cokacmux/` 디렉터�
 | `~/.cokacmux/agent_auxiliary.json` | 에이전트별 오른쪽 terminal/`cokacdir` 보조 패널 복원 정보 |
 | `~/.cokacmux/data/` | 복제 세션과 짝지어 저장한 작업 폴더 스냅샷 |
 | `~/.cokacmux/searchdata/` | AI search가 agent에게 넘기는 세션 summary preview 인덱스 |
-| `~/.cokacmux/bin/cokacdir` | PATH에서 `cokacdir`을 찾지 못할 때 자동 다운로드한 실행 파일 |
+| `~/.cokacmux/bin/cokacdir` | 설치 스크립트나 자동 다운로드가 저장한 `cokacdir` 실행 파일 |
 | `~/.cokacmux/agents/` | 실행 중인 백그라운드 실행 대상의 메타데이터와 통신용 소켓 |
 | `~/.cokacmux/agents/scrollback/*.ptylog` | 실행 중인 에이전트/터미널/`cokacdir` PTY 출력 복원용 보조 기록 |
-| `~/.cokacmux/debug/cokacmux.log` | `--debug` 또는 `--trace`로 실행했을 때 기록되는 런타임 로그 |
+| `~/.cokacmux/debug/cokacmux.log` | 기본 런타임 로그. `COKACMUX_DEBUG=0`으로 끌 수 있고, `--trace` 또는 `COKACMUX_TRACE=1`이면 더 자세히 기록됩니다. |
 | `~/.cokacmux/debug/cokacmux-stalls.log` | UI stall 진단 로그. debug가 꺼져 있어도 제한적으로 기록될 수 있습니다. |
 
 Windows에서 `~`는 보통 `C:\Users\사용자이름\`입니다. 따라서 `~/.cokacmux/`는 보통 `C:\Users\사용자이름\.cokacmux\`입니다.
@@ -1184,9 +1188,9 @@ cokacmux --debug
 
 ### 디버그 로그
 
-`--debug`를 붙여 실행하면 `~/.cokacmux/debug/cokacmux.log`에 로그가 기록됩니다. TUI, 세션 목록, 검색, 미리보기, 에이전트 시작/연결, 백그라운드 데몬, provider 처리, 변환/복제 흐름이 이 파일에 모입니다.
+기본 런타임 로그는 보통 자동으로 켜져 `~/.cokacmux/debug/cokacmux.log`에 기록됩니다. TUI, 세션 목록, 검색, 미리보기, 에이전트 시작/연결, 백그라운드 데몬, provider 처리, 변환/복제 흐름이 이 파일에 모입니다. `--debug` 또는 `COKACMUX_DEBUG=1`은 로그를 명시적으로 켜는 방법이고, 로그를 끄고 싶으면 `COKACMUX_DEBUG=0`으로 실행하세요.
 
-더 자세한 원인 분석이 필요하면 `--trace`를 사용할 수 있습니다.
+더 자세한 원인 분석이 필요하면 `--trace` 또는 `COKACMUX_TRACE=1`을 사용할 수 있습니다.
 
 ```bash
 cokacmux --trace
@@ -1246,7 +1250,7 @@ Windows:
 - C 컴파일러: OpenCode 지원을 위해 SQLite를 함께 빌드합니다.
 - macOS: Xcode Command Line Tools
 - Linux: `build-essential` 또는 `gcc`
-- Windows: MSVC 빌드 도구
+- Windows: MSVC 빌드 도구 또는 `build.py`가 준비하는 Windows gnullvm/zig 빌드 도구
 - 여러 OS용으로 한 번에 빌드하려면 Python 3. `build.py --setup`이 `zig` 등 cross build 도구를 로컬로 준비합니다.
 
 빌드:
@@ -1276,9 +1280,9 @@ python build.py --windows       # Windows targets only
 python build.py --status
 ```
 
-`--setup`은 Rust, zig, cargo-zigbuild, macOS SDK를 준비합니다. Windows cross build 도구는 필요할 때 자동 설정을 시도하지만, 미리 준비하려면 `python build.py --setup-windows`를 실행하세요.
+`--setup`은 Rust, zig, cargo-zigbuild, macOS SDK를 준비합니다. Windows cross build 도구는 필요할 때 자동 설정을 시도하지만, 미리 준비하려면 `python build.py --setup-windows`를 실행하세요. Windows에서 Visual Studio/MSVC linker가 없는 경우 `windows-x86_64`와 `windows-arm64` 별칭은 gnullvm toolchain 쪽으로 자동 해석됩니다. 명시적으로 고르고 싶으면 `windows-x86_64-msvc`, `windows-arm64-msvc`, `windows-x86_64-gnullvm`, `windows-arm64-gnullvm` target을 사용하세요.
 
-산출물은 `dist_beta/cokacmux-<OS>-<CPU>[.exe]` 형태로 만들어집니다.
+산출물은 보통 `dist_beta/cokacmux-<OS>-<CPU>[.exe]` 형태로 만들어집니다. Windows gnullvm target은 `dist_beta/cokacmux-windows-<CPU>-gnullvm.exe`처럼 toolchain suffix가 붙습니다.
 
 ---
 
