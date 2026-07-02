@@ -890,6 +890,7 @@ reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_remo
     "sessions_pane_percent": 45,
     "sessions_pane_width": null,
     "agent_sidebar_width": 30,
+    "agent_aux_width": null,
     "agent_sidebar_visible": true,
     "session_view": "tree",
     "agent_programs": {
@@ -912,6 +913,7 @@ reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_remo
 | `sessions_pane_percent` | 세션 목록 패널의 기본 너비 비율입니다. 기본값은 45입니다. |
 | `sessions_pane_width` | 세션 목록 패널의 고정 너비입니다. `null`이면 percent 값을 씁니다. 패널 크기를 조절하면 숫자로 저장됩니다. |
 | `agent_sidebar_width` | 에이전트 화면의 사이드바 너비입니다. |
+| `agent_aux_width` | 에이전트 화면 오른쪽 `cokacdir`/terminal 패널의 너비입니다. `null`이면 터미널 폭 기준 기본값을 씁니다. 패널 크기를 조절하면 숫자로 저장됩니다. |
 | `agent_sidebar_visible` | 에이전트 사이드바를 처음에 보일지 정합니다. |
 | `session_view` | `"tree"` 또는 `"list"`입니다. `v` 키로도 바뀝니다. |
 | `agent_programs` | 현재 지원 provider의 실행 파일 경로를 직접 지정하는 곳입니다. |

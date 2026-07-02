@@ -503,6 +503,8 @@ struct CokacmuxSettings {
     sessions_pane_width: Option<u16>,
     #[serde(default = "default_agent_sidebar_width")]
     agent_sidebar_width: u16,
+    #[serde(default)]
+    agent_aux_width: Option<u16>,
     /// Whether the left "agents N" sidebar is currently visible in the
     /// agents view. Toggled by Ctrl+B. The configured width is preserved
     /// regardless; hiding/showing just collapses the column to 0.
@@ -528,6 +530,7 @@ impl Default for CokacmuxSettings {
             sessions_pane_percent: DEFAULT_SESSIONS_PANE_PERCENT,
             sessions_pane_width: None,
             agent_sidebar_width: DEFAULT_AGENT_SIDEBAR_WIDTH,
+            agent_aux_width: None,
             agent_sidebar_visible: default_agent_sidebar_visible(),
             session_view: default_session_view(),
             agent_programs: AgentProgramSettings::default(),
@@ -8420,6 +8423,7 @@ impl App {
         let (keybindings, keybindings_mtime) =
             KeyBindings::load_with_mtime(keybindings_path.as_deref());
         let session_view = settings.cokacmux.session_view;
+        let configured_agent_aux_width = settings.cokacmux.agent_aux_width;
         let persisted_agent_aux = load_persisted_agent_auxiliaries();
         let startup_runtime_sweep = cleanup_stale_agent_runtime_files("app_start_runtime_sweep");
         let mut app = Self {
@@ -8470,7 +8474,7 @@ impl App {
             agent_aux_parent_infos: HashMap::new(),
             persisted_agent_aux,
             persist_agent_auxiliary_registry: true,
-            agent_aux_width: None,
+            agent_aux_width: configured_agent_aux_width,
             should_quit: false,
             main_tx: None,
             runtime_tx: None,
@@ -10889,18 +10893,37 @@ impl App {
             return;
         }
         self.agent_aux_width = Some(next);
+        self.settings.cokacmux.agent_aux_width = Some(next);
         let main = content_width.saturating_sub(next);
-        self.status = format!("layout changed: agent {} cols, right {} cols", main, next);
-        debug_log(
-            "agent_auxiliary_resize_changed",
-            serde_json::json!({
-                "next": next,
-                "main": main,
-                "content_width": content_width,
-                "total_width": total_width,
-                "delta": delta,
-            }),
-        );
+        match self.settings.save() {
+            Ok(()) => {
+                self.status = format!("layout saved: agent {} cols, right {} cols", main, next);
+                debug_log(
+                    "agent_auxiliary_resize_saved",
+                    serde_json::json!({
+                        "next": next,
+                        "main": main,
+                        "content_width": content_width,
+                        "total_width": total_width,
+                        "delta": delta,
+                    }),
+                );
+            }
+            Err(e) => {
+                self.status = format!("layout changed, save failed: {}", e);
+                debug_log(
+                    "agent_auxiliary_resize_save_failed",
+                    serde_json::json!({
+                        "next": next,
+                        "main": main,
+                        "content_width": content_width,
+                        "total_width": total_width,
+                        "delta": delta,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
     }
 
     fn refresh(&mut self) {
@@ -43615,6 +43638,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 "sessions_pane_percent": 99,
                 "sessions_pane_width": 88,
                 "agent_sidebar_width": 999,
+                "agent_aux_width": 77,
                 "session_view": "list",
                 "agent_programs": {
                   "codex": "/opt/codex/bin/codex",
@@ -43636,6 +43660,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert_eq!(settings.cokacmux.sessions_pane_percent, 99);
         assert_eq!(settings.cokacmux.sessions_pane_width, Some(88));
         assert_eq!(settings.cokacmux.agent_sidebar_width, 999);
+        assert_eq!(settings.cokacmux.agent_aux_width, Some(77));
         assert_eq!(settings.cokacmux.session_view, SessionViewMode::List);
         assert_eq!(
             settings
@@ -43701,6 +43726,9 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
 
         assert!(serialized
             .pointer("/cokacmux/sessions_pane_width")
+            .is_some_and(serde_json::Value::is_null));
+        assert!(serialized
+            .pointer("/cokacmux/agent_aux_width")
             .is_some_and(serde_json::Value::is_null));
         assert_eq!(
             serialized
@@ -47548,6 +47576,7 @@ IF EXIST "%~dp0\node.exe" (
             31,
         );
         assert_eq!(app.agent_aux_width, Some(46));
+        assert_eq!(app.settings.cokacmux.agent_aux_width, Some(46));
 
         handle_agent_key(
             &mut app,
@@ -47556,6 +47585,7 @@ IF EXIST "%~dp0\node.exe" (
             31,
         );
         assert_eq!(app.agent_aux_width, Some(44));
+        assert_eq!(app.settings.cokacmux.agent_aux_width, Some(44));
     }
 
     #[cfg(unix)]
@@ -47608,6 +47638,7 @@ IF EXIST "%~dp0\node.exe" (
             31,
         );
         assert_eq!(right_only.agent_aux_width, Some(46));
+        assert_eq!(right_only.settings.cokacmux.agent_aux_width, Some(46));
 
         let mut left_only = app_for_key_tests();
         left_only.settings.cokacmux.agent_sidebar_visible = true;
