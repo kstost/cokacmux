@@ -197,6 +197,8 @@ const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS: u64 = 2_000;
 const AGENT_DETACH_WRITE_TIMEOUT_MS: u64 = 300;
 const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
 const UI_ANIMATION_TICK_MS: u64 = STARTUP_SPINNER_TICK_MS as u64;
+const AGENT_EXIT_REQUEST_OVERLAY_TIMEOUT_MS: u64 = 15_000;
+const AGENT_EXIT_INPUT_LINE_LIMIT: usize = 256;
 const LIVE_SHELL_DISCOVERY_INTERVAL_MS: u64 = 10_000;
 /// How many consecutive discovery scans may miss a switchable shell before
 /// it stops being preserved. Preservation bridges transient scan races, but
@@ -3763,6 +3765,7 @@ fn agent_client_debug_value(agent: &AgentClient) -> serde_json::Value {
         "pending_input_since_epoch_ms": agent.pending_input_since_epoch_ms,
         "pending_input_key": agent.pending_input_key.as_deref(),
         "pending_input_count": agent.pending_input_count,
+        "exit_request": agent.exit_request.as_ref().map(agent_exit_request_debug_value),
         "last_screen_change_epoch_ms": agent.last_screen_change_epoch_ms,
         "last_output_epoch_ms": agent.last_output_epoch_ms,
         "last_input_epoch_ms": agent.last_input_epoch_ms,
@@ -3773,6 +3776,14 @@ fn agent_client_debug_value(agent: &AgentClient) -> serde_json::Value {
         "pending_snapshot_output": agent.pending_snapshot_output,
         "bracketed_paste_mode": agent.bracketed_paste_mode,
         "codex_transcript_overlay_assumed_open": agent.codex_transcript_overlay_assumed_open,
+    })
+}
+
+fn agent_exit_request_debug_value(request: &AgentExitRequest) -> serde_json::Value {
+    serde_json::json!({
+        "kind": request.kind.label(),
+        "phase": request.phase.label(),
+        "elapsed_ms": request.started_at.elapsed().as_millis(),
     })
 }
 
@@ -3787,6 +3798,7 @@ fn agent_client_io_debug_value(agent: &AgentClient) -> serde_json::Value {
         "pending_input_since_epoch_ms": agent.pending_input_since_epoch_ms,
         "pending_input_key": agent.pending_input_key.as_deref(),
         "pending_input_count": agent.pending_input_count,
+        "exit_request": agent.exit_request.as_ref().map(agent_exit_request_debug_value),
         "last_screen_change_epoch_ms": agent.last_screen_change_epoch_ms,
         "last_output_epoch_ms": agent.last_output_epoch_ms,
         "last_input_epoch_ms": agent.last_input_epoch_ms,
@@ -3867,6 +3879,54 @@ fn attach_in_flight_debug_value(attach: &AttachInFlight) -> serde_json::Value {
         "key": agent_key_debug_value(&attach.key),
         "target": attach_target_debug_value(&attach.target),
         "elapsed_ms": attach.started_at.elapsed().as_millis(),
+    })
+}
+
+fn agent_kill_target_debug_value(target: &AgentKillTarget) -> serde_json::Value {
+    match target {
+        AgentKillTarget::MainAgent => serde_json::json!({
+            "kind": "main_agent",
+        }),
+        AgentKillTarget::Auxiliary { kind, parent } => serde_json::json!({
+            "kind": "auxiliary",
+            "auxiliary_kind": kind.label(),
+            "parent": agent_key_debug_value(parent),
+        }),
+        AgentKillTarget::SelectedSession => serde_json::json!({
+            "kind": "selected_session",
+        }),
+    }
+}
+
+fn agent_kill_pending_debug_value(pending: &AgentKillPending) -> serde_json::Value {
+    serde_json::json!({
+        "seq": pending.seq,
+        "key": agent_key_debug_value(&pending.key),
+        "target": agent_kill_target_debug_value(&pending.target),
+        "label": &pending.label,
+        "elapsed_ms": pending.started_at.elapsed().as_millis(),
+    })
+}
+
+fn agent_kill_worker_result_debug_value(result: &AgentKillWorkerResult) -> serde_json::Value {
+    serde_json::json!({
+        "seq": result.seq,
+        "key": agent_key_debug_value(&result.key),
+        "info": session_info_debug_value(&result.info),
+        "target": agent_kill_target_debug_value(&result.target),
+        "label": &result.label,
+        "next_info": result.next_info.as_ref().map(session_info_debug_value),
+        "cols": result.cols,
+        "rows": result.rows,
+        "outcome_ok": result.outcome.is_ok(),
+        "outcome": result.outcome.as_ref().ok().map(|outcome| serde_json::json!({
+            "daemon_pid": outcome.pid,
+            "child_pid": outcome.child_pid,
+            "pty_log_deleted": outcome.pty_log_deleted,
+        })),
+        "error": result.outcome.as_ref().err(),
+        "queued_at_epoch_ms": result.queued_at_epoch_ms,
+        "elapsed_ms": result.elapsed_ms,
     })
 }
 
@@ -4163,6 +4223,13 @@ fn app_runtime_snapshot_debug_value(app: &App, verbose: bool) -> serde_json::Val
         app.queued_attach
             .as_ref()
             .map(attach_job_debug_value)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    snapshot.insert(
+        "agent_kill_pending".into(),
+        app.agent_kill_pending
+            .as_ref()
+            .map(agent_kill_pending_debug_value)
             .unwrap_or(serde_json::Value::Null),
     );
     snapshot.insert(
@@ -4495,6 +4562,10 @@ fn main_event_debug_value(event: &MainEvent) -> serde_json::Value {
         MainEvent::AttachResult(result) => serde_json::json!({
             "kind": "attach_result",
             "result": attach_worker_result_debug_value(result),
+        }),
+        MainEvent::AgentKillResult(result) => serde_json::json!({
+            "kind": "agent_kill_result",
+            "result": agent_kill_worker_result_debug_value(result),
         }),
         MainEvent::NewSessionPrepareResult(result) => {
             let mut value = new_session_prepare_result_debug_value(result);
@@ -6379,6 +6450,65 @@ struct AgentOutputBuffer {
     wake_pending: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentExitRequestKind {
+    TerminalExit,
+    CokacdirQuit,
+    ForcedKill,
+}
+
+impl AgentExitRequestKind {
+    fn label(self) -> &'static str {
+        match self {
+            AgentExitRequestKind::TerminalExit => "terminal exit",
+            AgentExitRequestKind::CokacdirQuit => "cokacdir quit",
+            AgentExitRequestKind::ForcedKill => "force kill",
+        }
+    }
+
+    fn waiting_label(self) -> &'static str {
+        match self {
+            AgentExitRequestKind::TerminalExit => "Waiting for terminal to exit",
+            AgentExitRequestKind::CokacdirQuit => "Waiting for cokacdir to quit",
+            AgentExitRequestKind::ForcedKill => "Terminating session",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentExitRequestPhase {
+    Requested,
+    Detected,
+}
+
+impl AgentExitRequestPhase {
+    fn label(self) -> &'static str {
+        match self {
+            AgentExitRequestPhase::Requested => "Exit requested",
+            AgentExitRequestPhase::Detected => "Finalizing exit",
+        }
+    }
+
+    fn label_for(self, kind: AgentExitRequestKind) -> &'static str {
+        match (self, kind) {
+            (AgentExitRequestPhase::Requested, AgentExitRequestKind::ForcedKill) => {
+                "Kill requested"
+            }
+            (AgentExitRequestPhase::Detected, AgentExitRequestKind::ForcedKill) => {
+                "Finalizing kill"
+            }
+            _ => self.label(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AgentExitRequest {
+    kind: AgentExitRequestKind,
+    phase: AgentExitRequestPhase,
+    started_at: Instant,
+}
+
 struct AgentClient {
     info: SessionInfo,
     command_line: String,
@@ -6397,6 +6527,8 @@ struct AgentClient {
     pending_input_since_epoch_ms: Option<u64>,
     pending_input_key: Option<String>,
     pending_input_count: u64,
+    exit_input_line: String,
+    exit_request: Option<AgentExitRequest>,
     pending_snapshot_output: bool,
     snapshot_parse_in_progress: bool,
     startup_spinner_started_at: Option<Instant>,
@@ -6776,6 +6908,8 @@ impl AgentClient {
             pending_input_since_epoch_ms: None,
             pending_input_key: None,
             pending_input_count: 0,
+            exit_input_line: String::new(),
+            exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -6919,6 +7053,7 @@ impl AgentClient {
                         "status": &status,
                     }),
                 );
+                self.mark_exit_detected();
                 self.exited = Some(status);
             }
             AgentDaemonEvent::Error { message } => {
@@ -6930,6 +7065,7 @@ impl AgentClient {
                         "message": &message,
                     }),
                 );
+                self.mark_exit_detected();
                 self.exited = Some(message);
             }
         }
@@ -7366,6 +7502,8 @@ impl AgentClient {
             if send_result.is_err() {
                 self.pending_input_since_epoch_ms = None;
                 self.pending_input_key = None;
+            } else {
+                self.track_exit_request_after_key_sent(key);
             }
             if DEBUG_ENABLED.load(Ordering::Relaxed) {
                 debug_log(
@@ -7390,6 +7528,110 @@ impl AgentClient {
                     "agent": agent_client_io_debug_value(self),
                 }),
             );
+        }
+    }
+
+    fn mark_exit_detected(&mut self) {
+        if let Some(request) = self.exit_request.as_mut() {
+            request.phase = AgentExitRequestPhase::Detected;
+        } else if is_plain_pty_tool_session_info(&self.info) {
+            let kind = if is_cokacdir_session_info(&self.info) {
+                AgentExitRequestKind::CokacdirQuit
+            } else {
+                AgentExitRequestKind::TerminalExit
+            };
+            self.exit_request = Some(AgentExitRequest {
+                kind,
+                phase: AgentExitRequestPhase::Detected,
+                started_at: Instant::now(),
+            });
+        }
+    }
+
+    fn set_exit_request(&mut self, kind: AgentExitRequestKind) {
+        self.exit_request = Some(AgentExitRequest {
+            kind,
+            phase: AgentExitRequestPhase::Requested,
+            started_at: Instant::now(),
+        });
+        debug_log(
+            "agent_exit_request_detected",
+            serde_json::json!({
+                "provider": self.info.provider.as_str(),
+                "session_id": &self.info.session_id,
+                "kind": kind.label(),
+            }),
+        );
+    }
+
+    fn track_exit_request_after_key_sent(&mut self, key: KeyEvent) {
+        if is_cokacdir_session_info(&self.info) {
+            if key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('q')) {
+                self.set_exit_request(AgentExitRequestKind::CokacdirQuit);
+            }
+            return;
+        }
+
+        if !is_shell_session_info(&self.info) {
+            return;
+        }
+
+        match key.code {
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.exit_input_line.push(ch);
+                if self.exit_input_line.len() > AGENT_EXIT_INPUT_LINE_LIMIT {
+                    self.exit_input_line.clear();
+                }
+            }
+            KeyCode::Backspace => {
+                self.exit_input_line.pop();
+            }
+            KeyCode::Enter => {
+                let exit_command = shell_line_is_exit_command(&self.exit_input_line);
+                self.exit_input_line.clear();
+                if exit_command {
+                    self.set_exit_request(AgentExitRequestKind::TerminalExit);
+                }
+            }
+            KeyCode::Esc => {
+                self.exit_input_line.clear();
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.exit_input_line.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn track_exit_request_after_paste_sent(&mut self, text: &str) {
+        if !is_shell_session_info(&self.info) {
+            return;
+        }
+
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for segment in normalized.split_inclusive('\n') {
+            let has_newline = segment.ends_with('\n');
+            let line_part = if has_newline {
+                &segment[..segment.len().saturating_sub(1)]
+            } else {
+                segment
+            };
+
+            self.exit_input_line.push_str(line_part);
+            if self.exit_input_line.len() > AGENT_EXIT_INPUT_LINE_LIMIT {
+                self.exit_input_line.clear();
+            }
+
+            if has_newline {
+                let exit_command = shell_line_is_exit_command(&self.exit_input_line);
+                self.exit_input_line.clear();
+                if exit_command {
+                    self.set_exit_request(AgentExitRequestKind::TerminalExit);
+                }
+            }
         }
     }
 
@@ -7454,6 +7696,8 @@ impl AgentClient {
         if send_result.is_err() {
             self.pending_input_since_epoch_ms = None;
             self.pending_input_key = None;
+        } else {
+            self.track_exit_request_after_paste_sent(text);
         }
         if DEBUG_ENABLED.load(Ordering::Relaxed) {
             debug_log(
@@ -8016,6 +8260,8 @@ enum MainEvent {
     /// An attach job (pre-checks + daemon connect/spawn) finished off the
     /// UI thread.
     AttachResult(Box<AttachWorkerResult>),
+    /// A Ctrl+K kill request finished off the UI thread.
+    AgentKillResult(Box<AgentKillWorkerResult>),
     /// New-session cwd normalization/creation completed off the UI thread.
     NewSessionPrepareResult(Box<NewSessionPrepareResult>),
     /// The keybindings watcher thread saw the file change.
@@ -8129,6 +8375,39 @@ struct AttachInFlight {
     key: AgentKey,
     target: AttachTarget,
     started_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AgentKillTarget {
+    MainAgent,
+    Auxiliary {
+        kind: AgentAuxKind,
+        parent: AgentKey,
+    },
+    SelectedSession,
+}
+
+#[derive(Clone, Debug)]
+struct AgentKillPending {
+    seq: u64,
+    key: AgentKey,
+    target: AgentKillTarget,
+    label: String,
+    started_at: Instant,
+}
+
+struct AgentKillWorkerResult {
+    seq: u64,
+    key: AgentKey,
+    info: SessionInfo,
+    target: AgentKillTarget,
+    label: String,
+    next_info: Option<SessionInfo>,
+    cols: u16,
+    rows: u16,
+    outcome: std::result::Result<AgentTermination, String>,
+    queued_at_epoch_ms: u64,
+    elapsed_ms: u128,
 }
 
 /// Run one attach job to completion. Everything here may block on the
@@ -8518,6 +8797,8 @@ struct App {
     attach_in_flight: Option<AttachInFlight>,
     /// Newest attach request received while one was in flight (latest wins).
     queued_attach: Option<AttachJob>,
+    agent_kill_seq: u64,
+    agent_kill_pending: Option<AgentKillPending>,
     new_session_launch_seq: u64,
     new_session_launch: Option<NewSessionLaunchPending>,
     /// First-seen order of agents-sidebar entries. Keeps the sidebar from
@@ -8664,6 +8945,8 @@ impl App {
             attach_seq: 0,
             attach_in_flight: None,
             queued_attach: None,
+            agent_kill_seq: 0,
+            agent_kill_pending: None,
             new_session_launch_seq: 0,
             new_session_launch: None,
             agent_sidebar_order: Vec::new(),
@@ -12143,9 +12426,21 @@ impl App {
         ))
     }
 
+    fn agent_exit_pending_status(&self) -> Option<String> {
+        let (target, request, _) = agent_exit_overlay_context(self)?;
+        Some(format!(
+            "{} {}: {} ({}s)",
+            startup_spinner_frame(request.started_at.elapsed()),
+            request.phase.label_for(request.kind),
+            target,
+            request.started_at.elapsed().as_secs()
+        ))
+    }
+
     fn display_status(&self) -> String {
         self.data_task_status()
             .or_else(|| self.new_session_launch_status())
+            .or_else(|| self.agent_exit_pending_status())
             .or_else(|| self.session_refresh_status())
             .or_else(|| self.ai_search_status())
             .or_else(|| self.ai_title_status())
@@ -14967,8 +15262,16 @@ impl App {
     /// method no longer pulls from the socket; it only reacts to flags
     /// the channel-driven `process_agent_event` already set.
     fn poll_agent_sessions(&mut self) {
+        let pending_kill_key = self
+            .agent_kill_pending
+            .as_ref()
+            .map(|pending| pending.key.clone());
         if let Some(agent) = self.active_agent.as_mut() {
             if let Some(exit_status) = agent.exited.clone() {
+                let active_key = AgentKey::new(&agent.info);
+                if pending_kill_key.as_ref() == Some(&active_key) {
+                    return;
+                }
                 let provider = agent.info.provider;
                 let session_id = agent.info.session_id.clone();
                 let reader_id = agent.reader_id;
@@ -15038,6 +15341,10 @@ impl App {
 
         if let Some(aux) = self.agent_aux.as_mut() {
             if let Some(exit_status) = aux.agent.exited.clone() {
+                let key = AgentKey::new(&aux.agent.info);
+                if pending_kill_key.as_ref() == Some(&key) {
+                    return;
+                }
                 let label = live_agent_status_label(&aux.agent.info);
                 let reader_id = aux.agent.reader_id;
                 if aux
@@ -15047,7 +15354,6 @@ impl App {
                     self.schedule_agent_output_available(reader_id);
                     return;
                 }
-                let key = AgentKey::new(&aux.agent.info);
                 self.agent_aux = None;
                 if self.agent_focus == AgentFocusPane::Auxiliary {
                     self.set_agent_focus(AgentFocusPane::Main);
@@ -15271,6 +15577,7 @@ impl App {
             let mut should_schedule_output = false;
             if agent.exited.is_none() {
                 agent.exited = Some(format!("daemon connection ended: {}", reason));
+                agent.mark_exit_detected();
                 if agent.has_pending_output() {
                     should_schedule_output = true;
                 }
@@ -15312,6 +15619,7 @@ impl App {
             let mut should_schedule_output = false;
             if agent.exited.is_none() {
                 agent.exited = Some(format!("daemon request writer ended: {}", reason));
+                agent.mark_exit_detected();
                 if agent.has_pending_output() {
                     should_schedule_output = true;
                 }
@@ -16524,6 +16832,40 @@ impl App {
     }
 
     fn kill_active_agent(&mut self) {
+        if self.main_tx.is_none() {
+            self.kill_active_agent_sync();
+            return;
+        }
+        if self.agent_kill_pending.is_some() {
+            self.status = "kill already in progress...".into();
+            return;
+        }
+        let Some(active_agent) = self.active_agent.as_ref() else {
+            return;
+        };
+        let key = AgentKey::new(&active_agent.info);
+        let active_info = active_agent.info.clone();
+        let killed_label = live_agent_status_label(&active_agent.info);
+        let cols = active_agent.pty_size.cols;
+        let rows = active_agent.pty_size.rows;
+        let next_info = self.next_agent_after_current();
+
+        if let Some(agent) = self.active_agent.as_mut() {
+            agent.set_exit_request(AgentExitRequestKind::ForcedKill);
+        }
+        self.cancel_pending_attach("kill_active_agent");
+        self.start_agent_kill_worker(
+            key,
+            active_info,
+            AgentKillTarget::MainAgent,
+            killed_label,
+            next_info,
+            cols,
+            rows,
+        );
+    }
+
+    fn kill_active_agent_sync(&mut self) {
         let Some(active_agent) = self.active_agent.as_ref() else {
             return;
         };
@@ -16614,6 +16956,393 @@ impl App {
                         "provider": provider.as_str(),
                         "session_id": &session_id,
                         "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn kill_auxiliary_agent(&mut self, reason: &'static str) {
+        if self.main_tx.is_none() {
+            let _ = self.close_auxiliary_agent(reason, true);
+            return;
+        }
+        if self.agent_kill_pending.is_some() {
+            self.status = "kill already in progress...".into();
+            return;
+        }
+        let Some(aux) = self.agent_aux.as_mut() else {
+            return;
+        };
+        let key = AgentKey::new(&aux.agent.info);
+        let info = aux.agent.info.clone();
+        let target = AgentKillTarget::Auxiliary {
+            kind: aux.kind,
+            parent: aux.parent.clone(),
+        };
+        let label = format!("right {}", live_agent_status_label(&aux.agent.info));
+        aux.agent.set_exit_request(AgentExitRequestKind::ForcedKill);
+        self.start_agent_kill_worker(key, info, target, label, None, 0, 0);
+    }
+
+    fn start_agent_kill_worker(
+        &mut self,
+        key: AgentKey,
+        info: SessionInfo,
+        target: AgentKillTarget,
+        label: String,
+        next_info: Option<SessionInfo>,
+        cols: u16,
+        rows: u16,
+    ) {
+        let Some(result_tx) = self.main_tx.clone() else {
+            self.status = format!("cannot kill {}; event loop is not ready", label);
+            return;
+        };
+        self.agent_kill_seq = self.agent_kill_seq.saturating_add(1);
+        let seq = self.agent_kill_seq;
+        self.agent_kill_pending = Some(AgentKillPending {
+            seq,
+            key: key.clone(),
+            target: target.clone(),
+            label: label.clone(),
+            started_at: Instant::now(),
+        });
+        self.status = format!("killing {}...", label);
+        debug_log(
+            "agent_kill_worker_starting",
+            serde_json::json!({
+                "seq": seq,
+                "key": agent_key_debug_value(&key),
+                "info": session_info_debug_value(&info),
+                "target": agent_kill_target_debug_value(&target),
+                "label": &label,
+                "next_info": next_info.as_ref().map(session_info_debug_value),
+                "snapshot": app_runtime_snapshot_debug_value(self, false),
+            }),
+        );
+        let worker_key = key.clone();
+        let worker_info = info.clone();
+        let worker_target = target.clone();
+        let worker_label = label.clone();
+        let worker_next_info = next_info.clone();
+        let spawn_result = thread::Builder::new()
+            .name("cokacmux-agent-kill".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    terminate_agent_daemon_for_info(&worker_key, &worker_info)
+                        .map_err(|error| error.to_string())
+                }))
+                .unwrap_or_else(|_| Err("agent kill worker panicked".to_string()));
+                let _ = result_tx.send(MainEvent::AgentKillResult(Box::new(
+                    AgentKillWorkerResult {
+                        seq,
+                        key: worker_key,
+                        info: worker_info,
+                        target: worker_target,
+                        label: worker_label,
+                        next_info: worker_next_info,
+                        cols,
+                        rows,
+                        outcome,
+                        queued_at_epoch_ms: current_epoch_ms(),
+                        elapsed_ms: started.elapsed().as_millis(),
+                    },
+                )));
+            });
+        if let Err(e) = spawn_result {
+            self.agent_kill_pending = None;
+            self.status = format!("kill {} failed: {}", label, e);
+            debug_log(
+                "agent_kill_worker_spawn_failed",
+                serde_json::json!({
+                    "seq": seq,
+                    "key": agent_key_debug_value(&key),
+                    "target": agent_kill_target_debug_value(&target),
+                    "error": e.to_string(),
+                    "snapshot": app_runtime_snapshot_debug_value(self, false),
+                }),
+            );
+        }
+    }
+
+    fn on_agent_kill_result(&mut self, result: Box<AgentKillWorkerResult>) {
+        let result = *result;
+        let pending_seq = self.agent_kill_pending.as_ref().map(|pending| pending.seq);
+        debug_log(
+            "agent_kill_result_received",
+            serde_json::json!({
+                "pending_seq": pending_seq,
+                "result": agent_kill_worker_result_debug_value(&result),
+                "queued_latency_ms": current_epoch_ms().saturating_sub(result.queued_at_epoch_ms),
+                "snapshot": app_runtime_snapshot_debug_value(self, false),
+            }),
+        );
+        if pending_seq != Some(result.seq) {
+            debug_log(
+                "agent_kill_result_stale",
+                serde_json::json!({
+                    "pending_seq": pending_seq,
+                    "result": agent_kill_worker_result_debug_value(&result),
+                    "snapshot": app_runtime_snapshot_debug_value(self, false),
+                }),
+            );
+            return;
+        }
+        self.agent_kill_pending = None;
+        match result.target.clone() {
+            AgentKillTarget::MainAgent => self.finish_active_agent_kill(result),
+            AgentKillTarget::Auxiliary { kind, parent } => {
+                self.finish_auxiliary_agent_kill(result, kind, parent)
+            }
+            AgentKillTarget::SelectedSession => self.finish_selected_agent_kill(result),
+        }
+    }
+
+    fn finish_active_agent_kill(&mut self, result: AgentKillWorkerResult) {
+        let AgentKillWorkerResult {
+            key,
+            info,
+            label,
+            next_info,
+            cols,
+            rows,
+            outcome,
+            ..
+        } = result;
+        let provider = info.provider;
+        let session_id = info.session_id.clone();
+        if let Some(agent) = self.active_agent.as_mut().filter(|agent| {
+            let active_key = AgentKey::new(&agent.info);
+            active_key == key
+        }) {
+            agent.exited = Some("terminated by Ctrl+K".into());
+            agent.mark_exit_detected();
+        }
+        if self
+            .active_agent
+            .as_ref()
+            .is_some_and(|agent| AgentKey::new(&agent.info) == key)
+        {
+            let agent = self.active_agent.take();
+            drop(agent);
+        }
+        let terminated_auxiliaries =
+            self.terminate_auxiliaries_for_parent(&key, "main_agent_killed");
+        self.agent_states.remove(&key);
+        self.live_shells.retain(|info| AgentKey::new(info) != key);
+        self.agent_focus_by_agent.remove(&key);
+        self.agent_focus = AgentFocusPane::Main;
+        self.discard_pending_agent_runtime_refresh();
+        self.refresh_agent_runtime_states();
+
+        match outcome {
+            Ok(outcome) => {
+                let history_suffix = agent_history_deleted_suffix(outcome.pty_log_deleted);
+                debug_log(
+                    "kill_agent",
+                    serde_json::json!({
+                        "provider": provider.as_str(),
+                        "session_id": &session_id,
+                        "daemon_pid": outcome.pid,
+                        "child_pid": outcome.child_pid,
+                        "pty_log_deleted": outcome.pty_log_deleted,
+                        "terminated_auxiliaries": terminated_auxiliaries,
+                        "has_next": next_info.is_some(),
+                    }),
+                );
+                match outcome.pid {
+                    Some(pid) => {
+                        if let Some(next_info) = next_info {
+                            self.attach_after_agent_kill(
+                                next_info,
+                                cols,
+                                rows,
+                                provider,
+                                &session_id,
+                                &label,
+                                pid,
+                            );
+                            if outcome.pty_log_deleted {
+                                self.status.push_str("; history deleted");
+                            }
+                        } else {
+                            self.status =
+                                format!("killed {} (pid {}){}", label, pid, history_suffix);
+                        }
+                    }
+                    None => {
+                        if let Some(next_info) = next_info {
+                            self.attach_after_agent_kill(
+                                next_info,
+                                cols,
+                                rows,
+                                provider,
+                                &session_id,
+                                &label,
+                                0,
+                            );
+                            if outcome.pty_log_deleted {
+                                self.status.push_str("; history deleted");
+                            }
+                        } else {
+                            self.status = format!("cleared {} runtime{}", label, history_suffix);
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                self.status = format!("kill {} failed: {}", label, error);
+                debug_log(
+                    "kill_agent_failed",
+                    serde_json::json!({
+                        "provider": provider.as_str(),
+                        "session_id": &session_id,
+                        "error": error,
+                    }),
+                );
+            }
+        }
+    }
+
+    fn finish_auxiliary_agent_kill(
+        &mut self,
+        result: AgentKillWorkerResult,
+        kind: AgentAuxKind,
+        parent: AgentKey,
+    ) {
+        let AgentKillWorkerResult {
+            key,
+            label,
+            outcome,
+            ..
+        } = result;
+        if let Some(aux) = self.agent_aux.as_mut().filter(|aux| {
+            let aux_key = AgentKey::new(&aux.agent.info);
+            aux_key == key
+        }) {
+            aux.agent.exited = Some("terminated by Ctrl+K".into());
+            aux.agent.mark_exit_detected();
+        }
+        if self
+            .agent_aux
+            .as_ref()
+            .is_some_and(|aux| AgentKey::new(&aux.agent.info) == key)
+        {
+            let aux = self.agent_aux.take();
+            drop(aux);
+        }
+        if self.agent_focus == AgentFocusPane::Auxiliary {
+            self.set_agent_focus(AgentFocusPane::Main);
+        }
+        self.remove_persisted_agent_auxiliary(&key, "kill_shortcut");
+        self.live_shells.retain(|info| AgentKey::new(info) != key);
+        self.agent_states.remove(&key);
+        self.live_shell_missing_strikes.remove(&key);
+        self.new_agent_backing_aliases.remove(&key);
+        self.new_agent_backing_probe_after.remove(&key);
+        self.discard_pending_agent_runtime_refresh();
+        self.refresh_agent_runtime_states();
+
+        match outcome {
+            Ok(outcome) => {
+                let history_suffix = agent_history_deleted_suffix(outcome.pty_log_deleted);
+                self.status = match outcome.pid {
+                    Some(pid) => {
+                        format!("closed {} (pid {}){}", label, pid, history_suffix)
+                    }
+                    None => format!("closed {}{}", label, history_suffix),
+                };
+                debug_log(
+                    "agent_auxiliary_killed",
+                    serde_json::json!({
+                        "kind": kind.label(),
+                        "parent": agent_key_debug_value(&parent),
+                        "key": agent_key_debug_value(&key),
+                        "daemon_pid": outcome.pid,
+                        "child_pid": outcome.child_pid,
+                        "pty_log_deleted": outcome.pty_log_deleted,
+                        "snapshot": app_runtime_snapshot_debug_value(self, false),
+                    }),
+                );
+            }
+            Err(error) => {
+                self.status = format!("close {} failed: {}", label, error);
+                debug_log(
+                    "agent_auxiliary_kill_failed",
+                    serde_json::json!({
+                        "kind": kind.label(),
+                        "parent": agent_key_debug_value(&parent),
+                        "key": agent_key_debug_value(&key),
+                        "error": error,
+                        "snapshot": app_runtime_snapshot_debug_value(self, false),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn finish_selected_agent_kill(&mut self, result: AgentKillWorkerResult) {
+        let AgentKillWorkerResult {
+            key, info, outcome, ..
+        } = result;
+        let selected_key = AgentKey::new(&info);
+        self.agent_states.remove(&selected_key);
+        self.agent_states.remove(&key);
+        self.live_shells.retain(|info| {
+            let live_key = AgentKey::new(info);
+            live_key != selected_key && live_key != key
+        });
+        self.discard_pending_agent_runtime_refresh();
+        self.refresh_agent_runtime_states();
+
+        match outcome {
+            Ok(outcome) => {
+                let history_suffix = agent_history_deleted_suffix(outcome.pty_log_deleted);
+                self.status = match outcome.pid {
+                    Some(pid) => format!(
+                        "killed {} agent {} (pid {}){}",
+                        info.provider.as_str(),
+                        truncate_width(&info.session_id, 14),
+                        pid,
+                        history_suffix
+                    ),
+                    None => format!(
+                        "no live {} agent for {}{}",
+                        info.provider.as_str(),
+                        truncate_width(&info.session_id, 14),
+                        history_suffix
+                    ),
+                };
+                debug_log(
+                    "kill_selected_agent",
+                    serde_json::json!({
+                        "provider": info.provider.as_str(),
+                        "session_id": &info.session_id,
+                        "runtime_provider": key.provider.as_str(),
+                        "runtime_session_id": &key.session_id,
+                        "daemon_pid": outcome.pid,
+                        "child_pid": outcome.child_pid,
+                        "pty_log_deleted": outcome.pty_log_deleted,
+                    }),
+                );
+            }
+            Err(error) => {
+                self.status = format!(
+                    "kill {} agent {} failed: {}",
+                    info.provider.as_str(),
+                    truncate_width(&info.session_id, 14),
+                    error
+                );
+                debug_log(
+                    "kill_selected_agent_failed",
+                    serde_json::json!({
+                        "provider": info.provider.as_str(),
+                        "session_id": &info.session_id,
+                        "runtime_provider": key.provider.as_str(),
+                        "runtime_session_id": &key.session_id,
+                        "error": error,
                     }),
                 );
             }
@@ -16777,6 +17506,41 @@ impl App {
     }
 
     fn kill_selected_agent(&mut self) {
+        if self.main_tx.is_some() {
+            self.kill_selected_agent_async();
+        } else {
+            self.kill_selected_agent_sync();
+        }
+    }
+
+    fn kill_selected_agent_async(&mut self) {
+        if self.agent_kill_pending.is_some() {
+            self.status = "kill already in progress...".into();
+            return;
+        }
+        let Some(info) = self.current().cloned() else {
+            self.status = "no session selected.".into();
+            return;
+        };
+        let runtime_info = self.runtime_info_for_selected_agent(&info);
+        let runtime_key = AgentKey::new(&runtime_info);
+        let label = format!(
+            "{} agent {}",
+            info.provider.as_str(),
+            truncate_width(&info.session_id, 14)
+        );
+        self.start_agent_kill_worker(
+            runtime_key,
+            runtime_info,
+            AgentKillTarget::SelectedSession,
+            label,
+            None,
+            0,
+            0,
+        );
+    }
+
+    fn kill_selected_agent_sync(&mut self) {
         let Some(info) = self.current().cloned() else {
             self.status = "no session selected.".into();
             return;
@@ -20724,6 +21488,7 @@ fn main_event_kind(event: &MainEvent) -> &'static str {
         MainEvent::RestoreResult(_) => "restore_result",
         MainEvent::AiTitleResult(_) => "ai_title_result",
         MainEvent::AttachResult(_) => "attach_result",
+        MainEvent::AgentKillResult(_) => "agent_kill_result",
         MainEvent::NewSessionPrepareResult(_) => "new_session_prepare_result",
         MainEvent::KeybindingsReloaded(_) => "keybindings_reloaded",
     }
@@ -20766,6 +21531,7 @@ fn main_event_queued_at_epoch_ms(event: &MainEvent) -> Option<u64> {
         MainEvent::AiTitleResult(result) => result.queued_at_epoch_ms,
         MainEvent::LiveShellDiscoveryResult(result) => result.queued_at_epoch_ms,
         MainEvent::AttachResult(result) => result.queued_at_epoch_ms,
+        MainEvent::AgentKillResult(result) => result.queued_at_epoch_ms,
         MainEvent::NewSessionPrepareResult(result) => result.queued_at_epoch_ms,
         _ => return None,
     }
@@ -21306,6 +22072,9 @@ fn handle_main_event(
         MainEvent::AttachResult(result) => {
             app.on_attach_result(result);
         }
+        MainEvent::AgentKillResult(result) => {
+            app.on_agent_kill_result(result);
+        }
         MainEvent::NewSessionPrepareResult(result) => {
             app.on_new_session_prepare_result(result);
         }
@@ -21586,25 +22355,37 @@ fn run(terminal: &mut Tui) -> Result<()> {
         // and are handled on the next loop after a render opportunity.
         let drain_started = Instant::now();
         let mut drained_events = 0usize;
-        loop {
-            if !should_continue_main_event_drain(drained_events, drain_started.elapsed()) {
-                break;
-            }
-            match main_rx.try_recv() {
-                Ok(event) => {
-                    drained_events = drained_events.saturating_add(1);
-                    handle_main_event(&mut app, event, &mut previous_is_agent_view, "queued_event");
-                    record_main_loop_heartbeat();
+        let skip_drain_for_kill_feedback = app.agent_kill_pending.is_some();
+        if !skip_drain_for_kill_feedback {
+            loop {
+                if !should_continue_main_event_drain(drained_events, drain_started.elapsed()) {
+                    break;
                 }
-                Err(_) => break,
+                match main_rx.try_recv() {
+                    Ok(event) => {
+                        drained_events = drained_events.saturating_add(1);
+                        handle_main_event(
+                            &mut app,
+                            event,
+                            &mut previous_is_agent_view,
+                            "queued_event",
+                        );
+                        record_main_loop_heartbeat();
+                    }
+                    Err(_) => break,
+                }
             }
         }
         let drain_elapsed = drain_started.elapsed();
-        if drained_events > 0 || TRACE_ENABLED.load(Ordering::Relaxed) {
+        if skip_drain_for_kill_feedback
+            || drained_events > 0
+            || TRACE_ENABLED.load(Ordering::Relaxed)
+        {
             debug_log(
                 "main_event_drain_done",
                 serde_json::json!({
                     "drained_events": drained_events,
+                    "skipped_for_kill_feedback": skip_drain_for_kill_feedback,
                     "elapsed_ms": drain_elapsed.as_millis(),
                     "limit": MAIN_EVENT_DRAIN_LIMIT,
                     "budget_ms": MAIN_EVENT_DRAIN_BUDGET_MS,
@@ -28957,6 +29738,11 @@ fn is_shell_session_info(info: &SessionInfo) -> bool {
     info.source.as_os_str() == SHELL_SESSION_SOURCE_MARKER
 }
 
+fn shell_line_is_exit_command(line: &str) -> bool {
+    let line = line.trim();
+    line == "exit" || line.starts_with("exit ")
+}
+
 fn is_plain_pty_tool_session_info(info: &SessionInfo) -> bool {
     is_shell_session_info(info) || is_cokacdir_session_info(info)
 }
@@ -30333,7 +31119,7 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
     {
         debug_log_agent_key(key, "kill");
         if app.agent_focus == AgentFocusPane::Auxiliary && app.agent_aux.is_some() {
-            let _ = app.close_auxiliary_agent("kill_shortcut", true);
+            app.kill_auxiliary_agent("kill_shortcut");
         } else {
             app.kill_active_agent();
         }
@@ -31737,7 +32523,6 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         AGENT_STATUS_HEIGHT.min(area.height),
     );
 
-    let app_status = app.display_status();
     let active_key = app
         .active_agent
         .as_ref()
@@ -31807,12 +32592,6 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             None
         };
 
-    let focused_outcome = if app.agent_focus == AgentFocusPane::Auxiliary {
-        auxiliary_outcome.as_ref().unwrap_or(&main_outcome)
-    } else {
-        &main_outcome
-    };
-
     let focused_cursor = match app.agent_focus {
         AgentFocusPane::Main => main_outcome.cursor,
         AgentFocusPane::Auxiliary => auxiliary_outcome
@@ -31824,75 +32603,14 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     let buf = f.buffer_mut();
     fill_area(buf, status_area, theme_status_style());
     let agent_help_items = agent_help_items(&app.keybindings);
-    let agent_status_subject = if is_plain_pty_tool_session_info(&focused_outcome.info) {
-        live_agent_status_label(&focused_outcome.info)
-    } else {
-        format!(
-            "{} {}",
-            focused_outcome.info.provider.as_str(),
-            truncate_width(&focused_outcome.info.session_id, 18)
-        )
-    };
-    let focus_label = match app.agent_focus {
-        AgentFocusPane::Sidebar => "focus agents".to_string(),
-        AgentFocusPane::Main => "focus agent".to_string(),
-        AgentFocusPane::Auxiliary => app
-            .agent_aux
-            .as_ref()
-            .map(|aux| format!("focus right {}", aux.kind.label()))
-            .unwrap_or_else(|| "focus right".to_string()),
-    };
-    let mut status_parts = vec![agent_status_subject, focus_label];
-    if let Some(aux) = app.agent_aux.as_ref() {
-        status_parts.push(format!("right {}", aux.kind.label()));
-    }
-    if !app_status.is_empty() {
-        status_parts.push(app_status);
-    }
-    if focused_outcome.scrollback_offset > 0 {
-        status_parts.push(format!(
-            "scrollback {} up",
-            focused_outcome.scrollback_offset
-        ));
-    }
-    let mut status_spans = Vec::new();
-    let mut used = 0usize;
-    let width = status_area.width as usize;
-    let status_style = theme_status_style();
-    let status_dim_style = Style::default().fg(THEME_FG_DIM).bg(THEME_STATUS_BG);
-    let shortcut_style = Style::default().fg(THEME_SHORTCUT).bg(THEME_STATUS_BG);
-    let mut first = true;
-    for part in status_parts {
-        let separator = if first { " " } else { "  " };
-        if !push_help_span(&mut status_spans, separator, status_style, &mut used, width)
-            || !push_help_span(&mut status_spans, &part, status_style, &mut used, width)
-        {
-            break;
-        }
-        first = false;
-    }
-    if used < width {
-        let _ = push_help_span(&mut status_spans, "  ", status_dim_style, &mut used, width);
-        push_help_item_spans(
+    f.render_widget(
+        help_line_from_items_with_bg(
             &agent_help_items,
-            &mut status_spans,
-            status_dim_style,
-            shortcut_style,
-            &mut used,
-            width,
-        );
-    }
-    if used < width {
-        let _ = push_help_span(&mut status_spans, "  ", status_dim_style, &mut used, width);
-        let _ = push_help_span(
-            &mut status_spans,
-            &focused_outcome.command_line,
-            status_dim_style,
-            &mut used,
-            width,
-        );
-    }
-    f.render_widget(Line::from(status_spans), status_area);
+            status_area.width as usize,
+            THEME_STATUS_BG,
+        ),
+        status_area,
+    );
 
     app.poll_agent_runtime_states();
     let mut sidebar_candidates_len = None;
@@ -31927,10 +32645,20 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         } else {
             draw_attach_progress_overlay(f, area, app)
         };
+    let agent_exit_overlay_drawn = if modal_drawn
+        || ai_search_overlay_drawn
+        || new_session_overlay_drawn
+        || attach_overlay_drawn
+    {
+        false
+    } else {
+        draw_agent_exit_pending_overlay(f, area, app)
+    };
     let runtime_refresh_overlay_drawn = if modal_drawn
         || ai_search_overlay_drawn
         || new_session_overlay_drawn
         || attach_overlay_drawn
+        || agent_exit_overlay_drawn
     {
         false
     } else {
@@ -31940,6 +32668,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         || ai_search_overlay_drawn
         || new_session_overlay_drawn
         || attach_overlay_drawn
+        || agent_exit_overlay_drawn
         || runtime_refresh_overlay_drawn
     {
         false
@@ -31951,6 +32680,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         && !ai_search_overlay_drawn
         && !new_session_overlay_drawn
         && !attach_overlay_drawn
+        && !agent_exit_overlay_drawn
         && !runtime_refresh_overlay_drawn
         && !session_refresh_overlay_drawn
     {
@@ -31982,6 +32712,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             "ai_search_overlay_drawn": ai_search_overlay_drawn,
             "new_session_overlay_drawn": new_session_overlay_drawn,
             "attach_overlay_drawn": attach_overlay_drawn,
+            "agent_exit_overlay_drawn": agent_exit_overlay_drawn,
             "runtime_refresh_overlay_drawn": runtime_refresh_overlay_drawn,
             "session_refresh_overlay_drawn": session_refresh_overlay_drawn,
             "sidebar_drawn": layout.sidebar.is_some() && active_key.is_some(),
@@ -32445,6 +33176,121 @@ fn draw_runtime_refresh_pending_overlay(f: &mut ratatui::Frame, area: Rect, app:
         .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
         .style(theme_alt_style())
         .title("Checking");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, modal_area);
+    f.render_widget(p, modal_area);
+    true
+}
+
+fn agent_exit_request_visible(agent: &AgentClient) -> Option<AgentExitRequest> {
+    let request = agent.exit_request.as_ref()?;
+    if agent.exited.is_some()
+        || request.phase == AgentExitRequestPhase::Detected
+        || request.started_at.elapsed()
+            < Duration::from_millis(AGENT_EXIT_REQUEST_OVERLAY_TIMEOUT_MS)
+    {
+        Some(request.clone())
+    } else {
+        None
+    }
+}
+
+fn agent_exit_overlay_context(app: &App) -> Option<(String, AgentExitRequest, Option<String>)> {
+    let active_context = || {
+        let agent = app.active_agent.as_ref()?;
+        let request = agent_exit_request_visible(agent)?;
+        Some((
+            live_agent_status_label(&agent.info),
+            request,
+            agent.exited.clone(),
+        ))
+    };
+    let auxiliary_context = || {
+        let aux = app.agent_aux.as_ref()?;
+        let request = agent_exit_request_visible(&aux.agent)?;
+        Some((
+            format!("right {}", aux.kind.label()),
+            request,
+            aux.agent.exited.clone(),
+        ))
+    };
+    let kill_context = || {
+        let pending = app.agent_kill_pending.as_ref()?;
+        Some((
+            pending.label.clone(),
+            AgentExitRequest {
+                kind: AgentExitRequestKind::ForcedKill,
+                phase: AgentExitRequestPhase::Requested,
+                started_at: pending.started_at,
+            },
+            None,
+        ))
+    };
+
+    if app.agent_focus == AgentFocusPane::Auxiliary {
+        auxiliary_context()
+            .or_else(active_context)
+            .or_else(kill_context)
+    } else {
+        active_context()
+            .or_else(auxiliary_context)
+            .or_else(kill_context)
+    }
+}
+
+fn draw_agent_exit_pending_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
+    let Some((target, request, exit_status)) = agent_exit_overlay_context(app) else {
+        return false;
+    };
+    let elapsed = request.started_at.elapsed();
+    let headline = if exit_status.is_some() || request.phase == AgentExitRequestPhase::Detected {
+        request.phase.label_for(request.kind).to_string()
+    } else {
+        request.kind.waiting_label().to_string()
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{} {}", startup_spinner_frame(elapsed), headline),
+            Style::default()
+                .fg(THEME_FG_STRONG)
+                .bg(THEME_BG_ALT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("Target: {}", truncate_width(&target, 60)),
+            Style::default().fg(THEME_FG).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            format!("Status: {}", request.phase.label_for(request.kind)),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ];
+    if let Some(exit_status) = exit_status {
+        lines.push(Line::from(Span::styled(
+            format!("Exit: {}", truncate_width(&exit_status, 60)),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("Elapsed: {}s", elapsed.as_secs()),
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+    )));
+
+    let title = if request.kind == AgentExitRequestKind::ForcedKill {
+        "Terminating"
+    } else {
+        "Exiting"
+    };
+    let modal_area = modal_area_for_wrapped_lines(area, title, &lines, 44, 88, 5, 8);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title(title);
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
@@ -34518,9 +35364,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         && !new_session_overlay_drawn
         && !attach_overlay_drawn
     {
-        let runtime_refresh_overlay_drawn = draw_runtime_refresh_pending_overlay(f, area, app);
-        if !runtime_refresh_overlay_drawn {
-            draw_session_refresh_pending_overlay(f, area, app);
+        let agent_exit_overlay_drawn = draw_agent_exit_pending_overlay(f, area, app);
+        if !agent_exit_overlay_drawn {
+            let runtime_refresh_overlay_drawn = draw_runtime_refresh_pending_overlay(f, area, app);
+            if !runtime_refresh_overlay_drawn {
+                draw_session_refresh_pending_overlay(f, area, app);
+            }
         }
     }
 }
@@ -38370,6 +39219,8 @@ mod tests {
             pending_input_since_epoch_ms: None,
             pending_input_key: None,
             pending_input_count: 0,
+            exit_input_line: String::new(),
+            exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -39447,6 +40298,8 @@ mod tests {
             attach_seq: 0,
             attach_in_flight: None,
             queued_attach: None,
+            agent_kill_seq: 0,
+            agent_kill_pending: None,
             new_session_launch_seq: 0,
             new_session_launch: None,
             agent_sidebar_order: Vec::new(),
@@ -47707,6 +48560,341 @@ IF EXIST "%~dp0\node.exe" (
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn terminal_exit_command_shows_exit_pending_overlay() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let (mut client, _request_rx) =
+            buffered_output_test_client_with_requests("terminal-exit", 271);
+        client.info = shell_session_info_for_cwd("/repo".into());
+        app.set_active_agent(client);
+
+        for ch in "exit".chars() {
+            handle_agent_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                80,
+                24,
+            );
+        }
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            80,
+            24,
+        );
+
+        let request = app
+            .active_agent
+            .as_ref()
+            .and_then(|agent| agent.exit_request.as_ref())
+            .expect("exit command should set a visible exit request");
+        assert_eq!(request.kind, AgentExitRequestKind::TerminalExit);
+        assert_eq!(request.phase, AgentExitRequestPhase::Requested);
+        assert!(app.display_status().contains("Exit requested"));
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                assert!(draw_agent_exit_pending_overlay(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Exiting"));
+        assert!(rendered.contains("Waiting for terminal to exit"));
+        assert!(rendered.contains("Target: shell at /repo"));
+        assert!(rendered.contains("Status: Exit requested"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_pasted_exit_without_newline_tracks_until_enter() {
+        let (mut client, _request_rx) =
+            buffered_output_test_client_with_requests("terminal-pasted-exit", 274);
+        client.info = shell_session_info_for_cwd("/repo".into());
+
+        client.send_paste("exit");
+        assert!(
+            client.exit_request.is_none(),
+            "paste without Enter should only update the tracked shell line"
+        );
+
+        client.send_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let request = client
+            .exit_request
+            .as_ref()
+            .expect("Enter after pasted exit should show an exit request");
+        assert_eq!(request.kind, AgentExitRequestKind::TerminalExit);
+        assert_eq!(request.phase, AgentExitRequestPhase::Requested);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cokacdir_q_shows_exit_pending_overlay() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let (mut client, _request_rx) =
+            buffered_output_test_client_with_requests("cokacdir-quit", 272);
+        client.info = cokacdir_session_info_for_cwd("/repo".into());
+        app.set_active_agent(client);
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            80,
+            24,
+        );
+
+        let request = app
+            .active_agent
+            .as_ref()
+            .and_then(|agent| agent.exit_request.as_ref())
+            .expect("q should set a visible cokacdir quit request");
+        assert_eq!(request.kind, AgentExitRequestKind::CokacdirQuit);
+        assert_eq!(request.phase, AgentExitRequestPhase::Requested);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                assert!(draw_agent_exit_pending_overlay(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Exiting"));
+        assert!(rendered.contains("Waiting for cokacdir to quit"));
+        assert!(rendered.contains("Target: cokacdir at /repo"));
+        assert!(rendered.contains("Status: Exit requested"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_exit_event_updates_pending_overlay_to_finalizing() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let (mut client, _request_rx) =
+            buffered_output_test_client_with_requests("terminal-finalizing", 273);
+        client.info = shell_session_info_for_cwd("/repo".into());
+        app.set_active_agent(client);
+
+        for ch in "exit".chars() {
+            handle_agent_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                80,
+                24,
+            );
+        }
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            80,
+            24,
+        );
+
+        app.on_agent_event(
+            273,
+            AgentDaemonEvent::Exited {
+                status: "exit status: 0".into(),
+            },
+        );
+
+        let agent = app.active_agent.as_ref().unwrap();
+        let request = agent
+            .exit_request
+            .as_ref()
+            .expect("exit event should keep a visible exit request");
+        assert_eq!(request.kind, AgentExitRequestKind::TerminalExit);
+        assert_eq!(request.phase, AgentExitRequestPhase::Detected);
+        assert_eq!(agent.exited.as_deref(), Some("exit status: 0"));
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                assert!(draw_agent_exit_pending_overlay(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Exiting"));
+        assert!(rendered.contains("Finalizing exit"));
+        assert!(rendered.contains("Status: Finalizing exit"));
+        assert!(rendered.contains("Exit: exit status: 0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_ctrl_k_shows_kill_pending_overlay_until_worker_result() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let (tx, rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
+        let mut client = buffered_output_test_client("active-kill-pending", 275);
+        client.info = shell_session_info_for_cwd("/repo".into());
+        app.set_active_agent(client);
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            80,
+            24,
+        );
+
+        assert!(app.active_agent.is_some());
+        let pending = app
+            .agent_kill_pending
+            .as_ref()
+            .expect("Ctrl+K should immediately create pending kill state");
+        assert!(matches!(pending.target, AgentKillTarget::MainAgent));
+        let request = app
+            .active_agent
+            .as_ref()
+            .and_then(|agent| agent.exit_request.as_ref())
+            .expect("active agent should show forced-kill request");
+        assert_eq!(request.kind, AgentExitRequestKind::ForcedKill);
+        assert_eq!(request.phase, AgentExitRequestPhase::Requested);
+        assert!(app.display_status().contains("Kill requested"));
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                assert!(draw_agent_exit_pending_overlay(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Terminating"));
+        assert!(rendered.contains("Terminating session"));
+        assert!(rendered.contains("Status: Kill requested"));
+
+        let event = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let MainEvent::AgentKillResult(result) = event else {
+            panic!("expected AgentKillResult");
+        };
+        app.on_agent_kill_result(result);
+
+        assert!(app.agent_kill_pending.is_none());
+        assert!(app.active_agent.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auxiliary_ctrl_k_shows_kill_pending_overlay_until_worker_result() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let (tx, rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
+        app.set_active_agent(buffered_output_test_client("aux-kill-main", 276));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        let mut aux = buffered_output_test_client("aux-kill-right", 277);
+        aux.info = shell_session_info_for_cwd("/repo".into());
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: aux,
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            100,
+            30,
+        );
+
+        assert!(app.active_agent.is_some());
+        assert!(app.agent_aux.is_some());
+        let pending = app
+            .agent_kill_pending
+            .as_ref()
+            .expect("right panel Ctrl+K should create pending kill state");
+        assert!(matches!(pending.target, AgentKillTarget::Auxiliary { .. }));
+        let request = app
+            .agent_aux
+            .as_ref()
+            .and_then(|aux| aux.agent.exit_request.as_ref())
+            .expect("right panel should show forced-kill request");
+        assert_eq!(request.kind, AgentExitRequestKind::ForcedKill);
+        assert_eq!(request.phase, AgentExitRequestPhase::Requested);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                assert!(draw_agent_exit_pending_overlay(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Terminating"));
+        assert!(rendered.contains("Target: right terminal"));
+        assert!(rendered.contains("Status: Kill requested"));
+
+        let event = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let MainEvent::AgentKillResult(result) = event else {
+            panic!("expected AgentKillResult");
+        };
+        app.on_agent_kill_result(result);
+
+        assert!(app.agent_kill_pending.is_none());
+        assert!(app.agent_aux.is_none());
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+    }
+
+    #[test]
+    fn session_ctrl_k_shows_kill_pending_overlay_until_worker_result() {
+        let mut app = app_for_key_tests();
+        let (tx, rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
+        let info = session_info(Provider::Codex, "session-kill-pending", "/repo");
+        app.sessions.push(info);
+        app.list_state.select(Some(0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        let pending = app
+            .agent_kill_pending
+            .as_ref()
+            .expect("session Ctrl+K should immediately create pending kill state");
+        assert!(matches!(pending.target, AgentKillTarget::SelectedSession));
+        assert!(app.display_status().contains("Kill requested"));
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                assert!(draw_agent_exit_pending_overlay(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Terminating"));
+        assert!(rendered.contains("Terminating session"));
+        assert!(rendered.contains("Status: Kill requested"));
+
+        let event = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let MainEvent::AgentKillResult(result) = event else {
+            panic!("expected AgentKillResult");
+        };
+        app.on_agent_kill_result(result);
+
+        assert!(app.agent_kill_pending.is_none());
+        assert!(app.status.contains("no live codex agent"));
+    }
+
     #[test]
     fn parser_snapshot_rehydrates_scrollback_lines() {
         let mut source = vt100::Parser::new(5, 20, AGENT_SCROLLBACK_LINES);
@@ -47879,6 +49067,8 @@ IF EXIST "%~dp0\node.exe" (
             pending_input_since_epoch_ms: None,
             pending_input_key: None,
             pending_input_count: 0,
+            exit_input_line: String::new(),
+            exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -47944,6 +49134,8 @@ IF EXIST "%~dp0\node.exe" (
             pending_input_since_epoch_ms: None,
             pending_input_key: None,
             pending_input_count: 0,
+            exit_input_line: String::new(),
+            exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -50233,6 +51425,8 @@ IF EXIST "%~dp0\node.exe" (
             pending_input_since_epoch_ms: None,
             pending_input_key: None,
             pending_input_count: 0,
+            exit_input_line: String::new(),
+            exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -50496,6 +51690,8 @@ IF EXIST "%~dp0\node.exe" (
             pending_input_since_epoch_ms: None,
             pending_input_key: None,
             pending_input_count: 0,
+            exit_input_line: String::new(),
+            exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
@@ -50569,6 +51765,8 @@ IF EXIST "%~dp0\node.exe" (
             pending_input_since_epoch_ms: None,
             pending_input_key: None,
             pending_input_count: 0,
+            exit_input_line: String::new(),
+            exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
             startup_spinner_started_at: None,
