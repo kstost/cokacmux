@@ -196,6 +196,7 @@ const DAEMON_EXIT_FLUSH_TIMEOUT_MS: u64 = 2_000;
 const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS: u64 = 2_000;
 const AGENT_DETACH_WRITE_TIMEOUT_MS: u64 = 300;
 const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
+const UI_ANIMATION_TICK_MS: u64 = STARTUP_SPINNER_TICK_MS as u64;
 const LIVE_SHELL_DISCOVERY_INTERVAL_MS: u64 = 10_000;
 /// How many consecutive discovery scans may miss a switchable shell before
 /// it stops being preserved. Preservation bridges transient scan races, but
@@ -2980,6 +2981,48 @@ const NEW_SESSION_FIELD_CWD: usize = 1;
 const NEW_SESSION_FIELD_PROVIDER: usize = 2;
 const NEW_SESSION_FIELD_PERMISSIONS: usize = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewSessionLaunchStage {
+    Preparing,
+    Starting,
+    Queued,
+}
+
+impl NewSessionLaunchStage {
+    fn label(self) -> &'static str {
+        match self {
+            NewSessionLaunchStage::Preparing => "Preparing",
+            NewSessionLaunchStage::Starting => "Starting",
+            NewSessionLaunchStage::Queued => "Queued",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NewSessionLaunchPending {
+    seq: u64,
+    kind: NewSessionKind,
+    raw_cwd: String,
+    provider: Provider,
+    launch_mode: AgentLaunchMode,
+    started_at: Instant,
+    stage: NewSessionLaunchStage,
+    attach_key: Option<AgentKey>,
+}
+
+struct NewSessionPrepareResult {
+    seq: u64,
+    kind: NewSessionKind,
+    raw_cwd: String,
+    provider: Provider,
+    launch_mode: AgentLaunchMode,
+    cols: u16,
+    rows: u16,
+    outcome: std::result::Result<String, String>,
+    queued_at_epoch_ms: u64,
+    elapsed_ms: u128,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PreviewKey {
     provider: Provider,
@@ -3159,6 +3202,13 @@ impl DataTaskKind {
         match self {
             DataTaskKind::Clone => "clone",
             DataTaskKind::Restore => "restore",
+        }
+    }
+
+    fn modal_title(self) -> &'static str {
+        match self {
+            DataTaskKind::Clone => "Clone in progress",
+            DataTaskKind::Restore => "Restore in progress",
         }
     }
 }
@@ -3820,6 +3870,43 @@ fn attach_in_flight_debug_value(attach: &AttachInFlight) -> serde_json::Value {
     })
 }
 
+fn new_session_launch_pending_debug_value(pending: &NewSessionLaunchPending) -> serde_json::Value {
+    serde_json::json!({
+        "seq": pending.seq,
+        "kind": pending.kind.as_str(),
+        "raw_cwd": &pending.raw_cwd,
+        "provider": pending.provider.as_str(),
+        "launch_mode": pending.launch_mode.as_str(),
+        "stage": pending.stage.label(),
+        "attach_key": pending.attach_key.as_ref().map(agent_key_debug_value),
+        "elapsed_ms": pending.started_at.elapsed().as_millis(),
+    })
+}
+
+fn new_session_prepare_result_debug_value(result: &NewSessionPrepareResult) -> serde_json::Value {
+    serde_json::json!({
+        "seq": result.seq,
+        "kind": result.kind.as_str(),
+        "raw_cwd": &result.raw_cwd,
+        "provider": result.provider.as_str(),
+        "launch_mode": result.launch_mode.as_str(),
+        "cols": result.cols,
+        "rows": result.rows,
+        "outcome": match &result.outcome {
+            Ok(cwd) => serde_json::json!({
+                "kind": "ok",
+                "cwd": cwd,
+            }),
+            Err(error) => serde_json::json!({
+                "kind": "err",
+                "error": error,
+            }),
+        },
+        "elapsed_ms": result.elapsed_ms,
+        "queued_at_epoch_ms": result.queued_at_epoch_ms,
+    })
+}
+
 fn attach_work_outcome_debug_value(outcome: &AttachWorkOutcome) -> serde_json::Value {
     match outcome {
         AttachWorkOutcome::Attached { agent, started } => serde_json::json!({
@@ -3995,6 +4082,13 @@ fn app_runtime_snapshot_debug_value(app: &App, verbose: bool) -> serde_json::Val
         serde_json::json!(app.agent_aux_width),
     );
     snapshot.insert(
+        "new_session_launch".into(),
+        app.new_session_launch
+            .as_ref()
+            .map(new_session_launch_pending_debug_value)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    snapshot.insert(
         "agent_focus_by_agent_len".into(),
         serde_json::json!(app.agent_focus_by_agent.len()),
     );
@@ -4078,6 +4172,16 @@ fn app_runtime_snapshot_debug_value(app: &App, verbose: bool) -> serde_json::Val
     snapshot.insert(
         "session_refresh_pending".into(),
         serde_json::json!(app.session_refresh_pending),
+    );
+    snapshot.insert(
+        "session_refresh_show_overlay".into(),
+        serde_json::json!(app.session_refresh_show_overlay),
+    );
+    snapshot.insert(
+        "session_refresh_pending_elapsed_ms".into(),
+        app.session_refresh_started_at
+            .map(|started| serde_json::json!(started.elapsed().as_millis()))
+            .unwrap_or(serde_json::Value::Null),
     );
     snapshot.insert(
         "search_pending".into(),
@@ -4268,6 +4372,10 @@ fn main_event_debug_value(event: &MainEvent) -> serde_json::Value {
             "kind": "tick",
             "queued_at_epoch_ms": queued_at_epoch_ms,
         }),
+        MainEvent::AnimationTick { queued_at_epoch_ms } => serde_json::json!({
+            "kind": "animation_tick",
+            "queued_at_epoch_ms": queued_at_epoch_ms,
+        }),
         MainEvent::PreviewReady { queued_at_epoch_ms } => serde_json::json!({
             "kind": "preview_ready",
             "queued_at_epoch_ms": queued_at_epoch_ms,
@@ -4388,6 +4496,16 @@ fn main_event_debug_value(event: &MainEvent) -> serde_json::Value {
             "kind": "attach_result",
             "result": attach_worker_result_debug_value(result),
         }),
+        MainEvent::NewSessionPrepareResult(result) => {
+            let mut value = new_session_prepare_result_debug_value(result);
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "kind".into(),
+                    serde_json::json!("new_session_prepare_result"),
+                );
+            }
+            value
+        }
         MainEvent::KeybindingsReloaded(reload) => serde_json::json!({
             "kind": "keybindings_reloaded",
             "has_keybindings": reload.keybindings.is_some(),
@@ -4399,7 +4517,10 @@ fn main_event_debug_value(event: &MainEvent) -> serde_json::Value {
 fn should_log_main_event_detail(kind: &'static str) -> bool {
     DEBUG_ENABLED.load(Ordering::Relaxed)
         && (TRACE_ENABLED.load(Ordering::Relaxed)
-            || !matches!(kind, "tick" | "agent_output_available" | "preview_ready"))
+            || !matches!(
+                kind,
+                "tick" | "animation_tick" | "agent_output_available" | "preview_ready"
+            ))
 }
 
 fn sorted_switchable_agent_keys(states: &HashMap<AgentKey, AgentListState>) -> Vec<AgentKey> {
@@ -7864,6 +7985,9 @@ enum MainEvent {
     /// agent runtime state polls get a chance to run even when the user is
     /// idle. Not a latency knob.
     Tick { queued_at_epoch_ms: u64 },
+    /// Lightweight animation tick for UI-only spinners. It deliberately does
+    /// not run housekeeping work.
+    AnimationTick { queued_at_epoch_ms: u64 },
     /// A preview worker result is ready in `preview_rx`; wake the main loop
     /// immediately instead of waiting for the housekeeping tick.
     PreviewReady { queued_at_epoch_ms: u64 },
@@ -7892,6 +8016,8 @@ enum MainEvent {
     /// An attach job (pre-checks + daemon connect/spawn) finished off the
     /// UI thread.
     AttachResult(Box<AttachWorkerResult>),
+    /// New-session cwd normalization/creation completed off the UI thread.
+    NewSessionPrepareResult(Box<NewSessionPrepareResult>),
     /// The keybindings watcher thread saw the file change.
     KeybindingsReloaded(Box<KeybindingsReload>),
 }
@@ -8217,6 +8343,48 @@ fn debug_log_attach_worker_job_done(
     );
 }
 
+fn run_new_session_prepare(
+    seq: u64,
+    kind: NewSessionKind,
+    raw_cwd: String,
+    provider: Provider,
+    launch_mode: AgentLaunchMode,
+    cols: u16,
+    rows: u16,
+) -> NewSessionPrepareResult {
+    let started = Instant::now();
+    debug_log(
+        "new_session_prepare_worker_start",
+        serde_json::json!({
+            "seq": seq,
+            "kind": kind.as_str(),
+            "raw_cwd": &raw_cwd,
+            "provider": provider.as_str(),
+            "launch_mode": launch_mode.as_str(),
+            "cols": cols,
+            "rows": rows,
+        }),
+    );
+    let outcome = normalize_launch_cwd(&raw_cwd);
+    let result = NewSessionPrepareResult {
+        seq,
+        kind,
+        raw_cwd,
+        provider,
+        launch_mode,
+        cols,
+        rows,
+        outcome,
+        queued_at_epoch_ms: current_epoch_ms(),
+        elapsed_ms: started.elapsed().as_millis(),
+    };
+    debug_log(
+        "new_session_prepare_worker_done",
+        new_session_prepare_result_debug_value(&result),
+    );
+    result
+}
+
 struct AgentRuntimeRefreshRequest {
     seq: u64,
     current_pid: u32,
@@ -8350,6 +8518,8 @@ struct App {
     attach_in_flight: Option<AttachInFlight>,
     /// Newest attach request received while one was in flight (latest wins).
     queued_attach: Option<AttachJob>,
+    new_session_launch_seq: u64,
+    new_session_launch: Option<NewSessionLaunchPending>,
     /// First-seen order of agents-sidebar entries. Keeps the sidebar from
     /// shuffling as sessions reorder by activity or discovery rescans the
     /// runtime dir; new agents append, departed agents free their slot.
@@ -8358,6 +8528,8 @@ struct App {
     ui_stall_log_count: u64,
     session_refresh_seq: u64,
     session_refresh_pending: bool,
+    session_refresh_started_at: Option<Instant>,
+    session_refresh_show_overlay: bool,
     session_refresh_restore_key: Option<AgentKey>,
     session_refresh_preserve_status: Option<String>,
     /// Monotonic id assigned to each agent reader thread. Used to ignore
@@ -8492,11 +8664,15 @@ impl App {
             attach_seq: 0,
             attach_in_flight: None,
             queued_attach: None,
+            new_session_launch_seq: 0,
+            new_session_launch: None,
             agent_sidebar_order: Vec::new(),
             last_ui_stall_log_at: None,
             ui_stall_log_count: 0,
             session_refresh_seq: 0,
             session_refresh_pending: false,
+            session_refresh_started_at: None,
+            session_refresh_show_overlay: false,
             session_refresh_restore_key: None,
             session_refresh_preserve_status: None,
             next_reader_id: 0,
@@ -10994,6 +11170,8 @@ impl App {
             return;
         };
         self.session_refresh_pending = true;
+        self.session_refresh_started_at = Some(Instant::now());
+        self.session_refresh_show_overlay = pending_status.is_some();
         self.session_refresh_restore_key = restore_key;
         self.session_refresh_preserve_status = preserve_status;
         if let Some(status) = pending_status {
@@ -11031,6 +11209,8 @@ impl App {
             Ok(_) => {}
             Err(e) => {
                 self.session_refresh_pending = false;
+                self.session_refresh_started_at = None;
+                self.session_refresh_show_overlay = false;
                 self.session_refresh_restore_key = None;
                 self.session_refresh_preserve_status = None;
                 self.status = format!(
@@ -11062,6 +11242,8 @@ impl App {
             return;
         }
         self.session_refresh_pending = false;
+        self.session_refresh_started_at = None;
+        self.session_refresh_show_overlay = false;
         let restore_key = self.session_refresh_restore_key.take();
         let preserve_status = self.session_refresh_preserve_status.take();
         match result.sessions {
@@ -11935,8 +12117,36 @@ impl App {
         ))
     }
 
+    fn new_session_launch_status(&self) -> Option<String> {
+        let pending = self.new_session_launch.as_ref()?;
+        Some(format!(
+            "{} {} {} ({}s)",
+            startup_spinner_frame(pending.started_at.elapsed()),
+            pending.stage.label(),
+            new_session_launch_target_label(pending.kind, pending.provider),
+            pending.started_at.elapsed().as_secs()
+        ))
+    }
+
+    fn session_refresh_status(&self) -> Option<String> {
+        if !self.session_refresh_pending || !self.session_refresh_show_overlay {
+            return None;
+        }
+        let elapsed = self
+            .session_refresh_started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        Some(format!(
+            "{} refreshing sessions ({}s)",
+            startup_spinner_frame(elapsed),
+            elapsed.as_secs()
+        ))
+    }
+
     fn display_status(&self) -> String {
         self.data_task_status()
+            .or_else(|| self.new_session_launch_status())
+            .or_else(|| self.session_refresh_status())
             .or_else(|| self.ai_search_status())
             .or_else(|| self.ai_title_status())
             .unwrap_or_else(|| self.status.clone())
@@ -12006,11 +12216,29 @@ impl App {
     }
 
     fn handle_data_task_key(&mut self, key: KeyEvent) -> bool {
-        let Some(task) = self.data_task.as_mut() else {
+        if self.data_task.is_none() {
             return false;
         };
+        let keybindings = self.keybindings.clone();
+        let allow_quit_key = keybindings.matches(KeyAction::GlobalQuit, key);
+        let task = self.data_task.as_mut().expect("data_task checked above");
         if task.kind != DataTaskKind::Clone {
-            return false;
+            if allow_quit_key {
+                return false;
+            }
+            let notice = format!("{} in progress; wait for worker", task.kind.label());
+            task.notice = Some(notice.clone());
+            self.status = notice;
+            debug_log(
+                "data_task_input_blocked",
+                serde_json::json!({
+                    "seq": task.seq,
+                    "kind": task.kind.label(),
+                    "key": key_code_label(key),
+                    "modifiers": format!("{:?}", key.modifiers),
+                }),
+            );
+            return true;
         }
 
         let is_plain_esc = key.code == KeyCode::Esc && key.modifiers.is_empty();
@@ -12727,10 +12955,90 @@ impl App {
                     "snapshot": app_runtime_snapshot_debug_value(self, false),
                 }),
             );
+            self.mark_new_session_launch_attach_queued(&job.ctx.key);
             self.queued_attach = Some(job);
             return;
         }
         self.start_attach_job(job);
+    }
+
+    fn mark_new_session_launch_attach_key(&mut self, seq: u64, key: AgentKey) {
+        if let Some(pending) = self
+            .new_session_launch
+            .as_mut()
+            .filter(|pending| pending.seq == seq)
+        {
+            pending.attach_key = Some(key);
+            pending.stage = NewSessionLaunchStage::Starting;
+        }
+    }
+
+    fn mark_new_session_launch_attach_queued(&mut self, key: &AgentKey) {
+        if let Some(pending) = self
+            .new_session_launch
+            .as_mut()
+            .filter(|pending| pending.attach_key.as_ref() == Some(key))
+        {
+            pending.stage = NewSessionLaunchStage::Queued;
+        }
+    }
+
+    fn mark_new_session_launch_attach_started(&mut self, key: &AgentKey) {
+        if let Some(pending) = self
+            .new_session_launch
+            .as_mut()
+            .filter(|pending| pending.attach_key.as_ref() == Some(key))
+        {
+            pending.stage = NewSessionLaunchStage::Starting;
+        }
+    }
+
+    fn finish_new_session_launch_for_key(&mut self, key: &AgentKey, reason: &'static str) {
+        let should_clear = self
+            .new_session_launch
+            .as_ref()
+            .and_then(|pending| pending.attach_key.as_ref())
+            == Some(key);
+        if should_clear {
+            debug_log(
+                "new_session_launch_done",
+                serde_json::json!({
+                    "reason": reason,
+                    "key": agent_key_debug_value(key),
+                    "pending": self
+                        .new_session_launch
+                        .as_ref()
+                        .map(new_session_launch_pending_debug_value),
+                    "snapshot": app_runtime_snapshot_debug_value(self, false),
+                }),
+            );
+            self.new_session_launch = None;
+        }
+    }
+
+    fn sync_new_session_launch_after_attach_request(&mut self, seq: u64, key: &AgentKey) {
+        let Some(pending) = self
+            .new_session_launch
+            .as_mut()
+            .filter(|pending| pending.seq == seq && pending.attach_key.as_ref() == Some(key))
+        else {
+            return;
+        };
+        if self
+            .attach_in_flight
+            .as_ref()
+            .is_some_and(|attach| attach.key == *key)
+        {
+            pending.stage = NewSessionLaunchStage::Starting;
+        } else if self
+            .queued_attach
+            .as_ref()
+            .is_some_and(|job| job.ctx.key == *key)
+        {
+            pending.stage = NewSessionLaunchStage::Queued;
+        } else {
+            self.new_session_launch = None;
+        }
     }
 
     fn start_attach_job(&mut self, job: AttachJob) {
@@ -12777,7 +13085,9 @@ impl App {
             target: ctx.target.clone(),
             started_at: Instant::now(),
         });
+        self.mark_new_session_launch_attach_started(&ctx.key);
         self.status = format!("attaching {}...", live_agent_status_label(&info));
+        let attach_key_for_pending = ctx.key.clone();
         debug_log(
             "attach_job_started",
             serde_json::json!({
@@ -12832,6 +13142,10 @@ impl App {
             });
         if let Err(e) = spawn_result {
             self.attach_in_flight = None;
+            self.finish_new_session_launch_for_key(
+                &attach_key_for_pending,
+                "attach_worker_spawn_failed",
+            );
             self.status = format!("attach failed: {}", e);
             debug_log(
                 "attach_worker_spawn_failed",
@@ -12877,6 +13191,7 @@ impl App {
             );
             return;
         }
+        self.finish_new_session_launch_for_key(&result.ctx.key, "attach_result");
         self.attach_in_flight = None;
         if let Some(queued) = self.queued_attach.take() {
             let result_seq = result.seq;
@@ -15053,10 +15368,10 @@ impl App {
         rows: u16,
         origin_tag: &str,
         main_focus_override_on_ready: Option<AgentFocusPane>,
-    ) {
+    ) -> Option<AgentKey> {
         if cwd.is_empty() {
             self.status = "no cwd to open a shell at.".into();
-            return;
+            return None;
         }
         let info = shell_session_info_for_cwd(cwd.clone());
         let key = AgentKey::new(&info);
@@ -15080,7 +15395,7 @@ impl App {
             prompt_for_saved_data: false,
             settings: self.settings.clone(),
             ctx: AttachUiCtx {
-                key,
+                key: key.clone(),
                 target: AttachTarget::MainAgent,
                 status_attached: format!("attached shell at {}", cwd_label),
                 status_started: format!("started shell at {}", cwd_label),
@@ -15097,6 +15412,7 @@ impl App {
                 failed_event: "shell_open_failed",
             },
         });
+        Some(key)
     }
 
     fn begin_new_session_from_focused(&mut self) {
@@ -15184,25 +15500,39 @@ impl App {
             );
             return false;
         }
-        let cwd = match normalize_launch_cwd(&cwd) {
-            Ok(cwd) => cwd,
-            Err(message) => {
-                self.status = message;
-                debug_log(
-                    "new_session_normalize_cwd_failed",
-                    serde_json::json!({
-                        "kind": kind.as_str(),
-                        "provider": provider.as_str(),
-                        "launch_mode": launch_mode.as_str(),
-                        "status": &self.status,
-                    }),
-                );
-                return false;
-            }
-        };
+        if cwd.trim().is_empty() {
+            self.status = "folder path is required.".into();
+            debug_log(
+                "new_session_cwd_empty",
+                serde_json::json!({
+                    "kind": kind.as_str(),
+                    "provider": provider.as_str(),
+                    "launch_mode": launch_mode.as_str(),
+                    "status": &self.status,
+                }),
+            );
+            return false;
+        }
+        self.new_session_launch_seq = self.new_session_launch_seq.saturating_add(1);
+        let seq = self.new_session_launch_seq;
+        self.new_session_launch = Some(NewSessionLaunchPending {
+            seq,
+            kind,
+            raw_cwd: cwd.clone(),
+            provider,
+            launch_mode,
+            started_at: Instant::now(),
+            stage: NewSessionLaunchStage::Preparing,
+            attach_key: None,
+        });
+        self.status = format!(
+            "preparing {}...",
+            new_session_launch_target_label(kind, provider)
+        );
         debug_log(
-            "new_session_start",
+            "new_session_prepare_start",
             serde_json::json!({
+                "seq": seq,
                 "kind": kind.as_str(),
                 "cwd": &cwd,
                 "provider": provider.as_str(),
@@ -15211,19 +15541,128 @@ impl App {
                 "rows": rows,
             }),
         );
+        let Some(tx) = self.main_tx.clone() else {
+            let result = run_new_session_prepare(seq, kind, cwd, provider, launch_mode, cols, rows);
+            self.on_new_session_prepare_result(Box::new(result));
+            return true;
+        };
+        match thread::Builder::new()
+            .name("cokacmux-new-session".into())
+            .spawn(move || {
+                let result =
+                    run_new_session_prepare(seq, kind, cwd, provider, launch_mode, cols, rows);
+                let _ = tx.send(MainEvent::NewSessionPrepareResult(Box::new(result)));
+            }) {
+            Ok(_) => true,
+            Err(e) => {
+                self.new_session_launch = None;
+                self.status = format!("new session worker failed: {}", e);
+                debug_log(
+                    "new_session_prepare_worker_spawn_failed",
+                    serde_json::json!({
+                        "seq": seq,
+                        "kind": kind.as_str(),
+                        "provider": provider.as_str(),
+                        "launch_mode": launch_mode.as_str(),
+                        "error": e.to_string(),
+                    }),
+                );
+                false
+            }
+        }
+    }
+
+    fn on_new_session_prepare_result(&mut self, result: Box<NewSessionPrepareResult>) {
+        let result = *result;
+        let pending_seq = self.new_session_launch.as_ref().map(|pending| pending.seq);
+        debug_log(
+            "new_session_prepare_result_received",
+            serde_json::json!({
+                "pending_seq": pending_seq,
+                "result": new_session_prepare_result_debug_value(&result),
+                "snapshot": app_runtime_snapshot_debug_value(self, false),
+            }),
+        );
+        if pending_seq != Some(result.seq) {
+            debug_log(
+                "new_session_prepare_result_stale",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "pending_seq": pending_seq,
+                    "snapshot": app_runtime_snapshot_debug_value(self, false),
+                }),
+            );
+            return;
+        }
+        let cwd = match result.outcome {
+            Ok(cwd) => cwd,
+            Err(message) => {
+                self.new_session_launch = None;
+                self.status = message.clone();
+                if matches!(self.input_mode, InputMode::Normal) {
+                    let provider_options =
+                        available_agent_provider_options(&self.settings.cokacmux.agent_programs);
+                    let provider =
+                        normalize_agent_provider_selection(result.provider, &provider_options)
+                            .unwrap_or(result.provider);
+                    let cwd_cursor = result.raw_cwd.len();
+                    self.input_mode = InputMode::NewSession {
+                        selected: NEW_SESSION_FIELD_CWD,
+                        kind: result.kind,
+                        cwd: result.raw_cwd,
+                        cwd_cursor,
+                        provider,
+                        provider_options,
+                        launch_mode: result.launch_mode,
+                    };
+                }
+                debug_log(
+                    "new_session_normalize_cwd_failed",
+                    serde_json::json!({
+                        "seq": result.seq,
+                        "kind": result.kind.as_str(),
+                        "provider": result.provider.as_str(),
+                        "launch_mode": result.launch_mode.as_str(),
+                        "status": &self.status,
+                        "elapsed_ms": result.elapsed_ms,
+                    }),
+                );
+                return;
+            }
+        };
+        debug_log(
+            "new_session_start",
+            serde_json::json!({
+                "seq": result.seq,
+                "kind": result.kind.as_str(),
+                "cwd": &cwd,
+                "provider": result.provider.as_str(),
+                "launch_mode": result.launch_mode.as_str(),
+                "cols": result.cols,
+                "rows": result.rows,
+                "prepare_elapsed_ms": result.elapsed_ms,
+            }),
+        );
         let main_focus_override_on_ready = Some(AgentFocusPane::Main);
-        match kind {
+        match result.kind {
             NewSessionKind::Terminal => {
-                self.open_shell_at_cwd(
+                if let Some(key) = self.open_shell_at_cwd(
                     cwd,
-                    cols,
-                    rows,
+                    result.cols,
+                    result.rows,
                     "new_session:terminal",
                     main_focus_override_on_ready,
-                );
+                ) {
+                    self.mark_new_session_launch_attach_key(result.seq, key.clone());
+                    self.sync_new_session_launch_after_attach_request(result.seq, &key);
+                } else {
+                    self.new_session_launch = None;
+                }
             }
             NewSessionKind::CokacDir => {
                 let info = cokacdir_session_info_for_cwd(cwd.clone());
+                let key = AgentKey::new(&info);
+                self.mark_new_session_launch_attach_key(result.seq, key.clone());
                 debug_log(
                     "cokacdir_open_start",
                     serde_json::json!({
@@ -15233,36 +15672,52 @@ impl App {
                 );
                 self.attach_agent_without_data_restore_prompt_with_main_focus_override(
                     info,
-                    cols,
-                    rows,
+                    result.cols,
+                    result.rows,
                     AgentLaunchMode::Normal,
                     main_focus_override_on_ready,
                 );
+                self.sync_new_session_launch_after_attach_request(result.seq, &key);
             }
             NewSessionKind::CodingAgent => {
-                let info = new_agent_session_info(provider, cwd.clone());
+                let info = new_agent_session_info(result.provider, cwd.clone());
+                let key = AgentKey::new(&info);
+                if self.block_live_coding_agent_cwd_conflict(&info) {
+                    self.new_session_launch = None;
+                    debug_log(
+                        "new_session_launch_done",
+                        serde_json::json!({
+                            "reason": "cwd_conflict",
+                            "key": agent_key_debug_value(&key),
+                            "snapshot": app_runtime_snapshot_debug_value(self, false),
+                        }),
+                    );
+                    return;
+                }
+                self.mark_new_session_launch_attach_key(result.seq, key.clone());
                 debug_log(
                     "new_agent_open_start",
                     serde_json::json!({
-                        "provider": provider.as_str(),
+                        "provider": result.provider.as_str(),
                         "session_id": &info.session_id,
                         "cwd": &cwd,
-                        "launch_mode": launch_mode.as_str(),
+                        "launch_mode": result.launch_mode.as_str(),
                     }),
                 );
                 self.attach_agent_with_main_focus_override(
                     info,
-                    cols,
-                    rows,
-                    launch_mode,
+                    result.cols,
+                    result.rows,
+                    result.launch_mode,
                     main_focus_override_on_ready,
                 );
+                self.sync_new_session_launch_after_attach_request(result.seq, &key);
                 debug_log(
                     "new_agent_open_after_attach",
                     serde_json::json!({
-                        "provider": provider.as_str(),
+                        "provider": result.provider.as_str(),
                         "cwd": &cwd,
-                        "launch_mode": launch_mode.as_str(),
+                        "launch_mode": result.launch_mode.as_str(),
                         "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
                         "show_sessions_view": self.show_sessions_view,
                         "agent_states": agent_state_entries_debug_value(&self.agent_states),
@@ -15270,7 +15725,6 @@ impl App {
                 );
             }
         }
-        true
     }
 
     fn begin_agent_launch(&mut self, cols: u16, rows: u16) {
@@ -20256,6 +20710,7 @@ fn main_event_kind(event: &MainEvent) -> &'static str {
         MainEvent::AgentReaderEnded { .. } => "agent_reader_ended",
         MainEvent::AgentWriterEnded { .. } => "agent_writer_ended",
         MainEvent::Tick { .. } => "tick",
+        MainEvent::AnimationTick { .. } => "animation_tick",
         MainEvent::PreviewReady { .. } => "preview_ready",
         MainEvent::RuntimeStateResult(_) => "runtime_state_result",
         MainEvent::LiveShellDiscoveryResult(_) => "live_shell_discovery_result",
@@ -20269,6 +20724,7 @@ fn main_event_kind(event: &MainEvent) -> &'static str {
         MainEvent::RestoreResult(_) => "restore_result",
         MainEvent::AiTitleResult(_) => "ai_title_result",
         MainEvent::AttachResult(_) => "attach_result",
+        MainEvent::NewSessionPrepareResult(_) => "new_session_prepare_result",
         MainEvent::KeybindingsReloaded(_) => "keybindings_reloaded",
     }
 }
@@ -20298,6 +20754,9 @@ fn main_event_queued_at_epoch_ms(event: &MainEvent) -> Option<u64> {
         }
         | MainEvent::Tick {
             queued_at_epoch_ms, ..
+        }
+        | MainEvent::AnimationTick {
+            queued_at_epoch_ms, ..
         } => *queued_at_epoch_ms,
         MainEvent::SessionRefreshResult(result) => result.queued_at_epoch_ms,
         MainEvent::SearchResult(result) => result.queued_at_epoch_ms,
@@ -20307,6 +20766,7 @@ fn main_event_queued_at_epoch_ms(event: &MainEvent) -> Option<u64> {
         MainEvent::AiTitleResult(result) => result.queued_at_epoch_ms,
         MainEvent::LiveShellDiscoveryResult(result) => result.queued_at_epoch_ms,
         MainEvent::AttachResult(result) => result.queued_at_epoch_ms,
+        MainEvent::NewSessionPrepareResult(result) => result.queued_at_epoch_ms,
         _ => return None,
     }
     .into()
@@ -20846,6 +21306,9 @@ fn handle_main_event(
         MainEvent::AttachResult(result) => {
             app.on_attach_result(result);
         }
+        MainEvent::NewSessionPrepareResult(result) => {
+            app.on_new_session_prepare_result(result);
+        }
         MainEvent::KeybindingsReloaded(reload) => {
             app.on_keybindings_reloaded(*reload);
         }
@@ -20854,6 +21317,7 @@ fn handle_main_event(
             app.poll_agent_sessions();
             app.poll_agent_runtime_states();
         }
+        MainEvent::AnimationTick { .. } => {}
         MainEvent::PreviewReady { .. } => {
             app.poll_preview_results();
         }
@@ -21059,6 +21523,27 @@ fn run(terminal: &mut Tui) -> Result<()> {
             {
                 debug_log(
                     "tick_event_send_failed",
+                    serde_json::json!({
+                        "reason": "main_receiver_dropped",
+                    }),
+                );
+                return;
+            }
+        })?;
+
+    let animation_tx = main_tx.clone();
+    let _animation_thread = thread::Builder::new()
+        .name("cokacmux-animation".into())
+        .spawn(move || loop {
+            thread::sleep(Duration::from_millis(UI_ANIMATION_TICK_MS));
+            if animation_tx
+                .send(MainEvent::AnimationTick {
+                    queued_at_epoch_ms: current_epoch_ms(),
+                })
+                .is_err()
+            {
+                debug_log(
+                    "animation_tick_send_failed",
                     serde_json::json!({
                         "reason": "main_receiver_dropped",
                     }),
@@ -29761,6 +30246,7 @@ fn handle_new_session_key(
     if let Some((kind, cwd, provider, launch_mode)) = start_action {
         if app.start_new_session_from_modal(kind, cwd, provider, launch_mode, cols, rows)
             && matches!(&app.input_mode, InputMode::NewSession { .. })
+            && app.new_session_launch.is_some()
         {
             app.input_mode = InputMode::Normal;
         }
@@ -31425,10 +31911,49 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     let modal_drawn = draw_input_modal(f, area, app);
-    let ai_search_overlay_drawn =
-        draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref());
+    let ai_search_overlay_drawn = if modal_drawn {
+        false
+    } else {
+        draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref())
+    };
+    let new_session_overlay_drawn = if modal_drawn || ai_search_overlay_drawn {
+        false
+    } else {
+        draw_new_session_launch_overlay(f, area, app.new_session_launch.as_ref())
+    };
+    let attach_overlay_drawn =
+        if modal_drawn || ai_search_overlay_drawn || new_session_overlay_drawn {
+            false
+        } else {
+            draw_attach_progress_overlay(f, area, app)
+        };
+    let runtime_refresh_overlay_drawn = if modal_drawn
+        || ai_search_overlay_drawn
+        || new_session_overlay_drawn
+        || attach_overlay_drawn
+    {
+        false
+    } else {
+        draw_runtime_refresh_pending_overlay(f, area, app)
+    };
+    let session_refresh_overlay_drawn = if modal_drawn
+        || ai_search_overlay_drawn
+        || new_session_overlay_drawn
+        || attach_overlay_drawn
+        || runtime_refresh_overlay_drawn
+    {
+        false
+    } else {
+        draw_session_refresh_pending_overlay(f, area, app)
+    };
     let mut cursor_set = None;
-    if !modal_drawn && !ai_search_overlay_drawn {
+    if !modal_drawn
+        && !ai_search_overlay_drawn
+        && !new_session_overlay_drawn
+        && !attach_overlay_drawn
+        && !runtime_refresh_overlay_drawn
+        && !session_refresh_overlay_drawn
+    {
         if let Some(cursor) = focused_cursor {
             f.set_cursor_position(cursor);
             cursor_set = Some(cursor);
@@ -31455,6 +31980,10 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             })),
             "modal_drawn": modal_drawn,
             "ai_search_overlay_drawn": ai_search_overlay_drawn,
+            "new_session_overlay_drawn": new_session_overlay_drawn,
+            "attach_overlay_drawn": attach_overlay_drawn,
+            "runtime_refresh_overlay_drawn": runtime_refresh_overlay_drawn,
+            "session_refresh_overlay_drawn": session_refresh_overlay_drawn,
             "sidebar_drawn": layout.sidebar.is_some() && active_key.is_some(),
             "sidebar_candidates_len": sidebar_candidates_len,
             "status": app.display_status(),
@@ -31464,11 +31993,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
-    if let Some(task) = app
-        .data_task
-        .as_ref()
-        .filter(|task| task.kind == DataTaskKind::Clone)
-    {
+    if let Some(task) = app.data_task.as_ref() {
         draw_data_task_modal(f, area, task);
     } else if let InputMode::DeleteConfirm {
         info,
@@ -31681,32 +32206,294 @@ fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPendi
     }
 
     lines.push(Line::from(""));
-    let help_items = if task.cancel_requested {
-        [direct_help_item(
+    let help_items = match task.kind {
+        DataTaskKind::Clone if task.cancel_requested => [direct_help_item(
             "Esc",
             "pressed · cancelling and rolling back when safe",
-        )]
-    } else {
-        [direct_help_item(
+        )],
+        DataTaskKind::Clone => [direct_help_item(
             "Esc",
             "cancel · all other actions locked until clone completes",
-        )]
+        )],
+        DataTaskKind::Restore => [direct_help_item(
+            "Wait",
+            "restore must finish before other actions",
+        )],
     };
     lines.push(modal_help_line(&help_items));
 
-    let modal_area = modal_area_for_wrapped_lines(area, "Clone in progress", &lines, 44, 86, 7, 12);
+    let title = task.kind.modal_title();
+    let modal_area = modal_area_for_wrapped_lines(area, title, &lines, 44, 86, 7, 12);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
         .style(theme_alt_style())
-        .title("Clone in progress");
+        .title(title);
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
         .wrap(Wrap { trim: true });
     f.render_widget(Clear, modal_area);
     f.render_widget(p, modal_area);
+}
+
+fn draw_new_session_launch_overlay(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    pending: Option<&NewSessionLaunchPending>,
+) -> bool {
+    let Some(pending) = pending else {
+        return false;
+    };
+    let elapsed = pending.started_at.elapsed();
+    let target = new_session_launch_target_label(pending.kind, pending.provider);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "{} {} {}",
+                startup_spinner_frame(elapsed),
+                pending.stage.label(),
+                target
+            ),
+            Style::default()
+                .fg(THEME_FG_STRONG)
+                .bg(THEME_BG_ALT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Folder: {}",
+                truncate_width(&display_cwd_str(&pending.raw_cwd), 60)
+            ),
+            Style::default().fg(THEME_FG).bg(THEME_BG_ALT),
+        )),
+    ];
+    if pending.kind == NewSessionKind::CodingAgent {
+        lines.push(Line::from(Span::styled(
+            format!("Permissions: {}", pending.launch_mode.label()),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("Elapsed: {}s", elapsed.as_secs()),
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+    )));
+
+    let modal_area =
+        modal_area_for_wrapped_lines(area, "Starting new session", &lines, 44, 88, 5, 8);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Starting new session");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, modal_area);
+    f.render_widget(p, modal_area);
+    true
+}
+
+fn agent_key_status_label(key: &AgentKey) -> String {
+    if key.session_id.starts_with("shell-") {
+        "terminal".to_string()
+    } else if key.session_id.starts_with("cokacdir-") {
+        "cokacdir".to_string()
+    } else {
+        format!(
+            "{} agent {}",
+            key.provider.as_str(),
+            truncate_width(&key.session_id, 14)
+        )
+    }
+}
+
+fn attach_progress_target_label(key: &AgentKey, target: &AttachTarget) -> String {
+    match target {
+        AttachTarget::MainAgent => agent_key_status_label(key),
+        AttachTarget::Auxiliary { kind, .. } => format!("right {}", kind.label()),
+    }
+}
+
+fn pending_runtime_action_label(action: &PendingRuntimeAction) -> String {
+    match action {
+        PendingRuntimeAction::LaunchSelected { info, .. } => {
+            format!("launch {}", live_agent_status_label(info))
+        }
+        PendingRuntimeAction::RestoreLive { selected_key, .. } => selected_key
+            .as_ref()
+            .map(|key| format!("restore {}", agent_key_status_label(key)))
+            .unwrap_or_else(|| "restore live agent".to_string()),
+        PendingRuntimeAction::SwitchActive {
+            current_key, delta, ..
+        } => {
+            let direction = if *delta >= 0 { "next" } else { "previous" };
+            format!(
+                "switch to {} agent from {}",
+                direction,
+                agent_key_status_label(current_key)
+            )
+        }
+    }
+}
+
+fn draw_attach_progress_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
+    if app.new_session_launch.is_some() {
+        return false;
+    }
+    let Some(attach) = app.attach_in_flight.as_ref() else {
+        return false;
+    };
+
+    let elapsed = attach.started_at.elapsed();
+    let target = attach_progress_target_label(&attach.key, &attach.target);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{} Connecting {}", startup_spinner_frame(elapsed), target),
+            Style::default()
+                .fg(THEME_FG_STRONG)
+                .bg(THEME_BG_ALT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("Status: {}", truncate_width(&app.status, 60)),
+            Style::default().fg(THEME_FG).bg(THEME_BG_ALT),
+        )),
+    ];
+    if let Some(job) = app.queued_attach.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Queued: {}",
+                truncate_width(
+                    &attach_progress_target_label(&job.ctx.key, &job.ctx.target),
+                    60
+                )
+            ),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("Elapsed: {}s", elapsed.as_secs()),
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+    )));
+
+    let modal_area = modal_area_for_wrapped_lines(area, "Connecting", &lines, 44, 88, 5, 8);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Connecting");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, modal_area);
+    f.render_widget(p, modal_area);
+    true
+}
+
+fn draw_runtime_refresh_pending_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
+    if app.new_session_launch.is_some() || app.attach_in_flight.is_some() {
+        return false;
+    }
+    let Some(action) = app.pending_runtime_action.as_ref() else {
+        return false;
+    };
+    if !app.runtime_refresh_pending && !app.runtime_refresh_queued {
+        return false;
+    }
+
+    let elapsed = app
+        .runtime_refresh_started_at
+        .map(|started_at| started_at.elapsed())
+        .unwrap_or_default();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{} Checking live state", startup_spinner_frame(elapsed)),
+            Style::default()
+                .fg(THEME_FG_STRONG)
+                .bg(THEME_BG_ALT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Target: {}",
+                truncate_width(&pending_runtime_action_label(action), 60)
+            ),
+            Style::default().fg(THEME_FG).bg(THEME_BG_ALT),
+        )),
+    ];
+    if !app.status.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("Status: {}", truncate_width(&app.status, 60)),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("Elapsed: {}s", elapsed.as_secs()),
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+    )));
+
+    let modal_area = modal_area_for_wrapped_lines(area, "Checking", &lines, 44, 88, 5, 8);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Checking");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, modal_area);
+    f.render_widget(p, modal_area);
+    true
+}
+
+fn draw_session_refresh_pending_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
+    if !app.session_refresh_pending || !app.session_refresh_show_overlay {
+        return false;
+    }
+    let elapsed = app
+        .session_refresh_started_at
+        .map(|started_at| started_at.elapsed())
+        .unwrap_or_default();
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("{} Refreshing sessions", startup_spinner_frame(elapsed)),
+            Style::default()
+                .fg(THEME_FG_STRONG)
+                .bg(THEME_BG_ALT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("Status: {}", truncate_width(&app.status, 60)),
+            Style::default().fg(THEME_FG).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            format!("Elapsed: {}s", elapsed.as_secs()),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ];
+
+    let modal_area = modal_area_for_wrapped_lines(area, "Refreshing", &lines, 44, 88, 5, 8);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Refreshing");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, modal_area);
+    f.render_widget(p, modal_area);
+    true
 }
 
 fn agent_sidebar_width(total_width: u16, configured_width: u16) -> u16 {
@@ -33709,8 +34496,33 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(Clear, outer[1]);
     draw_status(f, app, outer[1]);
 
-    draw_input_modal(f, area, app);
-    draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref());
+    let modal_drawn = draw_input_modal(f, area, app);
+    let ai_search_overlay_drawn = if modal_drawn {
+        false
+    } else {
+        draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref())
+    };
+    let new_session_overlay_drawn = if modal_drawn || ai_search_overlay_drawn {
+        false
+    } else {
+        draw_new_session_launch_overlay(f, area, app.new_session_launch.as_ref())
+    };
+    let attach_overlay_drawn =
+        if modal_drawn || ai_search_overlay_drawn || new_session_overlay_drawn {
+            false
+        } else {
+            draw_attach_progress_overlay(f, area, app)
+        };
+    if !modal_drawn
+        && !ai_search_overlay_drawn
+        && !new_session_overlay_drawn
+        && !attach_overlay_drawn
+    {
+        let runtime_refresh_overlay_drawn = draw_runtime_refresh_pending_overlay(f, area, app);
+        if !runtime_refresh_overlay_drawn {
+            draw_session_refresh_pending_overlay(f, area, app);
+        }
+    }
 }
 
 fn draw_delete_confirm_modal(
@@ -35403,6 +36215,14 @@ fn new_session_preview_command(
             new_agent_launch_spec_with_programs(&info, launch_mode, &settings.agent_programs)
                 .command_line()
         }
+    }
+}
+
+fn new_session_launch_target_label(kind: NewSessionKind, provider: Provider) -> String {
+    match kind {
+        NewSessionKind::Terminal => "terminal".to_string(),
+        NewSessionKind::CokacDir => "cokacdir".to_string(),
+        NewSessionKind::CodingAgent => format!("{} agent", provider.as_str()),
     }
 }
 
@@ -38516,6 +39336,26 @@ mod tests {
         }
     }
 
+    fn pump_new_session_prepare_result(app: &mut App, rx: &Receiver<MainEvent>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = rx
+                .recv_timeout(remaining)
+                .expect("new session prepare worker should send a result");
+            match event {
+                MainEvent::NewSessionPrepareResult(result) => {
+                    app.on_new_session_prepare_result(result);
+                    return;
+                }
+                MainEvent::AttachResult(result) => {
+                    app.on_attach_result(result);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn default_agent_launch_spec(
         info: &SessionInfo,
         launch_mode: AgentLaunchMode,
@@ -38607,11 +39447,15 @@ mod tests {
             attach_seq: 0,
             attach_in_flight: None,
             queued_attach: None,
+            new_session_launch_seq: 0,
+            new_session_launch: None,
             agent_sidebar_order: Vec::new(),
             last_ui_stall_log_at: None,
             ui_stall_log_count: 0,
             session_refresh_seq: 0,
             session_refresh_pending: false,
+            session_refresh_started_at: None,
+            session_refresh_show_overlay: false,
             session_refresh_restore_key: None,
             session_refresh_preserve_status: None,
             next_reader_id: 0,
@@ -40295,8 +41139,11 @@ mod tests {
         );
 
         // The cokacdir program check runs in the attach worker's prepare
-        // stage; the failure dialog opens when its result is applied.
+        // stage; cwd normalization is prepared first, then the attach result
+        // opens the failure dialog.
         assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.new_session_launch.is_some());
+        pump_new_session_prepare_result(&mut app, &rx);
         pump_attach_result(&mut app, &rx);
 
         match &app.input_mode {
@@ -42923,6 +43770,196 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn new_session_enter_shows_prepare_spinner_before_attach_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().display().to_string();
+        let mut app = app_for_key_tests();
+        let (tx, _rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
+        app.input_mode = InputMode::NewSession {
+            selected: NEW_SESSION_FIELD_KIND,
+            kind: NewSessionKind::Terminal,
+            cwd: cwd.clone(),
+            cwd_cursor: cwd.len(),
+            provider: Provider::Codex,
+            provider_options: Vec::new(),
+            launch_mode: AgentLaunchMode::Normal,
+        };
+
+        let keybindings = app.keybindings.clone();
+        handle_new_session_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            80,
+            24,
+            &keybindings,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.attach_in_flight.is_none());
+        let pending = app
+            .new_session_launch
+            .as_ref()
+            .expect("Enter should immediately show a new-session spinner");
+        assert_eq!(pending.kind, NewSessionKind::Terminal);
+        assert_eq!(pending.stage, NewSessionLaunchStage::Preparing);
+        assert_eq!(pending.raw_cwd, cwd);
+        assert!(app.display_status().contains("Preparing terminal"));
+    }
+
+    #[test]
+    fn new_session_launch_overlay_renders_at_80x24() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let pending = NewSessionLaunchPending {
+            seq: 1,
+            kind: NewSessionKind::Terminal,
+            raw_cwd: "/repo".into(),
+            provider: Provider::Codex,
+            launch_mode: AgentLaunchMode::Normal,
+            started_at: Instant::now(),
+            stage: NewSessionLaunchStage::Preparing,
+            attach_key: None,
+        };
+
+        terminal
+            .draw(|f| {
+                assert!(draw_new_session_launch_overlay(f, f.area(), Some(&pending)));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Starting new session"));
+        assert!(rendered.contains("Preparing terminal"));
+        assert!(rendered.contains("Folder: /repo"));
+    }
+
+    #[test]
+    fn attach_progress_overlay_renders_main_attach_at_80x24() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = app_for_key_tests();
+        app.status = "attaching codex agent session-abc...".into();
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 1,
+            key: AgentKey {
+                provider: Provider::Codex,
+                session_id: "session-abc".into(),
+            },
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+
+        terminal
+            .draw(|f| {
+                assert!(draw_attach_progress_overlay(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Connecting"));
+        assert!(rendered.contains("codex agent session-abc"));
+        assert!(rendered.contains("Status: attaching codex agent session-abc"));
+    }
+
+    #[test]
+    fn attach_progress_overlay_renders_auxiliary_attach_at_80x24() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = app_for_key_tests();
+        let parent = AgentKey {
+            provider: Provider::Codex,
+            session_id: "parent-agent".into(),
+        };
+        app.status = "attaching terminal...".into();
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 1,
+            key: AgentKey {
+                provider: Provider::Claude,
+                session_id: "shell-parent-agent".into(),
+            },
+            target: AttachTarget::Auxiliary {
+                kind: AgentAuxKind::Terminal,
+                parent,
+            },
+            started_at: Instant::now(),
+        });
+
+        terminal
+            .draw(|f| {
+                assert!(draw_attach_progress_overlay(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Connecting right terminal"));
+        assert!(rendered.contains("Status: attaching terminal"));
+    }
+
+    #[test]
+    fn runtime_refresh_pending_overlay_renders_deferred_launch_at_80x24() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = app_for_key_tests();
+        app.status = "checking live state for codex agent runtime-launch...".into();
+        app.runtime_refresh_pending = true;
+        app.runtime_refresh_started_at = Some(Instant::now());
+        app.pending_runtime_action = Some(PendingRuntimeAction::LaunchSelected {
+            info: session_info(Provider::Codex, "runtime-launch", "/repo"),
+            cols: 80,
+            rows: 24,
+        });
+
+        terminal
+            .draw(|f| {
+                assert!(draw_runtime_refresh_pending_overlay(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Checking live state"));
+        assert!(rendered.contains("Target: launch codex agent runtime-launch"));
+        assert!(rendered.contains("Status: checking live state"));
+    }
+
+    #[test]
+    fn manual_session_refresh_sets_visible_spinner_state() {
+        let mut app = app_for_key_tests();
+        let (tx, _rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
+
+        app.request_session_refresh();
+
+        assert!(app.session_refresh_pending);
+        assert!(app.session_refresh_show_overlay);
+        assert!(app.session_refresh_started_at.is_some());
+        assert!(app.display_status().contains("refreshing sessions"));
+        assert!(app.display_status().starts_with('⠋'));
+    }
+
+    #[test]
+    fn session_refresh_overlay_renders_manual_refresh_at_80x24() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = app_for_key_tests();
+        app.status = "refreshing sessions...".into();
+        app.session_refresh_pending = true;
+        app.session_refresh_started_at = Some(Instant::now());
+        app.session_refresh_show_overlay = true;
+
+        terminal
+            .draw(|f| {
+                assert!(draw_session_refresh_pending_overlay(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Refreshing"));
+        assert!(rendered.contains("Refreshing sessions"));
+        assert!(rendered.contains("Status: refreshing sessions"));
+    }
+
+    #[test]
     fn new_session_cwd_field_keeps_plain_jklh_as_text() {
         let mut app = app_for_key_tests();
         app.input_mode = InputMode::NewSession {
@@ -43070,6 +44107,8 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             NewSessionKind::CodingAgent,
         ] {
             let mut app = app_for_key_tests();
+            let (tx, rx) = mpsc::channel::<MainEvent>();
+            app.main_tx = Some(tx);
             app.settings.cokacmux.agent_programs.codex = Some(codex.display().to_string());
             app.attach_in_flight = Some(AttachInFlight {
                 seq: 1,
@@ -43089,6 +44128,11 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 100,
                 28,
             ));
+            assert!(app
+                .new_session_launch
+                .as_ref()
+                .is_some_and(|pending| pending.stage == NewSessionLaunchStage::Preparing));
+            pump_new_session_prepare_result(&mut app, &rx);
 
             let queued = app
                 .queued_attach
@@ -44080,6 +45124,32 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn restore_data_task_modal_renders_at_80x24() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = app_for_key_tests();
+        let mut task = DataTaskPending::new(
+            1,
+            DataTaskKind::Restore,
+            "restoring folder data for codex restored-id".to_string(),
+        );
+        task.progress_message = Some("Restoring saved folder snapshot".to_string());
+        app.data_task = Some(task);
+
+        terminal
+            .draw(|f| {
+                assert!(draw_input_modal(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Restore in progress"));
+        assert!(rendered.contains("restoring folder data"));
+        assert!(rendered.contains("Status: Restoring saved folder snapshot"));
+        assert!(rendered.contains("restore must finish before other actions"));
+    }
+
+    #[test]
     fn quit_is_blocked_while_data_task_runs() {
         let mut app = app_for_key_tests();
         app.data_task = Some(DataTaskPending::new(
@@ -44152,6 +45222,33 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         let task = app.data_task.as_ref().expect("clone task remains pending");
         assert!(task.cancel_requested);
         assert!(app.status.contains("cancellation requested"));
+    }
+
+    #[test]
+    fn restore_data_task_locks_regular_input() {
+        let mut app = app_for_key_tests();
+        app.sessions
+            .push(session_info(Provider::Codex, "first", "/repo/one"));
+        app.sessions
+            .push(session_info(Provider::Codex, "second", "/repo/two"));
+        app.list_state.select(Some(0));
+        app.data_task = Some(DataTaskPending::new(
+            1,
+            DataTaskKind::Restore,
+            "restoring folder data".to_string(),
+        ));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert_eq!(app.list_state.selected(), Some(0));
+        assert!(app.status.contains("restore in progress"));
+        assert!(app.data_task.is_some());
     }
 
     #[test]
