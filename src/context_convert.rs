@@ -117,14 +117,18 @@ pub fn wrap_session_for_context_convert(
 
 fn target_native_session_id(provider: Provider) -> String {
     match provider {
-        Provider::Claude | Provider::Codex => crate::ids::new_uuid_v7(),
+        Provider::Claude | Provider::Codex | Provider::Pi | Provider::Gjc => {
+            crate::ids::new_uuid_v7()
+        }
         Provider::OpenCode => crate::ids::opencode_session_id(),
     }
 }
 
 fn target_native_message_id(provider: Provider) -> String {
     match provider {
-        Provider::Claude | Provider::Codex => crate::ids::new_uuid_v7(),
+        Provider::Claude | Provider::Codex | Provider::Pi | Provider::Gjc => {
+            crate::ids::new_uuid_v7()
+        }
         Provider::OpenCode => crate::ids::opencode_message_id(),
     }
 }

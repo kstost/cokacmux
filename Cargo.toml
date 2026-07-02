@@ -17,13 +17,15 @@ path = "src/bin/cokacmux.rs"
 required-features = ["tui"]
 
 [features]
-default = ["claude", "codex", "opencode", "cli", "discovery", "tui"]
+default = ["claude", "codex", "opencode", "pi", "gjc", "cli", "discovery", "tui"]
 claude = []
 codex = []
 opencode = ["dep:rusqlite"]
+pi = ["discovery"]
+gjc = ["discovery", "pi"]
 cli = ["discovery"]
 discovery = ["dep:dirs"]
-tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:anyhow", "dep:portable-pty", "dep:vt100", "discovery", "claude", "codex"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:anyhow", "dep:portable-pty", "dep:vt100", "discovery", "claude", "codex", "pi", "gjc"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

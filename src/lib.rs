@@ -9,6 +9,10 @@
 //!   indexed by a SQLite `state_5.sqlite::threads` table.
 //! - **OpenCode**: SQLite database at `~/.local/share/opencode/opencode.db`
 //!   with `session`, `message`, and `part` tables.
+//! - **Pi**: JSONL session files under `~/.pi/agent/sessions/--<cwd>--/`
+//!   with in-file `id`/`parentId` tree structure.
+//! - **GJC**: JSONL session files under `~/.gjc/agent/sessions/<encoded-cwd>/`
+//!   with the same in-file tree structure as Pi.
 //!
 //! This crate defines [`UniversalSession`] — a provider-agnostic data model
 //! that can hold supported provider data without loss — and provides
@@ -74,7 +78,7 @@ use std::path::PathBuf;
 /// Where to read a session from.
 #[derive(Debug, Clone)]
 pub enum SessionSource {
-    /// A JSONL file path (Claude or Codex).
+    /// A JSONL file path (Claude, Codex, Pi, or GJC).
     Path(PathBuf),
     /// An OpenCode database + session id.
     OpenCodeDb {
@@ -89,7 +93,7 @@ pub enum SessionSource {
 /// Where to write a session to.
 #[derive(Debug, Clone)]
 pub enum SessionTarget {
-    /// A file path. JSONL for Claude/Codex; not valid for OpenCode.
+    /// A file path. JSONL for Claude/Codex/Pi/GJC; not valid for OpenCode.
     Path(PathBuf),
     /// An OpenCode database path (will INSERT into `session`/`message`/`part`).
     OpenCodeDb { db_path: PathBuf },
@@ -104,13 +108,17 @@ pub fn read_session(provider: Provider, src: &SessionSource) -> Result<Universal
             "source": session_source_label(src),
         }),
     );
-    let result = match (provider, src) {
+    let result: Result<UniversalSession> = match (provider, src) {
         #[cfg(feature = "claude")]
         (Provider::Claude, SessionSource::Path(p)) => {
             providers::claude::from_file(p, &Default::default())
         }
         #[cfg(feature = "codex")]
         (Provider::Codex, SessionSource::Path(p)) => providers::codex::from_file(p),
+        #[cfg(feature = "pi")]
+        (Provider::Pi, SessionSource::Path(p)) => providers::pi::from_file(p),
+        #[cfg(feature = "gjc")]
+        (Provider::Gjc, SessionSource::Path(p)) => providers::gjc::from_file(p),
         #[cfg(feature = "opencode")]
         (
             Provider::OpenCode,
@@ -164,7 +172,7 @@ pub fn write_session(
             "messages": session.messages.len(),
         }),
     );
-    let result = match (provider, dst) {
+    let result: Result<()> = match (provider, dst) {
         #[cfg(feature = "claude")]
         (Provider::Claude, SessionTarget::Path(p)) => {
             providers::claude::to_file(session, p, &Default::default())
@@ -172,6 +180,14 @@ pub fn write_session(
         #[cfg(feature = "codex")]
         (Provider::Codex, SessionTarget::Path(p)) => {
             providers::codex::to_file(session, p, &Default::default())
+        }
+        #[cfg(feature = "pi")]
+        (Provider::Pi, SessionTarget::Path(p)) => {
+            providers::pi::to_file(session, p, &Default::default())
+        }
+        #[cfg(feature = "gjc")]
+        (Provider::Gjc, SessionTarget::Path(p)) => {
+            providers::gjc::to_file(session, p, &Default::default())
         }
         #[cfg(feature = "opencode")]
         (Provider::OpenCode, SessionTarget::OpenCodeDb { db_path }) => {

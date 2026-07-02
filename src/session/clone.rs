@@ -103,6 +103,8 @@ pub fn clone_to_live(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport>
                 ))
             }
         }
+        Provider::Pi => clone_pi_same_provider(src, opts),
+        Provider::Gjc => clone_gjc_same_provider(src, opts),
     }
 }
 
@@ -377,6 +379,202 @@ fn clone_opencode_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<C
         new_cwd,
         artifact,
     })
+}
+
+#[cfg(feature = "pi")]
+fn clone_pi_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport> {
+    if !src.source.is_file() {
+        return Err(ConvertError::Other(format!(
+            "pi source JSONL not found: {}",
+            src.source.display()
+        )));
+    }
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| mint_id_for(Provider::Pi));
+    ensure_native_session_id_for(Provider::Pi, &new_id)?;
+    let new_cwd = opts.cwd.clone().unwrap_or_else(|| src.cwd.clone());
+    if new_cwd.is_empty() {
+        return Err(ConvertError::MissingField("session.cwd"));
+    }
+
+    let mut session = super::load(src)?;
+    session.session_id = new_id.clone();
+    session.cwd = new_cwd.clone();
+    session.created_at = Some(Utc::now());
+    session.updated_at = session.created_at;
+    session.extras.insert(
+        "pi_parent_session".into(),
+        serde_json::Value::String(
+            src.source
+                .canonicalize()
+                .unwrap_or_else(|_| src.source.clone())
+                .display()
+                .to_string(),
+        ),
+    );
+
+    let install_opts = pi_install_opts_from_source(&src.source, opts.overwrite);
+    let install = providers::pi::install::install_to_user_dir(&session, &install_opts)?;
+    let artifact = ArtifactPath::File(install.jsonl_path.clone());
+    let validation =
+        ensure_clone_artifact_native_or_cleanup(Provider::Pi, &new_id, &new_cwd, &artifact, opts)?;
+    crate::debug::log(
+        "clone_to_live_ok",
+        serde_json::json!({
+            "source_provider": src.provider.as_str(),
+            "source_session_id": &src.session_id,
+            "target_provider": Provider::Pi.as_str(),
+            "new_session_id": &new_id,
+            "artifact": format!("{:?}", &artifact),
+            "native_validation_checks": validation.checks.len(),
+            "path": "pi_native_jsonl_replay",
+        }),
+    );
+    Ok(CloneReport {
+        source_provider: Provider::Pi,
+        source_session_id: src.session_id.clone(),
+        new_session_id: new_id,
+        target_provider: Provider::Pi,
+        new_cwd,
+        artifact,
+    })
+}
+
+#[cfg(not(feature = "pi"))]
+fn clone_pi_same_provider(_src: &SessionInfo, _opts: &CloneOpts) -> Result<CloneReport> {
+    Err(ConvertError::Unsupported("pi feature not enabled".into()))
+}
+
+#[cfg(feature = "gjc")]
+fn clone_gjc_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport> {
+    if !src.source.is_file() {
+        return Err(ConvertError::Other(format!(
+            "gjc source JSONL not found: {}",
+            src.source.display()
+        )));
+    }
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| mint_id_for(Provider::Gjc));
+    ensure_native_session_id_for(Provider::Gjc, &new_id)?;
+    let new_cwd = opts.cwd.clone().unwrap_or_else(|| src.cwd.clone());
+    if new_cwd.is_empty() {
+        return Err(ConvertError::MissingField("session.cwd"));
+    }
+
+    let mut session = super::load(src)?;
+    session.session_id = new_id.clone();
+    session.cwd = new_cwd.clone();
+    session.created_at = Some(Utc::now());
+    session.updated_at = session.created_at;
+    session.extras.insert(
+        "gjc_parent_session".into(),
+        serde_json::Value::String(
+            src.source
+                .canonicalize()
+                .unwrap_or_else(|_| src.source.clone())
+                .display()
+                .to_string(),
+        ),
+    );
+
+    let install_opts = gjc_install_opts_from_source(&src.source, opts.overwrite);
+    let install = providers::gjc::install::install_to_user_dir(&session, &install_opts)?;
+    let artifact = ArtifactPath::File(install.jsonl_path.clone());
+    let validation =
+        ensure_clone_artifact_native_or_cleanup(Provider::Gjc, &new_id, &new_cwd, &artifact, opts)?;
+    crate::debug::log(
+        "clone_to_live_ok",
+        serde_json::json!({
+            "source_provider": src.provider.as_str(),
+            "source_session_id": &src.session_id,
+            "target_provider": Provider::Gjc.as_str(),
+            "new_session_id": &new_id,
+            "artifact": format!("{:?}", &artifact),
+            "native_validation_checks": validation.checks.len(),
+            "path": "gjc_native_jsonl_replay",
+        }),
+    );
+    Ok(CloneReport {
+        source_provider: Provider::Gjc,
+        source_session_id: src.session_id.clone(),
+        new_session_id: new_id,
+        target_provider: Provider::Gjc,
+        new_cwd,
+        artifact,
+    })
+}
+
+#[cfg(not(feature = "gjc"))]
+fn clone_gjc_same_provider(_src: &SessionInfo, _opts: &CloneOpts) -> Result<CloneReport> {
+    Err(ConvertError::Unsupported("gjc feature not enabled".into()))
+}
+
+#[cfg(feature = "pi")]
+fn pi_install_opts_from_source(
+    source: &Path,
+    overwrite: bool,
+) -> providers::pi::install::InstallOpts {
+    let Some(parent) = source.parent() else {
+        return providers::pi::install::InstallOpts {
+            overwrite,
+            ..Default::default()
+        };
+    };
+    let parent_name = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if parent_name.starts_with("--") && parent_name.ends_with("--") {
+        if let Some(sessions_dir) = parent.parent() {
+            if sessions_dir.file_name().and_then(|name| name.to_str()) == Some("sessions") {
+                if let Some(agent_dir) = sessions_dir.parent() {
+                    return providers::pi::install::InstallOpts {
+                        pi_agent_dir: Some(agent_dir.to_path_buf()),
+                        overwrite,
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+    }
+    providers::pi::install::InstallOpts {
+        pi_session_dir: Some(parent.to_path_buf()),
+        overwrite,
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "gjc")]
+fn gjc_install_opts_from_source(
+    source: &Path,
+    overwrite: bool,
+) -> providers::gjc::install::InstallOpts {
+    let Some(parent) = source.parent() else {
+        return providers::gjc::install::InstallOpts {
+            overwrite,
+            ..Default::default()
+        };
+    };
+    if let Some(sessions_dir) = parent.parent() {
+        if sessions_dir.file_name().and_then(|name| name.to_str()) == Some("sessions") {
+            if let Some(agent_dir) = sessions_dir.parent() {
+                return providers::gjc::install::InstallOpts {
+                    gjc_agent_dir: Some(agent_dir.to_path_buf()),
+                    overwrite,
+                    ..Default::default()
+                };
+            }
+        }
+    }
+    providers::gjc::install::InstallOpts {
+        gjc_session_dir: Some(parent.to_path_buf()),
+        overwrite,
+        ..Default::default()
+    }
 }
 
 fn read_jsonl_lines(path: &Path) -> Result<Vec<JsonLine>> {
@@ -1038,14 +1236,18 @@ fn remove_installed_clone_artifact(
 
 fn mint_id_for(target: Provider) -> String {
     match target {
-        Provider::Claude | Provider::Codex => uuid::Uuid::now_v7().to_string(),
+        Provider::Claude | Provider::Codex | Provider::Pi | Provider::Gjc => {
+            uuid::Uuid::now_v7().to_string()
+        }
         Provider::OpenCode => crate::ids::opencode_session_id(),
     }
 }
 
 fn ensure_native_session_id_for(target: Provider, session_id: &str) -> Result<()> {
     let ok = match target {
-        Provider::Claude | Provider::Codex => uuid::Uuid::parse_str(session_id).is_ok(),
+        Provider::Claude | Provider::Codex | Provider::Pi | Provider::Gjc => {
+            uuid::Uuid::parse_str(session_id).is_ok()
+        }
         Provider::OpenCode => is_opencode_session_id(session_id),
     };
     if ok {

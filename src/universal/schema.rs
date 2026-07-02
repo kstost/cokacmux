@@ -26,6 +26,8 @@ pub enum Provider {
     Codex,
     Claude,
     OpenCode,
+    Pi,
+    Gjc,
 }
 
 impl Provider {
@@ -34,6 +36,8 @@ impl Provider {
             Provider::Codex => "codex",
             Provider::Claude => "claude",
             Provider::OpenCode => "opencode",
+            Provider::Pi => "pi",
+            Provider::Gjc => "gjc",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -41,6 +45,8 @@ impl Provider {
             "codex" => Some(Provider::Codex),
             "claude" => Some(Provider::Claude),
             "opencode" => Some(Provider::OpenCode),
+            "pi" => Some(Provider::Pi),
+            "gjc" => Some(Provider::Gjc),
             _ => None,
         }
     }

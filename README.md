@@ -45,13 +45,13 @@
 | 미리보기 | 저장된 세션 파일을 읽어서 오른쪽 창에 보여주는 기능입니다. 에이전트를 실행하지 않습니다. |
 | 에이전트 | 실제로 실행 중인 코딩 에이전트 CLI 프로세스입니다. |
 | 프로세스 | 컴퓨터 안에서 실행 중인 프로그램 하나를 뜻합니다. cokacmux를 실행하면 cokacmux 프로세스가 생기고, 에이전트를 시작하면 에이전트 프로세스도 생깁니다. |
-| provider | cokacmux가 지원하는 에이전트 종류입니다. 현재는 Claude Code, Codex, OpenCode입니다. |
+| provider | cokacmux가 지원하는 에이전트 종류입니다. 현재는 Claude Code, Codex, OpenCode, Pi, GJC입니다. |
 | 백그라운드 실행 대상 | `Ctrl+]`로 목록 화면에 돌아와도 종료되지 않고 계속 살아있는 코딩 에이전트, 터미널, `cokacdir`입니다. |
 | 작업 폴더 | 에이전트를 시작할 폴더입니다. 코딩 작업의 기준 디렉터리입니다. |
 | cwd | current working directory의 줄임말입니다. 여기서는 작업 폴더와 같은 뜻으로 보면 됩니다. |
 | 홈 폴더 | 사용자 개인 파일이 들어가는 기본 폴더입니다. macOS/Linux에서는 보통 `/home/이름` 또는 `/Users/이름`, Windows에서는 보통 `C:\Users\이름`입니다. |
 | `~` | 홈 폴더를 짧게 쓰는 표시입니다. 예를 들어 `~/.cokacmux/`는 내 홈 폴더 안의 `.cokacmux` 폴더라는 뜻입니다. |
-| PATH | 터미널에서 `codex`, `claude`, `opencode` 같은 명령을 찾는 운영체제의 검색 경로입니다. |
+| PATH | 터미널에서 `codex`, `claude`, `opencode`, `pi`, `gjc` 같은 명령을 찾는 운영체제의 검색 경로입니다. |
 | JSON | 설정을 저장할 때 자주 쓰는 글자 형식입니다. `{`와 `}`가 많이 보입니다. 쉼표와 따옴표 위치가 틀리면 앱이 읽지 못할 수 있습니다. |
 | JSONL | JSON을 한 줄에 하나씩 쌓아 둔 파일 형식입니다. 일부 에이전트가 대화 기록을 이런 방식으로 저장합니다. |
 | SQLite | 파일 하나로 된 작은 데이터베이스입니다. OpenCode는 대화 기록을 SQLite 파일에 저장합니다. |
@@ -135,12 +135,14 @@ cokacmux --version
 
 ### 3단계: 사용하는 에이전트 CLI 확인
 
-사용하는 것만 확인하면 됩니다. 셋을 모두 설치할 필요는 없습니다.
+사용하는 것만 확인하면 됩니다. 모두 설치할 필요는 없습니다.
 
 ```bash
 claude --version
 codex --version
 opencode --version
+pi --help
+gjc --help
 ```
 
 ### 4단계: 실행
@@ -206,11 +208,11 @@ codex --version
 opencode --version
 ```
 
-셋을 모두 설치할 필요는 없습니다. 본인이 쓰는 에이전트만 실행 가능하면 됩니다.
+모두 설치할 필요는 없습니다. 본인이 쓰는 에이전트만 실행 가능하면 됩니다.
 
 ### 실행 파일 위치를 직접 지정해야 할 때
 
-기본적으로 cokacmux는 `claude`, `codex`, `opencode`라는 명령 이름을 그대로 실행합니다. 실제 위치는 운영체제의 PATH 해석에 맡깁니다.
+기본적으로 cokacmux는 `claude`, `codex`, `opencode`, `pi`, `gjc`라는 명령 이름을 그대로 실행합니다. 실제 위치는 운영체제의 PATH 해석에 맡깁니다.
 
 macOS/Linux에서 현재 잡힌 위치 확인:
 
@@ -218,6 +220,8 @@ macOS/Linux에서 현재 잡힌 위치 확인:
 command -v claude
 command -v codex
 command -v opencode
+command -v pi
+command -v gjc
 ```
 
 Windows PowerShell에서 현재 잡힌 위치 확인:
@@ -226,6 +230,8 @@ Windows PowerShell에서 현재 잡힌 위치 확인:
 Get-Command claude
 Get-Command codex
 Get-Command opencode
+Get-Command pi
+Get-Command gjc
 ```
 
 PATH에 여러 버전이 잡혀 있거나 특정 설치본을 꼭 쓰고 싶다면 `~/.cokacmux/settings.json`의 `agent_programs`나 `cokacdir_program`에 직접 적을 수 있습니다.
@@ -236,7 +242,9 @@ PATH에 여러 버전이 잡혀 있거나 특정 설치본을 꼭 쓰고 싶다�
     "agent_programs": {
       "claude": "~/.local/bin/claude",
       "codex": "/usr/bin/codex",
-      "opencode": "~/.opencode/bin/opencode"
+      "opencode": "~/.opencode/bin/opencode",
+      "pi": "~/.local/bin/pi",
+      "gjc": "~/.local/bin/gjc"
     },
     "cokacdir_program": "~/.local/bin/cokacdir"
   }
@@ -251,7 +259,9 @@ Windows 경로는 JSON 규칙에 맞게 `\\`로 쓰거나 `/`를 사용할 수 �
     "agent_programs": {
       "claude": "C:\\Users\\me\\.local\\bin\\claude.exe",
       "codex": "C:/Users/me/AppData/Roaming/npm/codex.cmd",
-      "opencode": "C:/Users/me/.opencode/bin/opencode.exe"
+      "opencode": "C:/Users/me/.opencode/bin/opencode.exe",
+      "pi": "C:/Users/me/AppData/Roaming/npm/pi.cmd",
+      "gjc": "C:/Users/me/AppData/Roaming/npm/gjc.cmd"
     },
     "cokacdir_program": "C:/Users/me/.cokacmux/bin/cokacdir.exe"
   }
@@ -303,6 +313,10 @@ cokacmux
 | Codex | `~/.codex/sessions/...` |
 | OpenCode | macOS/Linux: `~/.local/share/opencode/opencode.db` |
 | OpenCode | Windows: `%LOCALAPPDATA%\opencode\opencode.db` 또는 `%APPDATA%\opencode\opencode.db` |
+| Pi | 기본: `~/.pi/agent/sessions/...`, `PI_CODING_AGENT_DIR` 사용 시 `$PI_CODING_AGENT_DIR/sessions/...` |
+| Pi | `PI_CODING_AGENT_SESSION_DIR` 사용 시 해당 디렉터리 바로 아래의 `*.jsonl` |
+| GJC | 기본: `~/.gjc/agent/sessions/...`, `GJC_CODING_AGENT_DIR` 사용 시 `$GJC_CODING_AGENT_DIR/sessions/...` |
+| GJC | XDG data root 사용 시 `$XDG_DATA_HOME/gjc/sessions/...` |
 
 한 번도 쓰지 않은 에이전트가 있어도 괜찮습니다. 해당 에이전트 세션만 비어 있을 뿐입니다.
 
@@ -339,7 +353,7 @@ cokacmux
 |---|---|---|
 | 선택표시 | 현재 선택된 줄 앞에 붙는 표시입니다. 선택된 줄에는 `▶`가 보입니다. | `▶` |
 | `state` | 해당 세션의 실행 상태입니다. | `idle`, `quiet`, `busy` |
-| `provider` | 어느 코딩 에이전트의 세션인지 보여줍니다. | `claude`, `codex`, `opencode` |
+| `provider` | 어느 코딩 에이전트의 세션인지 보여줍니다. | `claude`, `codex`, `opencode`, `pi`, `gjc` |
 | `title` | 사람이 읽기 쉬운 제목입니다. 직접 붙인 제목이 있으면 그 제목을 보여줍니다. | `login bug fix` |
 | `age` | 마지막으로 바뀐 지 얼마나 됐는지입니다. | `20s`, `5m`, `3h`, `2d` |
 | `cwd` | 그 세션이 작업하던 폴더입니다. | `/home/me/project` |
@@ -354,6 +368,8 @@ cokacmux
 | `busy` | 에이전트가 최근에 출력을 냈거나 작업 중으로 보이는 상태입니다. |
 
 터미널 폭이 충분할 때는 `title`과 `cwd`가 가장 많은 공간을 가져갑니다. 이유는 사람이 실제로 세션을 구분할 때 제목과 폴더가 가장 도움이 되기 때문입니다. `session`은 내부 ID라서 끝부분 10칸만 보여주고, 남는 공간은 `title`과 `cwd`에 씁니다.
+
+title은 `~/.cokacmux/titles.json`에 직접 붙인 제목을 가장 먼저 사용합니다. 원본 세션에 provider가 저장한 제목이 있으면 그 다음 후보로 사용하고, Pi/GJC처럼 제목이 비어 있는 JSONL 세션은 첫 번째 user 메시지를 짧게 정리해 기본 title로 보여줍니다.
 
 터미널 폭이 좁으면 일부 칸이 줄어들 수 있습니다. 이때도 세션을 고르고 실행하는 기능은 그대로 동작합니다. 화면만 좁아서 덜 보이는 것입니다.
 
@@ -537,6 +553,8 @@ Skip permissions를 선택하면 이어 실행할 때 다음 형태가 됩니다
 | Claude Code | `CLAUDE_CODE_NO_FLICKER=1 claude --dangerously-skip-permissions --resume <session-id>` |
 | Codex | `codex --yolo -c tui.keymap... resume -C <cwd> <session-id>` |
 | OpenCode | `OPENCODE_PERMISSION='{"*":"allow"}' opencode <cwd> --session <session-id>` |
+| Pi | `pi --session <session-id>` |
+| GJC | `gjc --resume <jsonl-path>` |
 
 Codex 실행에는 cokacmux의 에이전트 화면 스크롤과 Codex transcript/pager 스크롤이 충돌하지 않도록 여러 `-c tui.keymap...` 옵션이 함께 붙습니다.
 
@@ -563,7 +581,7 @@ Codex 실행에는 cokacmux의 에이전트 화면 스크롤과 Codex transcript
 |---|---|
 | Type | `Terminal`, `cokacdir`, `Coding agent` |
 | Folder | 시작할 작업 폴더 |
-| Agent | Coding agent일 때 `claude`, `codex`, `opencode` 중 선택 |
+| Agent | Coding agent일 때 `claude`, `codex`, `opencode`, `pi`, `gjc` 중 선택 |
 | Permissions | Coding agent일 때 Normal 또는 Skip permissions 선택 |
 
 `Folder`에 없는 경로를 입력하면 시작 전에 자동으로 생성합니다.
@@ -579,8 +597,12 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 | Claude Code | `CLAUDE_CODE_NO_FLICKER=1 claude --dangerously-skip-permissions [--session-id <uuid>]` |
 | Codex | `codex --yolo -c tui.keymap... -C <cwd>` |
 | OpenCode | `OPENCODE_PERMISSION='{"*":"allow"}' opencode <cwd>` |
+| Pi | `pi [--session-id <uuid>]` |
+| GJC | `GJC_SESSION_ID=<uuid> GJC_LIFECYCLE_REQUEST_ID=cokacmux-<uuid> gjc` |
 
 새 Claude Code 세션은 cokacmux가 만든 synthetic session id에서 UUID를 얻을 수 있을 때 `--session-id <uuid>`를 함께 붙여, 실행 중 상태와 나중에 생성되는 Claude 세션 파일을 안정적으로 연결합니다.
+새 Pi 세션도 UUID를 얻을 수 있을 때 `--session-id <uuid>`를 붙입니다. Pi는 `PI_CODING_AGENT_SESSION_DIR`이 설정되어 있으면 cwd별 하위 폴더를 만들지 않고 그 디렉터리 바로 아래에 JSONL 파일을 씁니다.
+새 GJC 세션도 같은 synthetic session id에서 UUID를 얻을 수 있을 때 `GJC_SESSION_ID`와 `GJC_LIFECYCLE_REQUEST_ID`를 함께 전달해, 실행 중 상태와 나중에 생성되는 GJC 세션 파일을 안정적으로 연결합니다.
 
 ### 6-7. 실행 중인 에이전트 전환과 종료
 
@@ -607,7 +629,7 @@ Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`
 
 에이전트 터미널 화면은 일반 키 입력을 에이전트에 그대로 전달합니다. 그래서 스크롤용 키는 일반 방향키와 분리되어 있습니다.
 
-스크롤 키 처리 방식은 실행 대상별로 다릅니다. Codex는 line/page/top/bottom 스크롤을 Codex transcript/pager 입력으로 보냅니다. Claude Code는 page/top/bottom을 fullscreen scroll 키로 바꾸고, 한 줄 스크롤은 원래 키를 자식 CLI에 전달합니다. OpenCode는 page up/down만 전용 키로 바꾸고, line/top/bottom은 원래 키를 자식 CLI에 전달합니다. 일반 터미널은 cokacmux가 보관한 PTY scrollback을 직접 움직입니다.
+스크롤 키 처리 방식은 실행 대상별로 다릅니다. Codex는 line/page/top/bottom 스크롤을 Codex transcript/pager 입력으로 보냅니다. Claude Code는 page/top/bottom을 fullscreen scroll 키로 바꾸고, 한 줄 스크롤은 원래 키를 자식 CLI에 전달합니다. OpenCode는 page up/down만 전용 키로 바꾸고, line/top/bottom은 원래 키를 자식 CLI에 전달합니다. Pi와 GJC는 현재 원래 스크롤 키를 자식 CLI에 전달합니다. 일반 터미널은 cokacmux가 보관한 PTY scrollback을 직접 움직입니다.
 
 `cokacdir`에서는 Shift가 포함된 단축키를 자식 앱에 우선 전달합니다. 그래서 기본값 중 `Shift+...` 조합은 `cokacdir`로 들어가고, Shift가 없는 `Alt+Home` / `Alt+End`는 cokacmux의 parent PTY scrollback을 움직입니다. `cokacdir` 화면에서 parent scrollback을 더 많이 쓰고 싶다면 Shift 없는 단축키로 다시 지정하세요.
 
@@ -637,7 +659,7 @@ AI 제목 생성과 AI 검색에 사용할 agent는 세션 목록에서 `,` 설�
 
 세션 원문이 너무 크면 agent CLI의 입력 한계를 피하기 위해 전체 세션 summary 렌더러를 사용합니다.
 
-Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 `title` 필드를 받습니다. OpenCode는 `opencode run --format json`의 JSON 이벤트에서 최종 답변을 꺼낸 뒤, 그 답변 안의 `title` JSON 필드를 제목으로 사용합니다. 긴 세션에서 OS argv 길이 제한에 걸리지 않도록 agent prompt는 stdin으로 전달합니다. AI 제목 생성을 위해 별도로 실행한 agent 세션은 남기지 않습니다. Codex는 ephemeral 실행, Claude는 session persistence 비활성화 실행을 사용하고, OpenCode는 생성된 helper session id를 확인해 완료 후 삭제합니다.
+Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 `title` 필드를 받습니다. OpenCode는 `opencode run --format json`의 JSON 이벤트에서 최종 답변을 꺼낸 뒤, 그 답변 안의 `title` JSON 필드를 제목으로 사용합니다. Pi와 GJC는 `--print --no-session` 실행 결과에서 `title` JSON 필드를 읽습니다. 긴 세션에서 OS argv 길이 제한에 걸리지 않도록 agent prompt는 stdin으로 전달합니다. AI 제목 생성을 위해 별도로 실행한 agent 세션은 남기지 않습니다. Codex는 ephemeral 실행, Claude는 session persistence 비활성화 실행, Pi와 GJC는 no-session 실행을 사용하고, OpenCode는 생성된 helper session id를 확인해 완료 후 삭제합니다.
 
 세션 목록에서 `Ctrl+F`를 누르면 검색 방식 선택창이 열립니다. 일반 검색을 고르면 세션 ID, 작업 폴더, 제목과 세션 본문 전체를 로컬에서 검색합니다. AI 검색을 고르면 모든 세션의 summary preview를 `~/.cokacmux/searchdata`에 최신 파일로 준비한 뒤, 선택한 agent에게 그 폴더를 직접 탐색하라고 요청합니다. 검색 중에는 중앙 오버레이에 스피너, preview 인덱싱 진행률, 현재 단계가 표시되고 `Esc` 취소 외 입력은 잠깁니다. AI 검색 결과 목록은 AI 점수 순서로 표시되고 title 칼럼에는 짧은 match label이 함께 나옵니다.
 
@@ -652,6 +674,8 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | Claude Code | 해당 JSONL 세션 파일과, 있으면 같은 이름의 sidecar 디렉터리 삭제 |
 | Codex | 해당 rollout JSONL 파일 삭제. 접근 가능한 경우 `~/.codex/state_5.sqlite`의 `threads` 행도 삭제 |
 | OpenCode | SQLite DB의 `part`, `message`, `session_message`, `session` 행 삭제 |
+| Pi | 해당 JSONL 세션 파일 삭제 |
+| GJC | 해당 JSONL 세션 파일 삭제 |
 
 중요한 기록은 삭제 전에 백업하세요.
 
@@ -737,8 +761,8 @@ Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 
 | `Ctrl+K` | 현재 코딩 에이전트/일반 터미널 종료. `cokacdir` 화면에서는 자식 앱에 전달 |
 | `Ctrl+N` | 현재 작업 폴더를 기본값으로 새 세션 모달 열기 |
 | `Ctrl+B` | 에이전트 사이드바 표시/숨김 |
-| `Ctrl+F` | Codex/Claude/OpenCode의 현재 작업 폴더로 오른쪽 `cokacdir` 패널 표시/숨김 |
-| `Ctrl+T` | Codex/Claude/OpenCode의 현재 작업 폴더로 오른쪽 terminal 패널 표시/숨김 |
+| `Ctrl+F` | Codex/Claude/OpenCode/Pi/GJC의 현재 작업 폴더로 오른쪽 `cokacdir` 패널 표시/숨김 |
+| `Ctrl+T` | Codex/Claude/OpenCode/Pi/GJC의 현재 작업 폴더로 오른쪽 terminal 패널 표시/숨김 |
 | `Ctrl+1` | 왼쪽 agents 패널로 포커스 이동. 숨겨져 있으면 표시 |
 | `Ctrl+2` | 중앙 agent 패널로 포커스 이동 |
 | `Ctrl+3` | 오른쪽 보조 패널로 포커스 이동 |
@@ -862,7 +886,7 @@ killall cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_re
 
 정리 대상은 `~/.cokacmux/agents/`의 런타임 메타데이터와 운영체제 프로세스 목록을 함께 보고 찾습니다. 확인된 agent daemon, 연결된 cokacmux 클라이언트, daemon이 남긴 자식 PTY 프로세스, 오래된 cwd lock과 orphan ptylog를 정리합니다. Windows에서는 프로세스 command line을 스캔해 런타임 파일이 사라진 daemon도 찾되, 현재 프로세스이거나 cokacmux agent/client로 확인되지 않는 PID는 건너뜁니다.
 
-별도 터미널에서 직접 실행한 `claude`, `codex`, `opencode`는 cokacmux 프로세스나 그 자식 프로세스가 아니면 종료 대상이 아닙니다.
+별도 터미널에서 직접 실행한 `claude`, `codex`, `opencode`, `pi`, `gjc`는 cokacmux 프로세스나 그 자식 프로세스가 아니면 종료 대상이 아닙니다.
 
 ### `reset`
 
@@ -878,7 +902,7 @@ cokacmux reset
 reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_removed=0 pty_logs_deleted=2 cwd_locks_removed=1 untracked_daemons_scanned=0 untracked_daemons_terminated=0 untracked_daemons_skipped_self=0 untracked_daemons_skipped_unverified=0 clients_scanned=1 clients_terminated=1 clients_skipped_self=0 clients_skipped_unverified=0 errors=0 removed=true
 ```
 
-`reset`은 `settings.json`, `keybinding.json`, `titles.json`, `clone_tree.json`, `agent_auxiliary.json`, `data/`, `searchdata/`, `bin/`, `agents/`, `debug/`를 포함한 `~/.cokacmux` 디렉터리 전체를 지웁니다. Claude Code, Codex, OpenCode가 각자 저장하는 원본 세션 데이터는 `~/.cokacmux` 밖에 있으므로 삭제하지 않습니다.
+`reset`은 `settings.json`, `keybinding.json`, `titles.json`, `clone_tree.json`, `agent_auxiliary.json`, `data/`, `searchdata/`, `bin/`, `agents/`, `debug/`를 포함한 `~/.cokacmux` 디렉터리 전체를 지웁니다. Claude Code, Codex, OpenCode, Pi, GJC가 각자 저장하는 원본 세션 데이터는 `~/.cokacmux` 밖에 있으므로 삭제하지 않습니다.
 
 ---
 
@@ -900,7 +924,9 @@ reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_remo
     "agent_programs": {
       "codex": "",
       "claude": "",
-      "opencode": ""
+      "opencode": "",
+      "pi": "",
+      "gjc": ""
     },
     "ai": {
       "provider": null
@@ -926,7 +952,7 @@ reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_remo
 
 `agent_programs`와 `cokacdir_program`의 빈 문자열은 placeholder입니다. 비워 두면 기존처럼 PATH에서 기본 명령 이름을 찾습니다. `cokacdir`은 PATH에서 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용합니다. 설치 스크립트는 이 파일을 미리 내려받고, 직접 설치하지 않았거나 파일을 지운 경우에만 실행 시 자동 다운로드합니다.
 
-`ai.provider`는 `null`, `"claude"`, `"codex"`, `"opencode"` 중 하나입니다. `null`이면 AI 기능용 agent가 설정되지 않은 상태입니다.
+`ai.provider`는 `null`, `"claude"`, `"codex"`, `"opencode"`, `"pi"`, `"gjc"` 중 하나입니다. `null`이면 AI 기능용 agent가 설정되지 않은 상태입니다.
 
 ### `agent_programs` 자세히
 
@@ -935,6 +961,8 @@ reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_remo
 | `agent_programs.claude` | `claude` | Claude Code 세션 이어가기, 새 Claude Code 시작 |
 | `agent_programs.codex` | `codex` | Codex 세션 이어가기, 새 Codex 시작 |
 | `agent_programs.opencode` | `opencode` | OpenCode 세션 이어가기, 새 OpenCode 시작 |
+| `agent_programs.pi` | `pi` | Pi 세션 이어가기, 새 Pi 시작 |
+| `agent_programs.gjc` | `gjc` | GJC 세션 이어가기, 새 GJC 시작 |
 | `cokacdir_program` | `cokacdir` | New session 모달의 `cokacdir` 시작 |
 
 동작 규칙:
@@ -1045,6 +1073,10 @@ Windows에서 `~`는 보통 `C:\Users\사용자이름\`입니다. 따라서 `~/.
 | Codex | `~/.codex/sessions/...` |
 | OpenCode | macOS/Linux: `~/.local/share/opencode/opencode.db` |
 | OpenCode | Windows: `%LOCALAPPDATA%\opencode\opencode.db` 또는 `%APPDATA%\opencode\opencode.db` |
+| Pi | 기본: `~/.pi/agent/sessions/...`, `PI_CODING_AGENT_DIR` 사용 시 `$PI_CODING_AGENT_DIR/sessions/...` |
+| Pi | `PI_CODING_AGENT_SESSION_DIR` 사용 시 해당 디렉터리 바로 아래의 `*.jsonl` |
+| GJC | 기본: `~/.gjc/agent/sessions/...`, `GJC_CODING_AGENT_DIR` 사용 시 `$GJC_CODING_AGENT_DIR/sessions/...` |
+| GJC | XDG data root 사용 시 `$XDG_DATA_HOME/gjc/sessions/...` |
 
 ---
 
@@ -1075,6 +1107,8 @@ cokacmux 자체는 세션 데이터를 외부 서버로 전송하지 않습니�
 command -v claude
 command -v codex
 command -v opencode
+command -v pi
+command -v gjc
 ```
 
 Windows PowerShell:
@@ -1083,6 +1117,8 @@ Windows PowerShell:
 Get-Command claude
 Get-Command codex
 Get-Command opencode
+Get-Command pi
+Get-Command gjc
 ```
 
 로그인/인증이 끝나 있는지도 확인하세요. PATH가 애매하면 `settings.json`의 `agent_programs`에 직접 경로를 지정할 수 있습니다.
@@ -1104,6 +1140,8 @@ Get-Command opencode
 | Claude Code | `--dangerously-skip-permissions` |
 | Codex | `--yolo` |
 | OpenCode | `OPENCODE_PERMISSION='{"*":"allow"}'` |
+| Pi | 별도 권한 우회 옵션 없음 |
+| GJC | 별도 권한 우회 옵션 없음 |
 
 신뢰하지 않는 저장소, 외부에서 받은 코드, 중요한 파일이 많은 폴더에서는 사용하지 마세요.
 
@@ -1178,6 +1216,8 @@ cokacmux --check
 claude --version
 codex --version
 opencode --version
+pi --help
+gjc --help
 ```
 
 4. 디버그 모드로 실행:
@@ -1295,10 +1335,12 @@ python build.py --status
 | Claude Code | 작업 폴더별 JSONL 파일 |
 | Codex | 날짜별 JSONL rollout 파일과 SQLite 인덱스 |
 | OpenCode | SQLite 데이터베이스 |
+| Pi | 작업 폴더별 JSONL 파일. `PI_CODING_AGENT_SESSION_DIR`을 쓰면 지정 디렉터리 바로 아래의 JSONL 파일 |
+| GJC | 작업 폴더별 JSONL 파일. 홈/임시 폴더 안의 cwd는 GJC 방식의 짧은 상대 경로 디렉터리로 저장 |
 
 cokacmux는 이 데이터를 읽어 공통 모델로 표현합니다. 그래서 한 화면에서 여러 에이전트 세션을 같이 보여주고, 검색하고, 미리보기하고, 복제할 수 있습니다.
 
-에이전트를 실행할 때는 자체 AI 엔진을 쓰지 않습니다. 사용자의 시스템에 설치된 `claude`, `codex`, `opencode` CLI를 PTY 안에서 실행하고, TUI가 그 화면에 붙었다 떨어졌다 하는 방식입니다.
+에이전트를 실행할 때는 자체 AI 엔진을 쓰지 않습니다. 사용자의 시스템에 설치된 `claude`, `codex`, `opencode`, `pi`, `gjc` CLI를 PTY 안에서 실행하고, TUI가 그 화면에 붙었다 떨어졌다 하는 방식입니다.
 
 백그라운드 실행 대상 정보는 `~/.cokacmux/agents/`에 저장됩니다. 이 정보 덕분에 세션 목록으로 돌아와도 코딩 에이전트, 터미널, `cokacdir`이 계속 살아 있고, 나중에 다시 연결할 수 있습니다.
 

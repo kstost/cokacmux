@@ -9,5 +9,11 @@ pub mod codex;
 #[cfg(feature = "opencode")]
 pub mod opencode;
 
+#[cfg(feature = "pi")]
+pub mod pi;
+
+#[cfg(feature = "gjc")]
+pub mod gjc;
+
 #[cfg(feature = "discovery")]
 pub mod discovery;

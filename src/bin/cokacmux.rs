@@ -87,8 +87,29 @@ const AI_SEARCH_TIMEOUT_SECS: u64 = 180;
 const AI_SEARCH_DATA_DIR_NAME: &str = "searchdata";
 const AI_SEARCH_PREVIEW_FORMAT_VERSION: &str = "2";
 const AI_SEARCH_CANCELLED_ERROR: &str = "cancelled";
+const SEARCH_PROGRESS_STEP: usize = 32;
+const AI_SEARCH_INDEX_PROGRESS_STEP: usize = 32;
 const AI_SEARCH_PENDING_OVERLAY_MAX_WIDTH: u16 = 160;
+const AI_AGENT_STRUCTURED_OUTPUT_SYSTEM_PROMPT: &str = "You are a structured-output component. The final assistant response is parsed by software.\n- Return exactly one JSON value that satisfies the task output contract.\n- Do not include prose, markdown, code fences, labels, comments, logs, evidence dumps, tool output, or multiple JSON values.\n- If the task has no matches or no content, return the empty JSON value defined by the task output contract.\n- Ensure every string is a valid JSON string with escaped control characters.";
+const OPENCODE_AI_TITLE_PERMISSION: &str = r#"{"*":"deny","question":"deny","plan_exit":"deny"}"#;
 const OPENCODE_AI_SEARCH_PERMISSION: &str = r#"{"read":"allow","glob":"allow","grep":"allow","list":"allow","edit":"deny","bash":"deny","task":"deny"}"#;
+const OPENCODE_AI_TITLE_ARGS: &[&str] = &["run", "--agent", "plan", "--format", "json"];
+const OPENCODE_AI_SEARCH_ARGS: &[&str] = &["run", "--pure", "--format", "json"];
+const PI_AI_TITLE_ARGS: &[&str] = &[
+    "--print",
+    "--no-session",
+    "--no-tools",
+    "--no-context-files",
+];
+const PI_AI_SEARCH_ARGS: &[&str] = &[
+    "--print",
+    "--no-session",
+    "--no-context-files",
+    "--tools",
+    "read,grep,find,ls",
+];
+const GJC_AI_TITLE_ARGS: &[&str] = &["--print", "--no-session", "--no-tools"];
+const GJC_AI_SEARCH_ARGS: &[&str] = &["--print", "--no-session", "--tools", "read,grep,find"];
 #[cfg(windows)]
 const WINDOWS_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 #[cfg(windows)]
@@ -119,7 +140,7 @@ const AI_SEARCH_OUTPUT_SCHEMA: &str = r#"{
         "properties": {
           "provider": {
             "type": "string",
-            "enum": ["codex", "claude", "opencode"]
+            "enum": ["codex", "claude", "opencode", "pi", "gjc"]
           },
           "session_id": {
             "type": "string",
@@ -368,6 +389,8 @@ const THEME_BORDER_ACTIVE: Color = Color::Indexed(110);
 const THEME_PROVIDER_CLAUDE: Color = Color::Indexed(139);
 const THEME_PROVIDER_CODEX: Color = Color::Indexed(110);
 const THEME_PROVIDER_OPENCODE: Color = Color::Indexed(107);
+const THEME_PROVIDER_PI: Color = Color::Indexed(179);
+const THEME_PROVIDER_GJC: Color = Color::Indexed(81);
 const THEME_PREVIEW_USER: Color = Color::Indexed(117);
 const THEME_PREVIEW_ASSISTANT: Color = Color::Indexed(114);
 const THEME_PREVIEW_TOOL: Color = Color::Indexed(215);
@@ -439,6 +462,7 @@ impl Settings {
 
     fn normalized(mut self) -> Self {
         self.cokacmux.sessions_pane_percent = self.cokacmux.sessions_pane_percent.min(100);
+        self.cokacmux.ai.provider = normalize_ai_title_provider(self.cokacmux.ai.provider);
         self.cokacmux.agent_programs.normalize_placeholders();
         normalize_program_placeholder(&mut self.cokacmux.cokacdir_program);
         self
@@ -570,6 +594,10 @@ struct AgentProgramSettings {
     claude: Option<String>,
     #[serde(default)]
     opencode: Option<String>,
+    #[serde(default)]
+    pi: Option<String>,
+    #[serde(default)]
+    gjc: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -580,6 +608,8 @@ impl Default for AgentProgramSettings {
             codex: Some(String::new()),
             claude: Some(String::new()),
             opencode: Some(String::new()),
+            pi: Some(String::new()),
+            gjc: Some(String::new()),
             extra: serde_json::Map::new(),
         }
     }
@@ -591,6 +621,8 @@ impl AgentProgramSettings {
         option_string_is_blank_or_none(&self.codex)
             && option_string_is_blank_or_none(&self.claude)
             && option_string_is_blank_or_none(&self.opencode)
+            && option_string_is_blank_or_none(&self.pi)
+            && option_string_is_blank_or_none(&self.gjc)
             && self.extra.is_empty()
     }
 
@@ -598,6 +630,8 @@ impl AgentProgramSettings {
         normalize_program_placeholder(&mut self.codex);
         normalize_program_placeholder(&mut self.claude);
         normalize_program_placeholder(&mut self.opencode);
+        normalize_program_placeholder(&mut self.pi);
+        normalize_program_placeholder(&mut self.gjc);
     }
 
     fn program_for(&self, provider: Provider) -> String {
@@ -605,6 +639,8 @@ impl AgentProgramSettings {
             Provider::Codex => self.codex.as_deref(),
             Provider::Claude => self.claude.as_deref(),
             Provider::OpenCode => self.opencode.as_deref(),
+            Provider::Pi => self.pi.as_deref(),
+            Provider::Gjc => self.gjc.as_deref(),
         }
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -821,6 +857,7 @@ enum KeyAction {
     AiTitleSettingsClaude,
     AiTitleSettingsCodex,
     AiTitleSettingsOpenCode,
+    AiTitleSettingsPi,
     AgentLaunchCancel,
     AgentLaunchConfirm,
     AgentLaunchNext,
@@ -1262,6 +1299,7 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
         KeyAction::AiTitleSettingsOpenCode,
         &["4"],
     ),
+    ("ai_title_settings.pi", KeyAction::AiTitleSettingsPi, &["5"]),
     (
         "agent_launch.cancel",
         KeyAction::AgentLaunchCancel,
@@ -2158,7 +2196,9 @@ impl ProviderFilter {
             ProviderFilter::All => ProviderFilter::One(Provider::Claude),
             ProviderFilter::One(Provider::Claude) => ProviderFilter::One(Provider::Codex),
             ProviderFilter::One(Provider::Codex) => ProviderFilter::One(Provider::OpenCode),
-            ProviderFilter::One(Provider::OpenCode) => ProviderFilter::All,
+            ProviderFilter::One(Provider::OpenCode) => ProviderFilter::One(Provider::Pi),
+            ProviderFilter::One(Provider::Pi) => ProviderFilter::One(Provider::Gjc),
+            ProviderFilter::One(Provider::Gjc) => ProviderFilter::All,
         }
     }
     fn label(self) -> &'static str {
@@ -2167,6 +2207,8 @@ impl ProviderFilter {
             ProviderFilter::One(Provider::Claude) => "claude",
             ProviderFilter::One(Provider::Codex) => "codex",
             ProviderFilter::One(Provider::OpenCode) => "opencode",
+            ProviderFilter::One(Provider::Pi) => "pi",
+            ProviderFilter::One(Provider::Gjc) => "gjc",
         }
     }
     fn matches(self, p: Provider) -> bool {
@@ -2177,7 +2219,13 @@ impl ProviderFilter {
     }
 }
 
-const PROVIDER_OPTIONS: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::OpenCode];
+const PROVIDER_OPTIONS: [Provider; 5] = [
+    Provider::Claude,
+    Provider::Codex,
+    Provider::OpenCode,
+    Provider::Pi,
+    Provider::Gjc,
+];
 
 fn agent_launch_mode_at(index: usize) -> AgentLaunchMode {
     AGENT_LAUNCH_MODE_OPTIONS[index % AGENT_LAUNCH_MODE_OPTIONS.len()]
@@ -2278,15 +2326,23 @@ fn selection_index_after_removed_row(
     Some(removed_index.unwrap_or(0).min(len_after.saturating_sub(1)))
 }
 
-const AI_TITLE_PROVIDER_OPTIONS: [Option<Provider>; 4] = [
+const AI_TITLE_PROVIDER_OPTIONS: [Option<Provider>; 5] = [
     None,
     Some(Provider::Claude),
     Some(Provider::Codex),
     Some(Provider::OpenCode),
+    Some(Provider::Pi),
 ];
 
 fn ai_title_provider_at(index: usize) -> Option<Provider> {
     AI_TITLE_PROVIDER_OPTIONS[index % AI_TITLE_PROVIDER_OPTIONS.len()]
+}
+
+fn normalize_ai_title_provider(provider: Option<Provider>) -> Option<Provider> {
+    AI_TITLE_PROVIDER_OPTIONS
+        .contains(&provider)
+        .then_some(provider)
+        .flatten()
 }
 
 fn ai_title_provider_index(provider: Option<Provider>) -> usize {
@@ -2508,6 +2564,12 @@ impl SettingsState {
             (SettingsSection::Agents, SETTINGS_AGENTS_OPENCODE) => {
                 Some(SettingsTextField::AgentProgram(Provider::OpenCode))
             }
+            (SettingsSection::Agents, SETTINGS_AGENTS_PI) => {
+                Some(SettingsTextField::AgentProgram(Provider::Pi))
+            }
+            (SettingsSection::Agents, SETTINGS_AGENTS_GJC) => {
+                Some(SettingsTextField::AgentProgram(Provider::Gjc))
+            }
             (SettingsSection::Agents, SETTINGS_AGENTS_COKACDIR) => {
                 Some(SettingsTextField::CokacdirProgram)
             }
@@ -2527,6 +2589,8 @@ impl SettingsState {
             (SettingsSection::Agents, SETTINGS_AGENTS_CODEX)
             | (SettingsSection::Agents, SETTINGS_AGENTS_CLAUDE)
             | (SettingsSection::Agents, SETTINGS_AGENTS_OPENCODE)
+            | (SettingsSection::Agents, SETTINGS_AGENTS_PI)
+            | (SettingsSection::Agents, SETTINGS_AGENTS_GJC)
             | (SettingsSection::Agents, SETTINGS_AGENTS_COKACDIR) => SettingsRowKind::Text,
             _ => SettingsRowKind::ReadOnly,
         }
@@ -2614,7 +2678,7 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &CokacmuxSettings) -> Self {
         Self {
-            ai_provider: settings.ai.provider,
+            ai_provider: normalize_ai_title_provider(settings.ai.provider),
             session_view: settings.session_view,
             agent_sidebar_visible: settings.agent_sidebar_visible,
             sessions_pane_width: settings.sessions_pane_width,
@@ -2636,6 +2700,12 @@ impl SettingsDraft {
             SettingsTextField::AgentProgram(Provider::OpenCode) => {
                 self.agent_programs.opencode.as_deref().unwrap_or("")
             }
+            SettingsTextField::AgentProgram(Provider::Pi) => {
+                self.agent_programs.pi.as_deref().unwrap_or("")
+            }
+            SettingsTextField::AgentProgram(Provider::Gjc) => {
+                self.agent_programs.gjc.as_deref().unwrap_or("")
+            }
             SettingsTextField::CokacdirProgram => &self.cokacdir_program,
         }
     }
@@ -2650,6 +2720,12 @@ impl SettingsDraft {
             }
             SettingsTextField::AgentProgram(Provider::OpenCode) => {
                 self.agent_programs.opencode.get_or_insert_with(String::new)
+            }
+            SettingsTextField::AgentProgram(Provider::Pi) => {
+                self.agent_programs.pi.get_or_insert_with(String::new)
+            }
+            SettingsTextField::AgentProgram(Provider::Gjc) => {
+                self.agent_programs.gjc.get_or_insert_with(String::new)
             }
             SettingsTextField::CokacdirProgram => &mut self.cokacdir_program,
         }
@@ -2685,13 +2761,16 @@ const SETTINGS_AI_NONE: usize = 0;
 const SETTINGS_AI_CLAUDE: usize = 1;
 const SETTINGS_AI_CODEX: usize = 2;
 const SETTINGS_AI_OPENCODE: usize = 3;
+const SETTINGS_AI_PI: usize = 4;
 const SETTINGS_AI_ROW_COUNT: usize = AI_TITLE_PROVIDER_OPTIONS.len();
 
 const SETTINGS_AGENTS_CODEX: usize = 0;
 const SETTINGS_AGENTS_CLAUDE: usize = 1;
 const SETTINGS_AGENTS_OPENCODE: usize = 2;
-const SETTINGS_AGENTS_COKACDIR: usize = 3;
-const SETTINGS_AGENTS_ROW_COUNT: usize = 4;
+const SETTINGS_AGENTS_PI: usize = 3;
+const SETTINGS_AGENTS_GJC: usize = 4;
+const SETTINGS_AGENTS_COKACDIR: usize = 5;
+const SETTINGS_AGENTS_ROW_COUNT: usize = 6;
 
 const SETTINGS_KEYBINDINGS_FILE: usize = 0;
 const SETTINGS_KEYBINDINGS_RELOAD: usize = 1;
@@ -11918,6 +11997,9 @@ impl App {
             .spawn(move || {
                 let progress_query = worker_query.clone();
                 let mut report_progress = |progress: session::SearchProgress| {
+                    if !should_send_search_progress(progress.processed, progress.total) {
+                        return;
+                    }
                     let _ = tx.send(MainEvent::SearchProgress(SearchProgressEvent {
                         seq,
                         query: progress_query.clone(),
@@ -12452,6 +12534,97 @@ impl App {
         let message = message.into();
         self.status = message.clone();
         self.input_mode = InputMode::Notice { title, message };
+    }
+
+    fn promote_session_status_notice(&mut self) {
+        if !matches!(self.input_mode, InputMode::Normal)
+            || !self.show_sessions_view
+            || self.status_is_covered_by_session_overlay()
+        {
+            return;
+        }
+        let message = self.status.trim().to_string();
+        if !Self::session_status_should_open_notice(&message) {
+            return;
+        }
+        let title = Self::session_status_notice_title(&message).to_string();
+        self.input_mode = InputMode::Notice { title, message };
+    }
+
+    fn status_is_covered_by_session_overlay(&self) -> bool {
+        self.data_task.is_some()
+            || self.new_session_launch.is_some()
+            || self.attach_in_flight.is_some()
+            || self.agent_kill_pending.is_some()
+            || self.runtime_refresh_pending
+            || self.session_refresh_pending
+            || self.search_pending.is_some()
+            || self.ai_search_pending.is_some()
+            || self.ai_title_pending.is_some()
+    }
+
+    fn session_status_should_open_notice(message: &str) -> bool {
+        if message.is_empty()
+            || message == "loading…"
+            || message == "cancelled."
+            || is_plain_session_count_status(message)
+            || is_routine_attach_success_status(message)
+            || is_low_value_confirmation_status(message)
+            || message.ends_with("...")
+            || message.ends_with('…')
+        {
+            return false;
+        }
+        if message.starts_with("focus:")
+            || message.starts_with("preview:")
+            || message.starts_with("Terminal:")
+            || message.starts_with("Codex transcript:")
+            || message.starts_with("Claude fullscreen:")
+            || message.starts_with("OpenCode:")
+            || message.starts_with("right ")
+            || message.starts_with("hidden right ")
+            || message.starts_with("layout ")
+            || message.starts_with("agent ")
+            || message == "live agents updated."
+            || matches!(
+                message,
+                "settings."
+                    | "search sessions"
+                    | "choose search mode"
+                    | "AI search sessions"
+                    | "choose launch mode."
+                    | "editing title."
+                    | "choose clone option."
+                    | "choose what to start."
+                    | "agents sidebar focused."
+                    | "path edit cancelled."
+                    | "path edit done; Enter saves settings."
+            )
+            || message.starts_with("settings:")
+            || message.starts_with("AI agent:")
+            || message.starts_with("editing path;")
+        {
+            return false;
+        }
+        Self::session_status_is_error_notice(message)
+    }
+
+    fn session_status_notice_title(message: &str) -> &'static str {
+        if Self::session_status_is_error_notice(message) {
+            "Error"
+        } else {
+            "Notice"
+        }
+    }
+
+    fn session_status_is_error_notice(message: &str) -> bool {
+        let lower = message.to_lowercase();
+        lower.contains("failed")
+            || lower.contains("error")
+            || lower.contains("cannot")
+            || lower.contains("blocked")
+            || lower.contains("not installed")
+            || lower.contains("not ready")
     }
 
     fn show_cokacdir_error_dialog(&mut self, message: String) {
@@ -17972,6 +18145,29 @@ impl App {
     }
 }
 
+fn is_plain_session_count_status(message: &str) -> bool {
+    message
+        .strip_suffix(" sessions")
+        .is_some_and(|count| !count.is_empty() && count.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn is_routine_attach_success_status(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.starts_with("started ")
+        || lower.starts_with("attached ")
+        || lower.starts_with("switched to ")
+        || lower.starts_with("restored right ")
+        || lower.starts_with("discarded stale right ")
+}
+
+fn is_low_value_confirmation_status(message: &str) -> bool {
+    message == "settings saved."
+        || message.starts_with("search cleared:")
+        || message.starts_with("AI search cleared:")
+        || message.starts_with("title saved for ")
+        || message.starts_with("cleared title for ")
+}
+
 fn send_key_to_agent_client(agent: &mut AgentClient, key: KeyEvent) {
     let overlay_before = agent.codex_transcript_overlay_assumed_open;
     let before = agent_client_io_debug_value(agent);
@@ -19184,13 +19380,15 @@ fn build_ai_search_index(
         if ai_search_preview_load_status_ok(&text) {
             items.push(AiSearchIndexItem { info: info.clone() });
         }
-        progress.send(
-            AiSearchPhase::Indexing,
-            processed,
-            sessions.len(),
-            reused,
-            written,
-        );
+        if should_send_ai_search_index_progress(processed, sessions.len()) {
+            progress.send(
+                AiSearchPhase::Indexing,
+                processed,
+                sessions.len(),
+                reused,
+                written,
+            );
+        }
     }
     Ok(AiSearchIndexBuild {
         dir,
@@ -19198,6 +19396,14 @@ fn build_ai_search_index(
         reused,
         written,
     })
+}
+
+fn should_send_ai_search_index_progress(processed: usize, total: usize) -> bool {
+    processed > 0 && (processed == total || processed % AI_SEARCH_INDEX_PROGRESS_STEP == 0)
+}
+
+fn should_send_search_progress(processed: usize, total: usize) -> bool {
+    processed == 0 || processed == total || processed % SEARCH_PROGRESS_STEP == 0
 }
 
 fn load_or_render_ai_search_preview(
@@ -19464,6 +19670,21 @@ fn render_ai_search_preview(info: &SessionInfo) -> String {
     )
 }
 
+fn ai_agent_json_output_contract(
+    provider: Provider,
+    schema_backed_contract: &str,
+    prompt_only_contract: &str,
+) -> String {
+    let task_contract = match provider {
+        Provider::Codex | Provider::Claude => schema_backed_contract,
+        Provider::OpenCode | Provider::Pi | Provider::Gjc => prompt_only_contract,
+    };
+    format!(
+        "{}\n- Task output contract: {}",
+        AI_AGENT_STRUCTURED_OUTPUT_SYSTEM_PROMPT, task_contract
+    )
+}
+
 fn build_ai_search_prompt(
     query: &str,
     search_dir: &Path,
@@ -19471,18 +19692,18 @@ fn build_ai_search_prompt(
     provider: Provider,
 ) -> String {
     let query_json = serde_json::to_string(query).unwrap_or_else(|_| "\"\"".to_string());
-    let output_requirement = match provider {
-        Provider::Codex | Provider::Claude => "Return a JSON object matching the provided schema.",
-        Provider::OpenCode => {
-            "Return only a valid JSON object with one `results` array. No markdown, no explanation."
-        }
-    };
+    let output_contract = ai_agent_json_output_contract(
+        provider,
+        "Return one JSON object matching the provided schema.",
+        "Return one JSON object with exactly one field named `results`, whose value is an array.",
+    );
     format!(
         "You search cokacmux coding-agent session previews.\n\
          Search only this preview directory: {}\n\
          Search query JSON string: {}\n\n\
-         Requirements:\n\
-         - {}\n\
+         Output system:\n\
+         {}\n\n\
+         Task requirements:\n\
          - Autonomously inspect the search directory using read-only operations.\n\
          - Use only files ending in `.preview.md` as the evidence source.\n\
          - Ignore preview files whose `load_status` is not `ok`.\n\
@@ -19497,9 +19718,118 @@ fn build_ai_search_prompt(
          Indexed sessions: {}\n",
         search_dir.display(),
         query_json,
-        output_requirement,
+        output_contract,
         indexed_sessions,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiAgentTask {
+    Title,
+    Search,
+}
+
+impl AiAgentTask {
+    fn as_str(self) -> &'static str {
+        match self {
+            AiAgentTask::Title => "title",
+            AiAgentTask::Search => "search",
+        }
+    }
+
+    fn operation_label(self) -> &'static str {
+        match self {
+            AiAgentTask::Title => "AI title generation",
+            AiAgentTask::Search => "AI search",
+        }
+    }
+
+    fn timeout(self) -> Duration {
+        match self {
+            AiAgentTask::Title => Duration::from_secs(AI_TITLE_TIMEOUT_SECS),
+            AiAgentTask::Search => Duration::from_secs(AI_SEARCH_TIMEOUT_SECS),
+        }
+    }
+
+    fn output_schema(self) -> &'static str {
+        match self {
+            AiAgentTask::Title => AI_TITLE_OUTPUT_SCHEMA,
+            AiAgentTask::Search => AI_SEARCH_OUTPUT_SCHEMA,
+        }
+    }
+
+    fn codex_last_message_label(self) -> &'static str {
+        match self {
+            AiAgentTask::Title => "codex-last-message",
+            AiAgentTask::Search => "search-codex-last-message",
+        }
+    }
+
+    fn codex_output_schema_label(self) -> &'static str {
+        match self {
+            AiAgentTask::Title => "codex-output-schema",
+            AiAgentTask::Search => "search-codex-output-schema",
+        }
+    }
+
+    fn codex_schema_write_error(self) -> &'static str {
+        match self {
+            AiAgentTask::Title => "write codex output schema failed",
+            AiAgentTask::Search => "write codex search output schema failed",
+        }
+    }
+
+    fn claude_max_output_tokens(self) -> &'static str {
+        match self {
+            AiAgentTask::Title => "4096",
+            AiAgentTask::Search => "8192",
+        }
+    }
+
+    fn opencode_args(self) -> &'static [&'static str] {
+        match self {
+            AiAgentTask::Title => OPENCODE_AI_TITLE_ARGS,
+            AiAgentTask::Search => OPENCODE_AI_SEARCH_ARGS,
+        }
+    }
+
+    fn opencode_permission(self) -> &'static str {
+        match self {
+            AiAgentTask::Title => OPENCODE_AI_TITLE_PERMISSION,
+            AiAgentTask::Search => OPENCODE_AI_SEARCH_PERMISSION,
+        }
+    }
+
+    fn pi_args(self) -> &'static [&'static str] {
+        match self {
+            AiAgentTask::Title => PI_AI_TITLE_ARGS,
+            AiAgentTask::Search => PI_AI_SEARCH_ARGS,
+        }
+    }
+
+    fn gjc_args(self) -> &'static [&'static str] {
+        match self {
+            AiAgentTask::Title => GJC_AI_TITLE_ARGS,
+            AiAgentTask::Search => GJC_AI_SEARCH_ARGS,
+        }
+    }
+
+    fn gjc_prompt_label(self) -> &'static str {
+        match self {
+            AiAgentTask::Title => "gjc-title-prompt",
+            AiAgentTask::Search => "search-gjc-prompt",
+        }
+    }
+}
+
+struct AiAgentRequest<'a> {
+    task: AiAgentTask,
+    provider: Provider,
+    agent_programs: &'a AgentProgramSettings,
+    seq: u64,
+    cwd: &'a Path,
+    prompt: &'a str,
+    cancel: Option<&'a AtomicBool>,
 }
 
 fn run_ai_search_agent(
@@ -19510,45 +19840,173 @@ fn run_ai_search_agent(
     prompt: &str,
     cancel: Option<&AtomicBool>,
 ) -> std::result::Result<String, String> {
-    let configured_program = agent_programs.program_for(provider);
-    let program =
-        resolve_agent_program_for_provider(provider, agent_programs).ok_or_else(|| {
+    run_ai_agent_task(AiAgentRequest {
+        task: AiAgentTask::Search,
+        provider,
+        agent_programs,
+        seq,
+        cwd: search_dir,
+        prompt,
+        cancel,
+    })
+}
+
+fn run_ai_agent_task(request: AiAgentRequest<'_>) -> std::result::Result<String, String> {
+    let configured_program = request.agent_programs.program_for(request.provider);
+    let program = resolve_agent_program_for_provider(request.provider, request.agent_programs)
+        .ok_or_else(|| {
             format!(
-                "{} CLI not found for AI search: {}",
-                provider.as_str(),
+                "{} CLI not found for {}: {}",
+                request.provider.as_str(),
+                request.task.operation_label(),
                 configured_program
             )
         })?;
     debug_log(
-        "ai_search_agent_start",
+        "ai_agent_start",
         serde_json::json!({
-            "seq": seq,
-            "provider": provider.as_str(),
+            "task": request.task.as_str(),
+            "seq": request.seq,
+            "provider": request.provider.as_str(),
             "program": program.display().to_string(),
-            "cwd": search_dir.display().to_string(),
-            "prompt_len": prompt.len(),
+            "cwd": request.cwd.display().to_string(),
+            "prompt_len": request.prompt.len(),
         }),
     );
-    match provider {
-        Provider::Codex => run_codex_ai_search(&program, search_dir, seq, prompt, cancel),
-        Provider::Claude => run_claude_ai_search(&program, search_dir, prompt, cancel),
-        Provider::OpenCode => run_opencode_ai_search(&program, search_dir, prompt, cancel),
+    let started = Instant::now();
+    let result = match request.provider {
+        Provider::Codex => run_codex_ai_agent(
+            &program,
+            request.cwd,
+            request.seq,
+            request.prompt,
+            request.task,
+            request.cancel,
+        ),
+        Provider::Claude => run_claude_ai_agent(
+            &program,
+            request.cwd,
+            request.prompt,
+            request.task,
+            request.cancel,
+        ),
+        Provider::OpenCode => run_opencode_ai_agent(
+            &program,
+            request.cwd,
+            request.prompt,
+            request.task,
+            request.cancel,
+        ),
+        Provider::Pi => run_pi_ai_agent(
+            &program,
+            request.cwd,
+            request.prompt,
+            request.task,
+            request.cancel,
+        ),
+        Provider::Gjc => run_gjc_ai_agent(
+            &program,
+            request.cwd,
+            request.prompt,
+            request.task,
+            request.cancel,
+        ),
+    };
+    debug_log_ai_agent_response(&request, &program, started.elapsed(), &result);
+    result
+}
+
+fn debug_log_ai_agent_response(
+    request: &AiAgentRequest<'_>,
+    program: &Path,
+    elapsed: Duration,
+    result: &std::result::Result<String, String>,
+) {
+    match result {
+        Ok(raw) => {
+            debug_log(
+                "ai_agent_response",
+                serde_json::json!({
+                    "task": request.task.as_str(),
+                    "seq": request.seq,
+                    "provider": request.provider.as_str(),
+                    "program": program.display().to_string(),
+                    "cwd": request.cwd.display().to_string(),
+                    "elapsed_ms": elapsed.as_millis(),
+                    "raw_len": raw.len(),
+                    "raw_chars": raw.chars().count(),
+                    "raw_sample": truncate_width(raw.trim(), 1000),
+                }),
+            );
+        }
+        Err(error) => {
+            debug_log(
+                "ai_agent_response_failed",
+                serde_json::json!({
+                    "task": request.task.as_str(),
+                    "seq": request.seq,
+                    "provider": request.provider.as_str(),
+                    "program": program.display().to_string(),
+                    "cwd": request.cwd.display().to_string(),
+                    "elapsed_ms": elapsed.as_millis(),
+                    "error": truncate_width(error, 1000),
+                }),
+            );
+        }
     }
 }
 
-fn run_codex_ai_search(
+fn check_ai_agent_process_result(
+    provider: Provider,
+    output: &AiAgentCommandOutput,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<(), String> {
+    if output.cancelled || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err(AI_SEARCH_CANCELLED_ERROR.to_string());
+    }
+    if output.timed_out {
+        return Err(format!(
+            "{} timed out after {}s",
+            provider.as_str(),
+            output.duration.as_secs()
+        ));
+    }
+    if !output.status_success() {
+        return Err(ai_agent_process_error(provider.as_str(), output));
+    }
+    Ok(())
+}
+
+fn ai_agent_stdout_payload(
+    provider: Provider,
+    output: AiAgentCommandOutput,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    check_ai_agent_process_result(provider, &output, cancel)?;
+    if output.stdout.trim().is_empty() {
+        return Err(format!(
+            "{} produced empty output. {}",
+            provider.as_str(),
+            ai_agent_process_error(provider.as_str(), &output)
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn run_codex_ai_agent(
     program: &Path,
     cwd: &Path,
     seq: u64,
     prompt: &str,
+    task: AiAgentTask,
     cancel: Option<&AtomicBool>,
 ) -> std::result::Result<String, String> {
-    let out_path = ai_title_temp_path("search-codex-last-message", seq);
-    let schema_path = ai_title_temp_path("search-codex-output-schema", seq);
+    let out_path = ai_agent_temp_path(task.codex_last_message_label(), seq);
+    let schema_path = ai_agent_temp_path(task.codex_output_schema_label(), seq);
     let _ = fs::remove_file(&out_path);
     let _ = fs::remove_file(&schema_path);
-    fs::write(&schema_path, AI_SEARCH_OUTPUT_SCHEMA)
-        .map_err(|e| format!("write codex search output schema failed: {}", e))?;
+    fs::write(&schema_path, task.output_schema())
+        .map_err(|e| format!("{}: {}", task.codex_schema_write_error(), e))?;
     let mut command = Command::new(program);
     command
         .args([
@@ -19565,36 +20023,145 @@ fn run_codex_ai_search(
         .args(["--output-last-message"])
         .arg(&out_path)
         .arg("-");
-    configure_ai_title_command(&mut command, program, cwd);
-    let output = run_prompt_command_with_cancel(
-        command,
-        prompt,
-        Duration::from_secs(AI_SEARCH_TIMEOUT_SECS),
-        cancel,
-    );
+    configure_ai_agent_command(&mut command, program, cwd);
+    let output = run_prompt_command_with_cancel(command, prompt, task.timeout(), cancel);
     let last_message = fs::read_to_string(&out_path).ok();
     let _ = fs::remove_file(&out_path);
     let _ = fs::remove_file(&schema_path);
     let output = output?;
-    if output.cancelled || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
-        return Err(AI_SEARCH_CANCELLED_ERROR.to_string());
-    }
-    if output.timed_out {
-        return Err(format!(
-            "codex timed out after {}s",
-            output.duration.as_secs()
-        ));
-    }
-    if !output.status_success() {
-        return Err(ai_title_process_error("codex", &output));
-    }
+    check_ai_agent_process_result(Provider::Codex, &output, cancel)?;
     match last_message {
         Some(message) if !message.trim().is_empty() => Ok(message),
         _ => Err(format!(
             "codex produced no last-message output. {}",
-            ai_title_process_error("codex", &output)
+            ai_agent_process_error("codex", &output)
         )),
     }
+}
+
+fn run_claude_ai_agent(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+    task: AiAgentTask,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    let mut command = Command::new(program);
+    command.args(["-p", "--no-session-persistence"]);
+    match task {
+        AiAgentTask::Title => {
+            command.args(["--max-turns", "1", "--tools", ""]);
+        }
+        AiAgentTask::Search => {
+            command.args([
+                "--tools",
+                "Read,Grep,Glob,LS",
+                "--allowedTools",
+                "Read,Grep,Glob,LS",
+                "--add-dir",
+            ]);
+            command.arg(cwd);
+            command.args(["--permission-mode", "dontAsk"]);
+        }
+    }
+    command.args([
+        "--output-format",
+        "json",
+        "--json-schema",
+        task.output_schema(),
+    ]);
+    configure_ai_agent_command(&mut command, program, cwd);
+    command
+        .env(
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+            task.claude_max_output_tokens(),
+        )
+        .env_remove("CLAUDECODE");
+    let output = run_prompt_command_with_cancel(command, prompt, task.timeout(), cancel)?;
+    let raw = ai_agent_stdout_payload(Provider::Claude, output, cancel)?;
+    if let Some(error) = claude_structured_output_error_for_task(task, &raw) {
+        return Err(error);
+    }
+    Ok(raw)
+}
+
+fn run_opencode_ai_agent(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+    task: AiAgentTask,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    let mut command = Command::new(program);
+    command.args(task.opencode_args());
+    configure_ai_agent_command(&mut command, program, cwd);
+    command.env("OPENCODE_PERMISSION", task.opencode_permission());
+    let output = run_prompt_command_with_cancel(command, prompt, task.timeout(), cancel)?;
+    let cleanup_result = cleanup_opencode_ai_agent_sessions(program, cwd, &output.stdout);
+    if let Err(error) = check_ai_agent_process_result(Provider::OpenCode, &output, cancel) {
+        return Err(ai_agent_error_with_cleanup(error, cleanup_result));
+    }
+    if output.stdout.trim().is_empty() {
+        let error = format!(
+            "opencode produced empty output. {}",
+            ai_agent_process_error("opencode", &output)
+        );
+        return Err(ai_agent_error_with_cleanup(error, cleanup_result));
+    }
+    let payload = match opencode_ai_agent_payload_from_events(&output.stdout) {
+        Ok(payload) => payload,
+        Err(e) => {
+            let error = format!(
+                "opencode JSON output parse failed: {}. {}",
+                e,
+                ai_agent_process_error("opencode", &output)
+            );
+            return Err(ai_agent_error_with_cleanup(error, cleanup_result));
+        }
+    };
+    cleanup_result?;
+    Ok(payload)
+}
+
+fn run_pi_ai_agent(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+    task: AiAgentTask,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    let mut command = Command::new(program);
+    command.args(task.pi_args());
+    configure_ai_agent_command(&mut command, program, cwd);
+    let output = run_prompt_command_with_cancel(command, prompt, task.timeout(), cancel)?;
+    ai_agent_stdout_payload(Provider::Pi, output, cancel)
+}
+
+fn run_gjc_ai_agent(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+    task: AiAgentTask,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    let (prompt_path, prompt_arg) = write_gjc_prompt_file(task.gjc_prompt_label(), prompt)?;
+    let mut command = Command::new(program);
+    command.args(task.gjc_args()).arg(prompt_arg);
+    configure_ai_agent_command(&mut command, program, cwd);
+    let output = run_prompt_command_with_cancel(command, "", task.timeout(), cancel);
+    let _ = fs::remove_file(&prompt_path);
+    let output = output?;
+    ai_agent_stdout_payload(Provider::Gjc, output, cancel)
+}
+
+fn run_codex_ai_search(
+    program: &Path,
+    cwd: &Path,
+    seq: u64,
+    prompt: &str,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    run_codex_ai_agent(program, cwd, seq, prompt, AiAgentTask::Search, cancel)
 }
 
 fn run_claude_ai_search(
@@ -19603,54 +20170,7 @@ fn run_claude_ai_search(
     prompt: &str,
     cancel: Option<&AtomicBool>,
 ) -> std::result::Result<String, String> {
-    let mut command = Command::new(program);
-    command.args([
-        "-p",
-        "--no-session-persistence",
-        "--tools",
-        "Read,Grep,Glob,LS",
-        "--allowedTools",
-        "Read,Grep,Glob,LS",
-        "--add-dir",
-    ]);
-    command.arg(cwd);
-    command.args([
-        "--permission-mode",
-        "dontAsk",
-        "--output-format",
-        "json",
-        "--json-schema",
-        AI_SEARCH_OUTPUT_SCHEMA,
-    ]);
-    configure_ai_title_command(&mut command, program, cwd);
-    command
-        .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "8192")
-        .env_remove("CLAUDECODE");
-    let output = run_prompt_command_with_cancel(
-        command,
-        prompt,
-        Duration::from_secs(AI_SEARCH_TIMEOUT_SECS),
-        cancel,
-    )?;
-    if output.cancelled || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
-        return Err(AI_SEARCH_CANCELLED_ERROR.to_string());
-    }
-    if output.timed_out {
-        return Err(format!(
-            "claude timed out after {}s",
-            output.duration.as_secs()
-        ));
-    }
-    if !output.status_success() {
-        return Err(ai_title_process_error("claude", &output));
-    }
-    if output.stdout.trim().is_empty() {
-        return Err(format!(
-            "claude produced empty output. {}",
-            ai_title_process_error("claude", &output)
-        ));
-    }
-    Ok(output.stdout)
+    run_claude_ai_agent(program, cwd, prompt, AiAgentTask::Search, cancel)
 }
 
 fn run_opencode_ai_search(
@@ -19659,64 +20179,152 @@ fn run_opencode_ai_search(
     prompt: &str,
     cancel: Option<&AtomicBool>,
 ) -> std::result::Result<String, String> {
-    let mut command = Command::new(program);
-    command.args(["run", "--pure", "--format", "json"]);
-    configure_ai_title_command(&mut command, program, cwd);
-    command.env("OPENCODE_PERMISSION", OPENCODE_AI_SEARCH_PERMISSION);
-    let output = run_prompt_command_with_cancel(
-        command,
-        prompt,
-        Duration::from_secs(AI_SEARCH_TIMEOUT_SECS),
-        cancel,
-    )?;
-    let cleanup_result = cleanup_opencode_ai_title_sessions(program, cwd, &output.stdout);
-    if output.cancelled || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
-        return Err(ai_title_error_with_cleanup(
-            AI_SEARCH_CANCELLED_ERROR.to_string(),
-            cleanup_result,
-        ));
+    run_opencode_ai_agent(program, cwd, prompt, AiAgentTask::Search, cancel)
+}
+
+fn run_pi_ai_search(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    run_pi_ai_agent(program, cwd, prompt, AiAgentTask::Search, cancel)
+}
+
+fn run_gjc_ai_search(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<String, String> {
+    run_gjc_ai_agent(program, cwd, prompt, AiAgentTask::Search, cancel)
+}
+
+const AI_AGENT_JSON_CANDIDATE_MAX_DEPTH: usize = 3;
+
+fn ai_agent_json_candidates(raw: &str) -> Vec<serde_json::Value> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    collect_ai_agent_json_candidates_from_text(raw, 0, &mut seen, &mut candidates);
+    candidates
+}
+
+fn collect_ai_agent_json_candidates_from_text(
+    text: &str,
+    depth: usize,
+    seen: &mut HashSet<String>,
+    candidates: &mut Vec<serde_json::Value>,
+) {
+    if depth > AI_AGENT_JSON_CANDIDATE_MAX_DEPTH {
+        return;
     }
-    if output.timed_out {
-        let error = format!("opencode timed out after {}s", output.duration.as_secs());
-        return Err(ai_title_error_with_cleanup(error, cleanup_result));
-    }
-    if !output.status_success() {
-        return Err(ai_title_error_with_cleanup(
-            ai_title_process_error("opencode", &output),
-            cleanup_result,
-        ));
-    }
-    if output.stdout.trim().is_empty() {
-        let error = format!(
-            "opencode produced empty output. {}",
-            ai_title_process_error("opencode", &output)
-        );
-        return Err(ai_title_error_with_cleanup(error, cleanup_result));
-    }
-    let payload = match opencode_ai_title_payload_from_events(&output.stdout) {
-        Ok(payload) => payload,
-        Err(e) => {
-            let error = format!(
-                "opencode JSON output parse failed: {}. {}",
-                e,
-                ai_title_process_error("opencode", &output)
-            );
-            return Err(ai_title_error_with_cleanup(error, cleanup_result));
+
+    let mut index = 0;
+    while index < text.len() {
+        let Some((relative_start, _)) = text[index..]
+            .char_indices()
+            .find(|(_, ch)| ai_agent_json_value_start(*ch))
+        else {
+            break;
+        };
+        let start = index + relative_start;
+        let slice = &text[start..];
+        let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(value)) => {
+                let consumed = stream.byte_offset();
+                if consumed == 0 {
+                    index = next_char_index(text, start);
+                    continue;
+                }
+                push_ai_agent_json_candidate(value, depth, seen, candidates);
+                index = start.saturating_add(consumed);
+            }
+            Some(Err(_)) | None => {
+                index = next_char_index(text, start);
+            }
         }
-    };
-    cleanup_result?;
-    Ok(payload)
+    }
+}
+
+fn push_ai_agent_json_candidate(
+    value: serde_json::Value,
+    depth: usize,
+    seen: &mut HashSet<String>,
+    candidates: &mut Vec<serde_json::Value>,
+) {
+    if let Ok(key) = serde_json::to_string(&value) {
+        if seen.insert(key) {
+            candidates.push(value.clone());
+        }
+    }
+    if depth >= AI_AGENT_JSON_CANDIDATE_MAX_DEPTH {
+        return;
+    }
+    collect_ai_agent_json_string_candidates(&value, depth.saturating_add(1), seen, candidates);
+}
+
+fn collect_ai_agent_json_string_candidates(
+    value: &serde_json::Value,
+    depth: usize,
+    seen: &mut HashSet<String>,
+    candidates: &mut Vec<serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.chars().any(ai_agent_json_value_start) {
+                collect_ai_agent_json_candidates_from_text(text, depth, seen, candidates);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_ai_agent_json_string_candidates(item, depth, seen, candidates);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_ai_agent_json_string_candidates(item, depth, seen, candidates);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn ai_agent_json_value_start(ch: char) -> bool {
+    matches!(ch, '{' | '[' | '"' | '-' | '0'..='9' | 't' | 'f' | 'n')
+}
+
+fn next_char_index(text: &str, index: usize) -> usize {
+    text[index..]
+        .chars()
+        .next()
+        .map(|ch| index + ch.len_utf8())
+        .unwrap_or(text.len())
 }
 
 fn extract_ai_search_response(raw: &str) -> std::result::Result<Vec<AiSearchHit>, String> {
-    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).map_err(|e| {
-        format!(
-            "AI search returned invalid JSON: {}; raw: {}",
-            e,
+    let candidates = ai_agent_json_candidates(raw);
+    if candidates.is_empty() {
+        return Err(format!(
+            "AI search returned no JSON value; raw: {}",
             truncate_width(raw, 500)
-        )
-    })?;
-    parse_ai_search_value(&value)
+        ));
+    }
+
+    let mut first_error = None;
+    for value in candidates {
+        match parse_ai_search_value(&value) {
+            Ok(hits) => return Ok(hits),
+            Err(e) if first_error.is_none() => first_error = Some(e),
+            Err(_) => {}
+        }
+    }
+
+    Err(format!(
+        "AI search JSON did not satisfy the response contract: {}; raw: {}",
+        first_error.unwrap_or_else(|| "no matching JSON candidate".to_string()),
+        truncate_width(raw, 500)
+    ))
 }
 
 fn validate_ai_search_hits(
@@ -19870,19 +20478,17 @@ fn build_ai_title_prompt(
     transcript: &AiTitleTranscript,
     provider: Provider,
 ) -> String {
-    let output_requirement = match provider {
-        Provider::Codex | Provider::Claude => {
-            "- Return a JSON object that matches the provided output schema, with the title in the `title` field.\n"
-        }
-        Provider::OpenCode => {
-            "- Return only a valid JSON object with exactly one string field named `title`. No markdown, no prefix, no explanation.\n"
-        }
-    };
+    let output_contract = ai_agent_json_output_contract(
+        provider,
+        "Return one JSON object matching the provided output schema; put the title in the `title` string field.",
+        "Return one JSON object with exactly one string field named `title`.",
+    );
     format!(
         "You generate titles for coding-agent sessions.\n\
          Read the entire session transcript below and produce one concise title sentence for it.\n\n\
-         Requirements:\n\
-         {}\
+         Output system:\n\
+         {}\n\n\
+         Task requirements:\n\
          - Use the main language of the session. If the user mostly wrote Korean, write Korean.\n\
          - Summarize the concrete work or question, not the tool name or session id.\n\
          - Keep it short enough for a session list title, ideally under 80 characters.\n\n\
@@ -19893,7 +20499,7 @@ fn build_ai_title_prompt(
          transcript_mode: {}\n\
          full_transcript_chars: {}\n\n\
          === SESSION TRANSCRIPT ===\n{}\n=== END SESSION TRANSCRIPT ===",
-        output_requirement,
+        output_contract,
         source.provider.as_str(),
         source.session_id,
         source.cwd,
@@ -19910,31 +20516,16 @@ fn run_ai_title_agent(
     seq: u64,
     prompt: &str,
 ) -> std::result::Result<String, String> {
-    let configured_program = agent_programs.program_for(provider);
-    let program =
-        resolve_agent_program_for_provider(provider, agent_programs).ok_or_else(|| {
-            format!(
-                "{} CLI not found for AI title generation: {}",
-                provider.as_str(),
-                configured_program
-            )
-        })?;
     let cwd = ai_title_working_dir(source);
-    debug_log(
-        "ai_title_agent_start",
-        serde_json::json!({
-            "seq": seq,
-            "provider": provider.as_str(),
-            "program": program.display().to_string(),
-            "cwd": cwd.display().to_string(),
-            "prompt_len": prompt.len(),
-        }),
-    );
-    match provider {
-        Provider::Codex => run_codex_ai_title(&program, &cwd, seq, prompt),
-        Provider::Claude => run_claude_ai_title(&program, &cwd, prompt),
-        Provider::OpenCode => run_opencode_ai_title(&program, &cwd, prompt),
-    }
+    run_ai_agent_task(AiAgentRequest {
+        task: AiAgentTask::Title,
+        provider,
+        agent_programs,
+        seq,
+        cwd: &cwd,
+        prompt,
+        cancel: None,
+    })
 }
 
 fn run_codex_ai_title(
@@ -19943,50 +20534,7 @@ fn run_codex_ai_title(
     seq: u64,
     prompt: &str,
 ) -> std::result::Result<String, String> {
-    let out_path = ai_title_temp_path("codex-last-message", seq);
-    let schema_path = ai_title_temp_path("codex-output-schema", seq);
-    let _ = fs::remove_file(&out_path);
-    let _ = fs::remove_file(&schema_path);
-    fs::write(&schema_path, AI_TITLE_OUTPUT_SCHEMA)
-        .map_err(|e| format!("write codex output schema failed: {}", e))?;
-    let mut command = Command::new(program);
-    command
-        .args([
-            "exec",
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
-            "--color",
-            "never",
-            "--output-schema",
-        ])
-        .arg(&schema_path)
-        .args(["--output-last-message"])
-        .arg(&out_path)
-        .arg("-");
-    configure_ai_title_command(&mut command, program, cwd);
-    let output = run_prompt_command(command, prompt, Duration::from_secs(AI_TITLE_TIMEOUT_SECS));
-    let last_message = fs::read_to_string(&out_path).ok();
-    let _ = fs::remove_file(&out_path);
-    let _ = fs::remove_file(&schema_path);
-    let output = output?;
-    if output.timed_out {
-        return Err(format!(
-            "codex timed out after {}s",
-            output.duration.as_secs()
-        ));
-    }
-    if !output.status_success() {
-        return Err(ai_title_process_error("codex", &output));
-    }
-    match last_message {
-        Some(message) if !message.trim().is_empty() => Ok(message),
-        _ => Err(format!(
-            "codex produced no last-message output. {}",
-            ai_title_process_error("codex", &output)
-        )),
-    }
+    run_codex_ai_agent(program, cwd, seq, prompt, AiAgentTask::Title, None)
 }
 
 fn run_claude_ai_title(
@@ -19994,43 +20542,7 @@ fn run_claude_ai_title(
     cwd: &Path,
     prompt: &str,
 ) -> std::result::Result<String, String> {
-    let mut command = Command::new(program);
-    command.args([
-        "-p",
-        "--no-session-persistence",
-        "--max-turns",
-        "1",
-        "--tools",
-        "",
-        "--output-format",
-        "json",
-        "--json-schema",
-        AI_TITLE_OUTPUT_SCHEMA,
-    ]);
-    configure_ai_title_command(&mut command, program, cwd);
-    command
-        .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "4096")
-        .env_remove("CLAUDECODE");
-    let output = run_prompt_command(command, prompt, Duration::from_secs(AI_TITLE_TIMEOUT_SECS))?;
-    if output.timed_out {
-        return Err(format!(
-            "claude timed out after {}s",
-            output.duration.as_secs()
-        ));
-    }
-    if !output.status_success() {
-        return Err(ai_title_process_error("claude", &output));
-    }
-    if output.stdout.trim().is_empty() {
-        return Err(format!(
-            "claude produced empty output. {}",
-            ai_title_process_error("claude", &output)
-        ));
-    }
-    if let Some(error) = claude_structured_output_error(&output.stdout) {
-        return Err(error);
-    }
-    Ok(output.stdout)
+    run_claude_ai_agent(program, cwd, prompt, AiAgentTask::Title, None)
 }
 
 fn run_opencode_ai_title(
@@ -20038,52 +20550,40 @@ fn run_opencode_ai_title(
     cwd: &Path,
     prompt: &str,
 ) -> std::result::Result<String, String> {
-    let mut command = Command::new(program);
-    command.args(["run", "--agent", "plan", "--format", "json"]);
-    configure_ai_title_command(&mut command, program, cwd);
-    command.env(
-        "OPENCODE_PERMISSION",
-        r#"{"*":"deny","question":"deny","plan_exit":"deny"}"#,
-    );
-    let output = run_prompt_command(command, prompt, Duration::from_secs(AI_TITLE_TIMEOUT_SECS))?;
-    let cleanup_result = cleanup_opencode_ai_title_sessions(program, cwd, &output.stdout);
-    if output.timed_out {
-        let error = format!("opencode timed out after {}s", output.duration.as_secs());
-        return Err(ai_title_error_with_cleanup(error, cleanup_result));
-    }
-    if !output.status_success() {
-        return Err(ai_title_error_with_cleanup(
-            ai_title_process_error("opencode", &output),
-            cleanup_result,
-        ));
-    }
-    if output.stdout.trim().is_empty() {
-        let error = format!(
-            "opencode produced empty output. {}",
-            ai_title_process_error("opencode", &output)
-        );
-        return Err(ai_title_error_with_cleanup(error, cleanup_result));
-    }
-    let payload = match opencode_ai_title_payload_from_events(&output.stdout) {
-        Ok(payload) => payload,
-        Err(e) => {
-            let error = format!(
-                "opencode JSON output parse failed: {}. {}",
-                e,
-                ai_title_process_error("opencode", &output)
-            );
-            return Err(ai_title_error_with_cleanup(error, cleanup_result));
-        }
-    };
-    cleanup_result?;
-    Ok(payload)
+    run_opencode_ai_agent(program, cwd, prompt, AiAgentTask::Title, None)
 }
 
-fn configure_ai_title_command(command: &mut Command, program: &Path, cwd: &Path) {
+fn run_pi_ai_title(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+) -> std::result::Result<String, String> {
+    run_pi_ai_agent(program, cwd, prompt, AiAgentTask::Title, None)
+}
+
+fn run_gjc_ai_title(
+    program: &Path,
+    cwd: &Path,
+    prompt: &str,
+) -> std::result::Result<String, String> {
+    run_gjc_ai_agent(program, cwd, prompt, AiAgentTask::Title, None)
+}
+
+fn configure_ai_agent_command(command: &mut Command, program: &Path, cwd: &Path) {
     command.current_dir(cwd);
     if let Some(path) = path_with_program_parent(program) {
         command.env("PATH", path);
     }
+}
+
+fn write_gjc_prompt_file(
+    label: &str,
+    prompt: &str,
+) -> std::result::Result<(PathBuf, String), String> {
+    let path = ai_agent_temp_path(label, 0);
+    fs::write(&path, prompt).map_err(|e| format!("write gjc prompt file failed: {}", e))?;
+    let arg = format!("@{}", path.display());
+    Ok((path, arg))
 }
 
 fn ai_title_working_dir(source: &SessionInfo) -> PathBuf {
@@ -20100,13 +20600,13 @@ fn ai_title_working_dir(source: &SessionInfo) -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-fn ai_title_temp_path(label: &str, seq: u64) -> PathBuf {
+fn ai_agent_temp_path(label: &str, seq: u64) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!(
-        "cokacmux-ai-title-{}-{}-{}.txt",
+        "cokacmux-ai-agent-{}-{}-{}.txt",
         label,
         std::process::id(),
         seq.saturating_add(nanos as u64)
@@ -20122,7 +20622,7 @@ fn path_with_program_parent(program: &Path) -> Option<std::ffi::OsString> {
     std::env::join_paths(paths).ok()
 }
 
-struct AiTitleCommandOutput {
+struct AiAgentCommandOutput {
     status: Option<ExitStatus>,
     stdout: String,
     stderr: String,
@@ -20131,7 +20631,7 @@ struct AiTitleCommandOutput {
     duration: Duration,
 }
 
-impl AiTitleCommandOutput {
+impl AiAgentCommandOutput {
     fn status_success(&self) -> bool {
         self.status.is_some_and(|status| status.success())
     }
@@ -20141,7 +20641,7 @@ fn run_prompt_command(
     command: Command,
     prompt: &str,
     timeout: Duration,
-) -> std::result::Result<AiTitleCommandOutput, String> {
+) -> std::result::Result<AiAgentCommandOutput, String> {
     run_prompt_command_with_cancel(command, prompt, timeout, None)
 }
 
@@ -20150,10 +20650,10 @@ fn run_prompt_command_with_cancel(
     prompt: &str,
     timeout: Duration,
     cancel: Option<&AtomicBool>,
-) -> std::result::Result<AiTitleCommandOutput, String> {
+) -> std::result::Result<AiAgentCommandOutput, String> {
     let started = Instant::now();
     if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
-        return Ok(AiTitleCommandOutput {
+        return Ok(AiAgentCommandOutput {
             status: None,
             stdout: String::new(),
             stderr: String::new(),
@@ -20248,7 +20748,7 @@ fn run_prompt_command_with_cancel(
     }
     let stdout = String::from_utf8_lossy(&join_pipe_reader(stdout_reader, "stdout")?).to_string();
     let stderr = String::from_utf8_lossy(&join_pipe_reader(stderr_reader, "stderr")?).to_string();
-    Ok(AiTitleCommandOutput {
+    Ok(AiAgentCommandOutput {
         status,
         stdout,
         stderr,
@@ -20315,7 +20815,7 @@ fn join_pipe_reader(
         .map_err(|e| format!("{} read failed: {}", label, e))
 }
 
-fn ai_title_process_error(tool: &str, output: &AiTitleCommandOutput) -> String {
+fn ai_agent_process_error(tool: &str, output: &AiAgentCommandOutput) -> String {
     let mut details = Vec::new();
     if let Some(stdout) = command_output_tail("stdout", &output.stdout) {
         details.push(stdout);
@@ -20368,50 +20868,72 @@ fn codex_banner_line(line: &str) -> bool {
 }
 
 fn extract_ai_title_response(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
+    let candidates = ai_agent_json_candidates(raw);
+    for value in &candidates {
+        if let Some(title) = parse_structured_ai_title_value(&value) {
+            return Some(title);
+        }
     }
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(value) => parse_structured_ai_title_value(&value),
-        Err(_) => sanitize_ai_title_response(raw),
+    if candidates.is_empty() {
+        sanitize_ai_title_response(raw)
+    } else {
+        None
     }
 }
 
 fn parse_structured_ai_title_value(value: &serde_json::Value) -> Option<String> {
+    parse_structured_ai_title_value_at_depth(value, 0)
+}
+
+fn parse_structured_ai_title_value_at_depth(
+    value: &serde_json::Value,
+    depth: usize,
+) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return sanitize_ai_title_response_at_depth(text, depth.saturating_add(1));
+    }
     value
         .get("title")
         .and_then(serde_json::Value::as_str)
-        .and_then(sanitize_ai_title_response)
+        .and_then(|text| sanitize_ai_title_response_at_depth(text, depth.saturating_add(1)))
         .or_else(|| {
             value
                 .get("structured")
                 .and_then(|structured| structured.get("title"))
                 .and_then(serde_json::Value::as_str)
-                .and_then(sanitize_ai_title_response)
+                .and_then(|text| sanitize_ai_title_response_at_depth(text, depth.saturating_add(1)))
         })
         .or_else(|| {
             value
                 .pointer("/info/structured/title")
                 .and_then(serde_json::Value::as_str)
-                .and_then(sanitize_ai_title_response)
+                .and_then(|text| sanitize_ai_title_response_at_depth(text, depth.saturating_add(1)))
         })
         .or_else(|| {
             value
                 .pointer("/info/structured_output/title")
                 .and_then(serde_json::Value::as_str)
-                .and_then(sanitize_ai_title_response)
+                .and_then(|text| sanitize_ai_title_response_at_depth(text, depth.saturating_add(1)))
         })
         .or_else(|| {
             value
                 .get("structured_output")
                 .and_then(|structured| structured.get("title"))
                 .and_then(serde_json::Value::as_str)
-                .and_then(sanitize_ai_title_response)
+                .and_then(|text| sanitize_ai_title_response_at_depth(text, depth.saturating_add(1)))
         })
 }
 
+fn parse_structured_ai_title_text(text: &str, depth: usize) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(text.trim()).ok()?;
+    parse_structured_ai_title_value_at_depth(&value, depth)
+}
+
 fn claude_structured_output_error(raw: &str) -> Option<String> {
+    claude_structured_output_error_for_task(AiAgentTask::Title, raw)
+}
+
+fn claude_structured_output_error_for_task(task: AiAgentTask, raw: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
     if value.get("type").and_then(serde_json::Value::as_str) != Some("result") {
         return None;
@@ -20423,18 +20945,27 @@ fn claude_structured_output_error(raw: &str) -> Option<String> {
     if subtype != "success" {
         return Some(format!("claude structured output failed: {}", subtype));
     }
-    if parse_structured_ai_title_value(&value).is_none() {
-        return Some("claude structured output missing title".to_string());
+    match task {
+        AiAgentTask::Title => {
+            if parse_structured_ai_title_value(&value).is_none() {
+                return Some("claude structured output missing title".to_string());
+            }
+        }
+        AiAgentTask::Search => {
+            if ai_search_results_array(&value).is_none() {
+                return Some("claude structured output missing results".to_string());
+            }
+        }
     }
     None
 }
 
-fn cleanup_opencode_ai_title_sessions(
+fn cleanup_opencode_ai_agent_sessions(
     program: &Path,
     cwd: &Path,
     raw_events: &str,
 ) -> std::result::Result<(), String> {
-    let session_ids = opencode_ai_title_session_ids_from_events(raw_events);
+    let session_ids = opencode_ai_agent_session_ids_from_events(raw_events);
     if session_ids.is_empty() {
         return Ok(());
     }
@@ -20443,14 +20974,14 @@ fn cleanup_opencode_ai_title_sessions(
     for session_id in session_ids {
         let mut command = Command::new(program);
         command.args(["session", "delete", &session_id]);
-        configure_ai_title_command(&mut command, program, cwd);
+        configure_ai_agent_command(&mut command, program, cwd);
         match run_prompt_command(command, "", Duration::from_secs(30)) {
             Ok(output) if output.timed_out => {
                 errors.push(format!("delete {} timed out", session_id));
             }
             Ok(output) if output.status_success() || opencode_session_delete_not_found(&output) => {
                 debug_log(
-                    "ai_title_opencode_session_deleted",
+                    "ai_agent_opencode_session_deleted",
                     serde_json::json!({
                         "session_id": session_id,
                     }),
@@ -20459,7 +20990,7 @@ fn cleanup_opencode_ai_title_sessions(
             Ok(output) => errors.push(format!(
                 "delete {} failed: {}",
                 session_id,
-                ai_title_process_error("opencode session delete", &output)
+                ai_agent_process_error("opencode session delete", &output)
             )),
             Err(e) => errors.push(format!("delete {} failed: {}", session_id, e)),
         }
@@ -20469,19 +21000,19 @@ fn cleanup_opencode_ai_title_sessions(
         Ok(())
     } else {
         Err(format!(
-            "opencode AI title session cleanup failed: {}",
+            "opencode AI agent session cleanup failed: {}",
             errors.join("; ")
         ))
     }
 }
 
-fn opencode_session_delete_not_found(output: &AiTitleCommandOutput) -> bool {
+fn opencode_session_delete_not_found(output: &AiAgentCommandOutput) -> bool {
     !output.status_success()
         && (output.stdout.contains("Session not found")
             || output.stderr.contains("Session not found"))
 }
 
-fn ai_title_error_with_cleanup(
+fn ai_agent_error_with_cleanup(
     error: String,
     cleanup_result: std::result::Result<(), String>,
 ) -> String {
@@ -20491,7 +21022,7 @@ fn ai_title_error_with_cleanup(
     }
 }
 
-fn opencode_ai_title_session_ids_from_events(raw: &str) -> Vec<String> {
+fn opencode_ai_agent_session_ids_from_events(raw: &str) -> Vec<String> {
     let mut session_ids = Vec::new();
     for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -20515,7 +21046,7 @@ fn opencode_ai_title_session_ids_from_events(raw: &str) -> Vec<String> {
     session_ids
 }
 
-fn opencode_ai_title_payload_from_events(raw: &str) -> std::result::Result<String, String> {
+fn opencode_ai_agent_payload_from_events(raw: &str) -> std::result::Result<String, String> {
     let mut saw_event = false;
     let mut final_text = String::new();
     let mut fallback_text = String::new();
@@ -20528,7 +21059,7 @@ fn opencode_ai_title_payload_from_events(raw: &str) -> std::result::Result<Strin
         let value = serde_json::from_str::<serde_json::Value>(trimmed)
             .map_err(|e| format!("invalid JSON event on line {}: {}", idx + 1, e))?;
         saw_event = true;
-        if let Some(error) = opencode_ai_title_event_error(&value) {
+        if let Some(error) = opencode_ai_agent_event_error(&value) {
             return Err(error);
         }
         let Some(text) = value
@@ -20541,7 +21072,7 @@ fn opencode_ai_title_payload_from_events(raw: &str) -> std::result::Result<Strin
         if text.is_empty() {
             continue;
         }
-        if opencode_ai_title_event_is_final_answer(&value) {
+        if opencode_ai_agent_event_is_final_answer(&value) {
             final_text.push_str(text);
         }
         fallback_text.push_str(text);
@@ -20561,7 +21092,7 @@ fn opencode_ai_title_payload_from_events(raw: &str) -> std::result::Result<Strin
     Ok(payload.to_string())
 }
 
-fn opencode_ai_title_event_is_final_answer(value: &serde_json::Value) -> bool {
+fn opencode_ai_agent_event_is_final_answer(value: &serde_json::Value) -> bool {
     value
         .get("part")
         .and_then(|part| part.get("metadata"))
@@ -20571,7 +21102,7 @@ fn opencode_ai_title_event_is_final_answer(value: &serde_json::Value) -> bool {
         == Some("final_answer")
 }
 
-fn opencode_ai_title_event_error(value: &serde_json::Value) -> Option<String> {
+fn opencode_ai_agent_event_error(value: &serde_json::Value) -> Option<String> {
     if value.get("type").and_then(serde_json::Value::as_str) != Some("error") {
         return None;
     }
@@ -20583,6 +21114,10 @@ fn opencode_ai_title_event_error(value: &serde_json::Value) -> Option<String> {
 }
 
 fn sanitize_ai_title_response(raw: &str) -> Option<String> {
+    sanitize_ai_title_response_at_depth(raw, 0)
+}
+
+fn sanitize_ai_title_response_at_depth(raw: &str, depth: usize) -> Option<String> {
     let mut title = raw
         .lines()
         .map(str::trim)
@@ -20594,6 +21129,13 @@ fn sanitize_ai_title_response(raw: &str) -> Option<String> {
         .trim_start()
         .to_string();
     title = strip_ai_title_prefix(&title).to_string();
+    if depth < 3 {
+        if let Some(structured_title) =
+            parse_structured_ai_title_text(&title, depth.saturating_add(1))
+        {
+            return Some(structured_title);
+        }
+    }
     title = title
         .trim()
         .trim_matches('"')
@@ -24828,6 +25370,8 @@ fn new_agent_backing_session_from_meta(meta: &AgentMetaSnapshot) -> Option<NewAg
         Provider::Codex => codex_new_agent_backing_session(meta),
         Provider::Claude => claude_new_agent_backing_session(meta),
         Provider::OpenCode => opencode_new_agent_backing_session(meta),
+        Provider::Pi => pi_new_agent_backing_session(meta),
+        Provider::Gjc => gjc_new_agent_backing_session(meta),
     }
 }
 
@@ -24897,6 +25441,38 @@ fn opencode_new_agent_backing_session(meta: &AgentMetaSnapshot) -> Option<NewAge
     Some(NewAgentBackingSession {
         key: AgentKey {
             provider: Provider::OpenCode,
+            session_id,
+        },
+        backing_path,
+    })
+}
+
+fn pi_new_agent_backing_session(meta: &AgentMetaSnapshot) -> Option<NewAgentBackingSession> {
+    let session_uuid = new_agent_session_uuid(meta.session_id.as_deref()?)?;
+    let session_id = session_uuid.to_string();
+    let cwd = meta.cwd.as_deref().filter(|cwd| !cwd.is_empty())?;
+    let search_dir = cokacmux::providers::pi::default_project_session_dir(cwd)
+        .or_else(cokacmux::providers::pi::default_sessions_root)?;
+    let backing_path = cokacmux::providers::pi::find_session_file_by_id(&search_dir, &session_id)?;
+    Some(NewAgentBackingSession {
+        key: AgentKey {
+            provider: Provider::Pi,
+            session_id,
+        },
+        backing_path,
+    })
+}
+
+fn gjc_new_agent_backing_session(meta: &AgentMetaSnapshot) -> Option<NewAgentBackingSession> {
+    let session_uuid = new_agent_session_uuid(meta.session_id.as_deref()?)?;
+    let session_id = session_uuid.to_string();
+    let cwd = meta.cwd.as_deref().filter(|cwd| !cwd.is_empty())?;
+    let search_dir = cokacmux::providers::gjc::default_project_session_dir(cwd)
+        .or_else(cokacmux::providers::gjc::default_sessions_root)?;
+    let backing_path = cokacmux::providers::gjc::find_session_file_by_id(&search_dir, &session_id)?;
+    Some(NewAgentBackingSession {
+        key: AgentKey {
+            provider: Provider::Gjc,
             session_id,
         },
         backing_path,
@@ -30633,6 +31209,8 @@ fn windows_agent_provider_extensions(provider: Provider) -> &'static [&'static s
         Provider::Codex => &[".cmd", ".exe", ".bat", ".com"],
         Provider::Claude => &[".exe", ".cmd", ".bat", ".com"],
         Provider::OpenCode => &[".exe", ".cmd", ".bat", ".com"],
+        Provider::Pi => &[".cmd", ".exe", ".bat", ".com"],
+        Provider::Gjc => &[".cmd", ".exe", ".bat", ".com"],
     }
 }
 
@@ -30668,6 +31246,8 @@ fn default_agent_program(provider: Provider) -> &'static str {
         Provider::Codex => "codex",
         Provider::Claude => "claude",
         Provider::OpenCode => "opencode",
+        Provider::Pi => "pi",
+        Provider::Gjc => "gjc",
     }
 }
 
@@ -30780,6 +31360,36 @@ fn new_agent_launch_spec_with_programs(
                 cwd,
             }
         }
+        Provider::Pi => {
+            let mut args = Vec::new();
+            if let Some(session_uuid) = new_agent_session_uuid(&info.session_id) {
+                args.push("--session-id".to_string());
+                args.push(session_uuid.to_string());
+            }
+            AgentLaunchSpec {
+                program: agent_programs.program_for(Provider::Pi),
+                args,
+                env: Vec::new(),
+                cwd,
+            }
+        }
+        Provider::Gjc => {
+            let mut env = Vec::new();
+            if let Some(session_uuid) = new_agent_session_uuid(&info.session_id) {
+                let session_id = session_uuid.to_string();
+                env.push(("GJC_SESSION_ID".to_string(), session_id.clone()));
+                env.push((
+                    "GJC_LIFECYCLE_REQUEST_ID".to_string(),
+                    format!("cokacmux-{session_id}"),
+                ));
+            }
+            AgentLaunchSpec {
+                program: agent_programs.program_for(Provider::Gjc),
+                args: Vec::new(),
+                env,
+                cwd,
+            }
+        }
     }
 }
 
@@ -30865,6 +31475,24 @@ fn agent_launch_spec_with_programs(
                 program: agent_programs.program_for(Provider::OpenCode),
                 args,
                 env,
+                cwd,
+            }
+        }
+        Provider::Pi => {
+            let args = vec!["--session".to_string(), info.session_id.clone()];
+            AgentLaunchSpec {
+                program: agent_programs.program_for(Provider::Pi),
+                args,
+                env: Vec::new(),
+                cwd,
+            }
+        }
+        Provider::Gjc => {
+            let args = vec!["--resume".to_string(), info.source.display().to_string()];
+            AgentLaunchSpec {
+                program: agent_programs.program_for(Provider::Gjc),
+                args,
+                env: Vec::new(),
                 cwd,
             }
         }
@@ -31348,7 +31976,14 @@ fn handle_notice_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
     if notice_dismiss_key(key) {
+        let dismissed_message = match &app.input_mode {
+            InputMode::Notice { message, .. } => Some(message.clone()),
+            _ => None,
+        };
         app.input_mode = InputMode::Normal;
+        if dismissed_message.as_deref() == Some(app.status.as_str()) {
+            app.status.clear();
+        }
         debug_log_key_event(key, "notice_dismiss");
     } else {
         debug_log_key_event(key, "notice_ignored");
@@ -32856,16 +33491,18 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
 }
 
 fn draw_notice_modal(f: &mut ratatui::Frame, area: Rect, title: &str, message: &str) {
-    let help_items = [direct_help_item("Enter/Esc", "close")];
-    let lines = vec![
+    let sizing_lines = vec![
         Line::from(Span::styled(
             message.to_string(),
             Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
         )),
         Line::from(""),
-        modal_help_line(&help_items),
+        Line::from(Span::styled("[ OK ]", theme_selected_style())),
     ];
-    let modal_area = modal_area_for_wrapped_lines(area, title, &lines, 40, 92, 5, 12);
+    let modal_area = modal_area_for_wrapped_lines(area, title, &sizing_lines, 40, 92, 5, 12);
+    let content_width = modal_area.width.saturating_sub(2) as usize;
+    let content_height = modal_area.height.saturating_sub(2) as usize;
+    let lines = notice_modal_lines(message, content_width, content_height);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -32875,9 +33512,77 @@ fn draw_notice_modal(f: &mut ratatui::Frame, area: Rect, title: &str, message: &
     let p = Paragraph::new(lines)
         .block(block)
         .style(theme_alt_style())
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: false });
     f.render_widget(Clear, modal_area);
     f.render_widget(p, modal_area);
+}
+
+fn notice_modal_lines(
+    message: &str,
+    content_width: usize,
+    content_height: usize,
+) -> Vec<Line<'static>> {
+    if content_height == 0 {
+        return Vec::new();
+    }
+    let ok_line = notice_ok_button_line(content_width);
+    if content_height == 1 {
+        return vec![ok_line];
+    }
+    let reserve_blank_row = content_height >= 3;
+    let reserved_rows = if reserve_blank_row { 2 } else { 1 };
+    let max_message_rows = content_height.saturating_sub(reserved_rows).max(1);
+    let mut lines = notice_message_lines(message, content_width, max_message_rows);
+    if reserve_blank_row {
+        lines.push(Line::from(""));
+    }
+    lines.push(ok_line);
+    lines
+}
+
+fn notice_message_lines(
+    message: &str,
+    content_width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let width = content_width.max(1);
+    let mut rows = wrap_preview_lines(&sanitize_for_single_line(message), width);
+    let truncated = rows.len() > max_rows;
+    rows.truncate(max_rows.max(1));
+    if truncated {
+        if let Some(last) = rows.last_mut() {
+            *last = ellipsize_width(last, width);
+        }
+    }
+    rows.into_iter()
+        .map(|row| {
+            Line::from(Span::styled(
+                row,
+                Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+            ))
+        })
+        .collect()
+}
+
+fn ellipsize_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut base = truncate_width(text, width);
+    while UnicodeWidthStr::width(base.as_str()).saturating_add(1) > width && !base.is_empty() {
+        base.pop();
+    }
+    format!("{}…", base)
+}
+
+fn notice_ok_button_line(content_width: usize) -> Line<'static> {
+    let button = "[ OK ]";
+    let button_width = UnicodeWidthStr::width(button);
+    let padding = " ".repeat(content_width.saturating_sub(button_width) / 2);
+    Line::from(vec![
+        Span::styled(padding, theme_alt_style()),
+        Span::styled(button, theme_selected_style()),
+    ])
 }
 
 fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPending) {
@@ -34646,6 +35351,12 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             state.draft.ai_provider = Some(Provider::OpenCode);
             state.edit_finished = false;
             app.status = "AI agent: opencode".into();
+        } else if keybindings.matches(KeyAction::AiTitleSettingsPi, key) {
+            state.section = SettingsSection::Ai;
+            state.selected = SETTINGS_AI_PI;
+            state.draft.ai_provider = Some(Provider::Pi);
+            state.edit_finished = false;
+            app.status = "AI agent: pi".into();
         } else if matches!(key.code, KeyCode::Char(' ')) {
             app.status = state.activate_selected().into();
             debug_log_key_event(key, "settings_activate");
@@ -35304,7 +36015,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
     let sessions_width = app.sessions_pane_width(outer[0].width);
@@ -35340,7 +36051,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(Clear, main[1]);
     draw_preview(f, app, main[1]);
     f.render_widget(Clear, outer[1]);
-    draw_status(f, app, outer[1]);
+    draw_session_footer(f, app, outer[1]);
+    app.promote_session_status_notice();
 
     let modal_drawn = draw_input_modal(f, area, app);
     let ai_search_overlay_drawn = if modal_drawn {
@@ -36278,6 +36990,16 @@ fn settings_agents_lines(
             SETTINGS_AGENTS_OPENCODE,
             "OpenCode program",
             SettingsTextField::AgentProgram(Provider::OpenCode),
+        ),
+        (
+            SETTINGS_AGENTS_PI,
+            "Pi program",
+            SettingsTextField::AgentProgram(Provider::Pi),
+        ),
+        (
+            SETTINGS_AGENTS_GJC,
+            "GJC program",
+            SettingsTextField::AgentProgram(Provider::Gjc),
         ),
         (
             SETTINGS_AGENTS_COKACDIR,
@@ -37969,6 +38691,8 @@ fn provider_color_from_summary_line(value: &str) -> Option<Color> {
         "claude" => Some(THEME_PROVIDER_CLAUDE),
         "codex" => Some(THEME_PROVIDER_CODEX),
         "opencode" => Some(THEME_PROVIDER_OPENCODE),
+        "pi" => Some(THEME_PROVIDER_PI),
+        "gjc" => Some(THEME_PROVIDER_GJC),
         _ => None,
     }
 }
@@ -38049,38 +38773,12 @@ fn fill_area(buf: &mut Buffer, area: Rect, style: Style) {
     }
 }
 
-fn draw_status(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+fn draw_session_footer(f: &mut ratatui::Frame, app: &App, area: Rect) {
     fill_area(f.buffer_mut(), area, theme_status_style());
-    let width = area.width as usize;
-    let mode = format!(
-        "{} focus  {} preview",
-        match app.focus {
-            FocusPane::Sessions => "sessions",
-            FocusPane::Preview => "preview",
-        },
-        preview_mode_label(app.preview_mode)
+    f.render_widget(
+        help_line(app.focus, area.width as usize, &app.keybindings),
+        area,
     );
-    let mode = truncate_width(&mode, width);
-    let mode_width = UnicodeWidthStr::width(mode.as_str());
-    let status_width = width.saturating_sub(mode_width + 2);
-    let status_text = app.display_status();
-    let status = truncate_width(&status_text, status_width);
-    let mut status_spans = vec![Span::styled(
-        mode,
-        Style::default().fg(THEME_SHORTCUT).bg(THEME_STATUS_BG),
-    )];
-    if !status.is_empty() {
-        status_spans.push(Span::raw("  "));
-        status_spans.push(Span::styled(
-            status,
-            Style::default().fg(THEME_ACCENT).bg(THEME_STATUS_BG),
-        ));
-    }
-    let lines = vec![
-        Line::from(status_spans),
-        help_line(app.focus, width, &app.keybindings),
-    ];
-    f.render_widget(Paragraph::new(lines).style(theme_status_style()), area);
 }
 
 #[derive(Debug, Clone)]
@@ -38480,6 +39178,8 @@ fn provider_color(provider: Provider) -> Color {
         Provider::Claude => THEME_PROVIDER_CLAUDE,
         Provider::Codex => THEME_PROVIDER_CODEX,
         Provider::OpenCode => THEME_PROVIDER_OPENCODE,
+        Provider::Pi => THEME_PROVIDER_PI,
+        Provider::Gjc => THEME_PROVIDER_GJC,
     }
 }
 
@@ -38488,6 +39188,8 @@ fn prov_span(p: Provider) -> Span<'static> {
         Provider::Claude => ("claude  ", THEME_PROVIDER_CLAUDE),
         Provider::Codex => ("codex   ", THEME_PROVIDER_CODEX),
         Provider::OpenCode => ("opencode", THEME_PROVIDER_OPENCODE),
+        Provider::Pi => ("pi      ", THEME_PROVIDER_PI),
+        Provider::Gjc => ("gjc     ", THEME_PROVIDER_GJC),
     };
     Span::styled(
         text,
@@ -39253,6 +39955,23 @@ mod tests {
     }
 
     #[test]
+    fn ai_agent_json_candidates_extract_values_without_domain_knowledge() {
+        let candidates = ai_agent_json_candidates(
+            r#"noise {"alpha":1} "prefix {\"beta\":2} suffix" tail [true,false]"#,
+        );
+
+        assert!(candidates
+            .iter()
+            .any(|value| value.get("alpha") == Some(&serde_json::json!(1))));
+        assert!(candidates
+            .iter()
+            .any(|value| value.get("beta") == Some(&serde_json::json!(2))));
+        assert!(candidates
+            .iter()
+            .any(|value| value.as_array().is_some_and(|items| items.len() == 2)));
+    }
+
+    #[test]
     fn ai_search_response_parses_results_from_json() {
         let hits = extract_ai_search_response(
             r#"{
@@ -39332,13 +40051,52 @@ mod tests {
     }
 
     #[test]
-    fn ai_search_response_rejects_non_json_wrappers() {
-        let error = extract_ai_search_response(
+    fn ai_search_response_accepts_structural_noise_around_json() {
+        let hits = extract_ai_search_response(
             r#"prefix {"results":[{"provider":"codex","session_id":"session-a","score":0.42,"reason":"r1"}]} suffix"#,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("invalid JSON"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key.provider, Provider::Codex);
+        assert_eq!(hits[0].key.session_id, "session-a");
+    }
+
+    #[test]
+    fn ai_search_response_accepts_fenced_json_block() {
+        let hits = extract_ai_search_response(
+            "```json\n{\"results\":[{\"provider\":\"codex\",\"session_id\":\"session-a\",\"score\":0.42,\"reason\":\"r1\"}]}\n```",
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key.provider, Provider::Codex);
+        assert_eq!(hits[0].key.session_id, "session-a");
+    }
+
+    #[test]
+    fn ai_search_response_uses_first_contract_valid_json_candidate() {
+        let hits = extract_ai_search_response(
+            r#"{"results":[{"provider":"codex","session_id":"session-a","score":0.42,"reason":"r1"}]}
+               {"results":[{"provider":"claude","session_id":"session-b","score":0.72,"reason":"r2"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key.provider, Provider::Codex);
+        assert_eq!(hits[0].key.session_id, "session-a");
+    }
+
+    #[test]
+    fn ai_search_response_skips_json_that_does_not_satisfy_contract() {
+        let hits = extract_ai_search_response(
+            r#"{"event":"started"} {"results":[{"provider":"codex","session_id":"session-a","score":0.42,"reason":"r1"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key.provider, Provider::Codex);
+        assert_eq!(hits[0].key.session_id, "session-a");
     }
 
     #[test]
@@ -39420,11 +40178,16 @@ mod tests {
             "release query",
             Path::new("/tmp/searchdata"),
             3,
-            Provider::Codex,
+            Provider::Gjc,
         );
 
         assert!(prompt.contains("Search only this preview directory: /tmp/searchdata"));
         assert!(prompt.contains(r#"Search query JSON string: "release query""#));
+        assert!(prompt.contains("structured-output component"));
+        assert!(prompt.contains("Return exactly one JSON value"));
+        assert!(prompt.contains("multiple JSON values"));
+        assert!(prompt.contains("Task output contract"));
+        assert!(prompt.contains("exactly one field named `results`"));
         assert!(prompt.contains("Autonomously inspect the search directory"));
         assert!(prompt.contains("Use only files ending in `.preview.md`"));
         assert!(prompt.contains("Ignore preview files whose `load_status` is not `ok`"));
@@ -39785,6 +40548,39 @@ mod tests {
         assert_eq!(pending.phase, AiSearchPhase::Cancelling);
         assert_eq!(pending.indexed, 3);
         assert_eq!(pending.reused, 3);
+    }
+
+    #[test]
+    fn ai_search_index_progress_is_throttled() {
+        let total = 741;
+        let sent: Vec<usize> = (0..=total)
+            .filter(|processed| should_send_ai_search_index_progress(*processed, total))
+            .collect();
+
+        assert_eq!(sent.first().copied(), Some(AI_SEARCH_INDEX_PROGRESS_STEP));
+        assert_eq!(sent.last().copied(), Some(total));
+        assert!(!sent.contains(&0));
+        assert!(!sent.contains(&1));
+        assert!(!sent.contains(&31));
+        assert!(sent.contains(&32));
+        assert!(sent.contains(&64));
+        assert!(sent.len() <= (total / AI_SEARCH_INDEX_PROGRESS_STEP) + 1);
+    }
+
+    #[test]
+    fn text_search_progress_is_throttled() {
+        let total = 741;
+        let sent: Vec<usize> = (0..=total)
+            .filter(|processed| should_send_search_progress(*processed, total))
+            .collect();
+
+        assert_eq!(sent.first().copied(), Some(0));
+        assert_eq!(sent.last().copied(), Some(total));
+        assert!(!sent.contains(&1));
+        assert!(!sent.contains(&31));
+        assert!(sent.contains(&32));
+        assert!(sent.contains(&64));
+        assert!(sent.len() <= (total / SEARCH_PROGRESS_STEP) + 2);
     }
 
     #[test]
@@ -40479,6 +41275,7 @@ mod tests {
             value["sessions"]["ai_title_settings"],
             serde_json::json!(["comma"])
         );
+        assert!(value["ai_title_settings"].get("gjc").is_none());
         assert_eq!(
             value["sessions"]["toggle_focus"],
             serde_json::json!(["tab"])
@@ -41964,6 +42761,213 @@ mod tests {
     }
 
     #[test]
+    fn notice_dialog_renders_centered_ok_button() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_notice_modal(f, f.area(), "Notice", "message written as a dialog");
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("message written as a dialog"));
+        assert!(!rendered.contains("Enter/Esc close"));
+        let ok_line = rendered
+            .lines()
+            .find(|line| line.contains("[ OK ]"))
+            .unwrap_or_else(|| {
+                panic!("notice dialog should contain centered OK button\n{rendered}")
+            });
+        let ok_col = ok_line.find("[ OK ]").unwrap();
+        assert!(
+            (32..=42).contains(&ok_col),
+            "OK button should be centered, col={ok_col}\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn notice_dialog_long_message_keeps_ok_button_visible() {
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let message = format!(
+            "search failed: {}",
+            "very long error detail with path /tmp/cokacmux/that/keeps/going ".repeat(12)
+        );
+
+        terminal
+            .draw(|f| {
+                draw_notice_modal(f, f.area(), "Error", &message);
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("[ OK ]"), "{rendered}");
+        assert!(rendered.contains('…'), "{rendered}");
+    }
+
+    #[test]
+    fn notice_dialog_tiny_viewport_still_renders_ok_button() {
+        let backend = ratatui::backend::TestBackend::new(24, 4);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| {
+                draw_notice_modal(
+                    f,
+                    f.area(),
+                    "Error",
+                    "search failed: long detail that does not fit",
+                );
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("[ OK ]"), "{rendered}");
+    }
+
+    #[test]
+    fn sessions_footer_is_help_only_and_status_uses_notice_dialog() {
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = app_for_key_tests();
+        app.sessions
+            .push(session_info(Provider::Codex, "notice-session", "/repo"));
+        app.status = "search failed: index read error".to_string();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("search failed: index read error"));
+        assert!(rendered.contains("[ OK ]"));
+        assert!(rendered.contains("Tab preview"));
+        assert!(!rendered.contains("sessions focus"));
+        assert!(matches!(app.input_mode, InputMode::Notice { .. }));
+    }
+
+    #[test]
+    fn routine_attach_success_status_does_not_open_notice_dialog() {
+        for status in [
+            "started pi agent routine-start",
+            "attached shell at /repo",
+            "switched to live pi agent routine-start",
+            "right terminal shown",
+            "right terminal hidden",
+            "live agents updated.",
+        ] {
+            let backend = ratatui::backend::TestBackend::new(100, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let mut app = app_for_key_tests();
+            app.sessions
+                .push(session_info(Provider::Pi, "routine-start", "/repo"));
+            app.status = status.to_string();
+
+            terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+            let rendered = buffer_text(terminal.backend().buffer());
+            assert!(!rendered.contains(status), "{rendered}");
+            assert!(!rendered.contains("[ OK ]"), "{rendered}");
+            assert!(matches!(app.input_mode, InputMode::Normal), "{status}");
+        }
+    }
+
+    #[test]
+    fn low_value_confirmation_status_does_not_open_notice_dialog() {
+        for status in [
+            "search cleared: 3 sessions",
+            "AI search cleared: 3 sessions",
+            "settings saved.",
+            "title saved for abc123: Improve docs",
+            "cleared title for abc123",
+            "folder path is required.",
+            "no session selected.",
+            "no cwd to open a shell at.",
+            "choose an AI agent first: press comma.",
+            "AI search unavailable before UI event loop.",
+        ] {
+            let backend = ratatui::backend::TestBackend::new(100, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let mut app = app_for_key_tests();
+            app.sessions
+                .push(session_info(Provider::Codex, "routine-confirm", "/repo"));
+            app.status = status.to_string();
+
+            terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+            let rendered = buffer_text(terminal.backend().buffer());
+            assert!(!rendered.contains(status), "{rendered}");
+            assert!(!rendered.contains("[ OK ]"), "{rendered}");
+            assert!(matches!(app.input_mode, InputMode::Normal), "{status}");
+        }
+    }
+
+    #[test]
+    fn error_status_opens_notice_dialog() {
+        for status in [
+            "search failed: disk read failed",
+            "list error: permission denied",
+            "cannot switch to live pi agent abc; event loop is not ready",
+            "blocked: codex agent active at /repo",
+            "pi agent is not installed.",
+        ] {
+            let backend = ratatui::backend::TestBackend::new(100, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let mut app = app_for_key_tests();
+            app.sessions
+                .push(session_info(Provider::Codex, "error-notice", "/repo"));
+            app.status = status.to_string();
+
+            terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+            let rendered = buffer_text(terminal.backend().buffer());
+            assert!(rendered.contains(status), "{rendered}");
+            assert!(rendered.contains("[ OK ]"), "{rendered}");
+            match &app.input_mode {
+                InputMode::Notice { title, message } => {
+                    assert_eq!(title, "Error");
+                    assert_eq!(message, status);
+                }
+                other => panic!("expected error notice for {status}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn same_error_status_can_open_notice_again_after_dismiss() {
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = app_for_key_tests();
+        app.sessions
+            .push(session_info(Provider::Codex, "repeat-error", "/repo"));
+        app.status = "search failed: disk read failed".to_string();
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        assert!(matches!(app.input_mode, InputMode::Notice { .. }));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        assert!(matches!(app.input_mode, InputMode::Normal));
+
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(!rendered.contains("search failed: disk read failed"));
+        assert!(!rendered.contains("[ OK ]"));
+
+        app.status = "search failed: disk read failed".to_string();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        assert!(matches!(app.input_mode, InputMode::Notice { .. }));
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("search failed: disk read failed"));
+        assert!(rendered.contains("[ OK ]"));
+    }
+
+    #[test]
     fn cokacdir_start_failure_keeps_notice_dialog_open() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().display().to_string();
@@ -42387,6 +43391,27 @@ mod tests {
     }
 
     #[test]
+    fn ai_provider_gjc_normalizes_to_unconfigured() {
+        let settings = serde_json::from_value::<Settings>(serde_json::json!({
+            "cokacmux": {
+                "ai": {
+                    "provider": "gjc"
+                }
+            }
+        }))
+        .unwrap()
+        .normalized();
+
+        assert_eq!(settings.cokacmux.ai.provider, None);
+
+        let mut cokacmux = CokacmuxSettings::default();
+        cokacmux.ai.provider = Some(Provider::Gjc);
+        let state = SettingsState::new(&cokacmux);
+        assert_eq!(state.selected, SETTINGS_AI_NONE);
+        assert_eq!(state.draft.ai_provider, None);
+    }
+
+    #[test]
     fn ctrl_t_does_not_open_settings_from_sessions() {
         let mut app = app_for_key_tests();
 
@@ -42451,6 +43476,32 @@ mod tests {
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert_eq!(app.settings.cokacmux.ai.provider, Some(Provider::Codex));
         assert!(app.status.contains("settings saved"));
+    }
+
+    #[test]
+    fn settings_ai_removed_gjc_shortcut_does_not_select_provider() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::Settings {
+            state: SettingsState::new(&app.settings.cokacmux),
+            return_to: AiTitleSettingsReturn::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::Settings { state, .. } => {
+                assert_eq!(state.selected, SETTINGS_AI_NONE);
+                assert_eq!(state.draft.ai_provider, None);
+                assert!(!state.is_dirty());
+            }
+            other => panic!("expected settings mode, got {:?}", other),
+        }
     }
 
     #[test]
@@ -42563,6 +43614,7 @@ mod tests {
         assert!(ai.contains("! unsaved"));
         assert!(ai.contains("codex current"));
         assert!(ai.contains("Choose AI agent"));
+        assert!(!ai.contains("gjc"));
         assert!(!ai.contains("› AI agent"));
 
         state.section = SettingsSection::Keybindings;
@@ -42954,6 +44006,39 @@ mod tests {
             extract_ai_title_response("Title: Plain fallback title").as_deref(),
             Some("Plain fallback title")
         );
+        assert_eq!(
+            extract_ai_title_response("```json\n{\"title\":\"GJC fenced JSON title\"}\n```")
+                .as_deref(),
+            Some("GJC fenced JSON title")
+        );
+        assert_eq!(
+            extract_ai_title_response(
+                "noise before\n{\"title\":\"Embedded JSON title\"}\nnoise after"
+            )
+            .as_deref(),
+            Some("Embedded JSON title")
+        );
+        assert_eq!(
+            extract_ai_title_response(r#"{"title":"{\"title\":\"GJC nested JSON title\"}"}"#)
+                .as_deref(),
+            Some("GJC nested JSON title")
+        );
+    }
+
+    #[test]
+    fn extract_ai_title_response_uses_first_contract_valid_json_candidate() {
+        assert_eq!(
+            extract_ai_title_response(
+                r#"{"title":"First generated title"} {"title":"Second generated title"}"#
+            )
+            .as_deref(),
+            Some("First generated title")
+        );
+        assert_eq!(
+            extract_ai_title_response(r#"{"event":"started"} {"title":"First generated title"}"#)
+                .as_deref(),
+            Some("First generated title")
+        );
     }
 
     #[test]
@@ -42978,7 +44063,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_ai_title_payload_from_events_prefers_final_answer_text() {
+    fn opencode_ai_agent_payload_from_events_prefers_final_answer_text() {
         let raw = concat!(
             r#"{"type":"text","part":{"type":"text","text":"draft"}}"#,
             "\n",
@@ -42988,20 +44073,20 @@ mod tests {
         );
 
         assert_eq!(
-            opencode_ai_title_payload_from_events(raw).as_deref(),
+            opencode_ai_agent_payload_from_events(raw).as_deref(),
             Ok(r#"{"title":"Final OpenCode title"}"#)
         );
     }
 
     #[test]
-    fn opencode_ai_title_payload_from_events_reports_invalid_json() {
-        assert!(opencode_ai_title_payload_from_events("not json")
+    fn opencode_ai_agent_payload_from_events_reports_invalid_json() {
+        assert!(opencode_ai_agent_payload_from_events("not json")
             .unwrap_err()
             .contains("invalid JSON event on line 1"));
     }
 
     #[test]
-    fn opencode_ai_title_session_ids_from_events_collects_unique_ids() {
+    fn opencode_ai_agent_session_ids_from_events_collects_unique_ids() {
         let raw = concat!(
             r#"{"type":"step_start","sessionID":"ses_one","part":{"sessionID":"ses_one"}}"#,
             "\n",
@@ -43013,7 +44098,7 @@ mod tests {
         );
 
         assert_eq!(
-            opencode_ai_title_session_ids_from_events(raw),
+            opencode_ai_agent_session_ids_from_events(raw),
             vec![
                 "ses_one".to_string(),
                 "ses_two".to_string(),
@@ -43045,8 +44130,27 @@ mod tests {
     }
 
     #[test]
-    fn ai_title_process_error_reports_tail_instead_of_codex_banner() {
-        let output = AiTitleCommandOutput {
+    fn ai_title_prompt_uses_common_structured_output_system_prompt() {
+        let source = session_info(Provider::Gjc, "title-session", "/repo/title");
+        let transcript = AiTitleTranscript {
+            text: "USER #0\n제목을 만들어줘".to_string(),
+            mode: "full",
+            full_chars: 18,
+        };
+
+        let prompt = build_ai_title_prompt(&source, &transcript, Provider::Gjc);
+
+        assert!(prompt.contains("structured-output component"));
+        assert!(prompt.contains("Return exactly one JSON value"));
+        assert!(prompt.contains("multiple JSON values"));
+        assert!(prompt.contains("Task output contract"));
+        assert!(prompt.contains("exactly one string field named `title`"));
+        assert!(prompt.contains("=== SESSION TRANSCRIPT ==="));
+    }
+
+    #[test]
+    fn ai_agent_process_error_reports_tail_instead_of_codex_banner() {
+        let output = AiAgentCommandOutput {
             status: None,
             stdout: "context length exceeded\ntry a shorter prompt\n".to_string(),
             stderr: format!(
@@ -43058,7 +44162,7 @@ mod tests {
             duration: Duration::from_secs(1),
         };
 
-        let error = ai_title_process_error("codex", &output);
+        let error = ai_agent_process_error("codex", &output);
 
         assert!(error.contains("context length exceeded"));
         assert!(error.contains("error: request too large"));
@@ -43246,7 +44350,64 @@ case "$prompt" in
   *"SESSION TRANSCRIPT"*) ;;
   *) exit 2 ;;
 esac
-printf '%s\n' '{"type":"text","sessionID":"ses_fake_ai_title","part":{"type":"text","sessionID":"ses_fake_ai_title","text":"{\"title\":\"OpenCode generated title\"}","metadata":{"openai":{"phase":"final_answer"}}}}'
+        printf '%s\n' '{"type":"text","sessionID":"ses_fake_ai_title","part":{"type":"text","sessionID":"ses_fake_ai_title","text":"{\"title\":\"OpenCode generated title\"}","metadata":{"openai":{"phase":"final_answer"}}}}'
+"#,
+        );
+        let pi = write_executable_test_script(
+            dir.path(),
+            "fake-pi",
+            r#"#!/bin/sh
+no_session=""
+no_tools=""
+no_context=""
+for arg in "$@"; do
+  if [ "$arg" = "--no-session" ]; then
+    no_session="yes"
+  fi
+  if [ "$arg" = "--no-tools" ]; then
+    no_tools="yes"
+  fi
+  if [ "$arg" = "--no-context-files" ]; then
+    no_context="yes"
+  fi
+done
+[ "$no_session" = "yes" ] || exit 11
+[ "$no_tools" = "yes" ] || exit 12
+[ "$no_context" = "yes" ] || exit 13
+prompt="$(cat)"
+case "$prompt" in
+  *"SESSION TRANSCRIPT"*) ;;
+  *) exit 14 ;;
+esac
+printf '%s\n' '{"title":"Pi generated title"}'
+"#,
+        );
+        let gjc = write_executable_test_script(
+            dir.path(),
+            "fake-gjc",
+            r#"#!/bin/sh
+no_session=""
+no_tools=""
+prompt_file=""
+for arg in "$@"; do
+  if [ "$arg" = "--no-session" ]; then
+    no_session="yes"
+  fi
+  if [ "$arg" = "--no-tools" ]; then
+    no_tools="yes"
+  fi
+  case "$arg" in
+    @*) prompt_file="${arg#@}" ;;
+  esac
+done
+[ "$no_session" = "yes" ] || exit 17
+[ "$no_tools" = "yes" ] || exit 18
+[ -n "$prompt_file" ] || exit 19
+[ -f "$prompt_file" ] || exit 20
+stdin="$(cat)"
+[ -z "$stdin" ] || exit 21
+grep -q "SESSION TRANSCRIPT" "$prompt_file" || exit 22
+printf '%s\n' '{"title":"GJC generated title"}'
 "#,
         );
 
@@ -43254,6 +44415,8 @@ printf '%s\n' '{"type":"text","sessionID":"ses_fake_ai_title","part":{"type":"te
         let claude_raw = run_claude_ai_title(&claude, dir.path(), "embedded transcript").unwrap();
         let opencode_raw =
             run_opencode_ai_title(&opencode, dir.path(), "=== SESSION TRANSCRIPT ===").unwrap();
+        let pi_raw = run_pi_ai_title(&pi, dir.path(), "=== SESSION TRANSCRIPT ===").unwrap();
+        let gjc_raw = run_gjc_ai_title(&gjc, dir.path(), "=== SESSION TRANSCRIPT ===").unwrap();
 
         assert_eq!(
             extract_ai_title_response(&codex_raw).as_deref(),
@@ -43266,6 +44429,14 @@ printf '%s\n' '{"type":"text","sessionID":"ses_fake_ai_title","part":{"type":"te
         assert_eq!(
             extract_ai_title_response(&opencode_raw).as_deref(),
             Some("OpenCode generated title")
+        );
+        assert_eq!(
+            extract_ai_title_response(&pi_raw).as_deref(),
+            Some("Pi generated title")
+        );
+        assert_eq!(
+            extract_ai_title_response(&gjc_raw).as_deref(),
+            Some("GJC generated title")
         );
         assert_eq!(
             fs::read_to_string(dir.path().join("deleted-opencode-sessions"))
@@ -43375,7 +44546,68 @@ case "$prompt" in
   *"Search only this preview directory"*) ;;
   *) exit 13 ;;
 esac
-printf '%s\n' '{"type":"text","sessionID":"ses_fake_ai_search","part":{"type":"text","sessionID":"ses_fake_ai_search","text":"{\"results\":[{\"provider\":\"opencode\",\"session_id\":\"opencode-hit\",\"score\":0.7,\"reason\":\"r\"}]}","metadata":{"openai":{"phase":"final_answer"}}}}'
+        printf '%s\n' '{"type":"text","sessionID":"ses_fake_ai_search","part":{"type":"text","sessionID":"ses_fake_ai_search","text":"{\"results\":[{\"provider\":\"opencode\",\"session_id\":\"opencode-hit\",\"score\":0.7,\"reason\":\"r\"}]}","metadata":{"openai":{"phase":"final_answer"}}}}'
+"#,
+        );
+        let pi = write_executable_test_script(
+            dir.path(),
+            "fake-search-pi",
+            r#"#!/bin/sh
+tools=""
+no_session=""
+no_context=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--tools" ]; then
+    tools="$arg"
+  fi
+  if [ "$arg" = "--no-session" ]; then
+    no_session="yes"
+  fi
+  if [ "$arg" = "--no-context-files" ]; then
+    no_context="yes"
+  fi
+  prev="$arg"
+done
+[ "$no_session" = "yes" ] || exit 24
+[ "$no_context" = "yes" ] || exit 25
+printf '%s' "$tools" | grep -q 'read' || exit 26
+printf '%s' "$tools" | grep -q 'grep' || exit 27
+printf '%s' "$tools" | grep -q 'find' || exit 28
+printf '%s' "$tools" | grep -q 'ls' || exit 29
+prompt="$(cat)"
+case "$prompt" in
+  *"Search only this preview directory"*) ;;
+  *) exit 30 ;;
+esac
+printf '%s\n' '{"results":[{"provider":"pi","session_id":"pi-hit","score":0.65,"reason":"r"}]}'
+"#,
+        );
+        let gjc = write_executable_test_script(
+            dir.path(),
+            "fake-search-gjc",
+            r#"#!/bin/sh
+tools=""
+prompt_file=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--tools" ]; then
+    tools="$arg"
+  fi
+  case "$arg" in
+    @*) prompt_file="${arg#@}" ;;
+  esac
+  prev="$arg"
+done
+printf '%s' "$tools" | grep -q 'read' || exit 17
+printf '%s' "$tools" | grep -q 'grep' || exit 18
+printf '%s' "$tools" | grep -q 'find' || exit 19
+[ -n "$prompt_file" ] || exit 20
+[ -f "$prompt_file" ] || exit 21
+stdin="$(cat)"
+[ -z "$stdin" ] || exit 22
+grep -q "Search only this preview directory" "$prompt_file" || exit 23
+printf '%s\n' '{"results":[{"provider":"gjc","session_id":"gjc-hit","score":0.6,"reason":"r"}]}'
 "#,
         );
         let prompt = concat!(
@@ -43395,10 +44627,18 @@ printf '%s\n' '{"type":"text","sessionID":"ses_fake_ai_search","part":{"type":"t
             &run_opencode_ai_search(&opencode, dir.path(), prompt, None).unwrap(),
         )
         .unwrap();
+        let pi_hits =
+            extract_ai_search_response(&run_pi_ai_search(&pi, dir.path(), prompt, None).unwrap())
+                .unwrap();
+        let gjc_hits =
+            extract_ai_search_response(&run_gjc_ai_search(&gjc, dir.path(), prompt, None).unwrap())
+                .unwrap();
 
         assert_eq!(codex_hits[0].key.session_id, "codex-hit");
         assert_eq!(claude_hits[0].key.session_id, "claude-hit");
         assert_eq!(opencode_hits[0].key.session_id, "opencode-hit");
+        assert_eq!(pi_hits[0].key.session_id, "pi-hit");
+        assert_eq!(gjc_hits[0].key.session_id, "gjc-hit");
         assert_eq!(
             fs::read_to_string(dir.path().join("deleted-opencode-search-sessions"))
                 .unwrap()
@@ -43427,7 +44667,7 @@ printf '%s\n' '{"type":"text","sessionID":"ses_cleanup_failure","part":{"type":"
         let error =
             run_opencode_ai_title(&opencode, dir.path(), "=== SESSION TRANSCRIPT ===").unwrap_err();
 
-        assert!(error.contains("opencode AI title session cleanup failed"));
+        assert!(error.contains("opencode AI agent session cleanup failed"));
         assert!(error.contains("ses_cleanup_failure"));
     }
 
@@ -45685,6 +46925,8 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             codex: Some(codex.display().to_string()),
             claude: Some(dir.path().join("missing-claude").display().to_string()),
             opencode: Some(dir.path().join("missing-opencode").display().to_string()),
+            pi: Some(dir.path().join("missing-pi").display().to_string()),
+            gjc: Some(dir.path().join("missing-gjc").display().to_string()),
             extra: serde_json::Map::new(),
         };
 
@@ -45862,6 +47104,8 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             THEME_PROVIDER_CLAUDE,
             THEME_PROVIDER_CODEX,
             THEME_PROVIDER_OPENCODE,
+            THEME_PROVIDER_PI,
+            THEME_PROVIDER_GJC,
             THEME_PREVIEW_USER,
             THEME_PREVIEW_ASSISTANT,
             THEME_PREVIEW_TOOL,
@@ -47600,6 +48844,22 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert_eq!(opencode.program, "opencode");
         assert_eq!(opencode.args, vec!["/repo", "--session", "opencode-id"]);
         assert!(opencode.env.is_empty());
+
+        let pi = default_agent_launch_spec(
+            &session_info(Provider::Pi, "pi-id", "/repo"),
+            AgentLaunchMode::Normal,
+        );
+        assert_eq!(pi.program, "pi");
+        assert_eq!(pi.args, vec!["--session", "pi-id"]);
+        assert!(pi.env.is_empty());
+
+        let gjc = default_agent_launch_spec(
+            &session_info(Provider::Gjc, "gjc-id", "/repo"),
+            AgentLaunchMode::Normal,
+        );
+        assert_eq!(gjc.program, "gjc");
+        assert_eq!(gjc.args, vec!["--resume", "/tmp/source"]);
+        assert!(gjc.env.is_empty());
     }
 
     #[test]
@@ -47608,6 +48868,8 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             codex: Some("/custom/bin/codex".into()),
             claude: Some("/custom/bin/claude".into()),
             opencode: Some("/custom/bin/opencode".into()),
+            pi: Some("/custom/bin/pi".into()),
+            gjc: Some("/custom/bin/gjc".into()),
             extra: serde_json::Map::new(),
         };
 
@@ -47639,6 +48901,22 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert_eq!(opencode.program, "/custom/bin/opencode");
         assert_eq!(opencode.args, vec!["/repo", "--session", "opencode-id"]);
 
+        let pi = agent_launch_spec_with_programs(
+            &session_info(Provider::Pi, "pi-id", "/repo"),
+            AgentLaunchMode::Normal,
+            &agent_programs,
+        );
+        assert_eq!(pi.program, "/custom/bin/pi");
+        assert_eq!(pi.args, vec!["--session", "pi-id"]);
+
+        let gjc = agent_launch_spec_with_programs(
+            &session_info(Provider::Gjc, "gjc-id", "/repo"),
+            AgentLaunchMode::Normal,
+            &agent_programs,
+        );
+        assert_eq!(gjc.program, "/custom/bin/gjc");
+        assert_eq!(gjc.args, vec!["--resume", "/tmp/source"]);
+
         let fresh_codex = new_agent_launch_spec_with_programs(
             &new_agent_info(Provider::Codex, "/repo"),
             AgentLaunchMode::SkipPermissions,
@@ -47654,6 +48932,8 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             codex: Some("   ".into()),
             claude: None,
             opencode: None,
+            pi: None,
+            gjc: None,
             extra: serde_json::Map::new(),
         };
 
@@ -47676,6 +48956,8 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             codex: None,
             claude: Some("~/bin/claude".into()),
             opencode: None,
+            pi: None,
+            gjc: None,
             extra: serde_json::Map::new(),
         };
 
@@ -47768,6 +49050,14 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             opencode_skip.env,
             vec![("OPENCODE_PERMISSION".into(), r#"{"*":"allow"}"#.into())]
         );
+
+        let gjc = default_agent_launch_spec(
+            &new_agent_info(Provider::Gjc, "/repo"),
+            AgentLaunchMode::Normal,
+        );
+        assert_eq!(gjc.program, "gjc");
+        assert!(gjc.args.is_empty());
+        assert!(gjc.env.is_empty());
     }
 
     #[test]
@@ -47805,6 +49095,28 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             AgentLaunchMode::Normal,
         );
         assert!(legacy.args.is_empty());
+    }
+
+    #[test]
+    fn fresh_gjc_launch_spec_preallocates_session_id_from_synthetic_key() {
+        let info = new_agent_session_info(Provider::Gjc, "/repo".to_string());
+        let session_uuid = new_agent_session_uuid(&info.session_id).unwrap();
+        let session_id = session_uuid.to_string();
+
+        let spec = default_agent_launch_spec(&info, AgentLaunchMode::Normal);
+
+        assert_eq!(spec.program, "gjc");
+        assert!(spec.args.is_empty());
+        assert_eq!(
+            spec.env,
+            vec![
+                ("GJC_SESSION_ID".to_string(), session_id.clone()),
+                (
+                    "GJC_LIFECYCLE_REQUEST_ID".to_string(),
+                    format!("cokacmux-{session_id}")
+                ),
+            ]
+        );
     }
 
     #[test]

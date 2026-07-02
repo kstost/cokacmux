@@ -27,6 +27,14 @@ pub struct InstallSessionOpts {
     pub codex_update_index: bool,
     /// Override OpenCode's default DB path. Tests use this to install into a tempdir.
     pub opencode_db_path: Option<PathBuf>,
+    /// Override Pi's `~/.pi/agent` root. Tests use this to install into a tempdir.
+    pub pi_agent_dir: Option<PathBuf>,
+    /// Override Pi's `--session-dir` flat session directory.
+    pub pi_session_dir: Option<PathBuf>,
+    /// Override GJC's `~/.gjc/agent` root. Tests use this to install into a tempdir.
+    pub gjc_agent_dir: Option<PathBuf>,
+    /// Override GJC's `--session-dir` session directory.
+    pub gjc_session_dir: Option<PathBuf>,
 }
 
 impl Default for InstallSessionOpts {
@@ -38,6 +46,10 @@ impl Default for InstallSessionOpts {
             codex_state_5_path: None,
             codex_update_index: true,
             opencode_db_path: None,
+            pi_agent_dir: None,
+            pi_session_dir: None,
+            gjc_agent_dir: None,
+            gjc_session_dir: None,
         }
     }
 }
@@ -103,6 +115,30 @@ pub fn install_universal_session(
                 db_path: report.db_path,
                 session_id: session.session_id.clone(),
             }
+        }
+        #[cfg(feature = "pi")]
+        Provider::Pi => {
+            let report = providers::pi::install::install_to_user_dir(
+                session,
+                &providers::pi::install::InstallOpts {
+                    pi_agent_dir: opts.pi_agent_dir.clone(),
+                    pi_session_dir: opts.pi_session_dir.clone(),
+                    overwrite: opts.overwrite,
+                },
+            )?;
+            ArtifactPath::File(report.jsonl_path)
+        }
+        #[cfg(feature = "gjc")]
+        Provider::Gjc => {
+            let report = providers::gjc::install::install_to_user_dir(
+                session,
+                &providers::gjc::install::InstallOpts {
+                    gjc_agent_dir: opts.gjc_agent_dir.clone(),
+                    gjc_session_dir: opts.gjc_session_dir.clone(),
+                    overwrite: opts.overwrite,
+                },
+            )?;
+            ArtifactPath::File(report.jsonl_path)
         }
         #[allow(unreachable_patterns)]
         disabled => {

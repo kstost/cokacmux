@@ -28,7 +28,13 @@ pub use search::{
 pub fn list_all() -> Result<Vec<SessionInfo>> {
     crate::debug::log("session_list_all_start", serde_json::json!({}));
     let mut out: Vec<SessionInfo> = Vec::new();
-    for p in [Provider::Claude, Provider::Codex, Provider::OpenCode] {
+    for p in [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::OpenCode,
+        Provider::Pi,
+        Provider::Gjc,
+    ] {
         // Each provider list error is non-fatal — e.g. missing ~/.codex shouldn't
         // hide ~/.claude sessions.
         match discovery::list_all(p) {
@@ -150,6 +156,10 @@ pub fn load(info: &SessionInfo) -> Result<UniversalSession> {
         Provider::Claude => crate::providers::claude::from_file(&info.source, &Default::default()),
         #[cfg(feature = "codex")]
         Provider::Codex => crate::providers::codex::from_file(&info.source),
+        #[cfg(feature = "pi")]
+        Provider::Pi => crate::providers::pi::from_file(&info.source),
+        #[cfg(feature = "gjc")]
+        Provider::Gjc => crate::providers::gjc::from_file(&info.source),
         #[cfg(feature = "opencode")]
         Provider::OpenCode => {
             crate::providers::opencode::from_db_path(&info.source, &info.session_id)

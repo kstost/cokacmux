@@ -95,6 +95,8 @@ pub fn validate_info(info: &SessionInfo) -> Result<NativeValidationReport> {
             &NativeValidationOpts::default(),
         ),
         Provider::OpenCode => validate_opencode_db(&info.source, &info.session_id),
+        Provider::Pi => validate_pi_jsonl(&info.source, &info.session_id),
+        Provider::Gjc => validate_gjc_jsonl(&info.source, &info.session_id),
     }
 }
 
@@ -122,6 +124,8 @@ pub fn validate_clone_artifact_with_opts(
         (Provider::Codex, ArtifactPath::File(path)) => {
             validate_codex_rollout(path, session_id, &opts)
         }
+        (Provider::Pi, ArtifactPath::File(path)) => validate_pi_jsonl(path, session_id),
+        (Provider::Gjc, ArtifactPath::File(path)) => validate_gjc_jsonl(path, session_id),
         (
             Provider::OpenCode,
             ArtifactPath::OpenCodeDb {
@@ -507,6 +511,140 @@ fn infer_codex_home_from_rollout(path: &Path) -> Option<PathBuf> {
         return None;
     }
     sessions.parent().map(Path::to_path_buf)
+}
+
+fn validate_pi_jsonl(path: &Path, session_id: &str) -> Result<NativeValidationReport> {
+    validate_agent_jsonl(Provider::Pi, path, session_id)
+}
+
+fn validate_gjc_jsonl(path: &Path, session_id: &str) -> Result<NativeValidationReport> {
+    validate_agent_jsonl(Provider::Gjc, path, session_id)
+}
+
+fn validate_agent_jsonl(
+    provider: Provider,
+    path: &Path,
+    session_id: &str,
+) -> Result<NativeValidationReport> {
+    let mut report = NativeValidationReport::new(provider, session_id, path.display().to_string());
+    report.check("file_exists", path.is_file(), path.display().to_string());
+    report.check(
+        "extension_jsonl",
+        path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"),
+        path.display().to_string(),
+    );
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            report.check("read_file", false, error.to_string());
+            return Ok(report);
+        }
+    };
+    validate_pi_jsonl_text(&mut report, &content, session_id);
+    Ok(report)
+}
+
+fn validate_pi_jsonl_text(report: &mut NativeValidationReport, content: &str, session_id: &str) {
+    let mut line_count = 0usize;
+    let mut json_errors = 0usize;
+    let mut header_seen = false;
+    let mut header_id_ok = false;
+    let mut header_cwd_present = false;
+    let mut entry_rows = 0usize;
+    let mut message_rows = 0usize;
+    let mut missing_entry_ids = 0usize;
+    let mut duplicate_entry_ids = 0usize;
+    let mut missing_parent_refs = 0usize;
+    let mut ids = std::collections::HashSet::new();
+
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        line_count = line_count.saturating_add(1);
+        let value: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => {
+                json_errors = json_errors.saturating_add(1);
+                continue;
+            }
+        };
+        if !header_seen {
+            header_seen = true;
+            if value.get("type").and_then(Value::as_str) == Some("session") {
+                header_id_ok = value.get("id").and_then(Value::as_str) == Some(session_id);
+                header_cwd_present = value
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .is_some_and(|cwd| !cwd.is_empty());
+            }
+            continue;
+        }
+        entry_rows = entry_rows.saturating_add(1);
+        if value.get("type").and_then(Value::as_str) == Some("message") {
+            message_rows = message_rows.saturating_add(1);
+        }
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            missing_entry_ids = missing_entry_ids.saturating_add(1);
+            continue;
+        };
+        if !ids.insert(id.to_string()) {
+            duplicate_entry_ids = duplicate_entry_ids.saturating_add(1);
+        }
+        if let Some(parent_id) = value.get("parentId").and_then(Value::as_str) {
+            if !ids.contains(parent_id) {
+                missing_parent_refs = missing_parent_refs.saturating_add(1);
+            }
+        }
+    }
+
+    report.check(
+        "non_empty_jsonl",
+        line_count > 0,
+        format!("lines={line_count}"),
+    );
+    report.check(
+        "jsonl_parse",
+        json_errors == 0,
+        format!("errors={json_errors}"),
+    );
+    report.check(
+        "session_header_present",
+        header_seen,
+        "first line inspected",
+    );
+    report.check(
+        "session_header_id",
+        header_id_ok,
+        format!("expected={session_id}"),
+    );
+    report.check("session_header_cwd", header_cwd_present, "cwd present");
+    report.check(
+        "entry_rows_present",
+        entry_rows > 0,
+        format!("entries={entry_rows}"),
+    );
+    report.check(
+        "message_rows_present",
+        message_rows > 0,
+        format!("messages={message_rows}"),
+    );
+    report.check(
+        "entry_ids_present",
+        missing_entry_ids == 0,
+        format!("missing={missing_entry_ids}"),
+    );
+    report.check(
+        "entry_ids_unique",
+        duplicate_entry_ids == 0,
+        format!("duplicates={duplicate_entry_ids}"),
+    );
+    report.check(
+        "parent_refs_seen_before_child",
+        missing_parent_refs == 0,
+        format!("missing={missing_parent_refs}"),
+    );
 }
 
 fn validate_opencode_db(db_path: &Path, session_id: &str) -> Result<NativeValidationReport> {

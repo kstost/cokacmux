@@ -27,6 +27,8 @@ pub fn remove(info: &SessionInfo) -> Result<RemoveReport> {
         Provider::Claude => remove_claude(info),
         Provider::Codex => remove_codex(info),
         Provider::OpenCode => remove_opencode(info),
+        Provider::Pi => remove_pi(info),
+        Provider::Gjc => remove_gjc(info),
     };
     match &result {
         Ok(report) => crate::debug::log(
@@ -67,6 +69,38 @@ fn remove_claude(info: &SessionInfo) -> Result<RemoveReport> {
     }
     Ok(RemoveReport {
         provider: Provider::Claude,
+        deleted_file: Some(p.clone()),
+        deleted_rows: 0,
+    })
+}
+
+fn remove_pi(info: &SessionInfo) -> Result<RemoveReport> {
+    let p = &info.source;
+    if !p.exists() {
+        return Err(ConvertError::Other(format!(
+            "pi session file not found: {}",
+            p.display()
+        )));
+    }
+    std::fs::remove_file(p)?;
+    Ok(RemoveReport {
+        provider: Provider::Pi,
+        deleted_file: Some(p.clone()),
+        deleted_rows: 0,
+    })
+}
+
+fn remove_gjc(info: &SessionInfo) -> Result<RemoveReport> {
+    let p = &info.source;
+    if !p.exists() {
+        return Err(ConvertError::Other(format!(
+            "gjc session file not found: {}",
+            p.display()
+        )));
+    }
+    std::fs::remove_file(p)?;
+    Ok(RemoveReport {
+        provider: Provider::Gjc,
         deleted_file: Some(p.clone()),
         deleted_rows: 0,
     })

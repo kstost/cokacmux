@@ -6,8 +6,12 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "gjc")]
+use cokacmux::providers::gjc;
 #[cfg(feature = "opencode")]
 use cokacmux::providers::opencode;
+#[cfg(feature = "pi")]
+use cokacmux::providers::pi;
 use cokacmux::providers::{claude, codex};
 use cokacmux::session::{
     clone::ArtifactPath,
@@ -28,6 +32,22 @@ fn claude_fixture() -> &'static str {
 fn codex_fixture() -> &'static str {
     r#"{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{"id":"installtest-codex","cwd":"/tmp/abc"}}
 {"timestamp":"2026-05-20T01:00:00.500Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}
+"#
+}
+
+#[cfg(feature = "pi")]
+fn pi_fixture() -> &'static str {
+    r#"{"type":"session","version":3,"id":"019e0000-0000-7000-8000-0000000000aa","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp/abc"}
+{"type":"message","id":"019e0000-0000-7000-8000-0000000000ab","parentId":null,"timestamp":"2026-05-20T01:00:00.500Z","message":{"role":"user","content":"hi","timestamp":1779240000500}}
+{"type":"message","id":"019e0000-0000-7000-8000-0000000000ac","parentId":"019e0000-0000-7000-8000-0000000000ab","timestamp":"2026-05-20T01:00:01.500Z","message":{"role":"assistant","content":[{"type":"text","text":"yo"}],"provider":"openai","model":"gpt-5.5","usage":{"input":1,"output":1,"totalTokens":2,"cost":{"total":0}},"stopReason":"stop","timestamp":1779240001500}}
+"#
+}
+
+#[cfg(feature = "gjc")]
+fn gjc_fixture() -> &'static str {
+    r#"{"type":"session","version":3,"id":"019e0000-0000-7000-8000-0000000000ba","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp/abc","title":"GJC fixture","titleSource":"user"}
+{"type":"message","id":"019e0000-0000-7000-8000-0000000000bb","parentId":null,"timestamp":"2026-05-20T01:00:00.500Z","message":{"role":"user","content":"hi","timestamp":1779240000500}}
+{"type":"message","id":"019e0000-0000-7000-8000-0000000000bc","parentId":"019e0000-0000-7000-8000-0000000000bb","timestamp":"2026-05-20T01:00:01.500Z","message":{"role":"assistant","content":[{"type":"text","text":"yo"}],"provider":"openai","model":"gpt-5.5","usage":{"input":1,"output":1,"totalTokens":2,"cost":{"total":0}},"stopReason":"stop","timestamp":1779240001500}}
 "#
 }
 
@@ -237,6 +257,196 @@ fn codex_install_validation_failure_removes_rollout_when_required_index_is_missi
         jsonls.is_empty(),
         "failed install should remove rollout files: {jsonls:?}"
     );
+}
+
+#[cfg(feature = "pi")]
+#[test]
+fn pi_install_into_tempdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join(".pi").join("agent");
+    let session = pi::from_jsonl_str(pi_fixture(), &Default::default()).unwrap();
+    let report = pi::install::install_to_user_dir(
+        &session,
+        &pi::install::InstallOpts {
+            pi_agent_dir: Some(agent_dir.clone()),
+            pi_session_dir: None,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let expected_dir = agent_dir
+        .join("sessions")
+        .join(pi::encoded_cwd_dir("/tmp/abc"));
+    assert_eq!(report.jsonl_path.parent(), Some(expected_dir.as_path()));
+    assert!(report.jsonl_path.exists());
+    assert!(report
+        .jsonl_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(&format!("_{}.jsonl", session.session_id))));
+    let validation = native_validate::validate_clone_artifact(
+        Provider::Pi,
+        &session.session_id,
+        &ArtifactPath::File(report.jsonl_path.clone()),
+    )
+    .unwrap();
+    assert!(validation.ok, "{:?}", validation);
+
+    let err = pi::install::install_to_user_dir(
+        &session,
+        &pi::install::InstallOpts {
+            pi_agent_dir: Some(agent_dir.clone()),
+            pi_session_dir: None,
+            overwrite: false,
+        },
+    )
+    .expect_err("re-install without overwrite should fail");
+    assert!(err.to_string().contains("already exists"), "{err}");
+
+    pi::install::install_to_user_dir(
+        &session,
+        &pi::install::InstallOpts {
+            pi_agent_dir: Some(agent_dir),
+            pi_session_dir: None,
+            overwrite: true,
+        },
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "pi")]
+#[test]
+fn context_wrapper_install_into_pi_tempdir_validates_native_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join(".pi").join("agent");
+    let source = codex::from_jsonl_str(codex_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::Pi);
+
+    let report = install_universal_session(
+        Provider::Pi,
+        &converted,
+        &InstallSessionOpts {
+            pi_agent_dir: Some(agent_dir.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.provider, Provider::Pi);
+    assert_eq!(report.session_id, converted.session_id);
+    assert!(report.validation.ok, "{:?}", report.validation);
+    let ArtifactPath::File(path) = &report.artifact else {
+        panic!("expected Pi file artifact: {:?}", report.artifact);
+    };
+    assert!(path.starts_with(agent_dir.join("sessions")));
+    assert!(path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(&format!("_{}.jsonl", converted.session_id))));
+
+    let back = pi::from_file(path).unwrap();
+    let user_texts = text_messages_for_role(&back, Role::User);
+    assert_eq!(user_texts.len(), 1);
+    assert!(user_texts[0].ends_with(CONTEXT_CONTINUATION_PROMPT));
+    assert!(user_texts[0].contains("installtest-codex"));
+    let assistant_texts = text_messages_for_role(&back, Role::Assistant);
+    assert_eq!(assistant_texts, vec![CONTEXT_ACK]);
+}
+
+#[cfg(feature = "gjc")]
+#[test]
+fn gjc_install_into_tempdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join(".gjc").join("agent");
+    let session = gjc::from_jsonl_str(gjc_fixture(), &Default::default()).unwrap();
+    let report = gjc::install::install_to_user_dir(
+        &session,
+        &gjc::install::InstallOpts {
+            gjc_agent_dir: Some(agent_dir.clone()),
+            gjc_session_dir: None,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let expected_dir = agent_dir
+        .join("sessions")
+        .join(gjc::encoded_cwd_dir("/tmp/abc"));
+    assert_eq!(report.jsonl_path.parent(), Some(expected_dir.as_path()));
+    assert!(report.jsonl_path.exists());
+    assert!(report
+        .jsonl_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(&format!("_{}.jsonl", session.session_id))));
+    let validation = native_validate::validate_clone_artifact(
+        Provider::Gjc,
+        &session.session_id,
+        &ArtifactPath::File(report.jsonl_path.clone()),
+    )
+    .unwrap();
+    assert!(validation.ok, "{:?}", validation);
+
+    let err = gjc::install::install_to_user_dir(
+        &session,
+        &gjc::install::InstallOpts {
+            gjc_agent_dir: Some(agent_dir.clone()),
+            gjc_session_dir: None,
+            overwrite: false,
+        },
+    )
+    .expect_err("re-install without overwrite should fail");
+    assert!(err.to_string().contains("already exists"), "{err}");
+
+    gjc::install::install_to_user_dir(
+        &session,
+        &gjc::install::InstallOpts {
+            gjc_agent_dir: Some(agent_dir),
+            gjc_session_dir: None,
+            overwrite: true,
+        },
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "gjc")]
+#[test]
+fn context_wrapper_install_into_gjc_tempdir_validates_native_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join(".gjc").join("agent");
+    let source = codex::from_jsonl_str(codex_fixture(), &Default::default()).unwrap();
+    let converted = wrap_session_for_context_convert(&source, Provider::Gjc);
+
+    let report = install_universal_session(
+        Provider::Gjc,
+        &converted,
+        &InstallSessionOpts {
+            gjc_agent_dir: Some(agent_dir.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.provider, Provider::Gjc);
+    assert_eq!(report.session_id, converted.session_id);
+    assert!(report.validation.ok, "{:?}", report.validation);
+    let ArtifactPath::File(path) = &report.artifact else {
+        panic!("expected GJC file artifact: {:?}", report.artifact);
+    };
+    assert!(path.starts_with(agent_dir.join("sessions")));
+    assert!(path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(&format!("_{}.jsonl", converted.session_id))));
+
+    let back = gjc::from_file(path).unwrap();
+    let user_texts = text_messages_for_role(&back, Role::User);
+    assert_eq!(user_texts.len(), 1);
+    assert!(user_texts[0].ends_with(CONTEXT_CONTINUATION_PROMPT));
+    assert!(user_texts[0].contains("installtest-codex"));
+    let assistant_texts = text_messages_for_role(&back, Role::Assistant);
+    assert_eq!(assistant_texts, vec![CONTEXT_ACK]);
 }
 
 #[cfg(feature = "opencode")]

@@ -30,6 +30,8 @@ pub fn latest_for_cwd(provider: Provider, cwd: &Path) -> Result<UniversalSession
         Provider::Claude => latest_claude_by_cwd(&target_cwd)?,
         Provider::Codex => latest_codex_by_cwd(&target_cwd)?,
         Provider::OpenCode => latest_opencode_by_cwd(&target_cwd)?,
+        Provider::Pi => latest_pi_by_cwd(&target_cwd)?,
+        Provider::Gjc => latest_gjc_by_cwd(&target_cwd)?,
     };
     crate::debug::log(
         "discovery_latest_for_cwd_match",
@@ -44,6 +46,10 @@ pub fn latest_for_cwd(provider: Provider, cwd: &Path) -> Result<UniversalSession
         Provider::Claude => crate::providers::claude::from_file(&info.source, &Default::default()),
         #[cfg(feature = "codex")]
         Provider::Codex => crate::providers::codex::from_file(&info.source),
+        #[cfg(feature = "pi")]
+        Provider::Pi => crate::providers::pi::from_file(&info.source),
+        #[cfg(feature = "gjc")]
+        Provider::Gjc => crate::providers::gjc::from_file(&info.source),
         #[cfg(feature = "opencode")]
         Provider::OpenCode => {
             crate::providers::opencode::from_db_path(&info.source, &info.session_id)
@@ -89,6 +95,8 @@ pub fn list_all(provider: Provider) -> Result<Vec<SessionInfo>> {
         Provider::Claude => list_claude(),
         Provider::Codex => list_codex(),
         Provider::OpenCode => list_opencode(),
+        Provider::Pi => list_pi(),
+        Provider::Gjc => list_gjc(),
     };
     match &result {
         Ok(items) => crate::debug::log(
@@ -374,6 +382,368 @@ fn latest_codex_by_cwd(cwd: &str) -> Result<SessionInfo> {
         .ok_or_else(|| ConvertError::Parse(format!("no codex session matching cwd {}", cwd)))
 }
 
+// ---------- Pi ----------
+#[cfg(feature = "pi")]
+fn list_pi() -> Result<Vec<SessionInfo>> {
+    let Some(root) = crate::providers::pi::default_sessions_root() else {
+        return Ok(Vec::new());
+    };
+    if !root.is_dir() {
+        crate::debug::log(
+            "discovery_pi_missing_sessions",
+            serde_json::json!({
+                "path": root.display().to_string(),
+            }),
+        );
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    if std::env::var_os(crate::providers::pi::ENV_SESSION_DIR)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        scan_pi_session_dir(&root, &mut out);
+    } else {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return Ok(Vec::new());
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+                scan_pi_session_dir(&entry.path(), &mut out);
+            }
+        }
+    }
+    out.sort_by(|a, b| b.updated_at_epoch_s.cmp(&a.updated_at_epoch_s));
+    crate::debug::log(
+        "discovery_pi_scan_ok",
+        serde_json::json!({
+            "sessions_path": root.display().to_string(),
+            "count": out.len(),
+        }),
+    );
+    Ok(out)
+}
+
+#[cfg(not(feature = "pi"))]
+fn list_pi() -> Result<Vec<SessionInfo>> {
+    Err(ConvertError::Unsupported("pi feature not enabled".into()))
+}
+
+#[cfg(feature = "pi")]
+fn scan_pi_session_dir(dir: &Path, out: &mut Vec<SessionInfo>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|ty| ty.is_file()).unwrap_or(false)
+            || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+        {
+            continue;
+        }
+        let Some(meta) = extract_pi_meta_from_jsonl(&path) else {
+            continue;
+        };
+        let mtime = path
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push(SessionInfo {
+            provider: Provider::Pi,
+            session_id: meta.session_id,
+            cwd: meta.cwd,
+            source: path,
+            updated_at_epoch_s: meta.updated_at_epoch_s.unwrap_or(mtime),
+            title: meta.title,
+        });
+    }
+}
+
+#[cfg(feature = "pi")]
+#[derive(Debug, Default)]
+struct PiJsonlMeta {
+    session_id: String,
+    cwd: String,
+    title: Option<String>,
+    updated_at_epoch_s: Option<u64>,
+}
+
+#[cfg(feature = "pi")]
+fn extract_pi_meta_from_jsonl(path: &Path) -> Option<PiJsonlMeta> {
+    use std::io::{BufRead, BufReader};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut meta = PiJsonlMeta::default();
+    let mut header_seen = false;
+    for line in BufReader::new(file).lines().flatten() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if !header_seen {
+            header_seen = true;
+            if value.get("type").and_then(|ty| ty.as_str()) != Some("session") {
+                return None;
+            }
+            meta.session_id = value.get("id").and_then(|id| id.as_str())?.to_string();
+            meta.cwd = value
+                .get("cwd")
+                .and_then(|cwd| cwd.as_str())
+                .unwrap_or_default()
+                .to_string();
+            meta.updated_at_epoch_s = value
+                .get("timestamp")
+                .and_then(|ts| ts.as_str())
+                .and_then(crate::time::parse_rfc3339)
+                .map(|dt| dt.timestamp().max(0) as u64);
+            continue;
+        }
+        match value.get("type").and_then(|ty| ty.as_str()) {
+            Some("session_info") => {
+                if let Some(title) = value
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                {
+                    meta.title = Some(title);
+                }
+            }
+            Some("message") => {
+                let message = value.get("message").unwrap_or(&serde_json::Value::Null);
+                let role = message.get("role").and_then(|role| role.as_str());
+                if meta.title.is_none() {
+                    if let Some(title) = crate::providers::pi::user_message_title(message) {
+                        meta.title = Some(title);
+                    }
+                }
+                if matches!(role, Some("user" | "assistant")) {
+                    if let Some(epoch_s) = value
+                        .get("message")
+                        .and_then(|message| message.get("timestamp"))
+                        .and_then(|ts| ts.as_i64())
+                        .map(|ms| (ms / 1000).max(0) as u64)
+                        .or_else(|| {
+                            value
+                                .get("timestamp")
+                                .and_then(|ts| ts.as_str())
+                                .and_then(crate::time::parse_rfc3339)
+                                .map(|dt| dt.timestamp().max(0) as u64)
+                        })
+                    {
+                        meta.updated_at_epoch_s =
+                            Some(meta.updated_at_epoch_s.unwrap_or(0).max(epoch_s));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (!meta.session_id.is_empty()).then_some(meta)
+}
+
+fn latest_pi_by_cwd(cwd: &str) -> Result<SessionInfo> {
+    list_pi()?
+        .into_iter()
+        .find(|i| i.cwd == cwd)
+        .ok_or_else(|| ConvertError::Parse(format!("no pi session matching cwd {}", cwd)))
+}
+
+// ---------- GJC ----------
+#[cfg(feature = "gjc")]
+fn list_gjc() -> Result<Vec<SessionInfo>> {
+    let Some(root) = crate::providers::gjc::default_sessions_root() else {
+        return Ok(Vec::new());
+    };
+    if !root.is_dir() {
+        crate::debug::log(
+            "discovery_gjc_missing_sessions",
+            serde_json::json!({
+                "path": root.display().to_string(),
+            }),
+        );
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Ok(Vec::new());
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+            scan_gjc_session_dir(&entry.path(), &mut out);
+        }
+    }
+    out.sort_by(|a, b| b.updated_at_epoch_s.cmp(&a.updated_at_epoch_s));
+    crate::debug::log(
+        "discovery_gjc_scan_ok",
+        serde_json::json!({
+            "sessions_path": root.display().to_string(),
+            "count": out.len(),
+        }),
+    );
+    Ok(out)
+}
+
+#[cfg(not(feature = "gjc"))]
+fn list_gjc() -> Result<Vec<SessionInfo>> {
+    Err(ConvertError::Unsupported("gjc feature not enabled".into()))
+}
+
+#[cfg(feature = "gjc")]
+fn scan_gjc_session_dir(dir: &Path, out: &mut Vec<SessionInfo>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|ty| ty.is_file()).unwrap_or(false)
+            || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+        {
+            continue;
+        }
+        let Some(meta) = extract_gjc_meta_from_jsonl(&path) else {
+            continue;
+        };
+        let mtime = path
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push(SessionInfo {
+            provider: Provider::Gjc,
+            session_id: meta.session_id,
+            cwd: meta.cwd,
+            source: path,
+            updated_at_epoch_s: meta.updated_at_epoch_s.unwrap_or(mtime),
+            title: meta.title,
+        });
+    }
+}
+
+#[cfg(feature = "gjc")]
+#[derive(Debug, Default)]
+struct GjcJsonlMeta {
+    session_id: String,
+    cwd: String,
+    title: Option<String>,
+    updated_at_epoch_s: Option<u64>,
+}
+
+#[cfg(feature = "gjc")]
+fn extract_gjc_meta_from_jsonl(path: &Path) -> Option<GjcJsonlMeta> {
+    use std::io::{BufRead, BufReader};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut meta = GjcJsonlMeta::default();
+    let mut header_seen = false;
+    for line in BufReader::new(file).lines().flatten() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if !header_seen {
+            header_seen = true;
+            if value.get("type").and_then(|ty| ty.as_str()) != Some("session") {
+                return None;
+            }
+            meta.session_id = value.get("id").and_then(|id| id.as_str())?.to_string();
+            meta.cwd = value
+                .get("cwd")
+                .and_then(|cwd| cwd.as_str())
+                .unwrap_or_default()
+                .to_string();
+            meta.title = value
+                .get("title")
+                .and_then(|title| title.as_str())
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_string);
+            meta.updated_at_epoch_s = value
+                .get("timestamp")
+                .and_then(|ts| ts.as_str())
+                .and_then(crate::time::parse_rfc3339)
+                .map(|dt| dt.timestamp().max(0) as u64);
+            continue;
+        }
+        match value.get("type").and_then(|ty| ty.as_str()) {
+            Some("session_info") => {
+                if meta.title.is_none() {
+                    if let Some(title) = value
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                    {
+                        meta.title = Some(title);
+                    }
+                }
+            }
+            Some("compaction") => {
+                if meta.title.is_none() {
+                    if let Some(title) = value
+                        .get("shortSummary")
+                        .and_then(|name| name.as_str())
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                    {
+                        meta.title = Some(title);
+                    }
+                }
+            }
+            Some("message") => {
+                let message = value.get("message").unwrap_or(&serde_json::Value::Null);
+                let role = message.get("role").and_then(|role| role.as_str());
+                if meta.title.is_none() {
+                    if let Some(title) = crate::providers::gjc::user_message_title(message) {
+                        meta.title = Some(title);
+                    }
+                }
+                if matches!(role, Some("user" | "assistant")) {
+                    if let Some(epoch_s) = value
+                        .get("message")
+                        .and_then(|message| message.get("timestamp"))
+                        .and_then(|ts| ts.as_i64())
+                        .map(|ms| (ms / 1000).max(0) as u64)
+                        .or_else(|| {
+                            value
+                                .get("timestamp")
+                                .and_then(|ts| ts.as_str())
+                                .and_then(crate::time::parse_rfc3339)
+                                .map(|dt| dt.timestamp().max(0) as u64)
+                        })
+                    {
+                        meta.updated_at_epoch_s =
+                            Some(meta.updated_at_epoch_s.unwrap_or(0).max(epoch_s));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (!meta.session_id.is_empty()).then_some(meta)
+}
+
+fn latest_gjc_by_cwd(cwd: &str) -> Result<SessionInfo> {
+    list_gjc()?
+        .into_iter()
+        .find(|i| i.cwd == cwd)
+        .ok_or_else(|| ConvertError::Parse(format!("no gjc session matching cwd {}", cwd)))
+}
+
 // ---------- OpenCode ----------
 #[cfg(feature = "opencode")]
 fn list_opencode() -> Result<Vec<SessionInfo>> {
@@ -607,6 +977,51 @@ mod tests {
         let meta = extract_claude_meta_from_jsonl(file.path());
 
         assert_eq!(meta.title.as_deref(), Some("Named Agent"));
+    }
+
+    #[cfg(feature = "pi")]
+    #[test]
+    fn extracts_pi_first_user_message_as_title_for_discovery() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session","version":3,"id":"s1","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp/project"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","id":"u1","parentId":null,"timestamp":"2026-05-20T01:00:01.000Z","message":{{"role":"user","content":"  First\n\nuser   prompt  ","timestamp":1779240001000}}}}"#
+        )
+        .unwrap();
+
+        let meta = extract_pi_meta_from_jsonl(file.path()).unwrap();
+
+        assert_eq!(meta.title.as_deref(), Some("First user prompt"));
+    }
+
+    #[cfg(feature = "pi")]
+    #[test]
+    fn extracts_pi_session_info_title_over_first_user_fallback() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session","version":3,"id":"s1","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp/project"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","id":"u1","parentId":null,"timestamp":"2026-05-20T01:00:01.000Z","message":{{"role":"user","content":[{{"type":"text","text":"first user"}},{{"type":"image","data":"abc"}}],"timestamp":1779240001000}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session_info","id":"info","parentId":"u1","timestamp":"2026-05-20T01:00:02.000Z","name":"Named Pi Session"}}"#
+        )
+        .unwrap();
+
+        let meta = extract_pi_meta_from_jsonl(file.path()).unwrap();
+
+        assert_eq!(meta.title.as_deref(), Some("Named Pi Session"));
     }
 
     #[cfg(feature = "opencode")]

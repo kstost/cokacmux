@@ -31,6 +31,22 @@ fn codex_fixture() -> &'static str {
 "#
 }
 
+#[cfg(feature = "pi")]
+fn pi_fixture() -> &'static str {
+    r#"{"type":"session","version":3,"id":"sess-pi-1","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-05-20T01:00:00.500Z","message":{"role":"user","content":"hello there","timestamp":1779240000500}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-05-20T01:00:01.500Z","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}],"provider":"openai","model":"gpt-5.5","usage":{"input":3,"output":2,"totalTokens":5,"cost":{"total":0}},"stopReason":"stop","timestamp":1779240001500}}
+"#
+}
+
+#[cfg(feature = "gjc")]
+fn gjc_fixture() -> &'static str {
+    r#"{"type":"session","version":3,"id":"sess-gjc-1","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp","title":"Named GJC Session","titleSource":"user"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-05-20T01:00:00.500Z","message":{"role":"user","content":"hello there","timestamp":1779240000500}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-05-20T01:00:01.500Z","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}],"provider":"openai","model":"gpt-5.5","usage":{"input":3,"output":2,"totalTokens":5,"cost":{"total":0}},"stopReason":"stop","timestamp":1779240001500}}
+"#
+}
+
 // -------- Claude roundtrip --------
 
 #[test]
@@ -100,6 +116,129 @@ fn codex_token_count_extracted_to_usage_total() {
     assert_eq!(u.input_tokens, Some(10));
     assert_eq!(u.output_tokens, Some(5));
     assert_eq!(u.total_tokens, Some(15));
+}
+
+// -------- Pi roundtrip --------
+
+#[cfg(feature = "pi")]
+#[test]
+fn pi_same_provider_roundtrip_is_bit_identical() {
+    let src = pi_fixture();
+    let session = providers::pi::from_jsonl_str(src, &Default::default()).unwrap();
+    assert_eq!(session.cwd, "/tmp");
+    assert_eq!(session.session_id, "sess-pi-1");
+    assert_eq!(session.title.as_deref(), Some("hello there"));
+    assert_eq!(session.messages.len(), 2);
+
+    let out = providers::pi::to_jsonl_string(&session, &Default::default()).unwrap();
+    assert_eq!(out, src, "pi roundtrip should be bit-identical");
+}
+
+#[cfg(feature = "pi")]
+#[test]
+fn pi_session_info_title_overrides_first_user_fallback() {
+    let src = r#"{"type":"session","version":3,"id":"sess-pi-title","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-05-20T01:00:00.500Z","message":{"role":"user","content":[{"type":"text","text":"first user title"},{"type":"image","mimeType":"image/png","data":"iVBORw0KGgo="}],"timestamp":1779240000500}}
+{"type":"session_info","id":"info1","parentId":"u1","timestamp":"2026-05-20T01:00:01.000Z","name":"Named Pi Session"}
+"#;
+
+    let session = providers::pi::from_jsonl_str(src, &Default::default()).unwrap();
+
+    assert_eq!(session.title.as_deref(), Some("Named Pi Session"));
+}
+
+#[cfg(feature = "pi")]
+#[test]
+fn pi_model_change_entry_sets_session_model() {
+    let src = r#"{"type":"session","version":3,"id":"sess-pi-model","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp"}
+{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-05-20T01:00:00.100Z","provider":"openai","modelId":"gpt-4o-mini"}
+"#;
+
+    let session = providers::pi::from_jsonl_str(src, &Default::default()).unwrap();
+    let model = session.model.expect("model_change should populate model");
+
+    assert_eq!(model.provider_id.as_deref(), Some("openai"));
+    assert_eq!(model.model_id, "gpt-4o-mini");
+}
+
+#[cfg(feature = "pi")]
+#[test]
+fn pi_text_content_extracted() {
+    let session = providers::pi::from_jsonl_str(pi_fixture(), &Default::default()).unwrap();
+    let texts: Vec<&str> = session
+        .messages
+        .iter()
+        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+        .flat_map(|m| {
+            m.content.iter().filter_map(|b| {
+                if let cokacmux::ContentBlock::Text { text, .. } = b {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    assert_eq!(texts, vec!["hello there", "hi back"]);
+}
+
+// -------- GJC roundtrip --------
+
+#[cfg(feature = "gjc")]
+#[test]
+fn gjc_same_provider_roundtrip_preserves_header_title() {
+    let src = gjc_fixture();
+    let session = providers::gjc::from_jsonl_str(src, &Default::default()).unwrap();
+    assert_eq!(session.cwd, "/tmp");
+    assert_eq!(session.session_id, "sess-gjc-1");
+    assert_eq!(session.title.as_deref(), Some("Named GJC Session"));
+    assert_eq!(session.messages.len(), 2);
+
+    let out = providers::gjc::to_jsonl_string(&session, &Default::default()).unwrap();
+    let header: Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        header.get("title").and_then(|v| v.as_str()),
+        Some("Named GJC Session")
+    );
+    assert_eq!(
+        header.get("titleSource").and_then(|v| v.as_str()),
+        Some("user")
+    );
+}
+
+#[cfg(feature = "gjc")]
+#[test]
+fn gjc_model_change_entry_sets_session_model_from_combined_model_id() {
+    let src = r#"{"type":"session","version":3,"id":"sess-gjc-model","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp"}
+{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-05-20T01:00:00.100Z","model":"openai/gpt-4o-mini"}
+"#;
+
+    let session = providers::gjc::from_jsonl_str(src, &Default::default()).unwrap();
+    let model = session.model.expect("model_change should populate model");
+
+    assert_eq!(model.provider_id.as_deref(), Some("openai"));
+    assert_eq!(model.model_id, "gpt-4o-mini");
+}
+
+#[cfg(feature = "gjc")]
+#[test]
+fn gjc_text_content_extracted() {
+    let session = providers::gjc::from_jsonl_str(gjc_fixture(), &Default::default()).unwrap();
+    let texts: Vec<&str> = session
+        .messages
+        .iter()
+        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+        .flat_map(|m| {
+            m.content.iter().filter_map(|b| {
+                if let cokacmux::ContentBlock::Text { text, .. } = b {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    assert_eq!(texts, vec!["hello there", "hi back"]);
 }
 
 // -------- OpenCode roundtrip (via tempfile) --------

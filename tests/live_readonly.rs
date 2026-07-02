@@ -1,6 +1,6 @@
 //! Read-only live storage checks.
 //!
-//! These tests inspect real local Claude/Codex/OpenCode session artifacts,
+//! These tests inspect real local Claude/Codex/OpenCode/Pi/GJC session artifacts,
 //! but write only to tempdirs. They are ignored by default because they depend
 //! on the developer machine having live agent data.
 
@@ -8,6 +8,8 @@
     feature = "claude",
     feature = "codex",
     feature = "opencode",
+    feature = "pi",
+    feature = "gjc",
     feature = "discovery"
 ))]
 
@@ -47,7 +49,13 @@ fn live_recent_sessions_install_as_context_wrappers_in_all_target_native_layouts
         });
         assert_live_session_shape(sample.provider, &source);
 
-        for target_provider in [Provider::Claude, Provider::Codex, Provider::OpenCode] {
+        for target_provider in [
+            Provider::Claude,
+            Provider::Codex,
+            Provider::OpenCode,
+            Provider::Pi,
+            Provider::Gjc,
+        ] {
             if target_provider == sample.provider {
                 continue;
             }
@@ -94,6 +102,8 @@ fn live_samples(limit: usize) -> Vec<LiveSample> {
     out.extend(recent_claude_samples(limit));
     out.extend(recent_codex_samples(limit));
     out.extend(recent_opencode_samples(limit));
+    out.extend(recent_pi_samples(limit));
+    out.extend(recent_gjc_samples(limit));
     out
 }
 
@@ -185,6 +195,58 @@ fn recent_opencode_samples(limit: usize) -> Vec<LiveSample> {
     .collect()
 }
 
+fn recent_pi_samples(limit: usize) -> Vec<LiveSample> {
+    let Some(root) = providers::pi::default_sessions_root() else {
+        return Vec::new();
+    };
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    collect_jsonl_files(&root, &mut files);
+    files.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .map(std::cmp::Reverse)
+    });
+    files
+        .into_iter()
+        .take(limit)
+        .map(|path| LiveSample {
+            provider: Provider::Pi,
+            label: path.display().to_string(),
+            source: SessionSource::Path(path),
+        })
+        .collect()
+}
+
+fn recent_gjc_samples(limit: usize) -> Vec<LiveSample> {
+    let Some(root) = providers::gjc::default_sessions_root() else {
+        return Vec::new();
+    };
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    collect_jsonl_files(&root, &mut files);
+    files.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .map(std::cmp::Reverse)
+    });
+    files
+        .into_iter()
+        .take(limit)
+        .map(|path| LiveSample {
+            provider: Provider::Gjc,
+            label: path.display().to_string(),
+            source: SessionSource::Path(path),
+        })
+        .collect()
+}
+
 fn collect_jsonl_files(root: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -235,6 +297,12 @@ fn install_opts_for(provider: Provider, root: &Path) -> InstallSessionOpts {
         }
         Provider::OpenCode => {
             opts.opencode_db_path = Some(root.join("opencode.db"));
+        }
+        Provider::Pi => {
+            opts.pi_agent_dir = Some(root.join(".pi").join("agent"));
+        }
+        Provider::Gjc => {
+            opts.gjc_agent_dir = Some(root.join(".gjc").join("agent"));
         }
     }
     opts
@@ -318,6 +386,8 @@ fn assert_installed_wrapper_is_two_visible_messages(
             providers::claude::from_file(path, &Default::default()).unwrap()
         }
         (Provider::Codex, ArtifactPath::File(path)) => providers::codex::from_file(path).unwrap(),
+        (Provider::Pi, ArtifactPath::File(path)) => providers::pi::from_file(path).unwrap(),
+        (Provider::Gjc, ArtifactPath::File(path)) => providers::gjc::from_file(path).unwrap(),
         (Provider::OpenCode, ArtifactPath::OpenCodeDb { db_path, .. }) => {
             providers::opencode::from_db_path(db_path, session_id).unwrap()
         }

@@ -29,6 +29,21 @@ fn codex_fixture() -> &'static str {
 "#
 }
 
+fn pi_fixture() -> &'static str {
+    r#"{"type":"session","version":3,"id":"sess-pi-1","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-05-20T01:00:00.500Z","message":{"role":"user","content":"hello there","timestamp":1779240000500}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-05-20T01:00:01.500Z","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}],"provider":"openai","model":"gpt-5.5","usage":{"input":3,"output":2,"totalTokens":5,"cost":{"total":0}},"stopReason":"stop","timestamp":1779240001500}}
+"#
+}
+
+#[cfg(feature = "gjc")]
+fn gjc_fixture() -> &'static str {
+    r#"{"type":"session","version":3,"id":"sess-gjc-1","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp","title":"GJC title","titleSource":"user"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-05-20T01:00:00.500Z","message":{"role":"user","content":"hello there","timestamp":1779240000500}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-05-20T01:00:01.500Z","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}],"provider":"openai","model":"gpt-5.5","usage":{"input":3,"output":2,"totalTokens":5,"cost":{"total":0}},"stopReason":"stop","timestamp":1779240001500}}
+"#
+}
+
 fn user_assistant_texts(session: &UniversalSession) -> Vec<&str> {
     session
         .messages
@@ -172,6 +187,26 @@ fn rich_codex_fixture() -> &'static str {
 "#
 }
 
+fn rich_pi_fixture() -> &'static str {
+    r#"{"type":"session","version":3,"id":"rich-pi-1","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp/rich"}
+{"type":"session_info","id":"info-rich-pi","parentId":null,"timestamp":"2026-05-20T01:00:00.100Z","name":"Rich Pi"}
+{"type":"message","id":"u-rich-pi","parentId":"info-rich-pi","timestamp":"2026-05-20T01:00:00.500Z","message":{"role":"user","content":[{"type":"text","text":"please inspect repo"},{"type":"image","mimeType":"image/png","data":"iVBORw0KGgo="}],"timestamp":1779240000500}}
+{"type":"message","id":"a-rich-pi-1","parentId":"u-rich-pi","timestamp":"2026-05-20T01:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Need repo context"},{"type":"text","text":"I'll inspect the project."},{"type":"toolCall","id":"call_rich_pi","name":"shell","arguments":{"command":"ls"}}],"provider":"openai","model":"gpt-5.5","usage":{"input":12,"output":6,"totalTokens":18,"cost":{"total":0.42}},"stopReason":"tool_use","timestamp":1779240001000}}
+{"type":"message","id":"tr-rich-pi","parentId":"a-rich-pi-1","timestamp":"2026-05-20T01:00:02.000Z","message":{"role":"toolResult","toolCallId":"call_rich_pi","toolName":"shell","content":"permission denied","isError":true,"timestamp":1779240002000}}
+{"type":"message","id":"a-rich-pi-2","parentId":"tr-rich-pi","timestamp":"2026-05-20T01:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Reported the access failure."}],"provider":"openai","model":"gpt-5.5","usage":{"input":5,"output":4,"totalTokens":9,"cost":{"total":0}},"stopReason":"stop","timestamp":1779240003000}}
+"#
+}
+
+#[cfg(feature = "gjc")]
+fn rich_gjc_fixture() -> &'static str {
+    r#"{"type":"session","version":3,"id":"rich-gjc-1","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp/rich","title":"Rich GJC","titleSource":"user"}
+{"type":"message","id":"u-rich-gjc","parentId":null,"timestamp":"2026-05-20T01:00:00.500Z","message":{"role":"user","content":[{"type":"text","text":"please inspect repo"},{"type":"image","mimeType":"image/png","data":"iVBORw0KGgo="}],"timestamp":1779240000500}}
+{"type":"message","id":"a-rich-gjc-1","parentId":"u-rich-gjc","timestamp":"2026-05-20T01:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Need repo context"},{"type":"text","text":"I'll inspect the project."},{"type":"toolCall","id":"call_rich_gjc","name":"shell","arguments":{"command":"ls"}}],"provider":"openai","model":"gpt-5.5","usage":{"input":12,"output":6,"totalTokens":18,"cost":{"total":0.42}},"stopReason":"tool_use","timestamp":1779240001000}}
+{"type":"message","id":"tr-rich-gjc","parentId":"a-rich-gjc-1","timestamp":"2026-05-20T01:00:02.000Z","message":{"role":"toolResult","toolCallId":"call_rich_gjc","toolName":"shell","content":"permission denied","isError":true,"timestamp":1779240002000}}
+{"type":"message","id":"a-rich-gjc-2","parentId":"tr-rich-gjc","timestamp":"2026-05-20T01:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Reported the access failure."}],"provider":"openai","model":"gpt-5.5","usage":{"input":5,"output":4,"totalTokens":9,"cost":{"total":0}},"stopReason":"stop","timestamp":1779240003000}}
+"#
+}
+
 fn write_rich_opencode_fixture(db_path: &std::path::Path) {
     use cokacmux::providers::opencode::db;
 
@@ -284,6 +319,17 @@ fn write_native_source(provider: Provider, dir: &std::path::Path) -> SessionSour
             std::fs::write(&path, rich_codex_fixture()).unwrap();
             SessionSource::Path(path)
         }
+        Provider::Pi => {
+            let path = dir.join("rich-pi.jsonl");
+            std::fs::write(&path, rich_pi_fixture()).unwrap();
+            SessionSource::Path(path)
+        }
+        #[cfg(feature = "gjc")]
+        Provider::Gjc => {
+            let path = dir.join("rich-gjc.jsonl");
+            std::fs::write(&path, rich_gjc_fixture()).unwrap();
+            SessionSource::Path(path)
+        }
         Provider::OpenCode => {
             let db_path = dir.join("rich-opencode.db");
             write_rich_opencode_fixture(&db_path);
@@ -299,6 +345,8 @@ fn target_for(provider: Provider, session_id: &str, dir: &std::path::Path) -> Se
     match provider {
         Provider::Claude => SessionTarget::Path(dir.join("target-claude.jsonl")),
         Provider::Codex => SessionTarget::Path(dir.join("target-codex.jsonl")),
+        Provider::Pi => SessionTarget::Path(dir.join("target-pi.jsonl")),
+        Provider::Gjc => SessionTarget::Path(dir.join("target-gjc.jsonl")),
         Provider::OpenCode => SessionTarget::OpenCodeDb {
             db_path: dir.join(format!("target-opencode-{session_id}.db")),
         },
@@ -311,9 +359,10 @@ fn source_from_target(
     session_id: &str,
 ) -> SessionSource {
     match (provider, target) {
-        (Provider::Claude | Provider::Codex, SessionTarget::Path(path)) => {
-            SessionSource::Path(path.clone())
-        }
+        (
+            Provider::Claude | Provider::Codex | Provider::Pi | Provider::Gjc,
+            SessionTarget::Path(path),
+        ) => SessionSource::Path(path.clone()),
         (Provider::OpenCode, SessionTarget::OpenCodeDb { db_path }) => SessionSource::OpenCodeDb {
             db_path: db_path.clone(),
             session_id: session_id.to_string(),
@@ -322,9 +371,37 @@ fn source_from_target(
     }
 }
 
+#[cfg(feature = "opencode")]
+fn pivot_providers() -> Vec<Provider> {
+    let mut providers = vec![Provider::Claude, Provider::Codex, Provider::OpenCode];
+    #[cfg(feature = "pi")]
+    providers.push(Provider::Pi);
+    #[cfg(feature = "gjc")]
+    providers.push(Provider::Gjc);
+    providers
+}
+
 #[test]
 fn claude_to_codex_preserves_text() {
     let session = providers::claude::from_jsonl_str(claude_fixture(), &Default::default()).unwrap();
+    let codex_out = providers::codex::to_jsonl_string(&session, &Default::default()).unwrap();
+    let back = providers::codex::from_jsonl_str(&codex_out, &Default::default()).unwrap();
+    assert_eq!(user_assistant_texts(&back), vec!["hello there", "hi back"]);
+}
+
+#[cfg(feature = "pi")]
+#[test]
+fn pi_to_codex_preserves_text() {
+    let session = providers::pi::from_jsonl_str(pi_fixture(), &Default::default()).unwrap();
+    let codex_out = providers::codex::to_jsonl_string(&session, &Default::default()).unwrap();
+    let back = providers::codex::from_jsonl_str(&codex_out, &Default::default()).unwrap();
+    assert_eq!(user_assistant_texts(&back), vec!["hello there", "hi back"]);
+}
+
+#[cfg(feature = "gjc")]
+#[test]
+fn gjc_to_codex_preserves_text() {
+    let session = providers::gjc::from_jsonl_str(gjc_fixture(), &Default::default()).unwrap();
     let codex_out = providers::codex::to_jsonl_string(&session, &Default::default()).unwrap();
     let back = providers::codex::from_jsonl_str(&codex_out, &Default::default()).unwrap();
     assert_eq!(user_assistant_texts(&back), vec!["hello there", "hi back"]);
@@ -492,15 +569,15 @@ fn codex_to_claude_emits_resume_compatible_jsonl() {
 
 #[cfg(feature = "opencode")]
 #[test]
-fn all_six_cross_provider_conversions_wrap_source_context() {
-    let providers = [Provider::Claude, Provider::Codex, Provider::OpenCode];
-    for from in providers {
+fn all_configured_cross_provider_conversions_wrap_source_context() {
+    let providers = pivot_providers();
+    for from in providers.iter().copied() {
         let source_dir = tempfile::tempdir().unwrap();
         let source = write_native_source(from, source_dir.path());
         let source_session = read_session(from, &source).unwrap();
         let source_profile = semantic_profile(&source_session);
 
-        for to in providers.into_iter().filter(|to| *to != from) {
+        for to in providers.iter().copied().filter(|to| *to != from) {
             let target_dir = tempfile::tempdir().unwrap();
             let target = target_for(to, &source_session.session_id, target_dir.path());
             let converted_source = convert(from, to, &source, &target).unwrap();
@@ -533,6 +610,32 @@ fn all_six_cross_provider_conversions_wrap_source_context() {
                     report.failure_summary()
                 );
             }
+            if let (Provider::Pi, SessionTarget::Path(path)) = (to, &target) {
+                let report = native_validate::validate_clone_artifact(
+                    Provider::Pi,
+                    &converted_source.session_id,
+                    &ArtifactPath::File(path.clone()),
+                )
+                .unwrap();
+                assert!(
+                    report.ok,
+                    "{from:?} -> {to:?} Pi wrapper should pass native validation: {}",
+                    report.failure_summary()
+                );
+            }
+            if let (Provider::Gjc, SessionTarget::Path(path)) = (to, &target) {
+                let report = native_validate::validate_clone_artifact(
+                    Provider::Gjc,
+                    &converted_source.session_id,
+                    &ArtifactPath::File(path.clone()),
+                )
+                .unwrap();
+                assert!(
+                    report.ok,
+                    "{from:?} -> {to:?} GJC wrapper should pass native validation: {}",
+                    report.failure_summary()
+                );
+            }
 
             let target_source = source_from_target(to, &target, &converted_source.session_id);
             let converted = read_session(to, &target_source).unwrap();
@@ -544,7 +647,7 @@ fn all_six_cross_provider_conversions_wrap_source_context() {
 #[cfg(feature = "opencode")]
 #[test]
 fn rich_cross_provider_wrappers_install_into_native_live_layouts() {
-    let providers = [Provider::Claude, Provider::Codex, Provider::OpenCode];
+    let providers = pivot_providers();
     for from in providers.iter().copied() {
         let source_dir = tempfile::tempdir().unwrap();
         let source = write_native_source(from, source_dir.path());
@@ -573,6 +676,12 @@ fn rich_cross_provider_wrappers_install_into_native_live_layouts() {
                 }
                 Provider::OpenCode => {
                     opts.opencode_db_path = Some(target_dir.path().join("opencode.db"));
+                }
+                Provider::Pi => {
+                    opts.pi_agent_dir = Some(target_dir.path().join(".pi").join("agent"));
+                }
+                Provider::Gjc => {
+                    opts.gjc_agent_dir = Some(target_dir.path().join(".gjc").join("agent"));
                 }
             }
 
@@ -606,6 +715,10 @@ fn read_installed_session(
             providers::claude::from_file(path, &Default::default()).unwrap()
         }
         (Provider::Codex, ArtifactPath::File(path)) => providers::codex::from_file(path).unwrap(),
+        #[cfg(feature = "pi")]
+        (Provider::Pi, ArtifactPath::File(path)) => providers::pi::from_file(path).unwrap(),
+        #[cfg(feature = "gjc")]
+        (Provider::Gjc, ArtifactPath::File(path)) => providers::gjc::from_file(path).unwrap(),
         (Provider::OpenCode, ArtifactPath::OpenCodeDb { db_path, .. }) => {
             providers::opencode::from_db_path(db_path, session_id).unwrap()
         }
@@ -626,6 +739,12 @@ fn assert_installed_native_wrapper_shape(
         }
         (Provider::Codex, ArtifactPath::File(path)) => {
             assert_codex_native_wrapper_shape(path, session_id, codex_state_5_path);
+        }
+        (Provider::Pi, ArtifactPath::File(path)) => {
+            assert_pi_native_wrapper_shape(path, session_id);
+        }
+        (Provider::Gjc, ArtifactPath::File(path)) => {
+            assert_gjc_native_wrapper_shape(path, session_id);
         }
         (Provider::OpenCode, ArtifactPath::OpenCodeDb { db_path, .. }) => {
             assert_opencode_native_wrapper_shape(db_path, session_id);
@@ -904,6 +1023,74 @@ fn assert_codex_native_wrapper_shape(
         assert!(model.map(|m| !m.is_empty()).unwrap_or(false));
         assert!(reasoning_effort.map(|e| !e.is_empty()).unwrap_or(false));
     }
+}
+
+#[cfg(feature = "opencode")]
+fn assert_pi_native_wrapper_shape(path: &std::path::Path, session_id: &str) {
+    let values = jsonl_file_values(path);
+    let header = values
+        .first()
+        .expect("Pi wrapper artifact should have a session header");
+    assert_eq!(header.get("type").and_then(|v| v.as_str()), Some("session"));
+    assert_eq!(header.get("id").and_then(|v| v.as_str()), Some(session_id));
+    assert_eq!(header.get("version").and_then(|v| v.as_u64()), Some(3));
+    assert!(header
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|cwd| !cwd.is_empty())
+        .unwrap_or(false));
+
+    let messages = values
+        .iter()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("message"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages.len(),
+        2,
+        "Pi wrapper artifact should have exactly two message rows"
+    );
+
+    let user = messages[0];
+    let assistant = messages[1];
+    assert_eq!(
+        user.pointer("/message/role").and_then(|v| v.as_str()),
+        Some("user")
+    );
+    assert_eq!(
+        assistant.pointer("/message/role").and_then(|v| v.as_str()),
+        Some("assistant")
+    );
+    assert_eq!(
+        assistant.get("parentId").and_then(|v| v.as_str()),
+        user.get("id").and_then(|v| v.as_str())
+    );
+    assert!(user
+        .pointer("/message/content")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .ends_with(CONTEXT_CONTINUATION_PROMPT));
+    assert_eq!(
+        assistant
+            .pointer("/message/content/0/type")
+            .and_then(|v| v.as_str()),
+        Some("text")
+    );
+    assert_eq!(
+        assistant
+            .pointer("/message/content/0/text")
+            .and_then(|v| v.as_str()),
+        Some(CONTEXT_ACK)
+    );
+}
+
+#[cfg(feature = "opencode")]
+fn assert_gjc_native_wrapper_shape(path: &std::path::Path, session_id: &str) {
+    assert_pi_native_wrapper_shape(path, session_id);
+    let values = jsonl_file_values(path);
+    let header = values
+        .first()
+        .expect("GJC wrapper artifact should have a session header");
+    assert!(header.get("title").and_then(|v| v.as_str()).is_some());
 }
 
 #[cfg(feature = "opencode")]
