@@ -1,6 +1,6 @@
 # cokacmux Keybindings
 
-cokacmux는 `~/.cokacmux/keybinding.json`을 읽어 단축키를 설정합니다. 파일이 없으면 기본 단축키가 모두 들어간 파일을 자동으로 만듭니다.
+cokacmux는 config 디렉터리의 `keybinding.json`을 읽어 단축키를 설정합니다. 기본 위치는 `~/.cokacmux/keybinding.json`이고, `COKACMUX_CONFIG_DIR`을 쓰면 그 디렉터리 아래 파일을 읽습니다. 파일이 없으면 기본 단축키가 모두 들어간 파일을 자동으로 만듭니다.
 
 앱을 재시작하지 않아도 됩니다. 백그라운드 감시 스레드가 약 2초마다 파일의 수정 시각만 확인하고, 파일이 바뀐 경우에만 다시 읽어 파싱합니다. 실행 중 파일이 삭제되어도 다음 감시 스레드 확인 때 기본 파일을 다시 만듭니다. 파싱에 실패하면 기존 단축키를 유지하고 status/debug log에 실패 이유를 남깁니다.
 
@@ -198,7 +198,7 @@ G
 
 ### agent
 
-실행 중인 agent 화면에서 쓰는 액션입니다. 여기에 잡히지 않은 키는 active agent PTY로 전달됩니다. Codex는 line/page/top/bottom 스크롤을 transcript/pager 입력으로 보냅니다. Claude Code는 page/top/bottom을 fullscreen scroll 키로 바꾸고, 한 줄 스크롤은 원래 키를 자식 CLI에 전달합니다. OpenCode는 page up/down만 전용 키로 바꾸고, line/top/bottom은 원래 키를 자식 CLI에 전달합니다. 일반 터미널은 cokacmux PTY scrollback을 움직입니다. `cokacdir`에서는 Shift가 포함된 단축키를 자식 앱에 우선 전달하므로 기본 `Shift+...` 스크롤 키는 `cokacdir`로 들어가고, Shift가 없는 `Alt+Home` / `Alt+End`는 parent PTY scrollback을 움직입니다.
+실행 중인 agent 화면에서 쓰는 액션입니다. 여기에 잡히지 않은 키는 active agent PTY로 전달됩니다. Codex는 line/page/top/bottom 스크롤을 transcript/pager 입력으로 보냅니다. Claude Code는 page/top/bottom을 fullscreen scroll 키로 바꾸고, 한 줄 스크롤은 원래 키를 자식 CLI에 전달합니다. OpenCode는 page up/down만 전용 키로 바꾸고, line/top/bottom은 원래 키를 자식 CLI에 전달합니다. Pi와 GJC는 현재 원래 스크롤 키를 자식 CLI에 전달합니다. 일반 터미널은 cokacmux PTY scrollback을 움직입니다. `cokacdir`에서는 Shift가 포함된 단축키를 자식 앱에 우선 전달하므로 기본 `Shift+...` 스크롤 키는 `cokacdir`로 들어가고, Shift가 없는 `Alt+Home` / `Alt+End`는 parent PTY scrollback을 움직입니다.
 
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
@@ -206,8 +206,8 @@ G
 | `agent.kill` | `ctrl+k` | 현재 코딩 agent/일반 터미널 종료. `cokacdir` 화면에서는 자식 앱에 전달 |
 | `agent.new_shell` | `ctrl+n` | 현재 agent cwd를 기본값으로 새 세션 모달 열기 |
 | `agent.toggle_sidebar` | `ctrl+b` | agents 사이드바 표시/숨김 |
-| `agent.toggle_cokacdir_panel` | `ctrl+f` | Codex/Claude/OpenCode의 현재 cwd로 오른쪽 cokacdir 패널 표시/숨김. 숨김 중에도 자식 앱은 계속 실행 |
-| `agent.toggle_terminal_panel` | `ctrl+t` | Codex/Claude/OpenCode의 현재 cwd로 오른쪽 terminal 패널 표시/숨김. 숨김 중에도 자식 앱은 계속 실행 |
+| `agent.toggle_cokacdir_panel` | `ctrl+f` | 현재 코딩 에이전트의 cwd로 오른쪽 cokacdir 패널 표시/숨김. 숨김 중에도 자식 앱은 계속 실행 |
+| `agent.toggle_terminal_panel` | `ctrl+t` | 현재 코딩 에이전트의 cwd로 오른쪽 terminal 패널 표시/숨김. 숨김 중에도 자식 앱은 계속 실행 |
 | `agent.focus_sidebar` | `ctrl+1` | 왼쪽 agents 패널로 포커스 이동. 숨겨져 있으면 표시 |
 | `agent.focus_main` | `ctrl+2` | 중앙 agent 패널로 포커스 이동 |
 | `agent.focus_auxiliary` | `ctrl+3` | 오른쪽 보조 패널로 포커스 이동 |
@@ -308,6 +308,7 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 | `ai_title_settings.claude` | `2` | Claude 선택 |
 | `ai_title_settings.codex` | `3` | Codex 선택 |
 | `ai_title_settings.opencode` | `4` | OpenCode 선택 |
+| `ai_title_settings.pi` | `5` | Pi 선택 |
 
 설정 화면의 섹션 이동은 `←` / `→`입니다. `Space`는 현재 행의 값을 바꾸거나 AI provider를 선택합니다. Keybindings와 Data 섹션은 읽기 전용이며, 저장 전 변경사항은 설정 화면 상단에 표시됩니다.
 

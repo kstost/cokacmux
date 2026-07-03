@@ -1,1216 +1,94 @@
 # cokacmux
 
-> 로컬 코딩 에이전트 세션을 한 화면에서 보고, 찾고, 복제하고, 다시 실행하는 터미널 TUI 도구
+> 여러 코딩 도구의 예전 대화를 한 화면에서 보고 다시 여는 앱
 
-코딩 에이전트 CLI들은 모두 훌륭한 도구이지만 세션 저장 위치와 형식이 서로 다릅니다. 그래서 며칠 전에 어떤 에이전트로 어떤 작업을 했는지 찾거나, 저장된 대화를 이어 실행하거나, 같은 대화에서 다른 방향으로 실험하기가 번거롭습니다.
+`cokacmux`는 Claude Code, Codex, OpenCode, Pi, GJC가 저장해 둔 대화를 한곳에 모아 보여줍니다.
 
-`cokacmux`는 로컬에 저장된 에이전트 대화 기록을 한곳에 모아 보여주고, 키보드만으로 미리보기, 검색, 재실행, 새 에이전트 시작, 복제, 삭제, 백그라운드 전환을 할 수 있게 해주는 앱입니다.
+예전에 어떤 일을 했는지 찾고, 대화를 다시 열고, 비슷한 대화를 하나 더 만들어 다른 방향으로 이어 갈 수 있습니다.
 
-`cokacmux`의 세션 탐색, 미리보기, 실행 관리는 별도 서버나 AI API를 쓰지 않습니다. 세션 데이터는 내 컴퓨터 안에서 읽고 쓰며, 실제 코딩 작업은 사용자가 이미 설치해 둔 에이전트 CLI를 실행해서 처리합니다. 다만 설치/업데이트 스크립트와 `cokacdir` 자동 다운로드는 필요한 바이너리를 내려받기 위해 네트워크를 사용할 수 있습니다.
+`cokacmux` 자체가 새 AI 요금을 만들지는 않습니다. 다만 대화를 다시 열면, 선택한 코딩 도구는 평소처럼 자기 서비스와 통신할 수 있습니다.
 
 ---
 
 ## 목차
 
-1. [먼저 알아둘 개념](#1-먼저-알아둘-개념)
-2. [이 앱이 해주는 일](#2-이-앱이-해주는-일)
-3. [빠른 시작](#3-빠른-시작)
-4. [설치하기](#4-설치하기)
-5. [처음 실행해 보기](#5-처음-실행해-보기)
-6. [기본 사용 흐름과 튜토리얼](#6-기본-사용-흐름)
-7. [키보드 단축키](#7-키보드-단축키)
-8. [CLI 명령어](#8-cli-명령어)
-9. [설정 파일](#9-설정-파일)
-10. [단축키 설정](#10-단축키-설정)
-11. [데이터 저장 위치](#11-데이터-저장-위치)
-12. [자주 묻는 질문](#12-자주-묻는-질문)
-13. [문제가 생겼을 때](#13-문제가-생겼을-때)
-14. [업데이트와 제거](#14-업데이트와-제거)
-15. [소스에서 빌드하기](#15-소스에서-빌드하기)
-16. [작동 원리](#16-작동-원리)
+1. [이 앱으로 할 수 있는 일](#1-이-앱으로-할-수-있는-일)
+2. [설치하기](#2-설치하기)
+3. [처음 실행하기](#3-처음-실행하기)
+4. [기본 사용법](#4-기본-사용법)
+5. [자주 쓰는 키](#5-자주-쓰는-키)
+6. [문제가 생겼을 때](#6-문제가-생겼을-때)
+7. [업데이트와 제거](#7-업데이트와-제거)
+8. [알아둘 점](#8-알아둘-점)
 
 ---
 
-## 1. 먼저 알아둘 개념
+## 1. 이 앱으로 할 수 있는 일
 
-처음 쓰는 분은 아래 용어만 이해하면 됩니다.
+### 예전 대화 모아 보기
 
-| 용어 | 뜻 |
-|---|---|
-| 터미널 | 글자로 명령을 입력하는 검은색 또는 흰색 창입니다. macOS의 Terminal, Windows Terminal, Linux terminal 같은 앱입니다. |
-| 명령 | 터미널에 입력해서 실행하는 글자입니다. 예를 들어 `cokacmux`라고 입력하고 Enter를 누르는 것이 명령 실행입니다. |
-| CLI | Command Line Interface의 줄임말입니다. 터미널에서 명령으로 쓰는 프로그램이라는 뜻입니다. |
-| TUI | Text User Interface의 줄임말입니다. 마우스보다 키보드로 조작하는 글자 화면 앱이라는 뜻입니다. |
-| 세션 | 지원하는 코딩 에이전트가 저장한 대화 기록입니다. 예전 작업 내용입니다. |
-| 미리보기 | 저장된 세션 파일을 읽어서 오른쪽 창에 보여주는 기능입니다. 에이전트를 실행하지 않습니다. |
-| 에이전트 | 실제로 실행 중인 코딩 에이전트 CLI 프로세스입니다. |
-| 프로세스 | 컴퓨터 안에서 실행 중인 프로그램 하나를 뜻합니다. cokacmux를 실행하면 cokacmux 프로세스가 생기고, 에이전트를 시작하면 에이전트 프로세스도 생깁니다. |
-| provider | cokacmux가 지원하는 에이전트 종류입니다. 현재는 Claude Code, Codex, OpenCode, Pi, GJC입니다. |
-| 백그라운드 실행 대상 | `Ctrl+]`로 목록 화면에 돌아와도 종료되지 않고 계속 살아있는 코딩 에이전트, 터미널, `cokacdir`입니다. |
-| 작업 폴더 | 에이전트를 시작할 폴더입니다. 코딩 작업의 기준 디렉터리입니다. |
-| cwd | current working directory의 줄임말입니다. 여기서는 작업 폴더와 같은 뜻으로 보면 됩니다. |
-| 홈 폴더 | 사용자 개인 파일이 들어가는 기본 폴더입니다. macOS/Linux에서는 보통 `/home/이름` 또는 `/Users/이름`, Windows에서는 보통 `C:\Users\이름`입니다. |
-| `~` | 홈 폴더를 짧게 쓰는 표시입니다. 예를 들어 `~/.cokacmux/`는 내 홈 폴더 안의 `.cokacmux` 폴더라는 뜻입니다. |
-| PATH | 터미널에서 `codex`, `claude`, `opencode`, `pi`, `gjc` 같은 명령을 찾는 운영체제의 검색 경로입니다. |
-| JSON | 설정을 저장할 때 자주 쓰는 글자 형식입니다. `{`와 `}`가 많이 보입니다. 쉼표와 따옴표 위치가 틀리면 앱이 읽지 못할 수 있습니다. |
-| JSONL | JSON을 한 줄에 하나씩 쌓아 둔 파일 형식입니다. 일부 에이전트가 대화 기록을 이런 방식으로 저장합니다. |
-| SQLite | 파일 하나로 된 작은 데이터베이스입니다. OpenCode는 대화 기록을 SQLite 파일에 저장합니다. |
-| PTY | 터미널 화면을 프로그램 안에서 흉내 내는 기술입니다. cokacmux는 에이전트를 PTY 안에서 실행해서 화면을 보여줍니다. |
-| 바이너리 | 설치해서 실행하는 프로그램 파일입니다. 여기서는 `cokacmux` 실행 파일을 뜻합니다. |
-| launch mode | 에이전트를 일반 모드로 시작할지, 권한 확인 우회 옵션을 붙일지 고르는 모드입니다. |
-| Skip permissions | 권한 확인을 우회하는 위험한 실행 모드입니다. 신뢰하는 폴더에서만 사용하세요. |
+Claude Code, Codex, OpenCode, Pi, GJC의 대화 기록을 한 화면에서 볼 수 있습니다.
 
-중요한 차이가 하나 있습니다.
+### 대화 내용 바로 읽기
 
-- `Delete` 또는 `d`: 저장된 세션 기록을 삭제합니다.
-- `Ctrl+K`: 실행 중인 백그라운드 실행 대상을 종료합니다. `cokacdir` 화면에서는 자식 앱에 전달됩니다.
+목록에서 대화를 고르면 오른쪽에서 내용을 읽을 수 있습니다.
 
-기록을 지우는 것과 실행 중인 프로세스를 끄는 것은 다릅니다.
+### 검색하기
+
+`Ctrl+F`를 누르면 대화를 찾을 수 있습니다.
+
+- 글자로 찾기: 제목, 폴더, 대화 내용에서 찾습니다.
+- AI로 찾기: 선택한 코딩 도구에게 관련 대화를 찾아 달라고 합니다.
+
+### 대화 다시 열기
+
+대화를 고르고 `e` 또는 `Enter`를 누르면 그 대화를 다시 열 수 있습니다.
+
+### 새 작업 열기
+
+`Ctrl+N`을 누르면 새 명령창, `cokacdir`, 새 코딩 도구를 열 수 있습니다.
+
+### 대화 복사하기
+
+`c`를 누르면 선택한 대화를 하나 더 만들 수 있습니다. 필요하면 작업 폴더도 함께 복사할 수 있습니다.
+
+### 대화 삭제하기
+
+`Delete` 또는 `d`를 누르면 대화 기록을 지울 수 있습니다. 바로 지우지 않고 먼저 물어봅니다.
 
 ---
 
-## 2. 이 앱이 해주는 일
-
-### 세션을 한 화면에 모아 보기
-
-지원하는 코딩 에이전트가 각자 다른 위치에 저장한 대화를 하나의 세션 목록으로 보여줍니다.
-
-### 대화 미리보기
-
-세션을 선택하면 오른쪽 창에서 내용을 바로 볼 수 있습니다. 단순히 저장 파일을 읽는 동작이라 에이전트 CLI가 실행되지 않습니다.
-
-### 전체 검색
-
-`Ctrl+F` 키로 검색 방식 선택창을 열 수 있습니다. Text search는 세션 ID, 작업 폴더, 타이틀, 세션 본문 전체를 로컬에서 검색합니다. AI search는 설정한 에이전트 CLI가 cokacmux가 준비한 미리보기 인덱스를 탐색해 관련 세션을 찾습니다. 검색 중에는 UI가 멈춘 것처럼 보이지 않도록 진행 상태가 표시됩니다.
-
-### 저장된 세션 이어 실행
-
-세션을 고르고 `e` 또는 `Enter`를 누르면 해당 에이전트를 다시 실행해 대화를 이어갈 수 있습니다. 이미 cokacmux가 띄운 같은 에이전트가 살아 있으면 새로 실행하지 않고 다시 붙습니다. 같은 작업 폴더에서 다른 코딩 에이전트가 이미 살아 있으면 새 에이전트 실행은 막습니다.
-
-### 새 터미널, cokacdir, 새 코딩 에이전트 시작
-
-`Ctrl+N`을 누르면 새 세션 모달이 열립니다. 여기서 그냥 터미널을 열지, `cokacdir`을 열지, 지원하는 코딩 에이전트를 새 작업 폴더에서 시작할지 고를 수 있습니다. 입력한 폴더가 없으면 시작 전에 자동으로 만듭니다. 터미널은 같은 폴더에 여러 개 열 수 있지만, 코딩 에이전트는 같은 작업 폴더에서 동시에 둘 이상 시작하지 않습니다.
-
-### 백그라운드 유지와 전환
-
-에이전트를 실행한 뒤 `Ctrl+]` 또는 `Ctrl+[`를 누르면 세션 목록으로 돌아옵니다. 에이전트는 종료되지 않고 백그라운드에서 계속 살아 있습니다. 다시 `Ctrl+]` 또는 `Ctrl+[`를 누르거나 같은 세션에서 `e` 또는 `Enter`를 누르면 다시 연결됩니다.
-
-### 세션 복제
-
-`c`를 누르면 선택한 세션의 복제 옵션을 엽니다. 같은 에이전트로는 provider-native 저장 데이터를 복제하고, 다른 에이전트로는 원본 세션을 하나의 context 메시지로 묶은 2-message handoff 세션을 준비합니다. 폴더 데이터까지 복제하면 원본 작업 폴더 옆에 복제 세션 전용 작업 폴더를 만들고, 새 세션의 cwd도 그 폴더로 기록합니다.
-
-### 세션 삭제
-
-`Delete` 또는 `d`를 누르면 확인창을 띄운 뒤 세션 기록을 삭제합니다. 바로 삭제하지 않습니다.
-
-### 추가 요금 없음
-
-cokacmux는 어떤 AI API도 직접 호출하지 않습니다. 이미 설치해 둔 에이전트 CLI를 실행할 뿐입니다. 비용과 사용량은 각 에이전트의 기존 구독/정책을 따릅니다.
-
----
-
-## 3. 빠른 시작
-
-이미 지원되는 코딩 에이전트 중 하나를 사용하고 있다면 다음 순서만 따라 하면 됩니다.
-
-### 1단계: 설치
-
-macOS/Linux:
-
-```bash
-curl -fsSL https://cokacmux.cokac.com/manage.sh | bash
-```
-
-Windows PowerShell:
-
-```powershell
-irm https://cokacmux.cokac.com/manage.ps1 | iex
-```
-
-### 2단계: 설치 확인
-
-```bash
-cokacmux --version
-```
-
-### 3단계: 사용하는 에이전트 CLI 확인
-
-사용하는 것만 확인하면 됩니다. 모두 설치할 필요는 없습니다.
-
-```bash
-claude --version
-codex --version
-opencode --version
-pi --help
-gjc --help
-```
-
-### 4단계: 실행
-
-```bash
-cokacmux
-```
-
-### 5단계: 기본 조작
-
-| 하고 싶은 일 | 키 |
-|---|---|
-| 세션 선택 이동 | `↑`/`↓` |
-| 오른쪽 미리보기로 포커스 이동 | `Tab` |
-| 검색 | `Ctrl+F` |
-| 선택한 세션 이어 실행 | `e` 또는 `Enter` |
-| 미리보기 강제 새로고침 | `Space` |
-| 새 터미널/cokacdir/새 코딩 에이전트 시작 | `Ctrl+N` |
-| 에이전트 화면에서 목록으로 돌아오기 | `Ctrl+]` 또는 `Ctrl+[` |
-| 세션 복제 | `c` |
-| 세션 삭제 | `Delete` 또는 `d` |
-| 종료 | `q` 또는 `Ctrl+Q` |
-
----
-
-## 4. 설치하기
+## 2. 설치하기
 
 ### macOS / Linux
 
-터미널에 다음 명령을 붙여넣으세요.
+명령창에 아래 내용을 붙여 넣고 Enter를 누르세요.
 
 ```bash
 curl -fsSL https://cokacmux.cokac.com/manage.sh | bash
 ```
 
-설치 스크립트는 운영체제와 CPU 종류에 맞는 `cokacmux` 바이너리를 내려받아 `/usr/local/bin` 또는 `~/.local/bin`에 설치합니다. 같은 OS/CPU용 `cokacdir`도 `~/.cokacmux/bin/`에 함께 내려받습니다. 설치 후 새 터미널에서 `cokacmux` 명령을 사용할 수 있습니다.
-
 ### Windows
 
-PowerShell을 열고 다음 명령을 실행하세요. 관리자 권한은 필요 없습니다.
+PowerShell에 아래 내용을 붙여 넣고 Enter를 누르세요.
 
 ```powershell
 irm https://cokacmux.cokac.com/manage.ps1 | iex
 ```
 
-기본 설치 위치는 `%LOCALAPPDATA%\cokacmux\`입니다. 설치 스크립트는 `cokacmux.exe`를 그곳에 넣고, `cokacdir.exe`는 `%USERPROFILE%\.cokacmux\bin\`에 함께 내려받습니다. PATH가 갱신되므로 설치 후 PowerShell을 한 번 닫았다가 다시 여는 편이 안전합니다.
+설치가 끝나면 새 명령창을 열어 주세요.
 
-### 잘 설치됐는지 확인
+### 설치 확인
 
 ```bash
 cokacmux --version
 ```
 
-버전 번호가 출력되면 설치된 것입니다.
+버전 번호가 나오면 설치된 것입니다.
 
-### 에이전트 CLI 준비
+### 내가 쓰는 코딩 도구 확인
 
-cokacmux는 저장된 세션을 미리보기할 수 있지만, `e`, `Enter`, `Ctrl+N`으로 실제 에이전트를 실행하려면 해당 CLI가 설치되어 있고 로그인도 되어 있어야 합니다.
-
-```bash
-claude --version
-codex --version
-opencode --version
-```
-
-모두 설치할 필요는 없습니다. 본인이 쓰는 에이전트만 실행 가능하면 됩니다.
-
-### 실행 파일 위치를 직접 지정해야 할 때
-
-기본적으로 cokacmux는 `claude`, `codex`, `opencode`, `pi`, `gjc`라는 명령 이름을 그대로 실행합니다. 실제 위치는 운영체제의 PATH 해석에 맡깁니다.
-
-macOS/Linux에서 현재 잡힌 위치 확인:
-
-```bash
-command -v claude
-command -v codex
-command -v opencode
-command -v pi
-command -v gjc
-```
-
-Windows PowerShell에서 현재 잡힌 위치 확인:
-
-```powershell
-Get-Command claude
-Get-Command codex
-Get-Command opencode
-Get-Command pi
-Get-Command gjc
-```
-
-PATH에 여러 버전이 잡혀 있거나 특정 설치본을 꼭 쓰고 싶다면 `~/.cokacmux/settings.json`의 `agent_programs`나 `cokacdir_program`에 직접 적을 수 있습니다.
-
-```json
-{
-  "cokacmux": {
-    "agent_programs": {
-      "claude": "~/.local/bin/claude",
-      "codex": "/usr/bin/codex",
-      "opencode": "~/.opencode/bin/opencode",
-      "pi": "~/.local/bin/pi",
-      "gjc": "~/.local/bin/gjc"
-    },
-    "cokacdir_program": "~/.local/bin/cokacdir"
-  }
-}
-```
-
-Windows 경로는 JSON 규칙에 맞게 `\\`로 쓰거나 `/`를 사용할 수 있습니다.
-
-```json
-{
-  "cokacmux": {
-    "agent_programs": {
-      "claude": "C:\\Users\\me\\.local\\bin\\claude.exe",
-      "codex": "C:/Users/me/AppData/Roaming/npm/codex.cmd",
-      "opencode": "C:/Users/me/.opencode/bin/opencode.exe",
-      "pi": "C:/Users/me/AppData/Roaming/npm/pi.cmd",
-      "gjc": "C:/Users/me/AppData/Roaming/npm/gjc.cmd"
-    },
-    "cokacdir_program": "C:/Users/me/.cokacmux/bin/cokacdir.exe"
-  }
-}
-```
-
-주의할 점은 여기에 실행 옵션을 넣지 않는 것입니다. 아래처럼 쓰면 안 됩니다.
-
-```json
-{
-  "cokacmux": {
-    "agent_programs": {
-      "codex": "/usr/bin/codex --yolo"
-    }
-  }
-}
-```
-
-올바른 값은 실행 파일 경로 또는 명령 이름까지만입니다.
-
-```json
-{
-  "cokacmux": {
-    "agent_programs": {
-      "codex": "/usr/bin/codex"
-    },
-    "cokacdir_program": "/usr/local/bin/cokacdir"
-  }
-}
-```
-
-`--yolo`, `--dangerously-skip-permissions`, OpenCode 권한 환경변수 같은 옵션은 `e`, `Enter`, `Ctrl+N`에서 Skip permissions를 선택하면 cokacmux가 자동으로 붙입니다.
-
----
-
-## 5. 처음 실행해 보기
-
-터미널에서 실행합니다.
-
-```bash
-cokacmux
-```
-
-처음 실행하면 `~/.cokacmux/` 디렉터리와 기본 설정 파일이 자동으로 만들어집니다. 그 다음 cokacmux가 각 에이전트의 기본 저장 위치를 찾아 세션 목록을 만듭니다.
-
-| 에이전트 | 기본 저장 위치 |
-|---|---|
-| Claude Code | `~/.claude/projects/...` |
-| Codex | `~/.codex/sessions/...` |
-| OpenCode | macOS/Linux: `~/.local/share/opencode/opencode.db` |
-| OpenCode | Windows: `%LOCALAPPDATA%\opencode\opencode.db` 또는 `%APPDATA%\opencode\opencode.db` |
-| Pi | 기본: `~/.pi/agent/sessions/...`, `PI_CODING_AGENT_DIR` 사용 시 `$PI_CODING_AGENT_DIR/sessions/...` |
-| Pi | `PI_CODING_AGENT_SESSION_DIR` 사용 시 해당 디렉터리 바로 아래의 `*.jsonl` |
-| GJC | 기본: `~/.gjc/agent/sessions/...`, `GJC_CODING_AGENT_DIR` 사용 시 `$GJC_CODING_AGENT_DIR/sessions/...` |
-| GJC | XDG data root 사용 시 `$XDG_DATA_HOME/gjc/sessions/...` |
-
-한 번도 쓰지 않은 에이전트가 있어도 괜찮습니다. 해당 에이전트 세션만 비어 있을 뿐입니다.
-
-### 화면 구성
-
-```text
-┌──────────────────────────────────────────┬──────────────────────────────┐
-│ 세션 목록                                │ 선택한 세션 미리보기         │
-│ state provider title age cwd session     │ Session                      │
-│ idle  codex    README 2m /repo 426614... │   provider: codex            │
-│ busy  claude   bugfix 1h /app  a9f031... │ Messages                     │
-│                                          │                              │
-│  ▶ 선택된 줄                             │ USER #0                      │
-│    다른 줄                               │   이 문제를 고쳐줘           │
-│                                          │                              │
-└──────────────────────────────────────────┴──────────────────────────────┘
-```
-
-왼쪽은 세션 목록이고, 오른쪽은 선택한 세션의 미리보기입니다. 화면 아래에는 현재 쓸 수 있는 주요 단축키가 짧게 표시됩니다.
-
-에이전트를 실행하면 화면이 에이전트 터미널로 바뀝니다. 이때 왼쪽에는 실행 중인 에이전트/터미널/`cokacdir` 사이드바가 보일 수 있습니다. `Ctrl+B`로 숨기거나 다시 보일 수 있습니다.
-
-#### 세션 목록의 각 칸이 뜻하는 것
-
-세션 목록은 표처럼 보이지만, 터미널 폭이 좁아지면 덜 중요한 칸을 줄이거나 숨깁니다. 기본 순서는 다음과 같습니다.
-
-```text
-선택표시  state  provider  title  age  cwd  session
-```
-
-각 칸의 뜻은 아래와 같습니다.
-
-| 칸 | 뜻 | 예 |
-|---|---|---|
-| 선택표시 | 현재 선택된 줄 앞에 붙는 표시입니다. 선택된 줄에는 `▶`가 보입니다. | `▶` |
-| `state` | 해당 세션의 실행 상태입니다. | `idle`, `quiet`, `busy` |
-| `provider` | 어느 코딩 에이전트의 세션인지 보여줍니다. | `claude`, `codex`, `opencode`, `pi`, `gjc` |
-| `title` | 사람이 읽기 쉬운 제목입니다. 직접 붙인 제목이 있으면 그 제목을 보여줍니다. | `login bug fix` |
-| `age` | 마지막으로 바뀐 지 얼마나 됐는지입니다. | `20s`, `5m`, `3h`, `2d` |
-| `cwd` | 그 세션이 작업하던 폴더입니다. | `/home/me/project` |
-| `session` | 세션 ID의 마지막 부분입니다. 너무 길어서 `-` 뒤 마지막 조각만 최대 10칸으로 보여줍니다. | `426614174…` |
-
-`state` 값은 이렇게 읽으면 됩니다.
-
-| 값 | 뜻 |
-|---|---|
-| `idle` | 지금 cokacmux 안에서 실행 중인 에이전트가 없습니다. 저장된 기록만 있는 상태입니다. |
-| `quiet` | 에이전트가 살아 있지만 지금은 조용합니다. 보통 입력을 기다리는 상태입니다. |
-| `busy` | 에이전트가 최근에 출력을 냈거나 작업 중으로 보이는 상태입니다. |
-
-터미널 폭이 충분할 때는 `title`과 `cwd`가 가장 많은 공간을 가져갑니다. 이유는 사람이 실제로 세션을 구분할 때 제목과 폴더가 가장 도움이 되기 때문입니다. `session`은 내부 ID라서 끝부분 10칸만 보여주고, 남는 공간은 `title`과 `cwd`에 씁니다.
-
-title은 `~/.cokacmux/titles.json`에 직접 붙인 제목을 가장 먼저 사용합니다. 원본 세션에 provider가 저장한 제목이 있으면 그 다음 후보로 사용하고, Pi/GJC처럼 제목이 비어 있는 JSONL 세션은 첫 번째 user 메시지를 짧게 정리해 기본 title로 보여줍니다.
-
-터미널 폭이 좁으면 일부 칸이 줄어들 수 있습니다. 이때도 세션을 고르고 실행하는 기능은 그대로 동작합니다. 화면만 좁아서 덜 보이는 것입니다.
-
----
-
-## 6. 기본 사용 흐름
-
-### 6-0. 처음 10분 튜토리얼
-
-처음에는 기록을 지우거나 위험한 권한 모드를 쓰지 않고, 화면 이동과 실행 흐름만 익히는 편이 좋습니다. 아래 순서대로 한 번 훑으면 기본 조작에 익숙해질 수 있습니다.
-
-| 단계 | 해볼 일 | 키 또는 명령 |
-|---|---|---|
-| 1 | 세션이 보이는지 터미널에서 확인 | `cokacmux --check` |
-| 2 | TUI 시작 | `cokacmux` |
-| 3 | 세션 목록에서 위아래로 이동 | `↑`/`↓` |
-| 4 | Tree/List 보기 차이 확인 | `v` |
-| 5 | 미리보기로 포커스를 옮기고 읽기 | `Tab`, `↑`/`↓`, `PageUp`/`PageDown` |
-| 6 | 미리보기 캐시를 다시 읽기 | `Space` |
-| 7 | 검색하고, 빈 검색으로 전체 목록 복귀 | `Ctrl+F`, `Enter`, 검색어 입력, `Enter`; 다시 `Ctrl+F`, `Enter`, 빈 상태로 `Enter` |
-| 8 | 실행 모달만 열어 보고 취소 | `e` 또는 `Enter`, `Esc` |
-| 9 | 복제 옵션만 열어 보고 취소 | `c`, `Esc` |
-| 10 | 삭제 확인창만 열어 보고 취소 | `Delete` 또는 `d`, `Esc` |
-
-세션이 하나도 없다면 먼저 `Ctrl+N`을 눌러 `Terminal`을 선택하고 현재 폴더에서 일반 셸을 열어 보세요. 열린 터미널에서 `Ctrl+]`로 목록에 돌아오고, 목록에서 실행 중인 터미널을 선택한 뒤 `Ctrl+K`로 종료하면 백그라운드 실행 대상이 어떻게 관리되는지 안전하게 확인할 수 있습니다.
-
-저장된 세션을 실제로 이어 실행해 보고 싶을 때는 익숙한 프로젝트의 세션을 고르고 `e` 또는 `Enter`를 누른 뒤 `Normal`을 선택하세요. 실행 화면에서 `Ctrl+]`로 목록에 돌아와도 에이전트는 계속 살아 있고, 같은 세션에서 `e` 또는 `Enter`를 누르면 다시 연결됩니다. `Skip permissions`는 튜토리얼 단계에서는 쓰지 마세요.
-
-### 6-1. 세션 둘러보기
-
-`↑`/`↓`로 세션을 고릅니다. 미리보기는 선택이 바뀔 때 자동으로 갱신됩니다.
-
-빠르게 이동하려면:
-
-| 이동 | 키 |
-|---|---|
-| 10칸 위/아래 | `PageUp` / `PageDown` |
-| 맨 위 | `Home` 또는 `g` |
-| 맨 아래 | `End` 또는 `G` |
-
-맥북에는 전용 `PageUp`, `PageDown`, `Home`, `End` 키가 없는 경우가 많습니다. 보통은 다음 조합을 씁니다.
-
-| 맥북 입력 | 의미 |
-|---|---|
-| `fn+↑` | `PageUp` |
-| `fn+↓` | `PageDown` |
-| `fn+←` | `Home` |
-| `fn+→` | `End` |
-
-터미널 설정에 따라 일부 조합이 앱까지 전달되지 않을 수 있습니다. 그런 경우 [단축키 설정](#10-단축키-설정)으로 다른 키를 지정하세요.
-
-목록 모양은 `v`로 바꿀 수 있습니다.
-
-| 보기 | 뜻 |
-|---|---|
-| Tree | cokacmux에서 복제한 parent/child 관계를 들여쓰기로 보여주는 방식입니다. 복제 계보가 없는 세션은 최신순의 루트 항목으로 보이고, 검색할 때는 매칭된 child의 부모도 함께 보여줍니다. |
-| List | 모든 세션을 한 줄짜리 목록으로 쭉 보는 방식입니다. 가장 최근 세션을 빠르게 찾기에 좋습니다. |
-
-현재 선택한 보기 방식은 `~/.cokacmux/settings.json`의 `session_view`에 저장됩니다. 그래서 다음에 cokacmux를 다시 열어도 마지막으로 고른 보기 방식이 유지됩니다.
-
-### 6-2. 미리보기 읽기
-
-기본 포커스는 세션 목록에 있습니다. 오른쪽 미리보기를 스크롤하려면 `Tab`으로 포커스를 옮깁니다.
-
-미리보기 포커스에서:
-
-| 동작 | 키 |
-|---|---|
-| 위/아래 스크롤 | `↑`/`↓` |
-| 한 페이지 위/아래 | `PageUp` / `PageDown` |
-| 처음/끝 | `Home` / `End` 또는 `g` / `G` |
-| 목록으로 돌아가기 | `Tab` |
-
-`Space`를 누르면 미리보기 캐시를 무시하고 다시 읽습니다.
-
-현재 기본 TUI 미리보기는 Summary 모드입니다.
-
-Summary는 저장된 대화 내용을 그대로 길게 늘어놓기보다, 사람이 빠르게 훑을 수 있도록 메시지와 도구 실행을 정리해서 보여줍니다. `Enter`는 기본값에서 미리보기 전환이 아니라 선택한 세션을 시작하거나 다시 연결하는 키입니다.
-
-#### Summary 화면 읽는 법
-
-Summary는 긴 세션 파일을 그대로 늘어놓지 않고, 사람이 읽기 쉬운 모양으로 정리합니다.
-
-첫 부분에는 세션 정보가 나옵니다.
-
-```text
-Session
-  provider: codex
-  id      : ...
-  title   : ...
-  cwd     : ...
-  model   : ...
-  tokens  : ...
-  messages: 12/15 visible
-```
-
-그 다음에는 메시지가 순서대로 나옵니다.
-
-```text
-Messages
-USER #0
-  고쳐야 할 내용을 설명한 사용자 메시지
-
-ASSISTANT #1 · codex/gpt-5
-  thinking:
-    에이전트가 남긴 추론 요약
-  tool use: Bash #call-123...
-    cmd: cargo test
-  tool result #call-123... · ok
-    test result: ok
-```
-
-각 요소는 아래처럼 표시됩니다.
-
-| 표시 | 뜻 |
-|---|---|
-| `USER` | 사용자가 보낸 메시지입니다. |
-| `ASSISTANT` | 에이전트가 답한 메시지입니다. |
-| `TOOL` | 도구 실행 결과만 따로 저장된 메시지입니다. |
-| `thinking` | 에이전트의 추론 또는 reasoning 요약입니다. 비어 있으면 보이는 추론 텍스트가 없다는 뜻입니다. |
-| `tool use` | 에이전트가 실행하려 한 도구입니다. 예를 들어 셸 명령, 검색, 파일 수정 요청입니다. |
-| `tool result` | 도구 실행 결과입니다. `ok`는 성공, `error`는 실패를 뜻합니다. |
-| `image` | 이미지가 포함된 메시지입니다. 실제 이미지를 터미널에 그리지는 않고 이미지 종류와 위치를 보여줍니다. |
-| `attachment` | 첨부 파일입니다. 이름, 경로, MIME 종류가 있으면 보여줍니다. |
-| `patch` | 코드 변경 diff입니다. 추가된 줄 수와 삭제된 줄 수를 함께 보여줍니다. |
-| `other` | 아직 전용 모양이 없는 provider 고유 데이터입니다. 버리지 않고 요약해서 보여줍니다. |
-
-Summary에서는 너무 긴 텍스트와 JSON 값이 적당히 줄어듭니다. 줄어든 곳에는 `…` 또는 `+N chars` 같은 표시가 붙습니다. 원본 대화 데이터는 각 provider의 저장 위치에 그대로 남아 있습니다.
-
-#### 색상 의미
-
-지원하는 터미널에서는 Summary 화면의 요소가 색으로 구분됩니다.
-
-| 색이 붙는 대상 | 의미 |
-|---|---|
-| `USER`, `ASSISTANT`, `TOOL` | 누가 만든 메시지인지 구분합니다. |
-| `thinking` | 추론/생각 부분입니다. |
-| `tool use` | 도구를 실행하겠다는 요청입니다. |
-| `tool result · ok` | 도구가 성공했습니다. |
-| `tool result · error` | 도구가 실패했습니다. |
-| `image`, `attachment`, `patch`, `other` | 내용 종류를 빠르게 알아보기 위한 표시입니다. |
-| patch 안의 `+` 줄 | 추가된 줄입니다. |
-| patch 안의 `-` 줄 | 삭제된 줄입니다. |
-
-색은 보기 편하게 돕는 장식입니다. 색이 안 보이는 터미널에서도 글자는 그대로 나오므로 사용에는 문제가 없습니다.
-
-### 6-3. 검색하기
-
-`Ctrl+F`를 누르면 검색 방식 선택창이 열립니다. 기본 선택은 Text search입니다. `Enter` 또는 `1`로 일반 검색창을 열고, 검색어를 입력한 뒤 다시 `Enter`를 누르면 Search가 실행됩니다. `2`를 누르면 AI search 입력창이 열립니다.
-
-Text search 대상:
-
-- 세션 ID
-- 작업 폴더 경로
-- 세션 타이틀
-- 대화 본문 전체
-
-Text search 중에는 버튼이 Searching 상태로 바뀌고 처리한 세션 수와 hit 수가 표시됩니다. 긴 세션이 많아도 검색 작업은 백그라운드에서 진행됩니다. 취소하려면 `Esc`를 누르세요.
-
-AI search는 먼저 세션 summary preview 인덱스를 `~/.cokacmux/searchdata`에 준비한 뒤, 설정 화면에서 고른 agent CLI에게 그 폴더를 탐색하게 합니다. AI search를 쓰려면 세션 목록에서 `,`로 설정 화면을 열어 AI agent를 먼저 골라야 합니다. 진행 중에는 중앙 오버레이에 현재 단계와 인덱싱 진행률이 표시됩니다.
-
-검색 결과를 지우고 전체 목록으로 돌아가려면 빈 검색어로 Search를 실행하면 됩니다.
-
-### 6-4. 세션 이어 실행하기
-
-세션을 선택하고 `e` 또는 `Enter`를 누르면 이미 살아 있는 agent에는 바로 다시 연결합니다. 아직 실행 중이 아니면 Agent launch 모달이 열립니다.
-
-| 모드 | 의미 |
-|---|---|
-| Normal | 일반 실행입니다. 에이전트가 평소처럼 권한 확인을 요청할 수 있습니다. |
-| Skip permissions (danger) | 권한 확인을 우회하는 옵션을 붙입니다. 신뢰하는 폴더에서만 사용하세요. |
-
-모달에서 `↑`/`↓`로 선택하고 `Enter`로 시작합니다. `1`은 Normal, `2`는 Skip permissions로 선택을 옮깁니다. `Esc`는 취소입니다.
-
-이미 같은 세션의 백그라운드 코딩 에이전트가 살아 있으면 새로 실행하지 않고 바로 다시 연결하므로 launch mode 선택을 거치지 않습니다. 다른 cokacmux 프로세스가 이미 붙어 있는 세션은 자동으로 뺏어오지 않습니다. 같은 작업 폴더를 쓰는 다른 live 코딩에이전트가 있으면 새 실행은 차단됩니다. 터미널과 `cokacdir` 같은 일반 PTY 도구는 이 제한에서 제외됩니다.
-
-Skip permissions를 선택하면 이어 실행할 때 다음 형태가 됩니다.
-
-| 에이전트 | 실행 형태 |
-|---|---|
-| Claude Code | `CLAUDE_CODE_NO_FLICKER=1 claude --dangerously-skip-permissions --resume <session-id>` |
-| Codex | `codex --yolo -c tui.keymap... resume -C <cwd> <session-id>` |
-| OpenCode | `OPENCODE_PERMISSION='{"*":"allow"}' opencode <cwd> --session <session-id>` |
-| Pi | `pi --session <session-id>` |
-| GJC | `gjc --resume <jsonl-path>` |
-
-Codex 실행에는 cokacmux의 에이전트 화면 스크롤과 Codex transcript/pager 스크롤이 충돌하지 않도록 여러 `-c tui.keymap...` 옵션이 함께 붙습니다.
-
-저장된 세션의 작업 폴더가 사라진 경우에는 바로 만들지 않고 확인창을 띄웁니다. `1` 또는 `y`로 폴더를 만들고 시작할 수 있고, `2`, `n`, `Esc`로 취소할 수 있습니다.
-
-### 6-5. 에이전트 화면에서 목록으로 돌아오기
-
-에이전트가 실행된 화면에서 `Ctrl+]` 또는 `Ctrl+[`를 누르면 세션 목록 화면으로 돌아옵니다. 에이전트는 종료되지 않습니다.
-
-다시 에이전트로 돌아가려면:
-
-- `Ctrl+]` 또는 `Ctrl+[`를 다시 누릅니다.
-- 또는 세션 목록에서 같은 세션을 선택하고 `e` 또는 `Enter`를 누릅니다.
-
-세션 목록으로 돌아올 때 cokacmux는 디스크의 세션 목록과 실행 상태를 다시 읽어 최신 상태로 맞춥니다.
-
-### 6-6. 새 터미널, cokacdir, 새 코딩 에이전트 시작
-
-`Ctrl+N`을 누르면 New session 모달이 열립니다.
-
-설정할 수 있는 값:
-
-| 항목 | 설명 |
-|---|---|
-| Type | `Terminal`, `cokacdir`, `Coding agent` |
-| Folder | 시작할 작업 폴더 |
-| Agent | Coding agent일 때 `claude`, `codex`, `opencode`, `pi`, `gjc` 중 선택 |
-| Permissions | Coding agent일 때 Normal 또는 Skip permissions 선택 |
-
-`Folder`에 없는 경로를 입력하면 시작 전에 자동으로 생성합니다.
-
-Terminal을 선택하면 해당 폴더에서 일반 셸을 엽니다. `cokacdir`을 선택하면 해당 폴더에서 `cokacdir`을 엽니다. Coding agent를 선택하면 해당 폴더에서 지원 provider의 새 세션을 시작합니다. 같은 폴더에서 이미 live 코딩에이전트가 있으면 새 Coding agent 시작은 차단됩니다.
-
-`cokacdir` 실행 파일은 설정된 `cokacdir_program`이 있으면 먼저 그 경로를 쓰고, 비어 있으면 PATH의 `cokacdir`을 찾습니다. PATH에서도 찾지 못하면 `~/.cokacmux/bin/cokacdir`을 사용합니다. 설치 스크립트를 썼다면 보통 이 파일이 이미 있습니다. 파일이 없을 때만 현재 운영체제와 CPU에 맞는 단일 바이너리를 GitHub에서 내려받아 `~/.cokacmux/bin/cokacdir`에 저장한 뒤 실행합니다. Windows에서는 `~/.cokacmux/bin/cokacdir.exe`에 저장합니다.
-
-새 코딩 에이전트를 Skip permissions로 시작하면 다음 형태가 됩니다.
-
-| 에이전트 | 실행 형태 |
-|---|---|
-| Claude Code | `CLAUDE_CODE_NO_FLICKER=1 claude --dangerously-skip-permissions [--session-id <uuid>]` |
-| Codex | `codex --yolo -c tui.keymap... -C <cwd>` |
-| OpenCode | `OPENCODE_PERMISSION='{"*":"allow"}' opencode <cwd>` |
-| Pi | `pi [--session-id <uuid>]` |
-| GJC | `GJC_SESSION_ID=<uuid> GJC_LIFECYCLE_REQUEST_ID=cokacmux-<uuid> gjc` |
-
-새 Claude Code 세션은 cokacmux가 만든 synthetic session id에서 UUID를 얻을 수 있을 때 `--session-id <uuid>`를 함께 붙여, 실행 중 상태와 나중에 생성되는 Claude 세션 파일을 안정적으로 연결합니다.
-새 Pi 세션도 UUID를 얻을 수 있을 때 `--session-id <uuid>`를 붙입니다. Pi는 `PI_CODING_AGENT_SESSION_DIR`이 설정되어 있으면 cwd별 하위 폴더를 만들지 않고 그 디렉터리 바로 아래에 JSONL 파일을 씁니다.
-새 GJC 세션도 같은 synthetic session id에서 UUID를 얻을 수 있을 때 `GJC_SESSION_ID`와 `GJC_LIFECYCLE_REQUEST_ID`를 함께 전달해, 실행 중 상태와 나중에 생성되는 GJC 세션 파일을 안정적으로 연결합니다.
-
-### 6-7. 실행 중인 에이전트 전환과 종료
-
-에이전트 화면에서:
-
-| 동작 | 키 |
-|---|---|
-| 세션 목록으로 돌아가기 | `Ctrl+]` 또는 `Ctrl+[` |
-| 현재 코딩 에이전트/일반 터미널 종료 | `Ctrl+K` |
-| 이전/다음 실행 중인 대상 전환 | `Ctrl+PageUp` / `Ctrl+PageDown` |
-| 사이드바 보이기/숨기기 | `Ctrl+B` |
-| 오른쪽 `cokacdir`/terminal 패널 표시/숨김 | `Ctrl+F` / `Ctrl+T` |
-| 포커스 이동 | `Ctrl+1` agents, `Ctrl+2` agent, `Ctrl+3` right panel |
-| 사이드바 선택 이동 | `Alt+↑` / `Alt+↓` 또는 `Ctrl+Shift+↑` / `Ctrl+Shift+↓` |
-| 포커스된 side panel 폭 조절 | `Alt+←` / `Alt+→` 또는 `Ctrl+Shift+←` / `Ctrl+Shift+→` |
-
-사이드바를 숨긴 상태에서 왼쪽 패널 resize 대상에 `Alt+→` / `Ctrl+Shift+→`를 누르면 이전 폭을 복원하지 않고 0폭에서 한 단계만 펼칩니다. 중앙 agent에 포커스가 있고 양쪽 side panel이 모두 열려 있으면 resize는 동작하지 않습니다. 오른쪽 `cokacdir`와 terminal 패널은 한 번에 하나만 보이며, 숨겨져 있는 동안에도 자식 앱은 계속 실행됩니다. 오른쪽 패널 폭을 조절하면 `settings.json`의 `agent_aux_width`에 저장되어 다음 실행에도 유지됩니다.
-
-오른쪽 보조 패널은 부모 코딩 에이전트별로 기억됩니다. 다른 에이전트로 전환하면서 숨겨진 오른쪽 패널은 원래 부모 에이전트로 돌아왔을 때 자동으로 복원될 수 있고, 사용자가 `Ctrl+F` 또는 `Ctrl+T`로 직접 숨긴 패널은 자동으로 튀어나오지 않지만 같은 키로 다시 표시하면 기존 프로세스와 화면 상태를 재사용합니다. 이 복원 정보는 `~/.cokacmux/agent_auxiliary.json`에 저장됩니다.
-
-`cokacdir` 화면에서는 `Ctrl+K`를 cokacmux가 종료 단축키로 잡지 않고 `cokacdir`에 전달합니다. `cokacdir`을 cokacmux 쪽에서 종료하려면 세션 목록 화면으로 돌아간 뒤 실행 중인 항목을 선택하고 `Ctrl+K`를 누르세요.
-
-### 6-8. 에이전트 화면 스크롤
-
-에이전트 터미널 화면은 일반 키 입력을 에이전트에 그대로 전달합니다. 그래서 스크롤용 키는 일반 방향키와 분리되어 있습니다.
-
-스크롤 키 처리 방식은 실행 대상별로 다릅니다. Codex는 line/page/top/bottom 스크롤을 Codex transcript/pager 입력으로 보냅니다. Claude Code는 page/top/bottom을 fullscreen scroll 키로 바꾸고, 한 줄 스크롤은 원래 키를 자식 CLI에 전달합니다. OpenCode는 page up/down만 전용 키로 바꾸고, line/top/bottom은 원래 키를 자식 CLI에 전달합니다. Pi와 GJC는 현재 원래 스크롤 키를 자식 CLI에 전달합니다. 일반 터미널은 cokacmux가 보관한 PTY scrollback을 직접 움직입니다.
-
-`cokacdir`에서는 Shift가 포함된 단축키를 자식 앱에 우선 전달합니다. 그래서 기본값 중 `Shift+...` 조합은 `cokacdir`로 들어가고, Shift가 없는 `Alt+Home` / `Alt+End`는 cokacmux의 parent PTY scrollback을 움직입니다. `cokacdir` 화면에서 parent scrollback을 더 많이 쓰고 싶다면 Shift 없는 단축키로 다시 지정하세요.
-
-| 동작 | 키 |
-|---|---|
-| transcript/scrollback 한 줄 위/아래 | `Shift+↑` / `Shift+↓` |
-| transcript/scrollback 한 화면 위/아래 | `Shift+Alt+↑` / `Shift+Alt+↓` 또는 `Shift+Alt+PageUp` / `Shift+Alt+PageDown` 또는 `Alt+PageUp` / `Alt+PageDown` |
-| transcript/scrollback 맨 위/아래 | `Shift+Home` / `Shift+End` 또는 `Alt+Home` / `Alt+End` |
-
-### 6-9. 세션 복제하기
-
-세션을 선택하고 `c`를 누르면 복제 옵션 창이 열립니다. 기본 대상은 원본과 같은 에이전트이며, `Tab` / `BackTab`으로 대상 에이전트를 바꿀 수 있습니다.
-
-같은 provider로 복제할 때는 원본 세션을 수정하지 않고 provider-native 저장 데이터를 직접 복사한 뒤, 새 세션이 충돌 없이 열리도록 세션 ID, cwd, 내부 ID 참조만 패치합니다. 다른 provider로 준비할 때는 원본 세션을 렌더링한 context user 메시지 하나와 assistant `ok` 메시지 하나로 이루어진 target-native 세션을 만듭니다.
-
-원본 세션의 작업 폴더가 존재하면, 복제 시 실제 폴더 데이터도 함께 복제할지 확인합니다. 동의하면 원본 폴더와 겹치지 않는 형제 폴더를 만들고 그곳으로 폴더 내용을 복사합니다. 새 세션 기록의 cwd는 이 전용 폴더로 패치되므로, 원본 세션과 복제 세션이 같은 경로를 번갈아 덮어쓰지 않습니다. 복사 중 원본 폴더가 바뀌거나 복제본의 내용 해시가 원본과 맞지 않으면 복제는 실패하고 부분 복사 폴더를 정리합니다. 저장된 폴더 데이터를 복원할 때도 같은 cwd에 live 코딩에이전트가 있으면 복원/시작을 차단합니다.
-
-폴더 데이터 스냅샷이 저장된 복제 세션을 나중에 실행하면 저장 폴더 복원 확인창이 열립니다. 기본 선택은 `Start without restore`입니다. `1` 또는 `y`는 저장된 폴더 데이터를 복원한 뒤 시작하고, `2`, `n`, `Esc`는 복원 없이 시작합니다. `←`/`→`, `↑`/`↓`, `Tab`/`BackTab`으로 버튼을 고른 뒤 `Enter`로 실행할 수도 있습니다. 대상 폴더가 이미 있으면 기존 폴더를 `.cokacmux-backup-<timestamp>` 이름으로 백업한 뒤 복원합니다.
-
-### 6-10. 세션 타이틀 바꾸기
-
-세션을 선택하고 `t`를 누르면 제목 편집창이 열립니다. 사람이 알아보기 쉬운 이름을 붙일 수 있습니다.
-
-저장 위치는 `~/.cokacmux/titles.json`입니다. 원본 에이전트의 대화 파일을 직접 수정하지 않고, cokacmux가 보여줄 표시 이름만 저장합니다.
-
-AI 제목 생성과 AI 검색에 사용할 agent는 세션 목록에서 `,` 설정 화면으로 고릅니다. 기본값은 설정 없음입니다. 제목 편집창에서 `Ctrl+T`를 누르면 선택한 agent가 현재 세션 전체 내용을 읽고 한 문장 제목을 draft에 채웁니다. 처리 중에는 제목 편집창 안에 진행 상태가 표시되고 입력이 잠시 잠깁니다. 설정이 없으면 먼저 설정 화면이 열립니다.
-
-세션 원문이 너무 크면 agent CLI의 입력 한계를 피하기 위해 전체 세션 summary 렌더러를 사용합니다.
-
-Codex와 Claude는 각 CLI의 JSON Schema 기반 structured output 옵션으로 `title` 필드를 받습니다. OpenCode는 `opencode run --format json`의 JSON 이벤트에서 최종 답변을 꺼낸 뒤, 그 답변 안의 `title` JSON 필드를 제목으로 사용합니다. Pi와 GJC는 `--print --no-session` 실행 결과에서 `title` JSON 필드를 읽습니다. 긴 세션에서 OS argv 길이 제한에 걸리지 않도록 agent prompt는 stdin으로 전달합니다. AI 제목 생성을 위해 별도로 실행한 agent 세션은 남기지 않습니다. Codex는 ephemeral 실행, Claude는 session persistence 비활성화 실행, Pi와 GJC는 no-session 실행을 사용하고, OpenCode는 생성된 helper session id를 확인해 완료 후 삭제합니다.
-
-세션 목록에서 `Ctrl+F`를 누르면 검색 방식 선택창이 열립니다. 일반 검색을 고르면 세션 ID, 작업 폴더, 제목과 세션 본문 전체를 로컬에서 검색합니다. AI 검색을 고르면 모든 세션의 summary preview를 `~/.cokacmux/searchdata`에 최신 파일로 준비한 뒤, 선택한 agent에게 그 폴더를 직접 탐색하라고 요청합니다. 검색 중에는 중앙 오버레이에 스피너, preview 인덱싱 진행률, 현재 단계가 표시되고 `Esc` 취소 외 입력은 잠깁니다. AI 검색 결과 목록은 AI 점수 순서로 표시되고 title 칼럼에는 짧은 match label이 함께 나옵니다.
-
-### 6-11. 세션 삭제하기
-
-세션을 선택하고 `Delete` 또는 `d`를 누르면 확인창이 열립니다. 기본 선택은 Cancel입니다. `1` 또는 `y`로 바로 삭제하고, `2`, `n`, `Esc`로 취소합니다. `←`/`→`, `↑`/`↓`, `Tab`/`BackTab`으로 버튼을 고른 뒤 `Enter`로 실행할 수도 있습니다.
-
-삭제는 실제 저장소의 세션 기록을 지우는 동작입니다.
-
-| 에이전트 | 삭제 방식 |
-|---|---|
-| Claude Code | 해당 JSONL 세션 파일과, 있으면 같은 이름의 sidecar 디렉터리 삭제 |
-| Codex | 해당 rollout JSONL 파일 삭제. 접근 가능한 경우 `~/.codex/state_5.sqlite`의 `threads` 행도 삭제 |
-| OpenCode | SQLite DB의 `part`, `message`, `session_message`, `session` 행 삭제 |
-| Pi | 해당 JSONL 세션 파일 삭제 |
-| GJC | 해당 JSONL 세션 파일 삭제 |
-
-중요한 기록은 삭제 전에 백업하세요.
-
-### 6-12. 목록 새로고침과 종료
-
-| 동작 | 키 |
-|---|---|
-| 디스크에서 세션 목록 다시 읽기 | `r` |
-| 종료 | `q`, `Ctrl+Q`, `Ctrl+C` |
-
-`q`나 `Ctrl+Q`로 TUI를 종료해도 백그라운드 실행 대상은 사용자가 명시적으로 종료하지 않는 한 계속 살아 있습니다. 현재 실행 중인 대상을 정리하려면 `Ctrl+K`, 모두 정리하려면 `cokacmux killall`을 사용하세요.
-
----
-
-## 7. 키보드 단축키
-
-기본 단축키입니다. 모든 단축키는 `~/.cokacmux/keybinding.json`에서 바꿀 수 있습니다.
-
-### 세션 목록 / 미리보기 화면
-
-| 키 | 동작 |
-|---|---|
-| `q` | 종료 |
-| `Esc` | 종료. 검색 결과가 적용되어 있으면 먼저 전체 목록으로 복귀 |
-| `Ctrl+Q` | 어디서든 종료 |
-| `Ctrl+C` | 세션 화면에서 종료 |
-| `↑`/`↓` | 선택 이동. 미리보기 포커스에서는 미리보기 스크롤 |
-| `PageUp` / `PageDown` | 10칸 이동. 미리보기 포커스에서는 페이지 스크롤 |
-| `Home`/`g`, `End`/`G` | 맨 위 / 맨 아래 |
-| `Tab` | 세션 목록과 미리보기 포커스 전환 |
-| `Space` | 미리보기 강제 새로고침 |
-| `Ctrl+F` | 검색 방식 선택창 열기 |
-| `v` | 트리 보기 / 목록 보기 전환 |
-| `t` | 제목 편집 |
-| `,` | 설정 화면 열기 |
-| `r` | 세션 목록 새로고침 |
-| `c` | 복제 옵션 열기. 같은 provider는 native clone, 다른 provider는 2-message context handoff. 폴더 데이터 포함 시 전용 cwd 생성 |
-| `Delete` / `d` | 세션 삭제 확인창 열기 |
-| `e` / `Enter` | Agent launch 모달 열기 또는 live agent 연결 |
-| `Ctrl+N` | 새 터미널/cokacdir/새 코딩 에이전트 모달 열기 |
-| `Ctrl+K` | 선택한 실행 중 대상 종료 |
-| `Ctrl+]` / `Ctrl+[` | 활성 에이전트 화면으로 전환 또는 다시 연결 |
-| `Alt+↑` / `Alt+↓` | 세션 사이드바 선택 이동 |
-| `Ctrl+Shift+↑` / `Ctrl+Shift+↓` | 세션 사이드바 선택 이동 |
-| `Alt+←` / `Alt+→` | 세션 패널 크기 조절 |
-| `Ctrl+Shift+←` / `Ctrl+Shift+→` | 세션 패널 크기 조절 |
-
-### Agent launch 모달
-
-`e` 또는 `Enter`로 열리는 모달입니다.
-
-| 키 | 동작 |
-|---|---|
-| `Enter` | 선택한 모드로 시작/연결 |
-| `↑`/`↓` | 선택 이동 |
-| `1` | Normal 선택 |
-| `2` | Skip permissions 선택 |
-| `Esc` | 취소 |
-
-### New session 모달
-
-`Ctrl+N`으로 열리는 모달입니다.
-
-| 키 | 동작 |
-|---|---|
-| `Enter` | 선택한 설정으로 시작 |
-| `↑`/`↓`, `Tab` / `BackTab` | 입력 항목 이동 |
-| `←`/`→`, `Space` | Type / Agent / Permissions 값 변경 |
-| 폴더 입력 중 문자 키 | 경로 입력 |
-| 폴더 입력 중 `←`/`→` | 커서 이동 |
-| 폴더 입력 중 `Home` / `End` | 처음 / 끝으로 이동 |
-| 폴더 입력 중 `Backspace` / `Delete` | 글자 삭제 |
-| `Esc` | 취소 |
-
-폴더 입력 중에는 `j`, `k`, `h`, `l`, `Space`가 문자 입력으로 우선 처리됩니다. 입력 항목을 옮기려면 화살표, `Tab`, `BackTab`을 쓰세요.
-
-### 에이전트 화면
-
-| 키 | 동작 |
-|---|---|
-| `Ctrl+]` / `Ctrl+[` | 세션 목록으로 돌아가기 |
-| `Ctrl+Q` | TUI 종료 |
-| `Ctrl+K` | 현재 코딩 에이전트/일반 터미널 종료. `cokacdir` 화면에서는 자식 앱에 전달 |
-| `Ctrl+N` | 현재 작업 폴더를 기본값으로 새 세션 모달 열기 |
-| `Ctrl+B` | 에이전트 사이드바 표시/숨김 |
-| `Ctrl+F` | Codex/Claude/OpenCode/Pi/GJC의 현재 작업 폴더로 오른쪽 `cokacdir` 패널 표시/숨김 |
-| `Ctrl+T` | Codex/Claude/OpenCode/Pi/GJC의 현재 작업 폴더로 오른쪽 terminal 패널 표시/숨김 |
-| `Ctrl+1` | 왼쪽 agents 패널로 포커스 이동. 숨겨져 있으면 표시 |
-| `Ctrl+2` | 중앙 agent 패널로 포커스 이동 |
-| `Ctrl+3` | 오른쪽 보조 패널로 포커스 이동 |
-| `Ctrl+PageUp` / `Ctrl+PageDown` | 이전/다음 실행 중 대상 전환 |
-| `Shift+↑` / `Shift+↓` | transcript/scrollback 한 줄 위/아래 |
-| `Shift+Alt+↑` / `Shift+Alt+↓` | transcript/scrollback 한 화면 위/아래 |
-| `Shift+Alt+PageUp` / `Shift+Alt+PageDown` | transcript/scrollback 한 화면 위/아래 |
-| `Alt+PageUp` / `Alt+PageDown` | transcript/scrollback 한 화면 위/아래. Windows Terminal에서 `Shift+Alt+↑` / `Shift+Alt+↓`가 pane resize로 잡힐 때 사용 |
-| `Shift+Home` / `Shift+End` | transcript/scrollback 맨 위/아래 |
-| `Alt+Home` / `Alt+End` | transcript/scrollback 맨 위/아래 |
-| `Alt+↑` / `Alt+↓` | 에이전트 사이드바 선택 이동 |
-| `Ctrl+Shift+↑` / `Ctrl+Shift+↓` | 에이전트 사이드바 선택 이동 |
-| `Alt+←` / `Alt+→` | 포커스된 side panel 폭 조절. 중앙 포커스에서 양쪽이 모두 열려 있으면 동작하지 않음 |
-| `Ctrl+Shift+←` / `Ctrl+Shift+→` | 포커스된 side panel 폭 조절. 중앙 포커스에서 양쪽이 모두 열려 있으면 동작하지 않음 |
-| 그 외 키 | 현재 에이전트에 그대로 전달 |
-
-오른쪽 보조 패널은 한 번에 하나만 보입니다. `cokacdir`가 보이는 상태에서 terminal을 표시하면 `cokacdir`는 숨겨지고 terminal이 보입니다. 숨겨진 `cokacdir`/terminal은 자식 앱 안에서 직접 종료하기 전까지 계속 실행되며, 다시 표시하면 이전 화면 상태가 유지됩니다.
-
-### 검색창
-
-| 키 | 동작 |
-|---|---|
-| `Enter` | Search 실행 |
-| `Esc` | 닫기 |
-| `←` / `→` | 커서 이동 |
-| `Home` / `End` | 처음 / 끝 |
-| `Backspace` / `Delete` | 글자 삭제 |
-
-### 제목 편집창
-
-| 키 | 동작 |
-|---|---|
-| `Enter` | 저장 |
-| `Esc` | 취소 |
-| `←` / `→` | 커서 이동 |
-| `Home` / `End` | 처음 / 끝 |
-| `Backspace` / `Delete` | 글자 삭제 |
-| `Ctrl+T` | 선택한 AI agent로 세션 제목 자동 생성 |
-
-### 복제 옵션 선택 모달
-
-| 키 | 동작 |
-|---|---|
-| `Enter` | 선택한 옵션으로 복제 |
-| `←`/`→`, `↑`/`↓` | 옵션 이동 |
-| `Tab` / `BackTab` | 대상 provider 변경 |
-| `1` | 세션만 복제 |
-| `2` | 폴더 데이터도 함께 복제 |
-| `3` | 취소 |
-| `Esc` | 취소 |
-
-### 저장 폴더 복원 확인창
-
-폴더 데이터 스냅샷이 저장된 복제 세션을 실행할 때 열리는 모달입니다. 기본 선택은 `Start without restore`입니다.
-
-| 키 | 동작 |
-|---|---|
-| `Enter` | 선택한 버튼 실행 |
-| `←`/`→`, `↑`/`↓`, `Tab` / `BackTab` | 버튼 선택 |
-| `1` 또는 `y` / `Y` | Restore/start |
-| `2` 또는 `n` / `N` / `Esc` | Start without restore |
-
-### 삭제 확인창
-
-| 키 | 동작 |
-|---|---|
-| `Enter` | 선택한 버튼 실행 |
-| `←`/`→`, `↑`/`↓`, `Tab` / `BackTab` | 버튼 선택 |
-| `1` 또는 `y` / `Y` | 삭제 |
-| `2` 또는 `n` / `N` / `Esc` | 취소 |
-
----
-
-## 8. CLI 명령어
-
-TUI를 띄우지 않고 쓸 수 있는 명령도 있습니다.
-
-| 명령 | 설명 |
-|---|---|
-| `cokacmux` | TUI 실행 |
-| `cokacmux --check` | TUI 없이 세션 탐색이 되는지 확인 |
-| `cokacmux --debug` | 디버그 로그를 명시적으로 켜고 TUI 실행. 기본 로그는 보통 자동으로 켜집니다. |
-| `cokacmux --trace` | 훨씬 많은 로그를 남기며 TUI 실행. 문제 분석용입니다. |
-| `cokacmux killall` | cokacmux 프로세스 종료, `~/.cokacmux/agents`와 `~/.cokacmux/debug` 정리 |
-| `cokacmux agents killall` | `cokacmux killall`과 같은 별칭 |
-| `cokacmux reset` | cokacmux 프로세스 종료 후 `~/.cokacmux` 전체 삭제 |
-| `cokacmux --version` 또는 `cokacmux -V` | 버전 출력 |
-| `cokacmux --help` 또는 `cokacmux -h` | 도움말 출력 |
-
-### `--check`
-
-터미널 화면을 바꾸지 않고 세션 탐색만 수행합니다.
-
-```bash
-cokacmux --check
-```
-
-출력 예:
-
-```text
-cokacmux --check ok: 12 sessions discovered (status: 12 sessions)
-```
-
-세션이 안 보일 때 먼저 이 명령으로 확인하면 좋습니다.
-
-### `killall`
-
-cokacmux 관련 프로세스를 한 번에 종료하고 런타임/디버그 파일을 정리합니다.
-
-```bash
-cokacmux killall
-```
-
-출력 예:
-
-```text
-killall cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_removed=0 pty_logs_deleted=2 cwd_locks_removed=1 untracked_daemons_scanned=0 untracked_daemons_terminated=0 untracked_daemons_skipped_self=0 untracked_daemons_skipped_unverified=0 clients_scanned=1 clients_terminated=1 clients_skipped_self=0 clients_skipped_unverified=0 errors=0 agents_removed=true debug_removed=true
-```
-
-`killall`은 `reset`과 같은 범위로 cokacmux 데몬과 클라이언트 프로세스를 종료합니다. 파일 삭제 범위만 더 좁습니다. `~/.cokacmux` 아래에서는 `agents/`와 `debug/`만 삭제하고, `settings.json`, `keybinding.json`, `titles.json`, `clone_tree.json`, `agent_auxiliary.json`, `data/`, `searchdata/`, `bin/`은 남깁니다.
-
-정리 대상은 `~/.cokacmux/agents/`의 런타임 메타데이터와 운영체제 프로세스 목록을 함께 보고 찾습니다. 확인된 agent daemon, 연결된 cokacmux 클라이언트, daemon이 남긴 자식 PTY 프로세스, 오래된 cwd lock과 orphan ptylog를 정리합니다. Windows에서는 프로세스 command line을 스캔해 런타임 파일이 사라진 daemon도 찾되, 현재 프로세스이거나 cokacmux agent/client로 확인되지 않는 PID는 건너뜁니다.
-
-별도 터미널에서 직접 실행한 `claude`, `codex`, `opencode`, `pi`, `gjc`는 cokacmux 프로세스나 그 자식 프로세스가 아니면 종료 대상이 아닙니다.
-
-### `reset`
-
-cokacmux 관련 프로세스를 종료한 뒤 `~/.cokacmux` 전체를 삭제합니다.
-
-```bash
-cokacmux reset
-```
-
-출력 예:
-
-```text
-reset cokacmux: killed=2 stale=0 child_processes_terminated=2 runtime_files_removed=0 pty_logs_deleted=2 cwd_locks_removed=1 untracked_daemons_scanned=0 untracked_daemons_terminated=0 untracked_daemons_skipped_self=0 untracked_daemons_skipped_unverified=0 clients_scanned=1 clients_terminated=1 clients_skipped_self=0 clients_skipped_unverified=0 errors=0 removed=true
-```
-
-`reset`은 `settings.json`, `keybinding.json`, `titles.json`, `clone_tree.json`, `agent_auxiliary.json`, `data/`, `searchdata/`, `bin/`, `agents/`, `debug/`를 포함한 `~/.cokacmux` 디렉터리 전체를 지웁니다. Claude Code, Codex, OpenCode, Pi, GJC가 각자 저장하는 원본 세션 데이터는 `~/.cokacmux` 밖에 있으므로 삭제하지 않습니다.
-
----
-
-## 9. 설정 파일
-
-설정 파일은 `~/.cokacmux/settings.json`입니다. 처음 실행할 때 파일이 없으면 기본 파일이 자동으로 생성됩니다. 세션 목록에서 `,`를 누르면 설정 화면이 열리고, 여기서 AI agent, 세션 보기 방식, agent 실행 파일 경로, `cokacdir` 실행 파일 경로를 저장할 수 있습니다. 저장 전 변경사항은 설정 화면 상단에 표시됩니다. Keybindings와 Data 섹션은 현재 경로와 동작 상태를 보여주는 읽기 전용 섹션입니다.
-
-기본 생성 예:
-
-```json
-{
-  "cokacmux": {
-    "sessions_pane_percent": 45,
-    "sessions_pane_width": null,
-    "agent_sidebar_width": 30,
-    "agent_aux_width": null,
-    "agent_sidebar_visible": true,
-    "session_view": "tree",
-    "agent_programs": {
-      "codex": "",
-      "claude": "",
-      "opencode": "",
-      "pi": "",
-      "gjc": ""
-    },
-    "ai": {
-      "provider": null
-    },
-    "cokacdir_program": ""
-  }
-}
-```
-
-각 항목의 의미:
-
-| 키 | 의미 |
-|---|---|
-| `sessions_pane_percent` | 세션 목록 패널의 기본 너비 비율입니다. 기본값은 45입니다. |
-| `sessions_pane_width` | 세션 목록 패널의 고정 너비입니다. `null`이면 percent 값을 씁니다. 패널 크기를 조절하면 숫자로 저장됩니다. |
-| `agent_sidebar_width` | 에이전트 화면의 사이드바 너비입니다. |
-| `agent_aux_width` | 에이전트 화면 오른쪽 `cokacdir`/terminal 패널의 너비입니다. `null`이면 터미널 폭 기준 기본값을 씁니다. 패널 크기를 조절하면 숫자로 저장됩니다. |
-| `agent_sidebar_visible` | 에이전트 사이드바를 처음에 보일지 정합니다. |
-| `session_view` | `"tree"` 또는 `"list"`입니다. `v` 키로도 바뀝니다. |
-| `agent_programs` | 현재 지원 provider의 실행 파일 경로를 직접 지정하는 곳입니다. |
-| `ai.provider` | AI 제목 생성과 AI 검색에 사용할 agent입니다. 기본값은 `null`이며, 세션 목록의 `,` 설정 화면으로 직접 선택해야 합니다. |
-| `cokacdir_program` | `cokacdir` 실행 파일 경로를 직접 지정하는 곳입니다. |
-
-`agent_programs`와 `cokacdir_program`의 빈 문자열은 placeholder입니다. 비워 두면 기존처럼 PATH에서 기본 명령 이름을 찾습니다. `cokacdir`은 PATH에서 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용합니다. 설치 스크립트는 이 파일을 미리 내려받고, 직접 설치하지 않았거나 파일을 지운 경우에만 실행 시 자동 다운로드합니다.
-
-`ai.provider`는 `null`, `"claude"`, `"codex"`, `"opencode"`, `"pi"`, `"gjc"` 중 하나입니다. `null`이면 AI 기능용 agent가 설정되지 않은 상태입니다.
-
-### `agent_programs` 자세히
-
-| 키 | 비워 두면 실행하는 명령 | 쓰는 곳 |
-|---|---|---|
-| `agent_programs.claude` | `claude` | Claude Code 세션 이어가기, 새 Claude Code 시작 |
-| `agent_programs.codex` | `codex` | Codex 세션 이어가기, 새 Codex 시작 |
-| `agent_programs.opencode` | `opencode` | OpenCode 세션 이어가기, 새 OpenCode 시작 |
-| `agent_programs.pi` | `pi` | Pi 세션 이어가기, 새 Pi 시작 |
-| `agent_programs.gjc` | `gjc` | GJC 세션 이어가기, 새 GJC 시작 |
-| `cokacdir_program` | `cokacdir` | New session 모달의 `cokacdir` 시작 |
-
-동작 규칙:
-
-- 키를 생략하면 기본 명령 이름을 씁니다.
-- `null`, 빈 문자열, 공백뿐인 문자열은 설정하지 않은 것으로 보고 기본 명령 이름을 씁니다.
-- `~/bin/codex`처럼 `~/`로 시작하면 사용자 홈 디렉터리로 확장합니다.
-- `/usr/bin/codex`처럼 경로이면 그 파일을 실행합니다.
-- `codex-beta`처럼 명령 이름이면 PATH에서 다시 찾습니다.
-- Windows에서는 `.exe`, `.cmd`, `.bat`, `.ps1` 경로를 사용할 수 있습니다.
-- `cokacdir_program`이 비어 있고 PATH에서도 `cokacdir`을 찾지 못하면 `~/.cokacmux/bin/cokacdir` 파일을 사용합니다. 설치 스크립트가 보통 이 파일을 준비하며, 파일이 없으면 `~/.cokacmux/bin`에 자동 다운로드한 바이너리를 실행합니다.
-- 이미 실행 중인 백그라운드 실행 대상에는 변경된 경로가 적용되지 않습니다. 새 경로로 실행하려면 기존 실행 대상을 `Ctrl+K` 또는 `cokacmux killall`로 종료한 뒤 다시 시작하세요.
-
-설정 화면에서 저장한 값은 바로 `settings.json`에 쓰입니다. 다만 이미 실행 중인 백그라운드 실행 대상에는 실행 파일 경로 변경이 적용되지 않습니다. 파일을 직접 고친 뒤에는 cokacmux를 재시작하는 편이 가장 명확합니다. 단축키 파일인 `keybinding.json`만 실행 중 백그라운드 감시 스레드가 자동으로 다시 읽습니다.
-
----
-
-## 10. 단축키 설정
-
-단축키 파일은 `~/.cokacmux/keybinding.json`입니다. 파일이 없으면 기본 단축키가 모두 들어간 파일을 자동으로 만듭니다.
-
-앱을 재시작할 필요는 없습니다. 백그라운드 감시 스레드가 약 2초마다 파일 수정 시각을 확인하고, 바뀐 경우에만 다시 읽습니다. 파일을 잘못 수정해서 JSON 형식 오류가 나면 기존 단축키를 유지하고 상태줄/디버그 로그에 실패 이유를 남깁니다.
-
-원하는 액션만 적으면 됩니다.
-
-```json
-{
-  "sessions": {
-    "launch_agent": ["x"],
-    "delete": ["delete", "d"],
-    "quit": ["q", "ctrl+q"]
-  },
-  "agent_launch": {
-    "skip_permissions": ["2", "s"]
-  },
-  "new_session": {
-    "next": ["down", "tab"],
-    "prev": ["up", "backtab"]
-  },
-  "agent": {
-    "scroll_page_up": ["shift+alt+up", "shift+alt+pageup", "alt+pageup"],
-    "scroll_page_down": ["shift+alt+down", "shift+alt+pagedown", "alt+pagedown"],
-    "switch_prev": ["ctrl+,"],
-    "switch_next": ["ctrl+."]
-  }
-}
-```
-
-주의할 점:
-
-- 액션을 설정하면 기본값에 추가되는 것이 아니라 그 액션의 기본 단축키 전체를 대체합니다.
-- 파일에 없는 액션은 기본값을 그대로 씁니다.
-- 빈 배열 `[]` 또는 `null`을 넣으면 해당 액션이 비활성화됩니다.
-- 점 표기(`"sessions.launch_agent": ["x"]`)도 사용할 수 있습니다.
-- 현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.toggle_focus`는 `["tab"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다. Agent 화면에서는 `agent.toggle_cokacdir_panel`이 `["ctrl+f"]`, `agent.toggle_terminal_panel`이 `["ctrl+t"]`, `agent.focus_sidebar`/`agent.focus_main`/`agent.focus_auxiliary`가 각각 `["ctrl+1"]`/`["ctrl+2"]`/`["ctrl+3"]`입니다.
-- 구버전에서 자동 생성된 `sessions.launch_agent: ["e"]` + `sessions.toggle_preview: ["enter"]` 조합은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
-- 구버전에서 자동 생성된 `sessions.filter: ["/"]`와 `sessions.ai_search: ["ctrl+s"]` 값도 새 검색 선택창 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
-- 구버전에서 자동 생성된 `sessions.ai_title_settings: ["ctrl+t"]` 또는 `["comma", "ctrl+t"]` 값도 `["comma"]` 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
-- 구버전에서 자동 생성된 `sessions.toggle_focus: ["tab", "esc"]` 값도 `["tab"]` 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
-- 구버전에서 자동 생성된 agent page scroll 기본값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
-
-키 표기 예:
-
-```text
-ctrl+q
-alt+up
-shift+alt+up
-ctrl+shift+left
-enter
-esc
-space
-delete
-f1
-```
-
-지원하는 키 이름과 전체 액션 목록은 [`docs/KEYBINDINGS.md`](docs/KEYBINDINGS.md)에 정리되어 있습니다.
-
-기본 단축키 파일을 다시 만들고 싶다면 `~/.cokacmux/keybinding.json`을 삭제하세요. 실행 중에는 다음 감시 스레드 확인 때 기본 파일이 다시 생성되고, 앱이 꺼져 있으면 다음 실행 때 생성됩니다.
-
----
-
-## 11. 데이터 저장 위치
-
-cokacmux가 직접 만드는 파일은 홈 폴더 안의 `.cokacmux/` 디렉터리에 모입니다.
-
-| 위치 | 용도 |
-|---|---|
-| `~/.cokacmux/settings.json` | UI 설정과 에이전트 실행 파일 경로 설정 |
-| `~/.cokacmux/keybinding.json` | 단축키 설정 |
-| `~/.cokacmux/titles.json` | 사용자가 붙인 세션 표시 이름 |
-| `~/.cokacmux/clone_tree.json` | 복제한 세션의 parent/child 관계 |
-| `~/.cokacmux/agent_auxiliary.json` | 에이전트별 오른쪽 terminal/`cokacdir` 보조 패널 복원 정보 |
-| `~/.cokacmux/data/` | 복제 세션과 짝지어 저장한 작업 폴더 스냅샷 |
-| `~/.cokacmux/searchdata/` | AI search가 agent에게 넘기는 세션 summary preview 인덱스 |
-| `~/.cokacmux/bin/cokacdir` | 설치 스크립트나 자동 다운로드가 저장한 `cokacdir` 실행 파일 |
-| `~/.cokacmux/agents/` | 실행 중인 백그라운드 실행 대상의 메타데이터와 통신용 소켓 |
-| `~/.cokacmux/agents/scrollback/*.ptylog` | 실행 중인 에이전트/터미널/`cokacdir` PTY 출력 복원용 보조 기록 |
-| `~/.cokacmux/debug/cokacmux.log` | 기본 런타임 로그. `COKACMUX_DEBUG=0`으로 끌 수 있고, `--trace` 또는 `COKACMUX_TRACE=1`이면 더 자세히 기록됩니다. |
-| `~/.cokacmux/debug/cokacmux-stalls.log` | UI stall 진단 로그. debug가 꺼져 있어도 제한적으로 기록될 수 있습니다. |
-
-Windows에서 `~`는 보통 `C:\Users\사용자이름\`입니다. 따라서 `~/.cokacmux/`는 보통 `C:\Users\사용자이름\.cokacmux\`입니다.
-
-원본 에이전트 데이터는 각 에이전트의 저장소에 그대로 있습니다.
-
-| 에이전트 | 원본 데이터 |
-|---|---|
-| Claude Code | `~/.claude/projects/...` |
-| Codex | `~/.codex/sessions/...` |
-| OpenCode | macOS/Linux: `~/.local/share/opencode/opencode.db` |
-| OpenCode | Windows: `%LOCALAPPDATA%\opencode\opencode.db` 또는 `%APPDATA%\opencode\opencode.db` |
-| Pi | 기본: `~/.pi/agent/sessions/...`, `PI_CODING_AGENT_DIR` 사용 시 `$PI_CODING_AGENT_DIR/sessions/...` |
-| Pi | `PI_CODING_AGENT_SESSION_DIR` 사용 시 해당 디렉터리 바로 아래의 `*.jsonl` |
-| GJC | 기본: `~/.gjc/agent/sessions/...`, `GJC_CODING_AGENT_DIR` 사용 시 `$GJC_CODING_AGENT_DIR/sessions/...` |
-| GJC | XDG data root 사용 시 `$XDG_DATA_HOME/gjc/sessions/...` |
-
----
-
-## 12. 자주 묻는 질문
-
-### AI 비용이 더 나가나요?
-
-아니요. cokacmux는 AI API를 직접 호출하지 않습니다. 이미 쓰는 에이전트 CLI를 실행하고, 로컬에 저장된 세션 파일을 읽고 쓸 뿐입니다.
-
-### 제 대화 내용이 외부로 전송되나요?
-
-cokacmux 자체는 세션 데이터를 외부 서버로 전송하지 않습니다. 모든 처리는 로컬 파일과 로컬 프로세스를 대상으로 합니다. 단, 실제 에이전트 CLI가 동작하면서 각 서비스와 통신하는 것은 해당 에이전트의 일반 동작입니다.
-
-### 세션이 하나도 안 보여요.
-
-다음을 확인하세요.
-
-- 지원되는 코딩 에이전트 중 하나를 한 번이라도 사용해 세션이 생겼는지 확인합니다.
-- 각 에이전트가 기본 위치에 데이터를 저장하는지 확인합니다.
-- `cokacmux --check`를 실행해 몇 개의 세션이 발견되는지 확인합니다.
-- 문제가 계속되면 `cokacmux --debug`로 실행한 뒤 `~/.cokacmux/debug/` 로그를 확인합니다.
-
-### 미리보기는 되는데 `e` / `Enter`로 실행이 안 돼요.
-
-미리보기는 저장 파일만 읽으면 되지만, 실행은 실제 에이전트 CLI가 필요합니다. 해당 명령이 PATH에서 실행되는지 확인하세요.
-
-```bash
-command -v claude
-command -v codex
-command -v opencode
-command -v pi
-command -v gjc
-```
-
-Windows PowerShell:
-
-```powershell
-Get-Command claude
-Get-Command codex
-Get-Command opencode
-Get-Command pi
-Get-Command gjc
-```
-
-로그인/인증이 끝나 있는지도 확인하세요. PATH가 애매하면 `settings.json`의 `agent_programs`에 직접 경로를 지정할 수 있습니다.
-
-### `e` / `Enter`와 `Ctrl+N`은 뭐가 다른가요?
-
-`e`와 `Enter`는 선택한 저장 세션을 이어 실행하거나 이미 실행 중인 같은 세션에 다시 붙습니다.
-
-`Ctrl+N`은 새 세션 모달을 열어 새 터미널, `cokacdir`, 새 코딩 에이전트를 시작합니다.
-
-### Skip permissions는 언제 쓰나요?
-
-보통은 Normal을 쓰면 됩니다. Skip permissions는 에이전트가 명령 실행이나 파일 접근 전에 묻는 확인 절차를 우회하는 위험한 모드입니다.
-
-각 에이전트에서는 다음과 비슷한 효과가 납니다.
-
-| 에이전트 | 권한 우회 방식 |
-|---|---|
-| Claude Code | `--dangerously-skip-permissions` |
-| Codex | `--yolo` |
-| OpenCode | `OPENCODE_PERMISSION='{"*":"allow"}'` |
-| Pi | 별도 권한 우회 옵션 없음 |
-| GJC | 별도 권한 우회 옵션 없음 |
-
-신뢰하지 않는 저장소, 외부에서 받은 코드, 중요한 파일이 많은 폴더에서는 사용하지 마세요.
-
-### `Ctrl+]` / `Ctrl+[`가 안 먹혀요.
-
-일부 터미널은 `Ctrl+[`를 `Esc`로 보내거나, 특정 Ctrl 조합을 가로챌 수 있습니다. 이 경우 `Ctrl+]`를 먼저 써 보세요. 그래도 어렵다면 `keybinding.json`에서 `sessions.toggle_agent`와 `agent.toggle_sessions`를 다른 키로 바꾸면 됩니다.
-
-### 백그라운드 실행 대상은 언제 종료되나요?
-
-사용자가 명시적으로 종료하기 전까지 계속 살아 있습니다.
-
-종료 방법:
-
-- 현재 코딩 에이전트/일반 터미널 화면에서 `Ctrl+K`
-- 세션 목록에서 실행 중인 세션을 선택하고 `Ctrl+K`
-- 전체 정리: `cokacmux killall`
-
-`cokacdir` 화면에서는 `Ctrl+K`가 `cokacdir`에 전달되므로, cokacmux 쪽에서 종료하려면 세션 목록에서 해당 실행 항목을 선택하고 `Ctrl+K`를 누르세요.
-
-`q`나 `Ctrl+Q`로 TUI를 종료해도 백그라운드 실행 대상은 자동 종료하지 않습니다.
-
-### `Delete`와 `Ctrl+K`는 왜 둘 다 있나요?
-
-서로 대상이 다릅니다.
-
-| 키 | 대상 | 결과 |
-|---|---|---|
-| `Delete` / `d` | 저장된 세션 기록 | 실제 세션 데이터 삭제 |
-| `Ctrl+K` | 실행 중인 백그라운드 실행 대상 | 코딩 에이전트/일반 터미널 종료. `cokacdir`은 세션 목록에서 종료 |
-
-### 검색이 느릴 수 있나요?
-
-세션이 많고 본문이 길면 시간이 걸릴 수 있습니다. Text search는 백그라운드에서 실행되고 검색창에 Searching 상태와 진행률이 표시됩니다. AI search는 미리보기 인덱싱과 agent 실행 단계가 있어 더 오래 걸릴 수 있으며, 중앙 오버레이에 현재 단계가 표시됩니다.
-
-### 맥북에 PageUp/PageDown 키가 없어요.
-
-에이전트 화면 page scroll은 기본적으로 `Shift+Alt+↑`, `Shift+Alt+↓`도 지원하므로 전용 Page 키가 없어도 사용할 수 있습니다. `fn+↑`, `fn+↓`가 PageUp/PageDown으로 동작하는 터미널에서는 `Shift+Alt+PageUp`, `Shift+Alt+PageDown`도 같은 동작입니다. 터미널이 이 키를 전달하지 않으면 `keybinding.json`에서 다른 키를 지정하세요. 예를 들어 에이전트 스크롤을 `alt+u`, `alt+d`로 바꿀 수 있습니다.
-
-### Windows Terminal에서 `Shift+Alt+↑` / `Shift+Alt+↓`가 스크롤되지 않아요.
-
-Windows Terminal은 이 조합을 pane resize 기본 단축키로 사용할 수 있습니다. 이 경우 키가 앱까지 전달되지 않으므로 `Alt+PageUp` / `Alt+PageDown`을 사용하거나 Windows Terminal의 해당 action을 해제하세요.
-
-### Windows에서 한글이나 박스 문자가 깨져요.
-
-Windows Terminal 사용을 권장합니다. 글꼴은 한글과 박스 문자를 지원하는 등폭 글꼴을 선택하세요. 예를 들면 Cascadia Mono, D2Coding, JetBrains Mono 계열이 무난합니다.
-
-### 화면이 깨지거나 커서 위치가 이상해요.
-
-터미널 폭을 80칸 이상으로 넓혀 보세요. 그래도 문제가 있으면 `r`로 새로고침하거나 앱을 다시 실행하세요. 문제가 반복되면 `cokacmux --debug`로 로그를 남겨 확인하세요.
-
----
-
-## 13. 문제가 생겼을 때
-
-### 빠른 점검 순서
-
-1. 버전 확인:
-
-```bash
-cokacmux --version
-```
-
-2. 세션 탐색 확인:
-
-```bash
-cokacmux --check
-```
-
-3. 에이전트 CLI 확인:
+아래 명령 중 내가 쓰는 것만 확인하면 됩니다.
 
 ```bash
 claude --version
@@ -1220,45 +98,241 @@ pi --help
 gjc --help
 ```
 
-4. 디버그 모드로 실행:
+이 중 하나라도 잘 실행되면 `cokacmux`에서 그 도구의 대화를 다시 열 수 있습니다.
+
+---
+
+## 3. 처음 실행하기
+
+명령창에서 실행합니다.
+
+```bash
+cokacmux
+```
+
+처음 실행하면 `cokacmux`가 필요한 폴더를 자동으로 만듭니다.
+
+한 번도 쓰지 않은 코딩 도구가 있어도 괜찮습니다. 그 도구의 대화만 비어 있을 뿐입니다.
+
+화면은 크게 두 부분입니다.
+
+| 위치 | 내용 |
+|---|---|
+| 왼쪽 | 대화 목록 |
+| 오른쪽 | 선택한 대화 내용 |
+
+목록에는 아래 정보가 보입니다.
+
+| 칸 | 뜻 |
+|---|---|
+| 상태 | 지금 실행 중인지 보여줍니다. |
+| 도구 | Claude Code, Codex, OpenCode, Pi, GJC 중 어디서 나온 대화인지 보여줍니다. |
+| 제목 | 대화 이름입니다. 직접 바꿀 수 있습니다. |
+| 시간 | 마지막으로 바뀐 지 얼마나 됐는지입니다. |
+| 폴더 | 그 대화가 작업하던 폴더입니다. |
+
+---
+
+## 4. 기본 사용법
+
+### 처음에는 이렇게 해보세요
+
+처음에는 지우기나 위험한 실행을 하지 말고 화면 이동만 익혀 보세요.
+
+| 순서 | 해볼 일 | 키 또는 명령 |
+|---|---|---|
+| 1 | 대화가 보이는지 확인 | `cokacmux --check` |
+| 2 | 화면 열기 | `cokacmux` |
+| 3 | 목록에서 이동 | `↑` / `↓` |
+| 4 | 오른쪽 내용으로 이동 | `Tab` |
+| 5 | 오른쪽 내용 읽기 | `↑` / `↓` |
+| 6 | 검색창 열기 | `Ctrl+F` |
+| 7 | 다시 열기 창만 열고 닫기 | `e`, `Esc` |
+| 8 | 복사 창만 열고 닫기 | `c`, `Esc` |
+| 9 | 삭제 창만 열고 닫기 | `Delete`, `Esc` |
+
+### 대화 읽기
+
+`↑` / `↓`로 대화를 고릅니다. 선택이 바뀌면 오른쪽 내용도 바뀝니다.
+
+오른쪽 내용을 읽으려면 `Tab`을 누르세요. 다시 목록으로 돌아가려면 `Tab`을 한 번 더 누르면 됩니다.
+
+### 검색하기
+
+`Ctrl+F`를 누릅니다.
+
+| 하고 싶은 일 | 방법 |
+|---|---|
+| 글자로 찾기 | `Enter`를 누르고 검색어를 입력합니다. |
+| AI로 찾기 | `2`를 누르고 찾고 싶은 내용을 입력합니다. |
+| 검색 결과 지우기 | 빈 검색어로 다시 검색하거나 `Esc`를 누릅니다. |
+
+AI로 찾으려면 먼저 설정 화면에서 사용할 코딩 도구를 골라야 합니다. 설정 화면은 `,` 키로 엽니다.
+
+### 대화 다시 열기
+
+대화를 고르고 `e` 또는 `Enter`를 누릅니다.
+
+다시 열기 창에서 `Normal`이라고 보이면 그것을 고르세요. 이것이 보통 실행입니다.
+
+`Skip permissions`라고 보이는 선택지는 위험한 실행입니다. 코딩 도구가 파일 수정이나 명령 실행 전에 묻는 확인을 줄입니다. 내가 믿는 폴더에서만 쓰세요.
+
+대화를 실행한 뒤 목록으로 돌아오려면 `Ctrl+]` 또는 `Ctrl+[`를 누릅니다. 이때 코딩 도구는 꺼지지 않습니다.
+
+### 새 작업 열기
+
+`Ctrl+N`을 누릅니다.
+
+열 수 있는 것은 세 가지입니다.
+
+| 선택 | 뜻 |
+|---|---|
+| Terminal | 화면에 보이는 이름입니다. 일반 명령창을 엽니다. |
+| cokacdir | `cokacdir`를 엽니다. |
+| Coding agent | 화면에 보이는 이름입니다. 새 코딩 도구를 엽니다. |
+
+새 코딩 도구를 열 때는 Claude Code, Codex, OpenCode, Pi, GJC 중 하나를 고릅니다.
+
+### 실행 중인 화면으로 돌아가기
+
+코딩 도구를 실행한 뒤 목록으로 돌아와도 그 도구는 계속 살아 있습니다.
+
+| 하고 싶은 일 | 키 |
+|---|---|
+| 목록으로 돌아가기 | `Ctrl+]` 또는 `Ctrl+[` |
+| 다시 실행 화면으로 가기 | `Ctrl+]` 또는 `Ctrl+[` |
+| 지금 실행 중인 화면 끄기 | `Ctrl+K` |
+| 실행 중인 모든 것 끄기 | `cokacmux killall` |
+
+### 대화 복사하기
+
+대화를 고르고 `c`를 누릅니다.
+
+| 선택 | 뜻 |
+|---|---|
+| 대화만 복사 | 대화 기록만 하나 더 만듭니다. |
+| 폴더도 함께 복사 | 작업 폴더까지 새 폴더로 복사합니다. |
+
+폴더까지 복사하면 시간이 걸릴 수 있습니다.
+
+### 제목 바꾸기
+
+대화를 고르고 `t`를 누릅니다.
+
+제목만 바뀝니다. 원래 대화 내용은 바뀌지 않습니다.
+
+제목 편집창에서 `Ctrl+T`를 누르면 AI가 제목 초안을 만들어 줍니다.
+
+### 대화 삭제하기
+
+대화를 고르고 `Delete` 또는 `d`를 누릅니다.
+
+삭제하면 저장된 대화 기록이 실제로 지워집니다. 중요한 대화는 먼저 따로 보관하세요.
+
+---
+
+## 5. 자주 쓰는 키
+
+### 대화 목록
+
+| 키 | 동작 |
+|---|---|
+| `↑` / `↓` | 위아래 이동 |
+| `PageUp` / `PageDown` | 많이 이동 |
+| `Home` / `End` | 처음 / 끝으로 이동 |
+| `Tab` | 왼쪽 목록과 오른쪽 내용 사이 이동 |
+| `Ctrl+F` | 검색 |
+| `e` / `Enter` | 대화 다시 열기 |
+| `Ctrl+N` | 새 작업 열기 |
+| `c` | 대화 복사 |
+| `t` | 제목 바꾸기 |
+| `Delete` / `d` | 대화 삭제 |
+| `r` | 목록 다시 읽기 |
+| `q` 또는 `Ctrl+Q` | 종료 |
+
+### 코딩 도구 화면
+
+| 키 | 동작 |
+|---|---|
+| `Ctrl+]` / `Ctrl+[` | 목록으로 돌아가기 |
+| `Ctrl+K` | 지금 화면 끄기 |
+| `Ctrl+N` | 새 작업 열기 |
+| `Ctrl+B` | 왼쪽 실행 목록 보이기/숨기기 |
+| `Ctrl+F` | 오른쪽에 `cokacdir` 보이기/숨기기 |
+| `Ctrl+T` | 오른쪽에 명령창 보이기/숨기기 |
+| `Ctrl+PageUp` / `Ctrl+PageDown` | 이전/다음 실행 화면으로 이동 |
+| `Shift+↑` / `Shift+↓` | 한 줄씩 위아래로 읽기 |
+| `Alt+PageUp` / `Alt+PageDown` | 한 화면씩 위아래로 읽기 |
+
+### 작은 선택창
+
+| 키 | 동작 |
+|---|---|
+| `Enter` | 선택한 것 실행 |
+| `↑` / `↓` | 선택 이동 |
+| `Tab` | 다음 항목으로 이동 |
+| `Esc` | 닫기 |
+
+---
+
+## 6. 문제가 생겼을 때
+
+### 대화가 하나도 안 보여요
+
+아래를 확인하세요.
+
+1. Claude Code, Codex, OpenCode, Pi, GJC 중 하나를 한 번이라도 사용했는지 확인합니다.
+2. 아래 명령을 실행합니다.
+
+```bash
+cokacmux --check
+```
+
+3. 그래도 안 되면 아래 명령으로 실행한 뒤 나온 기록을 확인합니다.
 
 ```bash
 cokacmux --debug
 ```
 
-### 디버그 로그
+### 대화는 보이는데 다시 열리지 않아요
 
-기본 런타임 로그는 보통 자동으로 켜져 `~/.cokacmux/debug/cokacmux.log`에 기록됩니다. TUI, 세션 목록, 검색, 미리보기, 에이전트 시작/연결, 백그라운드 데몬, provider 처리, 변환/복제 흐름이 이 파일에 모입니다. `--debug` 또는 `COKACMUX_DEBUG=1`은 로그를 명시적으로 켜는 방법이고, 로그를 끄고 싶으면 `COKACMUX_DEBUG=0`으로 실행하세요.
-
-더 자세한 원인 분석이 필요하면 `--trace` 또는 `COKACMUX_TRACE=1`을 사용할 수 있습니다.
+내가 쓰는 코딩 도구가 설치되어 있고 로그인되어 있는지 확인하세요.
 
 ```bash
-cokacmux --trace
+claude --version
+codex --version
+opencode --version
+pi --help
+gjc --help
 ```
 
-`--trace`는 `--debug`보다 훨씬 많은 내용을 기록합니다. 로그 파일이 빨리 커질 수 있으므로, 평소 사용보다는 문제를 재현할 때만 쓰는 편이 좋습니다.
+### `Ctrl+]` / `Ctrl+[`가 안 돼요
 
-각 줄에는 시간, 프로세스 ID, 스레드 정보, 이벤트 이름, 세부 JSON이 함께 들어갑니다. 백그라운드 실행 대상처럼 별도 프로세스에서 발생한 로그도 같은 파일에 append됩니다.
+일부 명령창은 특정 키를 앱에 전달하지 않을 수 있습니다. 먼저 `Ctrl+]`를 써 보세요.
 
-UI stall 진단은 `~/.cokacmux/debug/cokacmux-stalls.log`에 따로 남습니다. 이 파일은 문제 재현에 필요한 최소 증거를 남기기 위해 `--debug` 없이도 제한적으로 기록될 수 있습니다.
+### Windows에서 글자가 깨져요
 
-로그 파일이 커지면 기존 파일은 `<파일명>.1`로 회전되고 새 파일에 이어서 기록됩니다.
+Windows Terminal을 써 보세요. 글꼴은 한글이 잘 보이는 글꼴을 고르면 됩니다.
+
+### 화면이 깨져 보여요
+
+명령창을 더 넓게 만든 뒤 `r`을 눌러 새로고침하세요.
 
 ---
 
-## 14. 업데이트와 제거
+## 7. 업데이트와 제거
 
 ### 업데이트
 
-설치 명령을 다시 실행하면 새 버전으로 덮어씁니다.
+설치할 때 쓴 명령을 다시 실행하면 새 버전으로 바뀝니다.
 
-macOS/Linux:
+macOS / Linux:
 
 ```bash
 curl -fsSL https://cokacmux.cokac.com/manage.sh | bash
 ```
 
-Windows PowerShell:
+Windows:
 
 ```powershell
 irm https://cokacmux.cokac.com/manage.ps1 | iex
@@ -1266,109 +340,29 @@ irm https://cokacmux.cokac.com/manage.ps1 | iex
 
 ### 제거
 
-macOS/Linux:
+설치된 실행 파일을 지우면 됩니다.
 
-- 실행 파일: `/usr/local/bin/cokacmux` 또는 `~/.local/bin/cokacmux`
-- 설정까지 지우려면: `~/.cokacmux/`
+설정과 임시 파일까지 지우고 싶으면 아래 폴더를 지우세요.
 
-Windows:
-
-- 실행 파일과 설치 폴더: `%LOCALAPPDATA%\cokacmux\`
-- 설정까지 지우려면: `C:\Users\사용자이름\.cokacmux\`
-
-원본 에이전트 세션 데이터는 별도 위치에 있으므로, 위 파일을 지워도 원본 에이전트 데이터가 자동으로 삭제되지는 않습니다.
-
----
-
-## 15. 소스에서 빌드하기
-
-일반 사용자는 설치 스크립트를 쓰면 됩니다. 직접 빌드하려면 Rust가 필요합니다.
-
-필요한 것:
-
-- Rust 안정 버전: https://rustup.rs
-- C 컴파일러: OpenCode 지원을 위해 SQLite를 함께 빌드합니다.
-- macOS: Xcode Command Line Tools
-- Linux: `build-essential` 또는 `gcc`
-- Windows: MSVC 빌드 도구 또는 `build.py`가 준비하는 Windows gnullvm/zig 빌드 도구
-- 여러 OS용으로 한 번에 빌드하려면 Python 3. `build.py --setup`이 `zig` 등 cross build 도구를 로컬로 준비합니다.
-
-빌드:
-
-```bash
-git clone https://github.com/kstost/cokacmux
-cd cokacmux
-cargo build --release --bin cokacmux
-./target/release/cokacmux
-```
-
-개발 중 검증:
-
-```bash
-cargo test
-cargo fmt --check
-cargo clippy --all-targets --all-features
-```
-
-여러 운영체제용 빌드:
-
-```bash
-python build.py --setup
-python build.py --all           # macOS + Linux targets
-python build.py --all --windows # macOS + Linux + Windows targets
-python build.py --windows       # Windows targets only
-python build.py --status
-```
-
-`--setup`은 Rust, zig, cargo-zigbuild, macOS SDK를 준비합니다. Windows cross build 도구는 필요할 때 자동 설정을 시도하지만, 미리 준비하려면 `python build.py --setup-windows`를 실행하세요. Windows에서 Visual Studio/MSVC linker가 없는 경우 `windows-x86_64`와 `windows-arm64` 별칭은 gnullvm toolchain 쪽으로 자동 해석됩니다. 명시적으로 고르고 싶으면 `windows-x86_64-msvc`, `windows-arm64-msvc`, `windows-x86_64-gnullvm`, `windows-arm64-gnullvm` target을 사용하세요.
-
-산출물은 보통 `dist_beta/cokacmux-<OS>-<CPU>[.exe]` 형태로 만들어집니다. Windows gnullvm target은 `dist_beta/cokacmux-windows-<CPU>-gnullvm.exe`처럼 toolchain suffix가 붙습니다.
-
----
-
-## 16. 작동 원리
-
-지원 provider는 세션 데이터를 서로 다른 방식으로 저장합니다.
-
-| 에이전트 | 저장 형식 |
+| 운영체제 | 폴더 |
 |---|---|
-| Claude Code | 작업 폴더별 JSONL 파일 |
-| Codex | 날짜별 JSONL rollout 파일과 SQLite 인덱스 |
-| OpenCode | SQLite 데이터베이스 |
-| Pi | 작업 폴더별 JSONL 파일. `PI_CODING_AGENT_SESSION_DIR`을 쓰면 지정 디렉터리 바로 아래의 JSONL 파일 |
-| GJC | 작업 폴더별 JSONL 파일. 홈/임시 폴더 안의 cwd는 GJC 방식의 짧은 상대 경로 디렉터리로 저장 |
+| macOS / Linux | `~/.cokacmux/` |
+| Windows | `C:\Users\사용자이름\.cokacmux\` |
 
-cokacmux는 이 데이터를 읽어 공통 모델로 표현합니다. 그래서 한 화면에서 여러 에이전트 세션을 같이 보여주고, 검색하고, 미리보기하고, 복제할 수 있습니다.
-
-에이전트를 실행할 때는 자체 AI 엔진을 쓰지 않습니다. 사용자의 시스템에 설치된 `claude`, `codex`, `opencode`, `pi`, `gjc` CLI를 PTY 안에서 실행하고, TUI가 그 화면에 붙었다 떨어졌다 하는 방식입니다.
-
-백그라운드 실행 대상 정보는 `~/.cokacmux/agents/`에 저장됩니다. 이 정보 덕분에 세션 목록으로 돌아와도 코딩 에이전트, 터미널, `cokacdir`이 계속 살아 있고, 나중에 다시 연결할 수 있습니다.
+원래 코딩 도구들이 저장한 대화 기록은 따로 있습니다. 위 폴더를 지워도 자동으로 지워지지 않습니다.
 
 ---
 
-## 더 알고 싶다면
+## 8. 알아둘 점
 
-- [`docs/KEYBINDINGS.md`](docs/KEYBINDINGS.md): 단축키 파일 형식, 키 이름, 전체 액션 목록
-- [`docs/PLAN.md`](docs/PLAN.md): 전체 설계 배경과 에이전트별 저장 형식 분석
-- [`docs/RESULTS.md`](docs/RESULTS.md): 실제 세션 데이터로 검증한 결과
+cokacmux는 내 컴퓨터에 저장된 대화 기록을 읽어서 보여줍니다.
 
----
+대화를 다시 열 때는 내 컴퓨터에 설치된 `claude`, `codex`, `opencode`, `pi`, `gjc` 명령을 실행합니다.
 
-## 라이선스 / 만든 사람
+`q`나 `Ctrl+Q`로 cokacmux를 종료해도 실행 중인 코딩 도구는 자동으로 꺼지지 않습니다. 끄려면 `Ctrl+K` 또는 `cokacmux killall`을 쓰세요.
 
-- 라이선스: MIT
-- 만든 사람: cokac <monogatree@gmail.com>
-- 저장소: https://github.com/kstost/cokacmux
-- 공식 페이지: https://cokacmux.cokac.com
+대화 삭제, 폴더 복사, 위험한 실행을 하기 전에는 중요한 파일을 따로 보관하세요.
 
-문제가 생기거나 새 기능 제안이 있으면 GitHub Issues로 알려주세요.
+문제가 생기거나 새 기능을 제안하고 싶으면 아래 주소를 이용하세요.
 
----
-
-## 면책조항
-
-이 소프트웨어는 있는 그대로 제공되며, 명시적이든 묵시적이든 어떠한 종류의 보증도 제공하지 않습니다. 여기에는 상품성, 특정 목적 적합성, 비침해성에 대한 보증이 포함되지만 이에 한정되지 않습니다.
-
-어떠한 경우에도 작성자, 저작권자 또는 기여자는 이 소프트웨어의 사용 또는 사용 불능과 관련해 발생하는 어떠한 청구, 손해 또는 기타 책임에 대해 책임지지 않습니다. 여기에는 데이터 손실 또는 손상, 시스템 오작동, 보안 문제, 금전적 손실, 직접적/간접적/부수적/특별/징벌적/결과적 손해가 포함되지만 이에 한정되지 않습니다.
-
-이 소프트웨어를 사용하는 데 따른 모든 위험과 책임은 사용자 본인에게 있습니다.
+https://github.com/kstost/cokacmux
