@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use chrono::{Duration, Utc};
 use serde_json::{json, Value};
@@ -33,25 +34,60 @@ pub fn wrap_session_for_context_convert(
     source: &UniversalSession,
     target_provider: Provider,
 ) -> UniversalSession {
+    wrap_session_with_context_text(
+        source,
+        target_provider,
+        context_user_message_text(source),
+        "two_message_context_wrapper",
+        None,
+    )
+}
+
+pub fn wrap_session_for_context_file_reference(
+    source: &UniversalSession,
+    target_provider: Provider,
+    context_file_path: &Path,
+) -> UniversalSession {
+    wrap_session_with_context_text(
+        source,
+        target_provider,
+        context_file_reference_message_text(context_file_path),
+        "file_reference_context_wrapper",
+        Some(context_file_path),
+    )
+}
+
+fn wrap_session_with_context_text(
+    source: &UniversalSession,
+    target_provider: Provider,
+    context: String,
+    strategy: &str,
+    context_file_path: Option<&Path>,
+) -> UniversalSession {
     let now = Utc::now();
     let created_at = now;
     let assistant_at = created_at + Duration::seconds(1);
     let session_id = target_native_session_id(target_provider);
     let user_id = target_native_message_id(target_provider);
     let assistant_id = target_native_message_id(target_provider);
-    let context = context_user_message_text(source);
+    let mut context_meta = json!({
+        "source_provider": source.origin.provider.map(|p| p.as_str()),
+        "source_session_id": &source.session_id,
+        "target_session_id": &session_id,
+        "target_provider": target_provider.as_str(),
+        "strategy": strategy,
+    });
+    if let Some(path) = context_file_path {
+        if let Some(object) = context_meta.as_object_mut() {
+            object.insert(
+                "context_file_path".into(),
+                Value::String(path.display().to_string()),
+            );
+        }
+    }
 
     let mut extras = BTreeMap::new();
-    extras.insert(
-        "context_convert".into(),
-        json!({
-            "source_provider": source.origin.provider.map(|p| p.as_str()),
-            "source_session_id": &source.session_id,
-            "target_session_id": &session_id,
-            "target_provider": target_provider.as_str(),
-            "strategy": "two_message_context_wrapper",
-        }),
-    );
+    extras.insert("context_convert".into(), context_meta);
 
     let mut wrapped = UniversalSession {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -88,6 +124,7 @@ pub fn wrap_session_for_context_convert(
             raw: json!({
                 "source_provider": source.origin.provider.map(|p| p.as_str()),
                 "source_session_id": &source.session_id,
+                "context_file_path": context_file_path.map(|path| path.display().to_string()),
             }),
         },
         extras: BTreeMap::new(),
@@ -143,6 +180,17 @@ pub fn context_user_message_text(source: &UniversalSession) -> String {
     }
     context.push_str(CONTEXT_CONTINUATION_PROMPT);
     context
+}
+
+pub fn context_file_contents(source: &UniversalSession) -> String {
+    render_source_session(source)
+}
+
+pub fn context_file_reference_message_text(context_file_path: &Path) -> String {
+    format!(
+        "The complete prior session context is stored in this file:\n{}\n\nBefore handling the user's next request, read this file first and use it as the full context for all work so far.\n\nYou should keep working from that file context. If you got it, then say ok",
+        context_file_path.display()
+    )
 }
 
 fn context_convert_title(source: &UniversalSession) -> Option<String> {
@@ -453,6 +501,56 @@ mod tests {
         assert_eq!(
             wrapped.messages[1].parent_id,
             Some(wrapped.messages[0].id.clone())
+        );
+    }
+
+    #[test]
+    fn file_reference_wrapper_points_to_context_file_without_inlining_source() {
+        let mut source = UniversalSession::new("source-id", Provider::Codex, "/repo");
+        source.messages.push(UMessage {
+            id: "m1".into(),
+            parent_id: None,
+            index: 0,
+            timestamp: None,
+            role: Role::User,
+            model: None,
+            usage: None,
+            stop_reason: None,
+            content: vec![ContentBlock::text("large prior work")],
+            flags: MessageFlags::default(),
+            provenance: Provenance {
+                source_event_type: "test".into(),
+                raw: json!({}),
+            },
+            extras: BTreeMap::new(),
+        });
+        let path = Path::new("/tmp/cokacmux/context/source.md");
+
+        let wrapped = wrap_session_for_context_file_reference(&source, Provider::Claude, path);
+
+        assert_eq!(wrapped.messages.len(), 2);
+        let ContentBlock::Text { text, .. } = &wrapped.messages[0].content[0] else {
+            panic!("expected text context");
+        };
+        assert!(text.contains("/tmp/cokacmux/context/source.md"));
+        assert!(text.contains("read this file first"));
+        assert!(!text.contains("large prior work"));
+        let ContentBlock::Text { text, .. } = &wrapped.messages[1].content[0] else {
+            panic!("expected ack text");
+        };
+        assert_eq!(text, CONTEXT_ACK);
+
+        let context_meta = wrapped
+            .extras
+            .get("context_convert")
+            .expect("expected context metadata");
+        assert_eq!(
+            context_meta["strategy"],
+            serde_json::json!("file_reference_context_wrapper")
+        );
+        assert_eq!(
+            context_meta["context_file_path"],
+            serde_json::json!("/tmp/cokacmux/context/source.md")
         );
     }
 }

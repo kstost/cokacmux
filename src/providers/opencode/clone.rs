@@ -78,6 +78,7 @@ pub fn clone_session_rows(
         }
     }
     super::db::ensure_schema(&conn)?;
+    let session_message_has_seq = super::db::table_has_column(&conn, "session_message", "seq")?;
 
     let new_session_id = opts
         .new_session_id
@@ -106,7 +107,8 @@ pub fn clone_session_rows(
     // 4. Read session_message rows + build id_map(evt_old → evt_new). CRITICAL:
     // `session_message.id` is globally primary-keyed; reusing origin's id would
     // overwrite the origin row on INSERT OR REPLACE. Always re-mint.
-    let session_message_rows = read_session_message_rows(&tx, src_session_id)?;
+    let session_message_rows =
+        read_session_message_rows(&tx, src_session_id, session_message_has_seq)?;
     let evt_id_map: HashMap<String, String> = session_message_rows
         .iter()
         .map(|r| (r.id.clone(), ids::opencode_event_id()))
@@ -239,18 +241,36 @@ pub fn clone_session_rows(
     let mut session_messages_copied = 0usize;
     for row in &session_message_rows {
         let new_id = evt_id_map.get(&row.id).expect("evt id_map complete");
-        tx.execute(
-            "INSERT INTO session_message (id, session_id, type, time_created, time_updated, data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                new_id,
-                new_session_id,
-                row.type_tag,
-                row.time_created,
-                row.time_updated,
-                row.data,
-            ],
-        )?;
+        if session_message_has_seq {
+            tx.execute(
+                "INSERT INTO session_message
+                    (id, session_id, type, time_created, time_updated, seq, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    new_id,
+                    new_session_id,
+                    row.type_tag,
+                    row.time_created,
+                    row.time_updated,
+                    row.seq.unwrap_or(session_messages_copied as i64),
+                    row.data,
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO session_message
+                    (id, session_id, type, time_created, time_updated, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    new_id,
+                    new_session_id,
+                    row.type_tag,
+                    row.time_created,
+                    row.time_updated,
+                    row.data,
+                ],
+            )?;
+        }
         session_messages_copied = session_messages_copied.saturating_add(1);
     }
 
@@ -416,18 +436,25 @@ struct SessionMessageRow {
     type_tag: String,
     time_created: i64,
     time_updated: i64,
+    seq: Option<i64>,
     data: String,
 }
 
 fn read_session_message_rows(
     conn: &Connection,
     session_id: &str,
+    has_seq: bool,
 ) -> Result<Vec<SessionMessageRow>> {
-    let mut stmt = conn.prepare(
+    let sql = if has_seq {
+        "SELECT id, type, time_created, time_updated, data, seq
+         FROM session_message WHERE session_id = ?1
+         ORDER BY seq, time_created, id"
+    } else {
         "SELECT id, type, time_created, time_updated, data
          FROM session_message WHERE session_id = ?1
-         ORDER BY time_created, id",
-    )?;
+         ORDER BY time_created, id"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt
         .query_map(rusqlite::params![session_id], |row| {
             Ok(SessionMessageRow {
@@ -436,6 +463,7 @@ fn read_session_message_rows(
                 time_created: row.get(2)?,
                 time_updated: row.get(3)?,
                 data: row.get(4)?,
+                seq: if has_seq { Some(row.get(5)?) } else { None },
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

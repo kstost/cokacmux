@@ -93,6 +93,14 @@ pub fn install_to_default_db(
 
 #[cfg(feature = "discovery")]
 fn default_db_path() -> Option<PathBuf> {
+    if let Some(home) = crate::providers::discovery::configured_home_dir() {
+        return Some(
+            home.join(".local")
+                .join("share")
+                .join("opencode")
+                .join("opencode.db"),
+        );
+    }
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         return Some(
             PathBuf::from(local_app_data)
@@ -100,12 +108,9 @@ fn default_db_path() -> Option<PathBuf> {
                 .join("opencode.db"),
         );
     }
-    crate::providers::discovery::configured_home_dir().map(|h| {
-        h.join(".local")
-            .join("share")
-            .join("opencode")
-            .join("opencode.db")
-    })
+    std::env::var("APPDATA")
+        .ok()
+        .map(|app_data| PathBuf::from(app_data).join("opencode").join("opencode.db"))
 }
 #[cfg(not(feature = "discovery"))]
 fn default_db_path() -> Option<PathBuf> {

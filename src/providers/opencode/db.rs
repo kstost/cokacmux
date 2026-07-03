@@ -19,6 +19,22 @@ pub fn open_readwrite(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+pub fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_sql_ident(table)))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn quote_sql_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
 /// Minimal schema for a target opencode.db we create from scratch. Mirrors
 /// the columns we use; opencode itself adds more migrations.
 pub const SCHEMA_MIN: &str = r#"
@@ -87,6 +103,7 @@ CREATE TABLE IF NOT EXISTS session_message (
     type TEXT NOT NULL,
     time_created INTEGER NOT NULL,
     time_updated INTEGER NOT NULL,
+    seq INTEGER NOT NULL DEFAULT 0,
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS session_message_session_idx

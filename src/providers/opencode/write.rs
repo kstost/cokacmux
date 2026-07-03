@@ -106,6 +106,7 @@ pub fn to_db_connection_with_opts(
         }),
     );
     let tx = conn.transaction()?;
+    let session_message_has_seq = db::table_has_column(&tx, "session_message", "seq")?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     if !opts.overwrite {
         let existing: i64 = tx.query_row(
@@ -236,7 +237,13 @@ pub fn to_db_connection_with_opts(
     for m in &session.messages {
         if let Some(row) = opencode_session_message_write_row(m, &session.session_id, time_created)
         {
-            insert_session_message_row(&tx, &session.session_id, &row)?;
+            insert_session_message_row(
+                &tx,
+                &session.session_id,
+                &row,
+                session_message_has_seq,
+                session_message_rows_inserted as i64,
+            )?;
             session_message_rows_inserted = session_message_rows_inserted.saturating_add(1);
         }
     }
@@ -246,13 +253,20 @@ pub fn to_db_connection_with_opts(
             type_tag: "agent-switched".into(),
             time_created,
             time_updated: time_created,
+            seq: None,
             data: serde_json::json!({
                 "agent": agent_str.as_str(),
                 "time": {"created": time_created},
             })
             .to_string(),
         };
-        insert_session_message_row(&tx, &session.session_id, &agent_row)?;
+        insert_session_message_row(
+            &tx,
+            &session.session_id,
+            &agent_row,
+            session_message_has_seq,
+            session_message_rows_inserted as i64,
+        )?;
         session_message_rows_inserted = session_message_rows_inserted.saturating_add(1);
 
         let model_row = SessionMessageWriteRow {
@@ -260,13 +274,20 @@ pub fn to_db_connection_with_opts(
             type_tag: "model-switched".into(),
             time_created,
             time_updated: time_created,
+            seq: None,
             data: serde_json::json!({
                 "model": session_model_json(&session_model),
                 "time": {"created": time_created},
             })
             .to_string(),
         };
-        insert_session_message_row(&tx, &session.session_id, &model_row)?;
+        insert_session_message_row(
+            &tx,
+            &session.session_id,
+            &model_row,
+            session_message_has_seq,
+            session_message_rows_inserted as i64,
+        )?;
         session_message_rows_inserted = session_message_rows_inserted.saturating_add(1);
     }
 
@@ -410,6 +431,7 @@ struct SessionMessageWriteRow {
     type_tag: String,
     time_created: i64,
     time_updated: i64,
+    seq: Option<i64>,
     data: String,
 }
 
@@ -450,20 +472,39 @@ fn insert_session_message_row(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
     row: &SessionMessageWriteRow,
+    has_seq: bool,
+    default_seq: i64,
 ) -> Result<()> {
-    tx.execute(
-        "INSERT OR REPLACE INTO session_message
-            (id, session_id, type, time_created, time_updated, data)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            row.id.as_str(),
-            session_id,
-            row.type_tag.as_str(),
-            row.time_created,
-            row.time_updated,
-            row.data.as_str()
-        ],
-    )?;
+    if has_seq {
+        tx.execute(
+            "INSERT OR REPLACE INTO session_message
+                (id, session_id, type, time_created, time_updated, seq, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                row.id.as_str(),
+                session_id,
+                row.type_tag.as_str(),
+                row.time_created,
+                row.time_updated,
+                row.seq.unwrap_or(default_seq),
+                row.data.as_str()
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT OR REPLACE INTO session_message
+                (id, session_id, type, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                row.id.as_str(),
+                session_id,
+                row.type_tag.as_str(),
+                row.time_created,
+                row.time_updated,
+                row.data.as_str()
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -880,6 +921,7 @@ fn opencode_session_message_write_row(
         .and_then(|r| r.get("time_updated"))
         .and_then(|v| v.as_i64())
         .unwrap_or(time_created);
+    let seq = raw_row.and_then(|r| r.get("seq")).and_then(|v| v.as_i64());
     let raw_session_id = raw_row
         .and_then(|r| r.get("session_id"))
         .and_then(|v| v.as_str());
@@ -917,6 +959,7 @@ fn opencode_session_message_write_row(
         type_tag,
         time_created,
         time_updated,
+        seq,
         data: data.to_string(),
     })
 }
@@ -1306,4 +1349,108 @@ fn tool_output_string(output: &serde_json::Value) -> String {
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| output.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::universal::{Provider, UniversalSession};
+
+    #[test]
+    fn writes_session_message_seq_when_schema_requires_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (
+                id TEXT PRIMARY KEY,
+                worktree TEXT NOT NULL,
+                vcs TEXT,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                sandboxes TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_id TEXT,
+                slug TEXT NOT NULL DEFAULT '',
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                version TEXT NOT NULL DEFAULT '',
+                share_url TEXT,
+                summary_additions INTEGER,
+                summary_deletions INTEGER,
+                summary_files INTEGER,
+                summary_diffs TEXT,
+                revert TEXT,
+                permission TEXT,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                time_compacting INTEGER,
+                time_archived INTEGER,
+                workspace_id TEXT,
+                path TEXT,
+                agent TEXT,
+                model TEXT,
+                cost REAL NOT NULL DEFAULT 0,
+                tokens_input INTEGER NOT NULL DEFAULT 0,
+                tokens_output INTEGER NOT NULL DEFAULT 0,
+                tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+                tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+                tokens_cache_write INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let session = UniversalSession::new("ses_seq_required", Provider::OpenCode, "/tmp/project");
+        to_db_path(&session, &db_path).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let rows: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT type, seq FROM session_message
+                 WHERE session_id = 'ses_seq_required'
+                 ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("agent-switched".to_string(), 0),
+                ("model-switched".to_string(), 1),
+            ]
+        );
+    }
 }

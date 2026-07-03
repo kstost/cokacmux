@@ -177,12 +177,19 @@ pub fn from_db_connection(conn: &Connection, session_id: &str) -> Result<Univers
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let session_message_rows = if table_exists(conn, "session_message")? {
-        let mut stmt = conn.prepare(
+        let has_seq = db::table_has_column(conn, "session_message", "seq")?;
+        let sql = if has_seq {
+            "SELECT id, session_id, type, time_created, time_updated, data, seq
+             FROM session_message
+             WHERE session_id = ?1
+             ORDER BY seq ASC, time_created ASC, id ASC"
+        } else {
             "SELECT id, session_id, type, time_created, time_updated, data
              FROM session_message
              WHERE session_id = ?1
-             ORDER BY time_created ASC, id ASC",
-        )?;
+             ORDER BY time_created ASC, id ASC"
+        };
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt
             .query_map(rusqlite::params![session_id], |row| {
                 Ok(SessionMessageRow {
@@ -192,6 +199,7 @@ pub fn from_db_connection(conn: &Connection, session_id: &str) -> Result<Univers
                     time_created: row.get(3)?,
                     time_updated: row.get(4)?,
                     data: row.get(5)?,
+                    seq: if has_seq { Some(row.get(6)?) } else { None },
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -296,6 +304,7 @@ pub struct SessionMessageRow {
     pub type_tag: String,
     pub time_created: i64,
     pub time_updated: i64,
+    pub seq: Option<i64>,
     pub data: String, // JSON
 }
 

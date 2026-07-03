@@ -880,6 +880,7 @@ enum KeyAction {
     CloneOptionsTargetPrev,
     CloneOptionsSessionOnly,
     CloneOptionsFolderData,
+    CloneOptionsContextMode,
     CloneOptionsCancelChoice,
     NewSessionCancel,
     NewSessionConfirm,
@@ -1015,11 +1016,7 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
         &["ctrl+]", "ctrl+["],
     ),
     ("agent.kill", KeyAction::AgentKill, &["ctrl+k"]),
-    (
-        "agent.kill_all",
-        KeyAction::AgentKillAll,
-        &["ctrl+shift+k"],
-    ),
+    ("agent.kill_all", KeyAction::AgentKillAll, &["ctrl+shift+k"]),
     ("agent.new_shell", KeyAction::AgentNewShell, &["ctrl+n"]),
     (
         "agent.toggle_sidebar",
@@ -1280,6 +1277,11 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
         "clone_options.folder_data",
         KeyAction::CloneOptionsFolderData,
         &["2"],
+    ),
+    (
+        "clone_options.context_mode",
+        KeyAction::CloneOptionsContextMode,
+        &["m"],
     ),
     (
         "clone_options.cancel_choice",
@@ -2907,6 +2909,7 @@ enum InputMode {
         target_options: Vec<Provider>,
         selected: usize,
         folder_data: CloneFolderDataAvailability,
+        context_mode: session::clone::CloneContextMode,
     },
     NewSession {
         selected: usize,
@@ -2930,6 +2933,12 @@ enum InputMode {
         title: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone)]
+struct NoticeDialog {
+    title: String,
+    message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3083,6 +3092,13 @@ fn move_clone_option_index(index: usize, delta: i32) -> usize {
     (index as i32 + delta).rem_euclid(CLONE_OPTION_COUNT as i32) as usize
 }
 
+fn clone_context_mode_label(mode: session::clone::CloneContextMode) -> &'static str {
+    match mode {
+        session::clone::CloneContextMode::Inline => "Inline",
+        session::clone::CloneContextMode::FileReference => "File reference",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentLaunchMode {
     Normal,
@@ -3217,6 +3233,14 @@ struct PreviewEntry {
     wrap_width: usize,
     lines: Vec<String>,
     summary_style_states: Vec<PreviewSummaryStyleState>,
+    scrollbar_probe: Option<PreviewScrollbarProbe>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewScrollbarProbe {
+    width: usize,
+    height: usize,
+    needed: bool,
 }
 
 impl PreviewEntry {
@@ -3227,6 +3251,7 @@ impl PreviewEntry {
             wrap_width,
             lines,
             summary_style_states,
+            scrollbar_probe: None,
         }
     }
 }
@@ -3489,6 +3514,42 @@ struct AiTitleWorkerResult {
     outcome: std::result::Result<String, String>,
     elapsed_ms: u128,
     queued_at_epoch_ms: u64,
+}
+
+fn ai_title_failure_notice_message(
+    source: &SessionInfo,
+    provider: Provider,
+    error: &str,
+    elapsed_ms: u128,
+) -> String {
+    format!(
+        "AI title failed with {}.\n\nSession: {}\nSource: {}\nWorking directory: {}\nElapsed: {}\nReason: {}",
+        provider.as_str(),
+        &source.session_id,
+        source.provider.as_str(),
+        &source.cwd,
+        format_elapsed_ms(elapsed_ms),
+        truncate_width(error, 1800)
+    )
+}
+
+fn ai_search_failure_notice_message(
+    query: &str,
+    provider: Provider,
+    error: &str,
+    elapsed_ms: u128,
+) -> String {
+    format!(
+        "AI search failed with {}.\n\nQuery: {}\nElapsed: {}\nReason: {}",
+        provider.as_str(),
+        truncate_width(query, 240),
+        format_elapsed_ms(elapsed_ms),
+        truncate_width(error, 1800)
+    )
+}
+
+fn format_elapsed_ms(elapsed_ms: u128) -> String {
+    format!("{}.{:03}s", elapsed_ms / 1000, elapsed_ms % 1000)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -4307,6 +4368,18 @@ fn app_runtime_snapshot_debug_value(app: &App, verbose: bool) -> serde_json::Val
     snapshot.insert(
         "input_mode".into(),
         serde_json::json!(input_mode_label(&app.input_mode)),
+    );
+    snapshot.insert(
+        "notice_overlay".into(),
+        app.notice_overlay
+            .as_ref()
+            .map(|notice| {
+                serde_json::json!({
+                    "title": &notice.title,
+                    "message_len": notice.message.chars().count(),
+                })
+            })
+            .unwrap_or(serde_json::Value::Null),
     );
     snapshot.insert("status".into(), serde_json::json!(&app.status));
     snapshot.insert("sessions_len".into(), serde_json::json!(app.sessions.len()));
@@ -9016,6 +9089,7 @@ struct App {
     data_task_seq: u64,
     data_task: Option<DataTaskPending>,
     input_mode: InputMode,
+    notice_overlay: Option<NoticeDialog>,
     preview_cache: HashMap<PreviewKey, PreviewEntry>,
     preview_cache_order: VecDeque<PreviewKey>,
     preview_requested: Option<(PreviewKey, u64)>,
@@ -9178,6 +9252,7 @@ impl App {
             data_task_seq: 0,
             data_task: None,
             input_mode: InputMode::Normal,
+            notice_overlay: None,
             preview_cache: HashMap::new(),
             preview_cache_order: VecDeque::new(),
             preview_requested: None,
@@ -9605,7 +9680,13 @@ impl App {
                 );
             }
             Err(error) => {
-                self.status = format!("AI title failed: {}", truncate_width(&error, 100));
+                let message = ai_title_failure_notice_message(
+                    &result.source,
+                    result.provider,
+                    &error,
+                    result.elapsed_ms,
+                );
+                self.show_notice_overlay("AI title failed", message);
                 debug_log(
                     "ai_title_result_failed",
                     serde_json::json!({
@@ -12597,7 +12678,13 @@ impl App {
                         }),
                     );
                 } else {
-                    self.status = format!("AI search failed: {}", truncate_width(&error, 100));
+                    let message = ai_search_failure_notice_message(
+                        &result.query,
+                        result.provider,
+                        &error,
+                        result.elapsed_ms,
+                    );
+                    self.show_notice_overlay("AI search failed", message);
                     debug_log(
                         "ai_search_result_failed",
                         serde_json::json!({
@@ -12739,9 +12826,33 @@ impl App {
         self.input_mode = InputMode::Notice { title, message };
     }
 
+    fn show_notice_overlay(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        let title = title.into();
+        let message = message.into();
+        self.status = message
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or(&message)
+            .trim()
+            .to_string();
+        self.notice_overlay = Some(NoticeDialog {
+            title: title.clone(),
+            message: message.clone(),
+        });
+        debug_log(
+            "notice_overlay_show",
+            serde_json::json!({
+                "title": title,
+                "message_len": message.chars().count(),
+                "input_mode": input_mode_label(&self.input_mode),
+            }),
+        );
+    }
+
     fn promote_session_status_notice(&mut self) {
         if !matches!(self.input_mode, InputMode::Normal)
             || !self.show_sessions_view
+            || self.notice_overlay.is_some()
             || self.status_is_covered_by_session_overlay()
         {
             return;
@@ -15602,6 +15713,33 @@ impl App {
         Some(entry.lines.len())
     }
 
+    fn preview_needs_scrollbar(
+        &mut self,
+        key: &PreviewKey,
+        width: usize,
+        height: usize,
+    ) -> Option<bool> {
+        let entry = self.preview_cache.get_mut(key)?;
+        let width = width.max(1);
+        if let Some(probe) = entry.scrollbar_probe {
+            if probe.width == width && probe.height == height {
+                return Some(probe.needed);
+            }
+        }
+        let line_count = if entry.wrap_width == width {
+            entry.lines.len()
+        } else {
+            wrap_preview_line_count(&entry.text, width)
+        };
+        let needed = width > 1 && line_count > height;
+        entry.scrollbar_probe = Some(PreviewScrollbarProbe {
+            width,
+            height,
+            needed,
+        });
+        Some(needed)
+    }
+
     fn preview_visible_lines(&self, key: &PreviewKey, start: usize, height: usize) -> Vec<String> {
         self.preview_cache
             .get(key)
@@ -17784,14 +17922,12 @@ impl App {
                     killall_cokacmux().map_err(|error| error.to_string())
                 }))
                 .unwrap_or_else(|_| Err("killall worker panicked".to_string()));
-                let _ = result_tx.send(MainEvent::KillAllResult(Box::new(
-                    KillAllWorkerResult {
-                        seq,
-                        outcome,
-                        queued_at_epoch_ms: current_epoch_ms(),
-                        elapsed_ms: started.elapsed().as_millis(),
-                    },
-                )));
+                let _ = result_tx.send(MainEvent::KillAllResult(Box::new(KillAllWorkerResult {
+                    seq,
+                    outcome,
+                    queued_at_epoch_ms: current_epoch_ms(),
+                    elapsed_ms: started.elapsed().as_millis(),
+                })));
             });
         if let Err(e) = spawn_result {
             self.killall_pending = None;
@@ -18922,10 +19058,17 @@ impl App {
             target_options,
             selected: CLONE_OPTION_SESSION_ONLY,
             folder_data,
+            context_mode: session::clone::CloneContextMode::Inline,
         };
     }
 
-    fn clone_session_to(&mut self, info: SessionInfo, target: Provider, copy_folder_data: bool) {
+    fn clone_session_to(
+        &mut self,
+        info: SessionInfo,
+        target: Provider,
+        copy_folder_data: bool,
+        context_mode: session::clone::CloneContextMode,
+    ) {
         if self.reject_while_data_task_running("cloning a session") {
             return;
         }
@@ -18937,6 +19080,7 @@ impl App {
                 "target_provider": target.as_str(),
                 "cwd": &info.cwd,
                 "copy_folder_data": copy_folder_data,
+                "context_mode": context_mode.as_str(),
             }),
         );
         let seq = self.next_data_task_seq();
@@ -18946,17 +19090,31 @@ impl App {
         } else if same_provider {
             format!("cloning {} session", info.provider.as_str())
         } else if copy_folder_data {
-            format!(
-                "preparing {} context session for {} + folder data",
-                info.provider.as_str(),
-                target.as_str()
-            )
+            match context_mode {
+                session::clone::CloneContextMode::Inline => format!(
+                    "preparing {} context session for {} + folder data",
+                    info.provider.as_str(),
+                    target.as_str()
+                ),
+                session::clone::CloneContextMode::FileReference => format!(
+                    "preparing {} file-reference context for {} + folder data",
+                    info.provider.as_str(),
+                    target.as_str()
+                ),
+            }
         } else {
-            format!(
-                "preparing {} context session for {}",
-                info.provider.as_str(),
-                target.as_str()
-            )
+            match context_mode {
+                session::clone::CloneContextMode::Inline => format!(
+                    "preparing {} context session for {}",
+                    info.provider.as_str(),
+                    target.as_str()
+                ),
+                session::clone::CloneContextMode::FileReference => format!(
+                    "preparing {} file-reference context for {}",
+                    info.provider.as_str(),
+                    target.as_str()
+                ),
+            }
         };
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.data_task = Some(
@@ -18965,7 +19123,15 @@ impl App {
         );
         self.status = label;
         let Some(tx) = self.main_tx.clone() else {
-            let result = run_clone_worker(seq, info, target, copy_folder_data, cancel_token, None);
+            let result = run_clone_worker(
+                seq,
+                info,
+                target,
+                copy_folder_data,
+                context_mode,
+                cancel_token,
+                None,
+            );
             self.on_clone_worker_result(result);
             return;
         };
@@ -18978,6 +19144,7 @@ impl App {
                     info,
                     target,
                     copy_folder_data,
+                    context_mode,
                     cancel_token,
                     Some(worker_tx.clone()),
                 );
@@ -18996,6 +19163,7 @@ impl App {
                         "seq": seq,
                         "target_provider": target.as_str(),
                         "copy_folder_data": copy_folder_data,
+                        "context_mode": context_mode.as_str(),
                         "error": e.to_string(),
                     }),
                 );
@@ -19166,6 +19334,7 @@ fn run_clone_worker(
     source: SessionInfo,
     target: Provider,
     copy_folder_data: bool,
+    context_mode: session::clone::CloneContextMode,
     cancel_token: Arc<AtomicBool>,
     progress_tx: Option<Sender<MainEvent>>,
 ) -> CloneWorkerResult {
@@ -19294,6 +19463,7 @@ fn run_clone_worker(
             cwd: planned_folder_clone
                 .as_ref()
                 .map(|(_, target_cwd)| target_cwd.display().to_string()),
+            context_mode,
             ..Default::default()
         },
     ) {
@@ -20342,11 +20512,17 @@ fn check_ai_agent_process_result(
         return Err(AI_SEARCH_CANCELLED_ERROR.to_string());
     }
     if output.timed_out {
-        return Err(format!(
+        let mut error = format!(
             "{} timed out after {}s",
             provider.as_str(),
             output.duration.as_secs()
-        ));
+        );
+        let detail = ai_agent_process_details(output);
+        if detail != "no output" {
+            error.push_str(". ");
+            error.push_str(&truncate_width(&detail, 500));
+        }
+        return Err(error);
     }
     if !output.status_success() {
         return Err(ai_agent_process_error(provider.as_str(), output));
@@ -21193,6 +21369,15 @@ fn join_pipe_reader(
 }
 
 fn ai_agent_process_error(tool: &str, output: &AiAgentCommandOutput) -> String {
+    format!(
+        "{} exited {:?}: {}",
+        tool,
+        output.status.and_then(|status| status.code()),
+        truncate_width(&ai_agent_process_details(output), 500)
+    )
+}
+
+fn ai_agent_process_details(output: &AiAgentCommandOutput) -> String {
     let mut details = Vec::new();
     if let Some(stdout) = command_output_tail("stdout", &output.stdout) {
         details.push(stdout);
@@ -21200,17 +21385,11 @@ fn ai_agent_process_error(tool: &str, output: &AiAgentCommandOutput) -> String {
     if let Some(stderr) = command_output_tail("stderr", &output.stderr) {
         details.push(stderr);
     }
-    let detail = if details.is_empty() {
+    if details.is_empty() {
         "no output".to_string()
     } else {
         details.join("; ")
-    };
-    format!(
-        "{} exited {:?}: {}",
-        tool,
-        output.status.and_then(|status| status.code()),
-        truncate_width(&detail, 500)
-    )
+    }
 }
 
 fn command_output_tail(label: &str, text: &str) -> Option<String> {
@@ -22687,6 +22866,19 @@ fn handle_paste_input_event(app: &mut App, text: String) {
             "input_paste_ignored",
             serde_json::json!({
                 "reason": "empty",
+                "snapshot": app_runtime_snapshot_debug_value(app, false),
+            }),
+        );
+        return;
+    }
+    if app.notice_overlay.is_some() || matches!(app.input_mode, InputMode::Notice { .. }) {
+        debug_log(
+            "input_paste_ignored",
+            serde_json::json!({
+                "reason": "notice",
+                "len": text.len(),
+                "agent_view": app.is_agent_view(),
+                "input_mode": input_mode_label(&app.input_mode),
                 "snapshot": app_runtime_snapshot_debug_value(app, false),
             }),
         );
@@ -30690,7 +30882,7 @@ fn windows_comspec() -> OsString {
 /// provider-backed session but an ephemeral shell pane spawned via the new
 /// session dialog. Reuses the existing AgentClient/daemon infrastructure
 /// (PTY + vt100 + socket) — `agent_launch_spec` branches on this to spawn
-/// `$SHELL` instead of the provider's resume command.
+/// the user's shell/default shell instead of the provider's resume command.
 const SHELL_SESSION_SOURCE_MARKER: &str = "@cokacmux-shell";
 
 fn is_shell_session_info(info: &SessionInfo) -> bool {
@@ -31127,18 +31319,20 @@ fn shell_launch_spec(info: &SessionInfo) -> AgentLaunchSpec {
     } else {
         Some(PathBuf::from(&info.cwd))
     };
-    let program = std::env::var("SHELL").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "cmd.exe".to_string()
-        } else {
-            "/bin/bash".to_string()
-        }
-    });
+    let program = std::env::var("SHELL").unwrap_or_else(|_| default_shell_program());
     AgentLaunchSpec {
         program,
         args: Vec::new(),
         env: Vec::new(),
         cwd,
+    }
+}
+
+fn default_shell_program() -> String {
+    if cfg!(windows) {
+        "powershell.exe".to_string()
+    } else {
+        "/bin/bash".to_string()
     }
 }
 
@@ -32365,6 +32559,19 @@ fn handle_ai_search_locked_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_notice_key(app: &mut App, key: KeyEvent) -> bool {
+    if let Some(notice) = app.notice_overlay.as_ref() {
+        if notice_dismiss_key(key) {
+            let dismissed_message = notice.message.clone();
+            app.notice_overlay = None;
+            if dismissed_message.as_str() == app.status.as_str() {
+                app.status.clear();
+            }
+            debug_log_key_event(key, "notice_overlay_dismiss");
+        } else {
+            debug_log_key_event(key, "notice_overlay_ignored");
+        }
+        return true;
+    }
     if !matches!(app.input_mode, InputMode::Notice { .. }) {
         return false;
     }
@@ -32389,20 +32596,19 @@ fn handle_killall_confirm_key(app: &mut App, key: KeyEvent) -> bool {
     if let InputMode::KillAllConfirm { selected } = &mut app.input_mode {
         let mut next_mode: Option<InputMode> = None;
         let mut start_killall = false;
-        let choose_option =
-            |option: KillAllOption,
-             start_killall: &mut bool,
-             next_mode: &mut Option<InputMode>,
-             status: &mut String| match option {
-                KillAllOption::Kill => {
-                    *start_killall = true;
-                    *next_mode = Some(InputMode::Normal);
-                }
-                KillAllOption::Cancel => {
-                    *status = "cancelled.".into();
-                    *next_mode = Some(InputMode::Normal);
-                }
-            };
+        let choose_option = |option: KillAllOption,
+                             start_killall: &mut bool,
+                             next_mode: &mut Option<InputMode>,
+                             status: &mut String| match option {
+            KillAllOption::Kill => {
+                *start_killall = true;
+                *next_mode = Some(InputMode::Normal);
+            }
+            KillAllOption::Cancel => {
+                *status = "cancelled.".into();
+                *next_mode = Some(InputMode::Normal);
+            }
+        };
 
         if keybindings.matches(KeyAction::KillAllConfirmCancel, key)
             || keybindings.matches(KeyAction::KillAllConfirmCancelChoice, key)
@@ -32412,12 +32618,7 @@ fn handle_killall_confirm_key(app: &mut App, key: KeyEvent) -> bool {
             debug_log_key_event(key, "killall_confirm_cancel");
         } else if keybindings.matches(KeyAction::KillAllConfirmConfirm, key) {
             let option = killall_option_at(*selected);
-            choose_option(
-                option,
-                &mut start_killall,
-                &mut next_mode,
-                &mut app.status,
-            );
+            choose_option(option, &mut start_killall, &mut next_mode, &mut app.status);
             debug_log(
                 "killall_confirm_confirm",
                 serde_json::json!({
@@ -33847,6 +34048,10 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
+    if let Some(notice) = app.notice_overlay.as_ref() {
+        draw_notice_modal(f, area, &notice.title, &notice.message);
+        return true;
+    }
     if draw_killall_pending_overlay(f, area, app.killall_pending.as_ref()) {
         return true;
     }
@@ -33916,6 +34121,7 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
         target_options: _,
         selected,
         folder_data,
+        context_mode,
     } = &app.input_mode
     {
         draw_clone_options_modal(
@@ -33925,6 +34131,7 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
             *target,
             *selected,
             folder_data,
+            *context_mode,
             &app.keybindings,
         );
     } else if let InputMode::NewSession {
@@ -34178,7 +34385,10 @@ fn draw_killall_pending_overlay(
     let elapsed = pending.started_at.elapsed();
     let lines = vec![
         Line::from(Span::styled(
-            format!("{} Turning off all running work", startup_spinner_frame(elapsed)),
+            format!(
+                "{} Turning off all running work",
+                startup_spinner_frame(elapsed)
+            ),
             Style::default()
                 .fg(THEME_FG_STRONG)
                 .bg(THEME_BG_ALT)
@@ -34197,8 +34407,7 @@ fn draw_killall_pending_overlay(
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
         )),
     ];
-    let modal_area =
-        modal_area_for_wrapped_lines(area, "Turning off all", &lines, 48, 92, 6, 10);
+    let modal_area = modal_area_for_wrapped_lines(area, "Turning off all", &lines, 48, 92, 6, 10);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -35634,28 +35843,40 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         target_options,
         selected,
         folder_data,
+        context_mode,
     } = &mut app.input_mode
     {
         let mut next_mode: Option<InputMode> = None;
-        let mut clone_action: Option<(SessionInfo, Provider, bool)> = None;
+        let mut clone_action: Option<(
+            SessionInfo,
+            Provider,
+            bool,
+            session::clone::CloneContextMode,
+        )> = None;
         let mut unavailable_reason: Option<String> = None;
         let choose_option = |option: CloneOption,
                              source: &SessionInfo,
                              target: Provider,
                              folder_data: &CloneFolderDataAvailability,
-                             clone_action: &mut Option<(SessionInfo, Provider, bool)>,
+                             context_mode: session::clone::CloneContextMode,
+                             clone_action: &mut Option<(
+            SessionInfo,
+            Provider,
+            bool,
+            session::clone::CloneContextMode,
+        )>,
                              unavailable_reason: &mut Option<String>,
                              next_mode: &mut Option<InputMode>| {
             match option {
                 CloneOption::SessionOnly => {
-                    *clone_action = Some((source.clone(), target, false));
+                    *clone_action = Some((source.clone(), target, false, context_mode));
                     *next_mode = Some(InputMode::Normal);
                 }
                 CloneOption::FolderData => {
                     if let Some(reason) = folder_data.unavailable_reason() {
                         *unavailable_reason = Some(reason.to_string());
                     } else {
-                        *clone_action = Some((source.clone(), target, true));
+                        *clone_action = Some((source.clone(), target, true, context_mode));
                         *next_mode = Some(InputMode::Normal);
                     }
                 }
@@ -35681,6 +35902,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 source,
                 *target,
                 folder_data,
+                *context_mode,
                 &mut clone_action,
                 &mut unavailable_reason,
                 &mut next_mode,
@@ -35692,6 +35914,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                     "source_session_id": &source.session_id,
                     "target_provider": target.as_str(),
                     "selected": *selected,
+                    "context_mode": context_mode.as_str(),
                 }),
             );
         } else if keybindings.matches(KeyAction::CloneOptionsTargetNext, key) {
@@ -35741,6 +35964,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 source,
                 *target,
                 folder_data,
+                *context_mode,
                 &mut clone_action,
                 &mut unavailable_reason,
                 &mut next_mode,
@@ -35752,10 +35976,37 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 source,
                 *target,
                 folder_data,
+                *context_mode,
                 &mut clone_action,
                 &mut unavailable_reason,
                 &mut next_mode,
             );
+        } else if keybindings.matches(KeyAction::CloneOptionsContextMode, key) {
+            if *target == source.provider {
+                app.status = "context mode is not used for native copy.".into();
+                debug_log(
+                    "clone_options_context_mode_ignored",
+                    serde_json::json!({
+                        "source_provider": source.provider.as_str(),
+                        "source_session_id": &source.session_id,
+                        "target_provider": target.as_str(),
+                        "context_mode": context_mode.as_str(),
+                        "reason": "native_copy",
+                    }),
+                );
+            } else {
+                *context_mode = context_mode.toggled();
+                app.status = format!("context mode: {}", clone_context_mode_label(*context_mode));
+                debug_log(
+                    "clone_options_context_mode_toggle",
+                    serde_json::json!({
+                        "source_provider": source.provider.as_str(),
+                        "source_session_id": &source.session_id,
+                        "target_provider": target.as_str(),
+                        "context_mode": context_mode.as_str(),
+                    }),
+                );
+            }
         } else {
             debug_log_key_event(key, "clone_options_ignored");
         }
@@ -35778,8 +36029,8 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         if let Some(mode) = next_mode {
             app.input_mode = mode;
         }
-        if let Some((source, target, copy_folder_data)) = clone_action {
-            app.clone_session_to(source, target, copy_folder_data);
+        if let Some((source, target, copy_folder_data, context_mode)) = clone_action {
+            app.clone_session_to(source, target, copy_folder_data, context_mode);
         }
         return;
     }
@@ -38076,6 +38327,7 @@ fn draw_clone_options_modal(
     target: Provider,
     selected: usize,
     folder_data: &CloneFolderDataAvailability,
+    context_mode: session::clone::CloneContextMode,
     keybindings: &KeyBindings,
 ) {
     let intro = format!(
@@ -38090,6 +38342,7 @@ fn draw_clone_options_modal(
     };
     let target_line = format!("Target: {} ({})", target.as_str(), target_kind);
     let data_line = clone_options_data_line(folder_data);
+    let context_line = clone_options_context_line(source.provider, target, context_mode);
     let help_items = clone_options_help_items(keybindings);
     let lines = vec![
         Line::from(Span::styled(
@@ -38101,6 +38354,7 @@ fn draw_clone_options_modal(
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
         )),
         clone_options_data_status_line(folder_data, data_line),
+        clone_options_context_status_line(source.provider, target, context_line),
         Line::from(""),
         clone_options_button_line(selected, folder_data, target == source.provider),
         modal_help_line(&help_items),
@@ -38147,6 +38401,31 @@ fn clone_options_data_status_line(
         }
     };
     Line::from(Span::styled(data_line, style))
+}
+
+fn clone_options_context_line(
+    source_provider: Provider,
+    target_provider: Provider,
+    context_mode: session::clone::CloneContextMode,
+) -> String {
+    if source_provider == target_provider {
+        "Context mode: not used for native copy".to_string()
+    } else {
+        format!("Context mode: {}", clone_context_mode_label(context_mode))
+    }
+}
+
+fn clone_options_context_status_line(
+    source_provider: Provider,
+    target_provider: Provider,
+    context_line: String,
+) -> Line<'static> {
+    let style = if source_provider == target_provider {
+        Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT)
+    } else {
+        Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT)
+    };
+    Line::from(Span::styled(context_line, style))
 }
 
 fn clone_options_button_line(
@@ -38665,6 +38944,12 @@ fn clone_options_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
             "Tab",
             "target",
         ),
+        help_item(
+            keybindings,
+            KeyAction::CloneOptionsContextMode,
+            "m",
+            "context",
+        ),
         direct_help_item(
             format!(
                 "{}/{}/{}",
@@ -38878,16 +39163,16 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         " preview ".to_string()
     } else if let Some(info) = current {
         let key = PreviewKey::new(&info, app.preview_mode);
-        app.request_preview(info.clone(), key.clone(), inner.width as usize);
-        if let Some(full_line_count) = app.ensure_wrapped_preview(&key, inner.width as usize) {
-            show_scrollbar = inner.width > 1 && full_line_count > inner.height as usize;
+        let no_scroll_width = inner.width as usize;
+        app.request_preview(info.clone(), key.clone(), no_scroll_width);
+        if app.preview_cache.contains_key(&key) {
+            show_scrollbar = app
+                .preview_needs_scrollbar(&key, no_scroll_width, inner.height as usize)
+                .unwrap_or(false);
             let content_area = scroll_content_area(inner, show_scrollbar);
-            line_count = if show_scrollbar {
-                app.ensure_wrapped_preview(&key, content_area.width as usize)
-                    .unwrap_or(full_line_count)
-            } else {
-                full_line_count
-            };
+            line_count = app
+                .ensure_wrapped_preview(&key, content_area.width as usize)
+                .unwrap_or(0);
             max_scroll = line_count
                 .saturating_sub(content_area.height as usize)
                 .min(u16::MAX as usize) as u16;
@@ -40263,6 +40548,41 @@ fn wrap_preview_lines(text: &str, width: usize) -> Vec<String> {
         rows.push(String::new());
     }
     rows
+}
+
+fn wrap_preview_line_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 0usize;
+    for source in text.split('\n') {
+        let mut used = 0usize;
+        for ch in source.chars() {
+            if ch == '\r' {
+                continue;
+            }
+            if ch == '\t' {
+                for _ in 0..4 {
+                    push_preview_piece_count(&mut rows, &mut used, 1, width);
+                }
+                continue;
+            }
+
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if char_width == 0 {
+                continue;
+            }
+            push_preview_piece_count(&mut rows, &mut used, char_width, width);
+        }
+        rows = rows.saturating_add(1);
+    }
+    rows.max(1)
+}
+
+fn push_preview_piece_count(rows: &mut usize, used: &mut usize, piece_width: usize, width: usize) {
+    if *used + piece_width > width && *used > 0 {
+        *rows = rows.saturating_add(1);
+        *used = 0;
+    }
+    *used = used.saturating_add(piece_width);
 }
 
 fn push_preview_piece(
@@ -41705,6 +42025,7 @@ mod tests {
             data_task_seq: 0,
             data_task: None,
             input_mode: InputMode::Normal,
+            notice_overlay: None,
             preview_cache: HashMap::new(),
             preview_cache_order: VecDeque::new(),
             preview_requested: None,
@@ -41916,6 +42237,10 @@ mod tests {
         assert_eq!(
             value["sessions"]["launch_agent"],
             serde_json::json!(["e", "enter"])
+        );
+        assert_eq!(
+            value["clone_options"]["context_mode"],
+            serde_json::json!(["m"])
         );
         assert_eq!(
             value["sessions"]["delete"],
@@ -42370,6 +42695,11 @@ mod tests {
 
         let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
 
+        assert!(keybindings.matches(
+            KeyAction::CloneOptionsContextMode,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)
+        ));
+
         for action in [
             KeyAction::SearchChoiceNext,
             KeyAction::SearchChoicePrev,
@@ -42706,12 +43036,14 @@ mod tests {
                 target_options,
                 selected,
                 folder_data: CloneFolderDataAvailability::Available(path),
+                context_mode,
             } => {
                 assert_eq!(source.session_id, "codex-id");
                 assert_eq!(target, Provider::Codex);
                 assert!(target_options.contains(&Provider::Claude));
                 assert!(target_options.contains(&Provider::Codex));
                 assert_eq!(selected, CLONE_OPTION_SESSION_ONLY);
+                assert_eq!(context_mode, session::clone::CloneContextMode::Inline);
                 assert!(session_cwd_eq(
                     &path.display().to_string(),
                     &dir.path().display().to_string()
@@ -42748,12 +43080,14 @@ mod tests {
                 target_options,
                 selected,
                 folder_data: CloneFolderDataAvailability::Unavailable(reason),
+                context_mode,
             } => {
                 assert_eq!(source.session_id, "codex-id");
                 assert_eq!(target, Provider::Codex);
                 assert!(target_options.contains(&Provider::Claude));
                 assert!(target_options.contains(&Provider::Codex));
                 assert_eq!(selected, CLONE_OPTION_SESSION_ONLY);
+                assert_eq!(context_mode, session::clone::CloneContextMode::Inline);
                 assert!(reason.contains(&missing.display().to_string()));
             }
             other => panic!(
@@ -42772,6 +43106,7 @@ mod tests {
             target_options: clone_target_provider_options(),
             selected: CLONE_OPTION_SESSION_ONLY,
             folder_data: CloneFolderDataAvailability::Unavailable("missing cwd".into()),
+            context_mode: session::clone::CloneContextMode::Inline,
         };
 
         handle_key(
@@ -42800,6 +43135,7 @@ mod tests {
             target_options: clone_target_provider_options(),
             selected: CLONE_OPTION_SESSION_ONLY,
             folder_data: CloneFolderDataAvailability::Available(PathBuf::from("/repo")),
+            context_mode: session::clone::CloneContextMode::Inline,
         };
 
         handle_key(
@@ -42823,6 +43159,7 @@ mod tests {
             target_options: clone_target_provider_options(),
             selected: CLONE_OPTION_SESSION_ONLY,
             folder_data: CloneFolderDataAvailability::Available(PathBuf::from("/repo")),
+            context_mode: session::clone::CloneContextMode::Inline,
         };
 
         handle_key(
@@ -42842,6 +43179,67 @@ mod tests {
             }
             other => panic!("expected clone options to stay open, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn clone_options_context_mode_toggles_for_cross_provider() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::CloneOptions {
+            source: session_info(Provider::Codex, "codex-id", "/repo"),
+            target: Provider::Claude,
+            target_options: clone_target_provider_options(),
+            selected: CLONE_OPTION_SESSION_ONLY,
+            folder_data: CloneFolderDataAvailability::Available(PathBuf::from("/repo")),
+            context_mode: session::clone::CloneContextMode::Inline,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match app.input_mode {
+            InputMode::CloneOptions { context_mode, .. } => {
+                assert_eq!(
+                    context_mode,
+                    session::clone::CloneContextMode::FileReference
+                );
+            }
+            other => panic!("expected clone options to stay open, got {:?}", other),
+        }
+        assert_eq!(app.status, "context mode: File reference");
+    }
+
+    #[test]
+    fn clone_options_context_mode_is_ignored_for_native_copy() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::CloneOptions {
+            source: session_info(Provider::Codex, "codex-id", "/repo"),
+            target: Provider::Codex,
+            target_options: clone_target_provider_options(),
+            selected: CLONE_OPTION_SESSION_ONLY,
+            folder_data: CloneFolderDataAvailability::Available(PathBuf::from("/repo")),
+            context_mode: session::clone::CloneContextMode::Inline,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match app.input_mode {
+            InputMode::CloneOptions { context_mode, .. } => {
+                assert_eq!(context_mode, session::clone::CloneContextMode::Inline);
+            }
+            other => panic!("expected clone options to stay open, got {:?}", other),
+        }
+        assert_eq!(app.status, "context mode is not used for native copy.");
     }
 
     #[test]
@@ -43105,12 +43503,7 @@ mod tests {
                 .unwrap();
             terminal
                 .draw(|f| {
-                    draw_killall_confirm_modal(
-                        f,
-                        f.area(),
-                        KILLALL_OPTION_CANCEL,
-                        &keybindings,
-                    );
+                    draw_killall_confirm_modal(f, f.area(), KILLALL_OPTION_CANCEL, &keybindings);
                 })
                 .unwrap();
             terminal
@@ -43222,6 +43615,7 @@ mod tests {
                         &CloneFolderDataAvailability::Unavailable(
                             "folder path is not available".to_string(),
                         ),
+                        session::clone::CloneContextMode::Inline,
                         &keybindings,
                     );
                 })
@@ -44640,6 +45034,101 @@ mod tests {
     }
 
     #[test]
+    fn ai_title_result_failure_opens_notice_overlay_and_preserves_title_edit() {
+        let source = session_info(Provider::Pi, "s1", "/tmp/project");
+        let key = AgentKey::new(&source);
+        let mut app = app_for_key_tests();
+        app.ai_title_pending = Some(AiTitlePending {
+            seq: 7,
+            key,
+            provider: Provider::Claude,
+            started_at: Instant::now(),
+        });
+        app.input_mode = InputMode::TitleEdit {
+            source: source.clone(),
+            draft: "Draft".to_string(),
+            cursor: "Draft".len(),
+        };
+
+        app.on_ai_title_worker_result(AiTitleWorkerResult {
+            seq: 7,
+            source,
+            provider: Provider::Claude,
+            outcome: Err("claude timed out after 180s. stderr: 529 overloaded_error".to_string()),
+            elapsed_ms: 180_339,
+            queued_at_epoch_ms: current_epoch_ms(),
+        });
+
+        assert!(app.ai_title_pending.is_none());
+        let notice = app
+            .notice_overlay
+            .as_ref()
+            .expect("expected notice overlay");
+        assert_eq!(notice.title, "AI title failed");
+        assert!(notice.message.contains("AI title failed with claude"));
+        assert!(notice.message.contains("Session: s1"));
+        assert!(notice
+            .message
+            .contains("Reason: claude timed out after 180s"));
+        assert!(notice.message.contains("529 overloaded_error"));
+        match &app.input_mode {
+            InputMode::TitleEdit { draft, cursor, .. } => {
+                assert_eq!(draft, "Draft");
+                assert_eq!(*cursor, "Draft".len());
+            }
+            other => panic!("expected title edit mode, got {:?}", other),
+        }
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(app.notice_overlay.is_none());
+        assert!(matches!(app.input_mode, InputMode::TitleEdit { .. }));
+    }
+
+    #[test]
+    fn ai_search_result_failure_opens_notice_overlay_and_preserves_prompt() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = app_for_key_tests();
+        app.ai_search_pending = Some(ai_search_pending_for_test(cancel));
+        app.input_mode = InputMode::AiSearch {
+            draft: "release".to_string(),
+            cursor: "release".len(),
+        };
+
+        app.on_ai_search_worker_result(AiSearchWorkerResult {
+            seq: 7,
+            query: "release".to_string(),
+            provider: Provider::Codex,
+            outcome: Err("codex exited Some(1): stderr: model overloaded".to_string()),
+            elapsed_ms: 1_234,
+            queued_at_epoch_ms: current_epoch_ms(),
+        });
+
+        assert!(app.ai_search_pending.is_none());
+        let notice = app
+            .notice_overlay
+            .as_ref()
+            .expect("expected notice overlay");
+        assert_eq!(notice.title, "AI search failed");
+        assert!(notice.message.contains("AI search failed with codex"));
+        assert!(notice.message.contains("Query: release"));
+        assert!(notice.message.contains("Reason: codex exited Some(1)"));
+        match &app.input_mode {
+            InputMode::AiSearch { draft, cursor } => {
+                assert_eq!(draft, "release");
+                assert_eq!(*cursor, "release".len());
+            }
+            other => panic!("expected AI search mode, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn sanitize_ai_title_response_keeps_first_clean_title_line() {
         assert_eq!(
             sanitize_ai_title_response("Title: Build AI title generation\n\nextra").as_deref(),
@@ -44852,6 +45341,24 @@ mod tests {
         assert!(error.contains("error: request too large"));
         assert!(!error.contains("OpenAI Codex v0.0.0"));
         assert!(!error.contains("workdir: /shared/cokacmux"));
+    }
+
+    #[test]
+    fn ai_agent_timeout_error_includes_output_tail() {
+        let output = AiAgentCommandOutput {
+            status: None,
+            stdout: String::new(),
+            stderr: "API error (attempt 1/11): 529 overloaded_error\nretrying\n".to_string(),
+            cancelled: false,
+            timed_out: true,
+            duration: Duration::from_secs(180),
+        };
+
+        let error = check_ai_agent_process_result(Provider::Claude, &output, None).unwrap_err();
+
+        assert!(error.contains("claude timed out after 180s"));
+        assert!(error.contains("stderr: API error"));
+        assert!(error.contains("529 overloaded_error"));
     }
 
     #[cfg(unix)]
@@ -47288,6 +47795,54 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn wrap_preview_line_count_matches_wrapped_lines() {
+        for text in [
+            "",
+            "abc",
+            "abcdefgh",
+            "a\tb",
+            "a\r\nb",
+            "zero\u{200b}width",
+            "abc\n\nxyz",
+        ] {
+            for width in 1..8 {
+                assert_eq!(
+                    wrap_preview_line_count(text, width),
+                    wrap_preview_lines(text, width).len(),
+                    "text={text:?} width={width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preview_scrollbar_wrap_width_stays_stable_across_draws() {
+        let mut app = app_for_key_tests();
+        let info = session_info(Provider::Codex, "preview-stable-scrollbar", "/repo");
+        let key = PreviewKey::new(&info, app.preview_mode);
+        let text = (0..30)
+            .map(|idx| format!("line {idx:02} {}", "x".repeat(40)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = wrap_preview_lines(&text, 28);
+        app.sessions.push(info);
+        app.list_state.select(Some(0));
+        app.cache_preview(key.clone(), text, 28, lines);
+
+        let backend = ratatui::backend::TestBackend::new(30, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_preview(f, &mut app, Rect::new(0, 0, 30, 8)))
+            .unwrap();
+        assert_eq!(app.preview_cache.get(&key).unwrap().wrap_width, 27);
+
+        terminal
+            .draw(|f| draw_preview(f, &mut app, Rect::new(0, 0, 30, 8)))
+            .unwrap();
+        assert_eq!(app.preview_cache.get(&key).unwrap().wrap_width, 27);
+    }
+
+    #[test]
     fn preview_summary_styles_field_values_by_semantics() {
         let cwd = preview_summary_line("  cwd     : /tmp/project");
         assert_eq!(cwd.spans[0].style.fg, Some(THEME_PREVIEW_FIELD));
@@ -49547,6 +50102,18 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    #[cfg(windows)]
+    fn default_shell_program_uses_powershell_on_windows() {
+        assert_eq!(default_shell_program(), "powershell.exe");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn default_shell_program_uses_bash_outside_windows() {
+        assert_eq!(default_shell_program(), "/bin/bash");
+    }
+
+    #[test]
     fn agent_launch_specs_use_configured_program_paths_when_present() {
         let agent_programs = AgentProgramSettings {
             codex: Some("/custom/bin/codex".into()),
@@ -50221,6 +50788,7 @@ IF EXIST "%~dp0\node.exe" (
             target_options: clone_target_provider_options(),
             selected: CLONE_OPTION_SESSION_ONLY,
             folder_data: CloneFolderDataAvailability::Available(PathBuf::from("/repo")),
+            context_mode: session::clone::CloneContextMode::Inline,
         };
         handle_key(&mut app, ctrl_q, 80, 50, 20);
         assert!(app.should_quit);
@@ -51072,7 +51640,8 @@ IF EXIST "%~dp0\node.exe" (
                 activity: AgentActivity::Busy,
             },
         );
-        app.live_shells.push(shell_session_info_for_cwd("/repo".into()));
+        app.live_shells
+            .push(shell_session_info_for_cwd("/repo".into()));
         app.killall_pending = Some(KillAllPending {
             seq: 9,
             started_at: Instant::now(),
@@ -51313,17 +51882,15 @@ IF EXIST "%~dp0\node.exe" (
         );
     }
 
-    #[cfg(unix)]
     fn buffered_output_test_client(session_id: &str, reader_id: u64) -> AgentClient {
         buffered_output_test_client_with_requests(session_id, reader_id).0
     }
 
-    #[cfg(unix)]
     fn buffered_output_test_client_with_requests(
         session_id: &str,
         reader_id: u64,
     ) -> (AgentClient, Receiver<AgentWriterRequest>) {
-        let (stream, _peer) = AgentStream::pair().unwrap();
+        let (stream, _peer) = agent_stream_pair_for_tests().unwrap();
         let (request_tx, request_rx) = mpsc::channel();
         let pty_size = agent_pty_size(80, 8);
         let mut client = AgentClient {

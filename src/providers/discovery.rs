@@ -885,6 +885,14 @@ fn unique_opencode_session_created_after_in_db(
 #[cfg(feature = "opencode")]
 fn default_opencode_db_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    if let Ok(home) = home_dir() {
+        paths.push(
+            home.join(".local")
+                .join("share")
+                .join("opencode")
+                .join("opencode.db"),
+        );
+    }
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         paths.push(
             PathBuf::from(local_app_data)
@@ -894,14 +902,6 @@ fn default_opencode_db_candidates() -> Vec<PathBuf> {
     }
     if let Ok(app_data) = std::env::var("APPDATA") {
         paths.push(PathBuf::from(app_data).join("opencode").join("opencode.db"));
-    }
-    if let Ok(home) = home_dir() {
-        paths.push(
-            home.join(".local")
-                .join("share")
-                .join("opencode")
-                .join("opencode.db"),
-        );
     }
     paths
 }

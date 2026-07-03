@@ -519,7 +519,7 @@ fn value_is_empty(value: &Value) -> bool {
 }
 
 fn session_message_raw(row: &SessionMessageRow, data: Value) -> Value {
-    json!({
+    let mut raw = json!({
         "session_message": {
             "id": row.id.clone(),
             "session_id": row.session_id.clone(),
@@ -528,7 +528,11 @@ fn session_message_raw(row: &SessionMessageRow, data: Value) -> Value {
             "time_updated": row.time_updated,
             "data": data,
         }
-    })
+    });
+    if let Some(seq) = row.seq {
+        raw["session_message"]["seq"] = json!(seq);
+    }
+    raw
 }
 
 fn parts_to_blocks(parts: &[&PartRow]) -> Vec<ContentBlock> {

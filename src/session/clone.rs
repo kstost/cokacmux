@@ -11,7 +11,10 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::context_convert::wrap_session_for_context_convert;
+use crate::context_convert::{
+    context_file_contents, wrap_session_for_context_convert,
+    wrap_session_for_context_file_reference,
+};
 use crate::error::{ConvertError, Result};
 use crate::providers;
 use crate::providers::discovery::SessionInfo;
@@ -30,6 +33,10 @@ pub struct CloneOpts {
     pub overwrite: bool,
     /// Override the new id (otherwise a fresh provider-native id is minted).
     pub new_id: Option<String>,
+    /// How cross-provider clones hand off the source context.
+    pub context_mode: CloneContextMode,
+    /// Override `~/.cokacmux/context` for file-reference context clones.
+    pub context_dir: Option<PathBuf>,
 }
 
 impl Default for CloneOpts {
@@ -39,6 +46,30 @@ impl Default for CloneOpts {
             cwd: None,
             overwrite: false,
             new_id: None,
+            context_mode: CloneContextMode::Inline,
+            context_dir: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneContextMode {
+    Inline,
+    FileReference,
+}
+
+impl CloneContextMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::FileReference => "file_reference",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Inline => Self::FileReference,
+            Self::FileReference => Self::Inline,
         }
     }
 }
@@ -80,6 +111,7 @@ pub fn clone_to_live(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport>
             "cwd_override": opts.cwd.as_deref(),
             "overwrite": opts.overwrite,
             "new_id_provided": opts.new_id.is_some(),
+            "context_mode": opts.context_mode.as_str(),
         }),
     );
 
@@ -135,7 +167,20 @@ fn clone_cross_provider_context_wrapper_with_install_opts(
     install_opts: &InstallSessionOpts,
 ) -> Result<CloneReport> {
     let source_session = super::load(src)?;
-    let mut wrapped = wrap_session_for_context_convert(&source_session, target_provider);
+    let context_file_path = match opts.context_mode {
+        CloneContextMode::Inline => None,
+        CloneContextMode::FileReference => Some(write_context_reference_file(
+            src,
+            target_provider,
+            &source_session,
+            opts.context_dir.as_deref(),
+        )?),
+    };
+    let mut wrapped = if let Some(path) = context_file_path.as_ref() {
+        wrap_session_for_context_file_reference(&source_session, target_provider, path)
+    } else {
+        wrap_session_for_context_convert(&source_session, target_provider)
+    };
     let new_cwd = opts.cwd.clone().unwrap_or_else(|| src.cwd.clone());
     if !new_cwd.is_empty() {
         wrapped.cwd = new_cwd.clone();
@@ -152,7 +197,15 @@ fn clone_cross_provider_context_wrapper_with_install_opts(
         }
     }
 
-    let install = install_universal_session(target_provider, &wrapped, install_opts)?;
+    let install = match install_universal_session(target_provider, &wrapped, install_opts) {
+        Ok(install) => install,
+        Err(error) => {
+            if let Some(path) = context_file_path.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error);
+        }
+    };
     crate::debug::log(
         "clone_cross_provider_context_wrapper_ok",
         serde_json::json!({
@@ -162,6 +215,8 @@ fn clone_cross_provider_context_wrapper_with_install_opts(
             "new_session_id": &install.session_id,
             "artifact": format!("{:?}", &install.artifact),
             "messages": wrapped.messages.len(),
+            "context_mode": opts.context_mode.as_str(),
+            "context_file_path": context_file_path.as_ref().map(|path| path.display().to_string()),
             "native_validation_checks": install.validation.checks.len(),
         }),
     );
@@ -173,6 +228,48 @@ fn clone_cross_provider_context_wrapper_with_install_opts(
         new_cwd,
         artifact: install.artifact,
     })
+}
+
+fn write_context_reference_file(
+    src: &SessionInfo,
+    target_provider: Provider,
+    source_session: &crate::universal::UniversalSession,
+    context_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let dir = match context_dir {
+        Some(path) => path.to_path_buf(),
+        None => default_context_dir()?,
+    };
+    fs::create_dir_all(&dir)?;
+    let filename = format!(
+        "{}-{}-to-{}-{}.md",
+        src.provider.as_str(),
+        safe_path_component(&src.session_id),
+        target_provider.as_str(),
+        safe_path_component(&crate::ids::new_uuid_v7()),
+    );
+    let path = dir.join(filename);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(context_file_contents(source_session).as_bytes())?;
+    crate::debug::log(
+        "clone_context_file_written",
+        serde_json::json!({
+            "source_provider": src.provider.as_str(),
+            "source_session_id": &src.session_id,
+            "target_provider": target_provider.as_str(),
+            "path": path.display().to_string(),
+        }),
+    );
+    Ok(path)
+}
+
+fn default_context_dir() -> Result<PathBuf> {
+    Ok(crate::providers::discovery::home_dir()?
+        .join(".cokacmux")
+        .join("context"))
 }
 
 fn clone_claude_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport> {
@@ -996,6 +1093,32 @@ fn default_codex_home() -> Option<PathBuf> {
     None
 }
 
+fn safe_path_component(value: &str) -> String {
+    if value.is_empty() {
+        return "%EMPTY".to_string();
+    }
+
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_') {
+            out.push(char::from(*byte));
+        } else {
+            out.push('%');
+            out.push(hex_digit(byte >> 4));
+            out.push(hex_digit(byte & 0x0f));
+        }
+    }
+    out
+}
+
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0' + nibble),
+        10..=15 => char::from(b'A' + (nibble - 10)),
+        _ => unreachable!("hex nibble is always <= 15"),
+    }
+}
+
 #[cfg(feature = "opencode")]
 fn copy_codex_state_thread_row(
     codex_home: &Path,
@@ -1343,6 +1466,60 @@ mod tests {
         assert!(user_text.contains("=== source-codex (codex) ==="));
         assert!(user_text.contains("continue this work"));
         assert!(user_text.ends_with(crate::CONTEXT_CONTINUATION_PROMPT));
+        assert_eq!(assistant_texts[0], crate::CONTEXT_ACK);
+    }
+
+    #[test]
+    fn cross_provider_clone_file_reference_writes_context_file_and_installs_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.jsonl");
+        fs::write(
+            &source_path,
+            r#"{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{"id":"source-codex","cwd":"/repo"}}
+{"timestamp":"2026-05-20T01:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"continue this work"}]}}
+"#,
+        )
+        .unwrap();
+        let context_dir = dir.path().join(".cokacmux").join("context");
+        let src = session_info(Provider::Codex, "source-codex", "/repo", source_path);
+        let report = clone_cross_provider_context_wrapper_with_install_opts(
+            &src,
+            Provider::Claude,
+            &CloneOpts {
+                context_mode: CloneContextMode::FileReference,
+                context_dir: Some(context_dir.clone()),
+                ..Default::default()
+            },
+            &InstallSessionOpts {
+                claude_home: Some(dir.path().join(".claude")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut context_paths = fs::read_dir(&context_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        context_paths.sort();
+        assert_eq!(context_paths.len(), 1);
+        let context_path = &context_paths[0];
+        let context_text = fs::read_to_string(context_path).unwrap();
+        assert!(context_text.contains("=== source-codex (codex) ==="));
+        assert!(context_text.contains("continue this work"));
+
+        let ArtifactPath::File(path) = &report.artifact else {
+            panic!("expected Claude file artifact, got {:?}", report.artifact);
+        };
+        let back = providers::claude::from_file(path, &Default::default()).unwrap();
+        let user_texts = text_messages_for_role(&back, crate::universal::Role::User);
+        let assistant_texts = text_messages_for_role(&back, crate::universal::Role::Assistant);
+        assert_eq!(user_texts.len(), 1);
+        assert_eq!(assistant_texts.len(), 1);
+        let user_text = user_texts[0];
+        assert!(user_text.contains(&context_path.display().to_string()));
+        assert!(user_text.contains("read this file first"));
+        assert!(!user_text.contains("continue this work"));
         assert_eq!(assistant_texts[0], crate::CONTEXT_ACK);
     }
 
