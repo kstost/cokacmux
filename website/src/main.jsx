@@ -33,9 +33,9 @@ const valueMoments = [
     icon: ClipboardList,
     title: '작업 세션 자체를 자산으로 남길 때',
     before:
-      '코드는 남지만 어떤 판단을 거쳤는지, 어떤 프롬프트와 결과가 있었는지는 흩어집니다.',
+      '멋진 코드는 남지만 그 코드를 얻기 위해 거친 대화와 판단 과정은 흩어집니다.',
     after:
-      '대화, 도구, 제목, 시간, 작업 폴더를 세션 단위로 모아 다음 작업의 출발점으로 씁니다.'
+      '세션 안의 대화 내용을 노하우로 보존하고, 다음 작업의 스킬셋처럼 다시 씁니다.'
   },
   {
     icon: Layers3,
@@ -80,22 +80,22 @@ const valueMoments = [
 ];
 
 const threePromises = [
-  '작업 중 만들어진 세션을 프로젝트와 도구 기준으로 모아 봅니다.',
-  '필요한 세션을 검색, 미리보기, 복제, 재개할 수 있게 합니다.',
-  'agent와 terminal 프로세스를 끄지 않고 백그라운드에 안전하게 둡니다.'
+  '바이브코딩으로 얻은 코드뿐 아니라 그 코드를 만든 과정까지 보존합니다.',
+  '세션 안의 대화 노하우를 검색, 미리보기, 복제, 재개로 다시 씁니다.',
+  '코딩에이전트를 위해 섬세하게 설계된 Multiplexer처럼 작업을 관리합니다.'
 ];
 
 const heroFacts = [
-  '작업 중 만들어진 대화와 실행 상태를 세션 자산으로 남깁니다.',
-  '여러 프로젝트의 agent와 terminal을 안전하게 살려 둔 채 전환합니다.',
-  '새 AI가 아니라, 이미 쓰던 코딩 도구의 세션을 찾고 복제하고 이어 여는 앱입니다.'
+  '세션 안의 대화 내용은 그 코드를 얻기 위해 사용한 노하우입니다.',
+  'Claude Code, Codex, Pi, OpenCode, GJC 세션을 한눈에 관리합니다.',
+  '코딩에이전트를 위해 섬세하게 설계된 Multiplexer입니다.'
 ];
 
 const heroSummary = [
-  ['세션 모으기', '도구, 제목, 시간, 작업 폴더를 한 목록에서 봅니다.'],
-  ['맥락 보존', '대화와 실행 중인 agent, terminal을 끊지 않고 유지합니다.'],
-  ['복제와 재개', '필요한 세션을 복사하거나 다시 열어 다음 작업으로 이어갑니다.'],
-  ['프로젝트 전환', '여러 프로젝트를 오가도 살아 있는 작업과 기록을 잃지 않습니다.']
+  ['과정 보존', '코드를 얻기까지의 대화와 판단 과정을 세션에 남깁니다.'],
+  ['노하우 재사용', '세션 안의 대화 내용을 찾아 다음 작업의 스킬셋처럼 씁니다.'],
+  ['에이전트 관리', '여러 코딩 에이전트 세션과 터미널을 한눈에 다룹니다.'],
+  ['안전한 전환', '프로젝트를 오가도 실행 중인 프로세스와 맥락을 잃지 않습니다.']
 ];
 
 const installCommands = [
@@ -167,7 +167,7 @@ const primerItems = [
     icon: Layers3,
     title: 'cokacmux는 무엇인가요?',
     text:
-      'Claude Code, Codex, OpenCode, Pi, GJC와 터미널 작업에서 생긴 세션을 여러 프로젝트에 걸쳐 관리하는 터미널 앱입니다. 새 AI가 아니라, 이미 쓰는 코딩 도구의 맥락을 찾고 이어 쓰는 작업대입니다.'
+      'Claude Code, Codex, Pi, OpenCode, GJC와 터미널 작업에서 생긴 세션을 여러 프로젝트에 걸쳐 관리하는 터미널 앱입니다. 코딩에이전트를 위해 섬세하게 설계된 Multiplexer라고 이해하면 쉽습니다.'
   },
   {
     icon: FolderSearch,
@@ -571,11 +571,11 @@ function App() {
       <section className="hero" aria-labelledby="hero-title">
         <div className="heroCopy">
           <p className="eyebrow">cokacmux overview</p>
-          <h1 id="hero-title">코드뿐 아니라 작업 세션까지 자산으로 관리합니다</h1>
+          <h1 id="hero-title">코딩에이전트를 위해 섬세하게 설계된 Multiplexer, cokacmux.</h1>
           <p className="heroLead">
-            cokacmux는 Claude Code, Codex 같은 코딩 도구와 터미널 작업을 세션 단위로
-            모아 둡니다. 대화 맥락과 실행 중인 프로세스를 안전하게 보존하고, 필요한
-            프로젝트의 세션을 찾고 복제하고 이어 열 수 있게 합니다.
+            바이브코딩으로 멋진 코드를 얻었다면, 그 코드를 얻기까지 거친 세션 안의
+            대화도 놓치면 안 됩니다. cokacmux는 Claude Code, Codex, Pi, OpenCode, GJC
+            같은 코딩 에이전트의 세션을 한눈에 관리하고 다시 사용할 수 있게 합니다.
           </p>
           <ul className="heroFacts" aria-label="cokacmux 핵심 요약">
             {heroFacts.map((fact) => (
@@ -613,7 +613,7 @@ function App() {
           </div>
         </div>
         <div className="heroTextPanel" aria-label="cokacmux 세션 관리 흐름">
-          <p className="panelLabel">세션을 자산처럼 다루는 흐름</p>
+          <p className="panelLabel">세션 속 노하우를 다시 쓰는 흐름</p>
           <ol>
             {heroSummary.map(([title, text], index) => (
               <li key={title}>
@@ -658,8 +658,9 @@ function App() {
           <h2 id="why-title">좋은 점은 작업의 맥락까지 잃지 않는 것입니다</h2>
           <p>
             AI 코딩을 오래 쓰면 프로젝트마다 agent, terminal, 테스트, 세션이 동시에
-            생깁니다. 중요한 것은 최종 코드만이 아니라 그 코드가 만들어진 세션입니다.
-            cokacmux는 세션을 찾고, 읽고, 복제하고, 이어 열 수 있게 관리합니다.
+            생깁니다. 중요한 것은 최종 코드만이 아니라 그 코드를 얻기 위해 거쳤던
+            대화 과정입니다. cokacmux는 그 세션들을 찾고, 읽고, 복제하고, 이어 열 수
+            있게 관리합니다.
           </p>
         </div>
 
