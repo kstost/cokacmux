@@ -66,7 +66,7 @@ main {
   color: var(--teal);
   font-size: 0.78rem;
   font-weight: 800;
-  letter-spacing: 0.12em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 
@@ -252,6 +252,148 @@ h3 {
   color: var(--text);
 }
 
+.screenTour {
+  display: grid;
+  gap: 28px;
+  padding: 44px 0 70px;
+  border-top: 1px solid var(--line);
+}
+
+.screenTourGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.04fr) minmax(300px, 0.96fr);
+  gap: 28px;
+  align-items: start;
+}
+
+.terminalMock {
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  background: #0b0c0d;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.32);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.mockTopBar,
+.mockHelp {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 42px;
+  padding: 10px 12px;
+  background: #191c1d;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.mockTopBar span:first-child {
+  color: var(--teal);
+  font-weight: 850;
+}
+
+.mockBody {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.9fr) minmax(0, 1.1fr);
+  min-height: 330px;
+}
+
+.mockList,
+.mockPreview {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 14px;
+}
+
+.mockList {
+  border-right: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.mockPanelTitle {
+  color: var(--amber);
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.mockRow {
+  display: grid;
+  grid-template-columns: 18px 64px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-height: 42px;
+  padding: 8px 9px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.mockRow strong {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mockRow.active {
+  border-color: rgba(76, 199, 189, 0.46);
+  background: rgba(76, 199, 189, 0.14);
+}
+
+.mockPreview p {
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.mockHelp {
+  justify-content: flex-start;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.mockHelp span {
+  padding: 5px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.tourList {
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--line);
+}
+
+.tourItem {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: 12px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.tourItem svg {
+  margin-top: 2px;
+  color: var(--teal);
+}
+
+.tourItem div {
+  display: grid;
+  gap: 8px;
+}
+
+.tourItem p {
+  color: var(--muted);
+  line-height: 1.66;
+}
+
+.tourItem strong {
+  color: #dcefd9;
+  line-height: 1.58;
+}
+
 .overview {
   display: grid;
   grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.2fr);
@@ -304,6 +446,56 @@ kbd {
   font-size: 0.86rem;
   line-height: 1.25;
   white-space: normal;
+}
+
+.beginnerGuide {
+  display: grid;
+  gap: 28px;
+  padding: 44px 0 72px;
+  border-top: 1px solid var(--line);
+}
+
+.beginnerSteps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.beginnerSteps li {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 14px;
+  min-height: 178px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.guideNumber {
+  width: 52px;
+  height: 52px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: rgba(76, 199, 189, 0.11);
+  color: var(--teal);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-weight: 850;
+}
+
+.guideBody {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.guideBody p {
+  color: var(--muted);
+  line-height: 1.68;
 }
 
 .workflowShell {
@@ -502,7 +694,9 @@ kbd {
 
   .hero,
   .firstRun,
+  .screenTourGrid,
   .overview,
+  .beginnerSteps,
   .workflowShell,
   .finish {
     grid-template-columns: 1fr;
@@ -514,6 +708,15 @@ kbd {
 
   .heroVisual {
     order: -1;
+  }
+
+  .mockBody {
+    grid-template-columns: 1fr;
+  }
+
+  .mockList {
+    border-right: 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
   }
 
   .scenarioNav {
@@ -542,6 +745,11 @@ kbd {
   }
 
   .chapterHeader {
+    grid-template-columns: 1fr;
+  }
+
+  .tourItem,
+  .beginnerSteps li {
     grid-template-columns: 1fr;
   }
 

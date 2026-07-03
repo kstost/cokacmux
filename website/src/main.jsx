@@ -55,6 +55,120 @@ const firstRunSteps = [
   ['4', '필요할 때만 다시 열기', 'e 또는 Enter로 원래 코딩 도구의 대화를 이어서 실행합니다.']
 ];
 
+const screenParts = [
+  {
+    icon: TerminalSquare,
+    name: '터미널 안에서 열리는 화면',
+    meaning:
+      'cokacmux는 웹 브라우저가 아니라 터미널에서 움직입니다. 글자와 키보드만으로 조작하는 작업 관리 화면이라고 생각하면 됩니다.',
+    action:
+      '처음에는 마우스를 찾지 말고 키보드의 위아래 화살표, Tab, Enter, Esc만 기억하면 됩니다.'
+  },
+  {
+    icon: ClipboardList,
+    name: '왼쪽 대화 목록',
+    meaning:
+      'Claude Code, Codex 같은 코딩 도구들이 예전에 나눴던 대화를 줄 단위로 보여줍니다. 한 줄이 하나의 대화 기록입니다.',
+    action:
+      '위아래 화살표로 줄을 옮기며 제목, 시간, 작업 폴더를 훑습니다. 지금 밝게 표시된 줄이 선택된 대화입니다.'
+  },
+  {
+    icon: FolderSearch,
+    name: '목록의 칸들',
+    meaning:
+      '상태는 실행 중인지, 도구는 어느 AI 코딩 도구의 대화인지, 제목은 사람이 알아보기 쉬운 이름, 폴더는 그 대화가 작업하던 위치입니다.',
+    action:
+      '제목만 보지 말고 폴더와 시간을 같이 봅니다. 비슷한 제목이 많을 때는 폴더가 가장 좋은 단서가 됩니다.'
+  },
+  {
+    icon: History,
+    name: '오른쪽 미리보기',
+    meaning:
+      '선택한 대화의 내용을 읽기 전용으로 보여주는 공간입니다. 여기서 읽는다고 대화가 다시 시작되지는 않습니다.',
+    action:
+      'Tab을 눌러 오른쪽으로 이동한 뒤 위아래로 읽습니다. 필요한 기록이 맞는지 확인한 다음에만 다시 엽니다.'
+  },
+  {
+    icon: Keyboard,
+    name: '하단 단축키 안내',
+    meaning:
+      '현재 화면에서 바로 쓸 수 있는 키를 짧게 보여주는 안내줄입니다. 화면이 바뀌면 안내되는 키도 바뀝니다.',
+    action:
+      '모든 단축키를 외우려 하지 말고, 아래 안내줄에서 지금 필요한 키만 확인합니다. 막히면 Esc로 한 단계 빠져나옵니다.'
+  },
+  {
+    icon: Play,
+    name: '다시 열기와 실행 화면',
+    meaning:
+      '대화를 다시 열면 원래 코딩 도구가 실제로 실행됩니다. 이때부터는 AI에게 새 질문을 하거나 이어서 작업할 수 있습니다.',
+    action:
+      'e 또는 Enter로 열고, 목록으로 돌아오고 싶으면 Ctrl+] 또는 Ctrl+[를 누릅니다. 돌아와도 실행 중인 작업은 꺼지지 않습니다.'
+  }
+];
+
+const beginnerSteps = [
+  {
+    title: '터미널을 엽니다',
+    detail:
+      'macOS와 Linux에서는 Terminal을, Windows에서는 PowerShell을 열면 됩니다. cokacmux는 이 창 안에서 실행됩니다.',
+    key: '터미널'
+  },
+  {
+    title: '설치가 되었는지 확인합니다',
+    detail:
+      'cokacmux --version을 입력했을 때 버전 번호가 나오면 준비가 된 상태입니다. 아무 반응이 없으면 설치부터 다시 확인합니다.',
+    key: 'cokacmux --version'
+  },
+  {
+    title: '대화가 읽히는지 점검합니다',
+    detail:
+      'cokacmux --check는 어떤 코딩 도구의 대화를 찾을 수 있는지 확인하는 명령입니다. 처음이라면 이 명령으로 상태를 먼저 보는 것이 좋습니다.',
+    key: 'cokacmux --check'
+  },
+  {
+    title: '앱을 실행합니다',
+    detail:
+      'cokacmux를 입력하면 대화 목록 화면이 열립니다. 이 화면이 앞으로 가장 자주 돌아오게 될 시작점입니다.',
+    key: 'cokacmux'
+  },
+  {
+    title: '가장 밝게 표시된 줄을 봅니다',
+    detail:
+      '밝게 표시된 줄이 현재 선택된 대화입니다. 오른쪽 미리보기는 항상 이 선택 줄을 따라 바뀝니다.',
+    key: '선택 줄'
+  },
+  {
+    title: '위아래로 천천히 움직입니다',
+    detail:
+      '처음에는 열려고 하지 말고 제목, 도구, 시간, 폴더가 어떻게 바뀌는지만 봅니다. 목록이 무엇을 뜻하는지 감이 생깁니다.',
+    key: '↑ / ↓'
+  },
+  {
+    title: '오른쪽 내용을 읽어 봅니다',
+    detail:
+      'Tab을 누르면 오른쪽 미리보기로 이동합니다. 여기서는 대화 내용만 읽는 단계라서 실수로 AI 작업이 시작되지 않습니다.',
+    key: 'Tab'
+  },
+  {
+    title: '필요한 대화가 맞는지 판단합니다',
+    detail:
+      '내가 찾던 파일명, 에러 메시지, 작업 내용이 보이면 맞는 대화일 가능성이 큽니다. 아니면 Tab으로 목록에 돌아가 다른 줄을 고릅니다.',
+    key: 'Tab'
+  },
+  {
+    title: '찾기 어려우면 검색합니다',
+    detail:
+      'Ctrl+F를 누르면 검색 방식을 고를 수 있습니다. 파일명처럼 정확한 단어가 있으면 글자 검색, 기억이 흐릿하면 AI 검색을 씁니다.',
+    key: 'Ctrl+F'
+  },
+  {
+    title: '정말 이어갈 때만 다시 엽니다',
+    detail:
+      'e 또는 Enter를 누르면 원래 코딩 도구로 대화를 이어서 엽니다. 단순히 읽기만 할 때는 미리보기에서 멈추면 됩니다.',
+    key: 'e / Enter'
+  }
+];
+
 const chapters = [
   {
     id: 'start',
@@ -331,9 +445,13 @@ function App() {
               <Play size={18} />
               먼저 이해하기
             </a>
-            <a href="#practice">
+            <a href="#screen-tour">
+              <Layers3 size={18} />
+              첫 화면 해설
+            </a>
+            <a href="#first-steps">
               <Keyboard size={18} />
-              실습으로 보기
+              10단계 따라하기
             </a>
           </div>
         </div>
@@ -384,6 +502,76 @@ function App() {
         </div>
       </section>
 
+      <section className="screenTour" id="screen-tour" aria-labelledby="screen-tour-title">
+        <div className="sectionIntro">
+          <p className="eyebrow">first screen tour</p>
+          <h2 id="screen-tour-title">처음 화면에서 보이는 것을 하나씩 해석합니다</h2>
+          <p>
+            처음에는 “어떤 키를 눌러야 하지?”보다 “내가 지금 무엇을 보고 있지?”가
+            먼저입니다. 아래 모형은 cokacmux를 켰을 때 마주치는 기본 화면을 단순화한
+            것입니다.
+          </p>
+        </div>
+
+        <div className="screenTourGrid">
+          <div className="terminalMock" aria-label="cokacmux 첫 화면 구조 예시">
+            <div className="mockTopBar">
+              <span>cokacmux</span>
+              <span>Sessions</span>
+              <span>3 running</span>
+            </div>
+            <div className="mockBody">
+              <div className="mockList">
+                <div className="mockPanelTitle">왼쪽: 대화 목록</div>
+                <div className="mockRow active">
+                  <span>●</span>
+                  <span>Codex</span>
+                  <strong>README 정리</strong>
+                </div>
+                <div className="mockRow">
+                  <span>○</span>
+                  <span>Claude</span>
+                  <strong>로그인 오류 수정</strong>
+                </div>
+                <div className="mockRow">
+                  <span>○</span>
+                  <span>OpenCode</span>
+                  <strong>테스트 실패 확인</strong>
+                </div>
+              </div>
+              <div className="mockPreview">
+                <div className="mockPanelTitle">오른쪽: 선택한 대화 미리보기</div>
+                <p>선택한 대화에서 어떤 작업을 했는지 읽어보는 곳입니다.</p>
+                <p>여기서 읽기만 해도 원래 AI 대화가 다시 시작되지는 않습니다.</p>
+              </div>
+            </div>
+            <div className="mockHelp">
+              <span>↑↓ 이동</span>
+              <span>Tab 미리보기</span>
+              <span>Ctrl+F 검색</span>
+              <span>e 다시 열기</span>
+              <span>Esc 닫기</span>
+            </div>
+          </div>
+
+          <div className="tourList">
+            {screenParts.map((part) => {
+              const Icon = part.icon;
+              return (
+                <article className="tourItem" key={part.name}>
+                  <Icon size={22} />
+                  <div>
+                    <h3>{part.name}</h3>
+                    <p>{part.meaning}</p>
+                    <strong>{part.action}</strong>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
       <section className="overview" id="keys" aria-labelledby="keys-title">
         <div>
           <p className="eyebrow">first 10 minutes</p>
@@ -397,6 +585,31 @@ function App() {
             </div>
           ))}
         </div>
+      </section>
+
+      <section className="beginnerGuide" id="first-steps" aria-labelledby="first-steps-title">
+        <div className="sectionIntro">
+          <p className="eyebrow">step by step</p>
+          <h2 id="first-steps-title">처음부터 열 단계로 따라갑니다</h2>
+          <p>
+            아래 순서는 cokacmux를 처음 설치한 사람이 실제로 해볼 만한 가장 안전한
+            흐름입니다. 삭제, 복사, 위험한 실행은 나중으로 미루고 먼저 읽고 찾는 방법부터
+            익힙니다.
+          </p>
+        </div>
+
+        <ol className="beginnerSteps">
+          {beginnerSteps.map((step, index) => (
+            <li key={step.title}>
+              <div className="guideNumber">{String(index + 1).padStart(2, '0')}</div>
+              <div className="guideBody">
+                <kbd>{step.key}</kbd>
+                <h3>{step.title}</h3>
+                <p>{step.detail}</p>
+              </div>
+            </li>
+          ))}
+        </ol>
       </section>
 
       <section className="workflowShell" id="practice" aria-label="튜토리얼 구성">
