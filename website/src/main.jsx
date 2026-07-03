@@ -91,13 +91,6 @@ const heroFacts = [
   '코딩에이전트를 위해 섬세하게 설계된 Multiplexer입니다.'
 ];
 
-const heroSummary = [
-  ['과정 보존', '코드를 얻기까지의 대화와 판단 과정을 세션에 남깁니다.'],
-  ['노하우 재사용', '세션 안의 대화 내용을 찾아 다음 작업의 스킬셋처럼 씁니다.'],
-  ['에이전트 관리', '여러 코딩 에이전트 세션과 터미널을 한눈에 다룹니다.'],
-  ['안전한 전환', '프로젝트를 오가도 실행 중인 프로세스와 맥락을 잃지 않습니다.']
-];
-
 const installCommands = [
   {
     os: 'macOS / Linux',
@@ -611,20 +604,6 @@ function App() {
               GitHub
             </a>
           </div>
-        </div>
-        <div className="heroTextPanel" aria-label="cokacmux 세션 관리 흐름">
-          <p className="panelLabel">세션 속 노하우를 다시 쓰는 흐름</p>
-          <ol>
-            {heroSummary.map(([title, text], index) => (
-              <li key={title}>
-                <strong>{String(index + 1).padStart(2, '0')}</strong>
-                <span>
-                  <b>{title}</b>
-                  {text}
-                </span>
-              </li>
-            ))}
-          </ol>
         </div>
       </section>
 

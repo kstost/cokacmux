@@ -50,8 +50,8 @@ main {
 .hero {
   min-height: 88vh;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.78fr);
-  gap: clamp(28px, 5vw, 68px);
+  grid-template-columns: minmax(0, 1fr);
+  gap: 28px;
   align-items: center;
   padding: clamp(28px, 6vh, 72px) 0 34px;
 }
@@ -78,7 +78,7 @@ p {
 }
 
 h1 {
-  max-width: 720px;
+  max-width: 980px;
   font-size: clamp(2.45rem, 6vw, 5.8rem);
   line-height: 0.98;
   font-weight: 860;
@@ -95,7 +95,7 @@ h3 {
 }
 
 .heroLead {
-  max-width: 620px;
+  max-width: 760px;
   color: var(--muted);
   font-size: clamp(1.04rem, 2vw, 1.25rem);
   line-height: 1.75;
@@ -114,7 +114,7 @@ h3 {
   grid-template-columns: 24px minmax(0, 1fr);
   gap: 9px;
   align-items: start;
-  max-width: 650px;
+  max-width: 760px;
   color: #dcefd9;
   line-height: 1.56;
 }
@@ -148,57 +148,6 @@ h3 {
   background: var(--teal);
   color: #071312;
   border-color: transparent;
-}
-
-.heroTextPanel {
-  display: grid;
-  gap: 18px;
-  padding-left: clamp(18px, 3vw, 32px);
-  border-left: 1px solid rgba(76, 199, 189, 0.34);
-}
-
-.panelLabel {
-  color: var(--amber);
-  font-size: 0.88rem;
-  font-weight: 850;
-}
-
-.heroTextPanel ol {
-  display: grid;
-  gap: 16px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.heroTextPanel li {
-  display: grid;
-  grid-template-columns: 42px minmax(0, 1fr);
-  gap: 12px;
-  align-items: start;
-}
-
-.heroTextPanel li > strong {
-  width: 42px;
-  height: 42px;
-  display: grid;
-  place-items: center;
-  border-radius: 999px;
-  background: rgba(76, 199, 189, 0.12);
-  color: var(--teal);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 0.84rem;
-}
-
-.heroTextPanel span {
-  display: grid;
-  gap: 4px;
-  color: var(--muted);
-  line-height: 1.62;
-}
-
-.heroTextPanel b {
-  color: var(--text);
 }
 
 .installSection {
@@ -1039,15 +988,9 @@ kbd {
   }
 
   .tourItem,
-  .heroTextPanel li,
   .storySteps li,
   .beginnerSteps li {
     grid-template-columns: 1fr;
-  }
-
-  .heroTextPanel {
-    padding-left: 0;
-    border-left: 0;
   }
 
   .chapterHeader h2 {
