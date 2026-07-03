@@ -764,6 +764,7 @@ enum KeyAction {
     SessionForceQuit,
     SessionToggleAgent,
     SessionKillAgent,
+    SessionKillAll,
     SessionNewShell,
     SessionToggleFocus,
     SessionTogglePreview,
@@ -789,6 +790,7 @@ enum KeyAction {
     SessionsSidebarNext,
     AgentToggleSessions,
     AgentKill,
+    AgentKillAll,
     AgentNewShell,
     AgentToggleSidebar,
     AgentToggleCokacdirPanel,
@@ -814,6 +816,12 @@ enum KeyAction {
     DeleteConfirmPrev,
     DeleteConfirmDelete,
     DeleteConfirmCancelChoice,
+    KillAllConfirmCancel,
+    KillAllConfirmConfirm,
+    KillAllConfirmNext,
+    KillAllConfirmPrev,
+    KillAllConfirmKill,
+    KillAllConfirmCancelChoice,
     CreateFolderCancel,
     CreateFolderConfirm,
     CreateFolderNext,
@@ -904,6 +912,11 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
         "sessions.kill_agent",
         KeyAction::SessionKillAgent,
         &["ctrl+k"],
+    ),
+    (
+        "sessions.kill_all",
+        KeyAction::SessionKillAll,
+        &["ctrl+shift+k"],
     ),
     (
         "sessions.new_shell",
@@ -1002,6 +1015,11 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
         &["ctrl+]", "ctrl+["],
     ),
     ("agent.kill", KeyAction::AgentKill, &["ctrl+k"]),
+    (
+        "agent.kill_all",
+        KeyAction::AgentKillAll,
+        &["ctrl+shift+k"],
+    ),
     ("agent.new_shell", KeyAction::AgentNewShell, &["ctrl+n"]),
     (
         "agent.toggle_sidebar",
@@ -1117,6 +1135,36 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "delete_confirm.cancel_choice",
         KeyAction::DeleteConfirmCancelChoice,
+        &["2"],
+    ),
+    (
+        "killall_confirm.cancel",
+        KeyAction::KillAllConfirmCancel,
+        &["esc", "n", "N"],
+    ),
+    (
+        "killall_confirm.confirm",
+        KeyAction::KillAllConfirmConfirm,
+        &["enter"],
+    ),
+    (
+        "killall_confirm.next",
+        KeyAction::KillAllConfirmNext,
+        HORIZONTAL_CHOICE_NEXT_DEFAULTS,
+    ),
+    (
+        "killall_confirm.prev",
+        KeyAction::KillAllConfirmPrev,
+        HORIZONTAL_CHOICE_PREV_DEFAULTS,
+    ),
+    (
+        "killall_confirm.kill",
+        KeyAction::KillAllConfirmKill,
+        &["1"],
+    ),
+    (
+        "killall_confirm.cancel_choice",
+        KeyAction::KillAllConfirmCancelChoice,
         &["2"],
     ),
     (
@@ -1426,6 +1474,14 @@ impl KeyBinding {
             return true;
         }
         if let (KeyCode::Char(expected), KeyCode::Char(actual)) = (self.code, key.code) {
+            if self.modifiers == key.modifiers
+                && self.modifiers.contains(KeyModifiers::SHIFT)
+                && expected.eq_ignore_ascii_case(&actual)
+            {
+                return true;
+            }
+        }
+        if let (KeyCode::Char(expected), KeyCode::Char(actual)) = (self.code, key.code) {
             if expected == actual
                 && self.modifiers == KeyModifiers::NONE
                 && key.modifiers == KeyModifiers::SHIFT
@@ -1472,6 +1528,11 @@ fn key_binding_control_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<V
     if !modifiers.contains(KeyModifiers::CONTROL) {
         return None;
     }
+    if modifiers.intersects(
+        KeyModifiers::SHIFT | KeyModifiers::SUPER | KeyModifiers::META | KeyModifiers::HYPER,
+    ) {
+        return None;
+    }
     let KeyCode::Char(c) = code else {
         return None;
     };
@@ -1484,6 +1545,11 @@ fn key_binding_control_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<V
 
 fn key_event_control_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.modifiers.intersects(
+            KeyModifiers::SHIFT | KeyModifiers::SUPER | KeyModifiers::META | KeyModifiers::HYPER,
+        ) {
+            return None;
+        }
         if let Some(bytes) = key_event_to_bytes(key) {
             if bytes != [0x1b] && bytes != [0x1d] {
                 return Some(bytes);
@@ -2812,6 +2878,9 @@ enum InputMode {
         removed_index: Option<usize>,
         selected: usize,
     },
+    KillAllConfirm {
+        selected: usize,
+    },
     CreateFolderConfirm {
         info: SessionInfo,
         path: PathBuf,
@@ -2910,6 +2979,27 @@ fn delete_option_at(index: usize) -> DeleteOption {
 
 fn move_delete_option_index(index: usize, delta: i32) -> usize {
     (index as i32 + delta).rem_euclid(DELETE_OPTION_COUNT as i32) as usize
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillAllOption {
+    Kill,
+    Cancel,
+}
+
+const KILLALL_OPTION_KILL: usize = 0;
+const KILLALL_OPTION_CANCEL: usize = 1;
+const KILLALL_OPTION_COUNT: usize = 2;
+
+fn killall_option_at(index: usize) -> KillAllOption {
+    match index % KILLALL_OPTION_COUNT {
+        KILLALL_OPTION_KILL => KillAllOption::Kill,
+        _ => KillAllOption::Cancel,
+    }
+}
+
+fn move_killall_option_index(index: usize, delta: i32) -> usize {
+    (index as i32 + delta).rem_euclid(KILLALL_OPTION_COUNT as i32) as usize
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4009,6 +4099,79 @@ fn agent_kill_worker_result_debug_value(result: &AgentKillWorkerResult) -> serde
     })
 }
 
+fn killall_report_debug_value(report: &KillAllCokacmuxReport) -> serde_json::Value {
+    serde_json::json!({
+        "agents_killed": report.killall.killed,
+        "stale_agents": report.killall.stale,
+        "child_processes_terminated": report.killall.child_processes_terminated,
+        "runtime_files_removed": report.killall.runtime_files_removed,
+        "pty_logs_deleted": report.killall.pty_logs_deleted,
+        "cwd_locks_removed": report.killall.cwd_locks_removed,
+        "clients_scanned": report.client_processes_scanned,
+        "clients_terminated": report.client_processes_terminated,
+        "clients_skipped_self": report.client_processes_skipped_self,
+        "clients_skipped_unverified": report.client_processes_skipped_unverified,
+        "client_errors": report.client_process_errors,
+        "untracked_daemons_scanned": report.untracked_daemon_processes_scanned,
+        "untracked_daemons_terminated": report.untracked_daemon_processes_terminated,
+        "untracked_daemons_skipped_self": report.untracked_daemon_processes_skipped_self,
+        "untracked_daemons_skipped_unverified": report.untracked_daemon_processes_skipped_unverified,
+        "untracked_daemon_errors": report.untracked_daemon_process_errors,
+        "agents_removed": report.agents_removed,
+        "agents_missing": report.agents_missing,
+        "debug_removed": report.debug_removed,
+        "debug_missing": report.debug_missing,
+    })
+}
+
+fn killall_pending_debug_value(pending: &KillAllPending) -> serde_json::Value {
+    serde_json::json!({
+        "seq": pending.seq,
+        "elapsed_ms": pending.started_at.elapsed().as_millis(),
+    })
+}
+
+fn killall_worker_result_debug_value(result: &KillAllWorkerResult) -> serde_json::Value {
+    serde_json::json!({
+        "seq": result.seq,
+        "outcome_ok": result.outcome.is_ok(),
+        "outcome": result.outcome.as_ref().ok().map(killall_report_debug_value),
+        "error": result.outcome.as_ref().err(),
+        "queued_at_epoch_ms": result.queued_at_epoch_ms,
+        "elapsed_ms": result.elapsed_ms,
+    })
+}
+
+fn killall_status_summary(report: &KillAllCokacmuxReport) -> String {
+    let terminated = report
+        .killall
+        .killed
+        .saturating_add(report.killall.child_processes_terminated)
+        .saturating_add(report.client_processes_terminated)
+        .saturating_add(report.untracked_daemon_processes_terminated);
+    let cleaned = report
+        .killall
+        .runtime_files_removed
+        .saturating_add(usize::from(report.agents_removed))
+        .saturating_add(usize::from(report.debug_removed));
+    let errors = report
+        .killall
+        .errors
+        .saturating_add(report.client_process_errors)
+        .saturating_add(report.untracked_daemon_process_errors);
+    if errors > 0 {
+        format!(
+            "killall finished with {} error(s): turned off {}, cleaned {}",
+            errors, terminated, cleaned
+        )
+    } else {
+        format!(
+            "killall complete: turned off {}, cleaned {}",
+            terminated, cleaned
+        )
+    }
+}
+
 fn new_session_launch_pending_debug_value(pending: &NewSessionLaunchPending) -> serde_json::Value {
     serde_json::json!({
         "seq": pending.seq,
@@ -4309,6 +4472,13 @@ fn app_runtime_snapshot_debug_value(app: &App, verbose: bool) -> serde_json::Val
         app.agent_kill_pending
             .as_ref()
             .map(agent_kill_pending_debug_value)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    snapshot.insert(
+        "killall_pending".into(),
+        app.killall_pending
+            .as_ref()
+            .map(killall_pending_debug_value)
             .unwrap_or(serde_json::Value::Null),
     );
     snapshot.insert(
@@ -4645,6 +4815,10 @@ fn main_event_debug_value(event: &MainEvent) -> serde_json::Value {
         MainEvent::AgentKillResult(result) => serde_json::json!({
             "kind": "agent_kill_result",
             "result": agent_kill_worker_result_debug_value(result),
+        }),
+        MainEvent::KillAllResult(result) => serde_json::json!({
+            "kind": "killall_result",
+            "result": killall_worker_result_debug_value(result),
         }),
         MainEvent::NewSessionPrepareResult(result) => {
             let mut value = new_session_prepare_result_debug_value(result);
@@ -8341,6 +8515,8 @@ enum MainEvent {
     AttachResult(Box<AttachWorkerResult>),
     /// A Ctrl+K kill request finished off the UI thread.
     AgentKillResult(Box<AgentKillWorkerResult>),
+    /// A Ctrl+Shift+K killall request finished off the UI thread.
+    KillAllResult(Box<KillAllWorkerResult>),
     /// New-session cwd normalization/creation completed off the UI thread.
     NewSessionPrepareResult(Box<NewSessionPrepareResult>),
     /// The keybindings watcher thread saw the file change.
@@ -8485,6 +8661,19 @@ struct AgentKillWorkerResult {
     cols: u16,
     rows: u16,
     outcome: std::result::Result<AgentTermination, String>,
+    queued_at_epoch_ms: u64,
+    elapsed_ms: u128,
+}
+
+#[derive(Clone, Debug)]
+struct KillAllPending {
+    seq: u64,
+    started_at: Instant,
+}
+
+struct KillAllWorkerResult {
+    seq: u64,
+    outcome: std::result::Result<KillAllCokacmuxReport, String>,
     queued_at_epoch_ms: u64,
     elapsed_ms: u128,
 }
@@ -8878,6 +9067,8 @@ struct App {
     queued_attach: Option<AttachJob>,
     agent_kill_seq: u64,
     agent_kill_pending: Option<AgentKillPending>,
+    killall_seq: u64,
+    killall_pending: Option<KillAllPending>,
     new_session_launch_seq: u64,
     new_session_launch: Option<NewSessionLaunchPending>,
     /// First-seen order of agents-sidebar entries. Keeps the sidebar from
@@ -9026,6 +9217,8 @@ impl App {
             queued_attach: None,
             agent_kill_seq: 0,
             agent_kill_pending: None,
+            killall_seq: 0,
+            killall_pending: None,
             new_session_launch_seq: 0,
             new_session_launch: None,
             agent_sidebar_order: Vec::new(),
@@ -12519,9 +12712,19 @@ impl App {
         ))
     }
 
+    fn killall_pending_status(&self) -> Option<String> {
+        let pending = self.killall_pending.as_ref()?;
+        Some(format!(
+            "{} turning off all running work ({}s)",
+            startup_spinner_frame(pending.started_at.elapsed()),
+            pending.started_at.elapsed().as_secs()
+        ))
+    }
+
     fn display_status(&self) -> String {
         self.data_task_status()
             .or_else(|| self.new_session_launch_status())
+            .or_else(|| self.killall_pending_status())
             .or_else(|| self.agent_exit_pending_status())
             .or_else(|| self.session_refresh_status())
             .or_else(|| self.ai_search_status())
@@ -12556,6 +12759,7 @@ impl App {
             || self.new_session_launch.is_some()
             || self.attach_in_flight.is_some()
             || self.agent_kill_pending.is_some()
+            || self.killall_pending.is_some()
             || self.runtime_refresh_pending
             || self.session_refresh_pending
             || self.search_pending.is_some()
@@ -17522,6 +17726,179 @@ impl App {
         }
     }
 
+    fn begin_killall_confirm(&mut self, reason: &'static str) {
+        if self.killall_pending.is_some() {
+            self.status = "killall already in progress...".into();
+            return;
+        }
+        self.input_mode = InputMode::KillAllConfirm {
+            selected: KILLALL_OPTION_CANCEL,
+        };
+        self.status = "confirm turning off all running work.".into();
+        debug_log(
+            "killall_confirm_open",
+            serde_json::json!({
+                "reason": reason,
+                "known_live_agents": self.known_live_agent_count(),
+                "snapshot": app_runtime_snapshot_debug_value(self, false),
+            }),
+        );
+    }
+
+    fn known_live_agent_count(&self) -> usize {
+        self.agent_states
+            .values()
+            .filter(|state| is_switchable_agent_state(**state))
+            .count()
+    }
+
+    fn start_killall_worker(&mut self) {
+        if self.killall_pending.is_some() {
+            self.status = "killall already in progress...".into();
+            return;
+        }
+        let Some(result_tx) = self.main_tx.clone() else {
+            self.status = "cannot killall; event loop is not ready".into();
+            return;
+        };
+        self.killall_seq = self.killall_seq.saturating_add(1);
+        let seq = self.killall_seq;
+        self.killall_pending = Some(KillAllPending {
+            seq,
+            started_at: Instant::now(),
+        });
+        self.input_mode = InputMode::Normal;
+        self.status = "turning off all running work...".into();
+        debug_log(
+            "killall_worker_starting",
+            serde_json::json!({
+                "seq": seq,
+                "snapshot": app_runtime_snapshot_debug_value(self, false),
+            }),
+        );
+        let spawn_result = thread::Builder::new()
+            .name("cokacmux-killall".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    killall_cokacmux().map_err(|error| error.to_string())
+                }))
+                .unwrap_or_else(|_| Err("killall worker panicked".to_string()));
+                let _ = result_tx.send(MainEvent::KillAllResult(Box::new(
+                    KillAllWorkerResult {
+                        seq,
+                        outcome,
+                        queued_at_epoch_ms: current_epoch_ms(),
+                        elapsed_ms: started.elapsed().as_millis(),
+                    },
+                )));
+            });
+        if let Err(e) = spawn_result {
+            self.killall_pending = None;
+            self.status = format!("killall failed: {}", e);
+            debug_log(
+                "killall_worker_spawn_failed",
+                serde_json::json!({
+                    "seq": seq,
+                    "error": e.to_string(),
+                    "snapshot": app_runtime_snapshot_debug_value(self, false),
+                }),
+            );
+        }
+    }
+
+    fn on_killall_result(&mut self, result: Box<KillAllWorkerResult>) {
+        let result = *result;
+        let pending_seq = self.killall_pending.as_ref().map(|pending| pending.seq);
+        debug_log(
+            "killall_result_received",
+            serde_json::json!({
+                "pending_seq": pending_seq,
+                "result": killall_worker_result_debug_value(&result),
+                "queued_latency_ms": current_epoch_ms().saturating_sub(result.queued_at_epoch_ms),
+                "snapshot": app_runtime_snapshot_debug_value(self, false),
+            }),
+        );
+        if pending_seq != Some(result.seq) {
+            debug_log(
+                "killall_result_stale",
+                serde_json::json!({
+                    "pending_seq": pending_seq,
+                    "result": killall_worker_result_debug_value(&result),
+                    "snapshot": app_runtime_snapshot_debug_value(self, false),
+                }),
+            );
+            return;
+        }
+        self.killall_pending = None;
+        match result.outcome {
+            Ok(report) => {
+                self.clear_live_runtime_after_killall();
+                self.status = killall_status_summary(&report);
+                debug_log(
+                    "killall_complete",
+                    serde_json::json!({
+                        "seq": result.seq,
+                        "report": killall_report_debug_value(&report),
+                        "elapsed_ms": result.elapsed_ms,
+                        "snapshot": app_runtime_snapshot_debug_value(self, false),
+                    }),
+                );
+            }
+            Err(error) => {
+                self.status = format!("killall failed: {}", error);
+                debug_log(
+                    "killall_failed",
+                    serde_json::json!({
+                        "seq": result.seq,
+                        "error": error,
+                        "elapsed_ms": result.elapsed_ms,
+                        "snapshot": app_runtime_snapshot_debug_value(self, false),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn clear_live_runtime_after_killall(&mut self) {
+        self.agent_kill_pending = None;
+        self.attach_in_flight = None;
+        self.queued_attach = None;
+        self.new_session_launch = None;
+        self.pending_runtime_action = None;
+        self.active_agent = None;
+        self.agent_aux = None;
+        self.hidden_agent_aux.clear();
+        self.agent_aux_parent_infos.clear();
+        self.agent_focus_by_agent.clear();
+        self.agent_focus = AgentFocusPane::Main;
+        self.show_sessions_view = true;
+        self.live_shells.clear();
+        self.agent_states.clear();
+        self.new_agent_backing_aliases.clear();
+        self.new_agent_backing_probe_after.clear();
+        self.live_shell_missing_strikes.clear();
+        self.agent_sidebar_order.clear();
+        self.persisted_agent_aux.clear();
+        if self.persist_agent_auxiliary_registry {
+            let _ = save_persisted_agent_auxiliaries(&self.persisted_agent_aux);
+        }
+        if self.runtime_refresh_pending {
+            self.runtime_refresh_applied_seq = self
+                .runtime_refresh_applied_seq
+                .max(self.runtime_refresh_seq.saturating_add(1));
+        }
+        self.runtime_refresh_pending = false;
+        self.runtime_refresh_started_at = None;
+        self.runtime_refresh_queued = false;
+        self.live_shell_discovery_seq = self.live_shell_discovery_seq.saturating_add(1);
+        self.live_shell_discovery_pending = false;
+        self.live_shell_discovery_started_at = None;
+        self.live_shell_discovery_last_slow_log_at = None;
+        self.last_live_shell_discovery = Instant::now();
+        self.discard_pending_agent_runtime_refresh();
+    }
+
     fn next_agent_after_current(&mut self) -> Option<SessionInfo> {
         let active_agent = self.active_agent.as_ref()?;
         let current_key = AgentKey::new(&active_agent.info);
@@ -22031,6 +22408,7 @@ fn main_event_kind(event: &MainEvent) -> &'static str {
         MainEvent::AiTitleResult(_) => "ai_title_result",
         MainEvent::AttachResult(_) => "attach_result",
         MainEvent::AgentKillResult(_) => "agent_kill_result",
+        MainEvent::KillAllResult(_) => "killall_result",
         MainEvent::NewSessionPrepareResult(_) => "new_session_prepare_result",
         MainEvent::KeybindingsReloaded(_) => "keybindings_reloaded",
     }
@@ -22074,6 +22452,7 @@ fn main_event_queued_at_epoch_ms(event: &MainEvent) -> Option<u64> {
         MainEvent::LiveShellDiscoveryResult(result) => result.queued_at_epoch_ms,
         MainEvent::AttachResult(result) => result.queued_at_epoch_ms,
         MainEvent::AgentKillResult(result) => result.queued_at_epoch_ms,
+        MainEvent::KillAllResult(result) => result.queued_at_epoch_ms,
         MainEvent::NewSessionPrepareResult(result) => result.queued_at_epoch_ms,
         _ => return None,
     }
@@ -22617,6 +22996,9 @@ fn handle_main_event(
         MainEvent::AgentKillResult(result) => {
             app.on_agent_kill_result(result);
         }
+        MainEvent::KillAllResult(result) => {
+            app.on_killall_result(result);
+        }
         MainEvent::NewSessionPrepareResult(result) => {
             app.on_new_session_prepare_result(result);
         }
@@ -22897,7 +23279,8 @@ fn run(terminal: &mut Tui) -> Result<()> {
         // and are handled on the next loop after a render opportunity.
         let drain_started = Instant::now();
         let mut drained_events = 0usize;
-        let skip_drain_for_kill_feedback = app.agent_kill_pending.is_some();
+        let skip_drain_for_kill_feedback =
+            app.agent_kill_pending.is_some() || app.killall_pending.is_some();
         if !skip_drain_for_kill_feedback {
             loop {
                 if !should_continue_main_event_drain(drained_events, drain_started.elapsed()) {
@@ -31712,6 +32095,10 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         debug_log_agent_key_outcome(app, key, "notice");
         return;
     }
+    if handle_killall_confirm_key(app, key) {
+        debug_log_agent_key_outcome(app, key, "killall_confirm");
+        return;
+    }
     if matches!(app.input_mode, InputMode::NewSession { .. }) {
         let viewport = agent_viewports_for_terminal(
             total_width,
@@ -31739,6 +32126,12 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         );
         app.show_sessions_view = true;
         debug_log_agent_key_outcome(app, key, "toggle_to_sessions");
+        return;
+    }
+    if keybindings.matches(KeyAction::AgentKillAll, key) {
+        debug_log_agent_key(key, "killall_confirm");
+        app.begin_killall_confirm("agent_shortcut");
+        debug_log_agent_key_outcome(app, key, "killall_confirm");
         return;
     }
     if !shift_shortcuts_disabled
@@ -31991,6 +32384,90 @@ fn handle_notice_key(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
+fn handle_killall_confirm_key(app: &mut App, key: KeyEvent) -> bool {
+    let keybindings = app.keybindings.clone();
+    if let InputMode::KillAllConfirm { selected } = &mut app.input_mode {
+        let mut next_mode: Option<InputMode> = None;
+        let mut start_killall = false;
+        let choose_option =
+            |option: KillAllOption,
+             start_killall: &mut bool,
+             next_mode: &mut Option<InputMode>,
+             status: &mut String| match option {
+                KillAllOption::Kill => {
+                    *start_killall = true;
+                    *next_mode = Some(InputMode::Normal);
+                }
+                KillAllOption::Cancel => {
+                    *status = "cancelled.".into();
+                    *next_mode = Some(InputMode::Normal);
+                }
+            };
+
+        if keybindings.matches(KeyAction::KillAllConfirmCancel, key)
+            || keybindings.matches(KeyAction::KillAllConfirmCancelChoice, key)
+        {
+            next_mode = Some(InputMode::Normal);
+            app.status = "cancelled.".into();
+            debug_log_key_event(key, "killall_confirm_cancel");
+        } else if keybindings.matches(KeyAction::KillAllConfirmConfirm, key) {
+            let option = killall_option_at(*selected);
+            choose_option(
+                option,
+                &mut start_killall,
+                &mut next_mode,
+                &mut app.status,
+            );
+            debug_log(
+                "killall_confirm_confirm",
+                serde_json::json!({
+                    "selected": *selected,
+                    "option": match option {
+                        KillAllOption::Kill => "kill",
+                        KillAllOption::Cancel => "cancel",
+                    },
+                }),
+            );
+        } else if keybindings.matches(KeyAction::KillAllConfirmNext, key) {
+            *selected = move_killall_option_index(*selected, 1);
+            debug_log(
+                "killall_confirm_move",
+                serde_json::json!({
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::KillAllConfirmPrev, key) {
+            *selected = move_killall_option_index(*selected, -1);
+            debug_log(
+                "killall_confirm_move",
+                serde_json::json!({
+                    "selected": *selected,
+                }),
+            );
+        } else if keybindings.matches(KeyAction::KillAllConfirmKill, key) {
+            *selected = KILLALL_OPTION_KILL;
+            choose_option(
+                KillAllOption::Kill,
+                &mut start_killall,
+                &mut next_mode,
+                &mut app.status,
+            );
+            debug_log_key_event(key, "killall_confirm_kill");
+        } else {
+            debug_log_key_event(key, "killall_confirm_ignored");
+        }
+
+        if let Some(mode) = next_mode {
+            app.input_mode = mode;
+        }
+        if start_killall {
+            app.start_killall_worker();
+        }
+        return true;
+    }
+    false
+}
+
 fn agent_shift_shortcuts_disabled_for_active_info(
     info: Option<&SessionInfo>,
     key: KeyEvent,
@@ -32024,8 +32501,18 @@ fn is_session_kill_key(key: KeyEvent) -> bool {
 }
 
 #[cfg(test)]
+fn is_session_killall_key(key: KeyEvent) -> bool {
+    KeyBindings::default().matches(KeyAction::SessionKillAll, key)
+}
+
+#[cfg(test)]
 fn is_agent_kill_key(key: KeyEvent) -> bool {
     KeyBindings::default().matches(KeyAction::AgentKill, key)
+}
+
+#[cfg(test)]
+fn is_agent_killall_key(key: KeyEvent) -> bool {
+    KeyBindings::default().matches(KeyAction::AgentKillAll, key)
 }
 
 #[cfg(test)]
@@ -32409,6 +32896,7 @@ fn input_mode_label(mode: &InputMode) -> &'static str {
         InputMode::Filter { .. } => "filter",
         InputMode::AiSearch { .. } => "ai_search",
         InputMode::DeleteConfirm { .. } => "delete_confirm",
+        InputMode::KillAllConfirm { .. } => "killall_confirm",
         InputMode::CreateFolderConfirm { .. } => "create_folder_confirm",
         InputMode::RestoreDataConfirm { .. } => "restore_data_confirm",
         InputMode::AgentLaunch { .. } => "agent_launch",
@@ -33359,7 +33847,12 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
-    if let Some(task) = app.data_task.as_ref() {
+    if draw_killall_pending_overlay(f, area, app.killall_pending.as_ref()) {
+        return true;
+    }
+    if let InputMode::KillAllConfirm { selected } = &app.input_mode {
+        draw_killall_confirm_modal(f, area, *selected, &app.keybindings);
+    } else if let Some(task) = app.data_task.as_ref() {
         draw_data_task_modal(f, area, task);
     } else if let InputMode::DeleteConfirm {
         info,
@@ -33672,6 +34165,53 @@ fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPendi
         .wrap(Wrap { trim: true });
     f.render_widget(Clear, modal_area);
     f.render_widget(p, modal_area);
+}
+
+fn draw_killall_pending_overlay(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    pending: Option<&KillAllPending>,
+) -> bool {
+    let Some(pending) = pending else {
+        return false;
+    };
+    let elapsed = pending.started_at.elapsed();
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("{} Turning off all running work", startup_spinner_frame(elapsed)),
+            Style::default()
+                .fg(THEME_FG_STRONG)
+                .bg(THEME_BG_ALT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Closing agents, terminals, and other cokacmux screens.",
+            Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            "Settings and saved sessions are kept.",
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            format!("Elapsed: {}s", elapsed.as_secs()),
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+    ];
+    let modal_area =
+        modal_area_for_wrapped_lines(area, "Turning off all", &lines, 48, 92, 6, 10);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Turning off all");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, modal_area);
+    f.render_widget(p, modal_area);
+    true
 }
 
 fn draw_new_session_launch_overlay(
@@ -34715,6 +35255,10 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     }
     if handle_notice_key(app, key) {
         debug_log_session_key(app, key, "notice");
+        return;
+    }
+    if handle_killall_confirm_key(app, key) {
+        debug_log_session_key(app, key, "killall_confirm");
         return;
     }
 
@@ -35878,6 +36422,11 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         );
         return;
     }
+    if keybindings.matches(KeyAction::SessionKillAll, key) {
+        app.begin_killall_confirm("sessions_shortcut");
+        debug_log_session_key(app, key, "killall_confirm");
+        return;
+    }
     if keybindings.matches(KeyAction::SessionKillAgent, key) {
         app.kill_selected_agent();
         return;
@@ -36107,6 +36656,60 @@ fn draw_delete_confirm_modal(
         .wrap(Wrap { trim: false });
     f.render_widget(ratatui::widgets::Clear, modal_area);
     f.render_widget(p, modal_area);
+}
+
+fn draw_killall_confirm_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    selected: usize,
+    keybindings: &KeyBindings,
+) {
+    let lines = killall_confirm_lines(selected, keybindings);
+    let modal_area = modal_area_for_wrapped_lines(area, "Turn off all", &lines, 54, 92, 8, 13);
+    fill_area(f.buffer_mut(), modal_area, theme_alt_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME_BORDER_ACTIVE))
+        .style(theme_alt_style())
+        .title("Turn off all");
+    let p = Paragraph::new(lines)
+        .block(block)
+        .style(theme_alt_style())
+        .wrap(Wrap { trim: false });
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    f.render_widget(p, modal_area);
+}
+
+fn killall_confirm_lines(selected: usize, keybindings: &KeyBindings) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Turn off all running work?",
+            Style::default().fg(THEME_FG_STRONG).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            "This closes every cokacmux agent and terminal.",
+            Style::default().fg(THEME_ACCENT).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            "Other open cokacmux screens may close too.",
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+        Line::from(Span::styled(
+            "Settings and saved sessions stay in place.",
+            Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
+        )),
+        Line::from(""),
+        killall_confirm_button_line(selected),
+        modal_help_line(&killall_confirm_help_items(keybindings)),
+    ]
+}
+
+fn killall_confirm_button_line(selected: usize) -> Line<'static> {
+    Line::from(vec![
+        modal_button_span("1 Turn off all", selected == KILLALL_OPTION_KILL, true),
+        Span::raw("  "),
+        modal_button_span("2 Cancel", selected == KILLALL_OPTION_CANCEL, true),
+    ])
 }
 
 fn delete_confirm_lines(
@@ -37949,6 +38552,39 @@ fn delete_confirm_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
     ]
 }
 
+fn killall_confirm_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+    vec![
+        help_item(
+            keybindings,
+            KeyAction::KillAllConfirmConfirm,
+            "Enter",
+            "choose",
+        ),
+        help_pair_item(
+            keybindings,
+            KeyAction::KillAllConfirmPrev,
+            KeyAction::KillAllConfirmNext,
+            "←",
+            "→",
+            "select",
+        ),
+        help_item(
+            keybindings,
+            KeyAction::KillAllConfirmKill,
+            "1",
+            "turn off all",
+        ),
+        direct_help_item(
+            format!(
+                "{}/{}",
+                keybindings.help(KeyAction::KillAllConfirmCancelChoice, "2"),
+                keybindings.help(KeyAction::KillAllConfirmCancel, "Esc")
+            ),
+            "cancel",
+        ),
+    ]
+}
+
 fn create_folder_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
     vec![
         help_item(
@@ -38931,6 +39567,12 @@ fn help_items(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Vec<
             help_item(keybindings, KeyAction::SessionClone, "c", "clone"),
             help_item(keybindings, KeyAction::SessionDelete, "Delete/d", "delete"),
             help_item(keybindings, KeyAction::SessionLaunchAgent, "e", "launch"),
+            help_item(
+                keybindings,
+                KeyAction::SessionKillAll,
+                "Ctrl+Shift+K",
+                "kill all",
+            ),
             quit_help_item(keybindings),
         ],
         FocusPane::Sessions if width >= 104 => vec![
@@ -39169,6 +39811,12 @@ fn agent_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
             "resize",
         ),
         help_item(keybindings, KeyAction::AgentKill, "Ctrl+K", "kill"),
+        help_item(
+            keybindings,
+            KeyAction::AgentKillAll,
+            "Ctrl+Shift+K",
+            "kill all",
+        ),
         help_item(keybindings, KeyAction::GlobalQuit, "Ctrl+Q", "quit"),
     ]
 }
@@ -41096,6 +41744,8 @@ mod tests {
             queued_attach: None,
             agent_kill_seq: 0,
             agent_kill_pending: None,
+            killall_seq: 0,
+            killall_pending: None,
             new_session_launch_seq: 0,
             new_session_launch: None,
             agent_sidebar_order: Vec::new(),
@@ -41171,6 +41821,8 @@ mod tests {
             KeyAction::SearchChoicePrev,
             KeyAction::DeleteConfirmNext,
             KeyAction::DeleteConfirmPrev,
+            KeyAction::KillAllConfirmNext,
+            KeyAction::KillAllConfirmPrev,
             KeyAction::CreateFolderNext,
             KeyAction::CreateFolderPrev,
             KeyAction::RestoreDataNext,
@@ -41280,6 +41932,10 @@ mod tests {
             value["sessions"]["toggle_focus"],
             serde_json::json!(["tab"])
         );
+        assert_eq!(
+            value["sessions"]["kill_all"],
+            serde_json::json!(["ctrl+shift+k"])
+        );
         assert_eq!(value["sessions"]["move_next"], serde_json::json!(["down"]));
         assert_eq!(value["sessions"]["move_prev"], serde_json::json!(["up"]));
         assert_eq!(value["search"]["next"], serde_json::json!(["down", "tab"]));
@@ -41287,7 +41943,12 @@ mod tests {
             value["search"]["prev"],
             serde_json::json!(["up", "backtab"])
         );
-        for section in ["delete_confirm", "create_folder", "restore_data"] {
+        for section in [
+            "delete_confirm",
+            "killall_confirm",
+            "create_folder",
+            "restore_data",
+        ] {
             assert_eq!(
                 value[section]["next"],
                 serde_json::json!(["right", "down", "tab"])
@@ -41343,6 +42004,10 @@ mod tests {
         assert_eq!(
             value["agent"]["toggle_terminal_panel"],
             serde_json::json!(["ctrl+t"])
+        );
+        assert_eq!(
+            value["agent"]["kill_all"],
+            serde_json::json!(["ctrl+shift+k"])
         );
         assert_eq!(
             value["agent"]["focus_sidebar"],
@@ -42440,6 +43105,16 @@ mod tests {
                 .unwrap();
             terminal
                 .draw(|f| {
+                    draw_killall_confirm_modal(
+                        f,
+                        f.area(),
+                        KILLALL_OPTION_CANCEL,
+                        &keybindings,
+                    );
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
                     draw_filter_modal(
                         f,
                         f.area(),
@@ -42481,6 +43156,15 @@ mod tests {
                 .draw(|f| {
                     let pending = ai_search_pending_for_test(Arc::new(AtomicBool::new(false)));
                     assert!(draw_ai_search_pending_overlay(f, f.area(), Some(&pending)));
+                })
+                .unwrap();
+            terminal
+                .draw(|f| {
+                    let pending = KillAllPending {
+                        seq: 1,
+                        started_at: Instant::now(),
+                    };
+                    assert!(draw_killall_pending_overlay(f, f.area(), Some(&pending)));
                 })
                 .unwrap();
             terminal
@@ -49364,6 +50048,39 @@ IF EXIST "%~dp0\node.exe" (
             KeyCode::Char('k'),
             KeyModifiers::NONE
         )));
+        assert!(!is_agent_kill_key(KeyEvent::new(
+            KeyCode::Char('K'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+    }
+
+    #[test]
+    fn killall_key_accepts_ctrl_shift_k_without_shadowing_ctrl_k() {
+        let ctrl_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        let raw_ctrl_k = KeyEvent::new(KeyCode::Char('\u{b}'), KeyModifiers::NONE);
+        let ctrl_shift_k = KeyEvent::new(
+            KeyCode::Char('K'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let ctrl_shift_lower_k = KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+
+        assert!(is_agent_killall_key(ctrl_shift_k));
+        assert!(is_agent_killall_key(ctrl_shift_lower_k));
+        assert!(is_session_killall_key(ctrl_shift_k));
+        assert!(!is_agent_killall_key(ctrl_k));
+        assert!(!is_session_killall_key(ctrl_k));
+        assert!(!is_agent_killall_key(raw_ctrl_k));
+        assert!(!is_session_killall_key(raw_ctrl_k));
+
+        assert!(is_agent_kill_key(ctrl_k));
+        assert!(is_agent_kill_key(raw_ctrl_k));
+        assert!(!is_agent_kill_key(ctrl_shift_k));
+
+        let plain_x = KeyBinding::parse("x").unwrap();
+        assert!(!plain_x.matches(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE)));
     }
 
     #[test]
@@ -49478,6 +50195,13 @@ IF EXIST "%~dp0\node.exe" (
             info: session_info(Provider::Codex, "codex-id", "/repo"),
             removed_index: Some(0),
             selected: DELETE_OPTION_CANCEL,
+        };
+        handle_key(&mut app, ctrl_q, 80, 50, 20);
+        assert!(app.should_quit);
+
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::KillAllConfirm {
+            selected: KILLALL_OPTION_CANCEL,
         };
         handle_key(&mut app, ctrl_q, 80, 50, 20);
         assert!(app.should_quit);
@@ -50205,6 +50929,180 @@ IF EXIST "%~dp0\node.exe" (
 
         assert!(app.agent_kill_pending.is_none());
         assert!(app.status.contains("no live codex agent"));
+    }
+
+    #[test]
+    fn session_ctrl_shift_k_opens_killall_confirm_with_cancel_default() {
+        let mut app = app_for_key_tests();
+        handle_key(
+            &mut app,
+            KeyEvent::new(
+                KeyCode::Char('K'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            100,
+            80,
+            20,
+        );
+
+        match app.input_mode {
+            InputMode::KillAllConfirm { selected } => {
+                assert_eq!(selected, KILLALL_OPTION_CANCEL);
+            }
+            ref other => panic!("expected killall confirm, got {:?}", other),
+        }
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.killall_pending.is_none());
+        assert_eq!(app.status, "cancelled.");
+    }
+
+    #[test]
+    fn agent_ctrl_shift_k_opens_killall_confirm() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("agent-killall-confirm", 278));
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(
+                KeyCode::Char('K'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            100,
+            24,
+        );
+
+        assert!(matches!(
+            app.input_mode,
+            InputMode::KillAllConfirm {
+                selected: KILLALL_OPTION_CANCEL
+            }
+        ));
+    }
+
+    #[test]
+    fn cokacdir_agent_ctrl_shift_k_still_opens_killall_confirm() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut client = buffered_output_test_client("cokacdir-killall-confirm", 280);
+        client.info = cokacdir_session_info_for_cwd("/repo".into());
+        app.set_active_agent(client);
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(
+                KeyCode::Char('K'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            100,
+            24,
+        );
+
+        assert!(matches!(
+            app.input_mode,
+            InputMode::KillAllConfirm {
+                selected: KILLALL_OPTION_CANCEL
+            }
+        ));
+    }
+
+    #[test]
+    fn killall_confirm_requires_explicit_kill_choice() {
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::KillAllConfirm {
+            selected: KILLALL_OPTION_CANCEL,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.killall_pending.is_none());
+        assert_eq!(app.status, "cannot killall; event loop is not ready");
+    }
+
+    #[test]
+    fn killall_pending_overlay_is_centered_modal() {
+        let mut app = app_for_key_tests();
+        app.killall_pending = Some(KillAllPending {
+            seq: 1,
+            started_at: Instant::now(),
+        });
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                assert!(draw_input_modal(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Turning off all"));
+        assert!(rendered.contains("Turning off all running work"));
+        assert!(rendered.contains("Settings and saved sessions are kept"));
+    }
+
+    #[test]
+    fn killall_result_clears_live_runtime_state() {
+        let mut app = app_for_key_tests();
+        let info = session_info(Provider::Codex, "killall-active", "/repo");
+        let key = AgentKey::new(&info);
+        let mut active = buffered_output_test_client("killall-active", 279);
+        active.info = info.clone();
+        app.set_active_agent(active);
+        app.show_sessions_view = false;
+        app.agent_states.insert(
+            key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Busy,
+            },
+        );
+        app.live_shells.push(shell_session_info_for_cwd("/repo".into()));
+        app.killall_pending = Some(KillAllPending {
+            seq: 9,
+            started_at: Instant::now(),
+        });
+
+        let report = KillAllCokacmuxReport {
+            killall: KillAllAgentsReport {
+                killed: 1,
+                child_processes_terminated: 1,
+                runtime_files_removed: 2,
+                ..Default::default()
+            },
+            agents_removed: true,
+            debug_removed: true,
+            ..Default::default()
+        };
+
+        app.on_killall_result(Box::new(KillAllWorkerResult {
+            seq: 9,
+            outcome: Ok(report),
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 5,
+        }));
+
+        assert!(app.killall_pending.is_none());
+        assert!(app.active_agent.is_none());
+        assert!(app.agent_states.is_empty());
+        assert!(app.live_shells.is_empty());
+        assert!(app.show_sessions_view);
+        assert!(app.status.contains("killall complete"));
     }
 
     #[test]
