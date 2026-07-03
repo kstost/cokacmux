@@ -150,6 +150,108 @@ h3 {
   box-shadow: 0 28px 80px var(--shadow);
 }
 
+.primer {
+  display: grid;
+  gap: 26px;
+  padding: 44px 0 70px;
+  border-top: 1px solid var(--line);
+}
+
+.sectionIntro {
+  max-width: 780px;
+  display: grid;
+  gap: 12px;
+}
+
+.sectionIntro h2 {
+  margin-top: 4px;
+}
+
+.sectionIntro p:last-child {
+  color: var(--muted);
+  line-height: 1.72;
+}
+
+.primerGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.primerCard {
+  min-height: 210px;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.primerCard svg {
+  color: var(--teal);
+}
+
+.primerCard p {
+  color: var(--muted);
+  line-height: 1.68;
+}
+
+.firstRun {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.72fr) minmax(0, 1.28fr);
+  gap: 28px;
+  align-items: start;
+  padding: clamp(20px, 4vw, 30px);
+  border: 1px solid rgba(237, 183, 94, 0.24);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(237, 183, 94, 0.1), rgba(76, 199, 189, 0.055)),
+    var(--surface);
+}
+
+.firstRun h2 {
+  margin-top: 10px;
+}
+
+.firstRun ol {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.firstRun li {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.firstRun li strong {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: rgba(237, 183, 94, 0.15);
+  color: var(--amber);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.firstRun li span {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  line-height: 1.62;
+}
+
+.firstRun li b {
+  color: var(--text);
+}
+
 .overview {
   display: grid;
   grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.2fr);
@@ -399,6 +501,7 @@ kbd {
   }
 
   .hero,
+  .firstRun,
   .overview,
   .workflowShell,
   .finish {
@@ -433,6 +536,7 @@ kbd {
   }
 
   .keyGrid,
+  .primerGrid,
   .scenarioNav {
     grid-template-columns: 1fr;
   }

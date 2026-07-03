@@ -4,6 +4,7 @@ import {
   BadgeCheck,
   ClipboardList,
   Copy,
+  FolderSearch,
   History,
   Keyboard,
   Layers3,
@@ -11,6 +12,7 @@ import {
   Search,
   ShieldAlert,
   SplitSquareHorizontal,
+  TerminalSquare,
   Wand2
 } from 'lucide-react';
 import heroImage from './assets/cokacmux-hero.png';
@@ -25,14 +27,42 @@ const quickKeys = [
   ['현재 작업 종료', 'Ctrl+K']
 ];
 
+const primerItems = [
+  {
+    icon: Layers3,
+    title: 'cokacmux는 무엇인가요?',
+    text:
+      'Claude Code, Codex, OpenCode, Pi, GJC가 남긴 대화 기록을 한 화면에 모아 보여주는 터미널 앱입니다. 새 AI가 아니라, 이미 쓰는 코딩 도구의 대화를 찾고 다시 여는 작업대입니다.'
+  },
+  {
+    icon: FolderSearch,
+    title: '언제 필요해지나요?',
+    text:
+      '어제 고친 버그 대화를 찾거나, 같은 대화를 복사해 다른 방향을 실험하거나, 여러 agent와 terminal을 켜 둔 채 번갈아 볼 때 씁니다.'
+  },
+  {
+    icon: TerminalSquare,
+    title: '처음에는 무엇을 보나요?',
+    text:
+      '왼쪽에는 대화 목록이 있고 오른쪽에는 선택한 대화 내용이 보입니다. 먼저 목록을 훑고, 필요한 대화인지 미리보기로 확인하면 됩니다.'
+  }
+];
+
+const firstRunSteps = [
+  ['1', 'cokacmux 실행', '터미널에서 앱을 열면 기존 코딩 도구들이 저장한 대화 목록을 읽어 옵니다.'],
+  ['2', '왼쪽 목록 확인', '도구, 제목, 시간, 작업 폴더를 보며 어떤 대화인지 먼저 구분합니다.'],
+  ['3', '오른쪽 미리보기 읽기', 'Tab으로 포커스를 옮겨 대화 내용을 열기 전에 확인합니다.'],
+  ['4', '필요할 때만 다시 열기', 'e 또는 Enter로 원래 코딩 도구의 대화를 이어서 실행합니다.']
+];
+
 const chapters = [
   {
     id: 'start',
-    eyebrow: '상황 1',
-    title: '월요일 아침, 지난주 대화를 다시 찾는다',
+    eyebrow: '실습 1',
+    title: '지난 대화를 찾아 미리보기로 확인한다',
     icon: History,
     scene:
-      '지난주에 Claude Code와 Codex로 여러 작업을 했는데, 어떤 대화에서 버그 원인을 찾았는지 기억이 흐릿한 상태입니다.',
+      'cokacmux가 무엇을 보여주는지 알았다면, 이제 저장된 대화 목록에서 필요한 작업 기록을 찾는 흐름을 익힙니다.',
     steps: [
       {
         key: 'cokacmux',
@@ -59,7 +89,7 @@ const chapters = [
   },
   {
     id: 'search',
-    eyebrow: '상황 2',
+    eyebrow: '실습 2',
     title: '기억나는 단어가 있을 때 빠르게 검색한다',
     icon: Search,
     scene:
@@ -90,7 +120,7 @@ const chapters = [
   },
   {
     id: 'resume',
-    eyebrow: '상황 3',
+    eyebrow: '실습 3',
     title: '대화를 다시 열어 이어서 작업한다',
     icon: Play,
     scene:
@@ -121,7 +151,7 @@ const chapters = [
   },
   {
     id: 'parallel',
-    eyebrow: '상황 4',
+    eyebrow: '실습 4',
     title: '한 작업은 켜 두고, 다른 작업을 나란히 연다',
     icon: SplitSquareHorizontal,
     scene:
@@ -152,7 +182,7 @@ const chapters = [
   },
   {
     id: 'switch',
-    eyebrow: '상황 5',
+    eyebrow: '실습 5',
     title: '켜 둔 작업 사이를 빠르게 오간다',
     icon: Layers3,
     scene:
@@ -183,7 +213,7 @@ const chapters = [
   },
   {
     id: 'clone',
-    eyebrow: '상황 6',
+    eyebrow: '실습 6',
     title: '같은 대화를 복사해 다른 방향을 실험한다',
     icon: Copy,
     scene:
@@ -214,7 +244,7 @@ const chapters = [
   },
   {
     id: 'organize',
-    eyebrow: '상황 7',
+    eyebrow: '실습 7',
     title: '제목을 정리하고 오래된 기록을 치운다',
     icon: ClipboardList,
     scene:
@@ -245,7 +275,7 @@ const chapters = [
   },
   {
     id: 'cleanup',
-    eyebrow: '상황 8',
+    eyebrow: '실습 8',
     title: '하루가 끝나면 실행 중인 작업을 안전하게 종료한다',
     icon: ShieldAlert,
     scene:
@@ -290,20 +320,20 @@ function App() {
     <main>
       <section className="hero" aria-labelledby="hero-title">
         <div className="heroCopy">
-          <p className="eyebrow">cokacmux tutorial</p>
-          <h1 id="hero-title">상황을 따라가며 배우는 cokacmux 사용법</h1>
+          <p className="eyebrow">cokacmux overview</p>
+          <h1 id="hero-title">AI 코딩 대화를 한곳에서 찾고 다시 여는 터미널 작업대</h1>
           <p className="heroLead">
-            예전 대화를 찾고, 다시 열고, 여러 코딩 도구를 켜 둔 채 오가는 흐름을
-            실제 작업 상황처럼 단계별로 따라갑니다.
+            cokacmux는 Claude Code, Codex, OpenCode, Pi, GJC의 대화 기록을 모아
+            보여주고, 필요한 대화를 원래 도구로 다시 이어서 열 수 있게 해줍니다.
           </p>
           <div className="heroActions" aria-label="빠른 이동">
-            <a href="#start">
+            <a href="#what-is">
               <Play size={18} />
-              처음부터 보기
+              먼저 이해하기
             </a>
-            <a href="#keys">
+            <a href="#practice">
               <Keyboard size={18} />
-              핵심 키 보기
+              실습으로 보기
             </a>
           </div>
         </div>
@@ -312,10 +342,52 @@ function App() {
         </div>
       </section>
 
+      <section className="primer" id="what-is" aria-labelledby="what-is-title">
+        <div className="sectionIntro">
+          <p className="eyebrow">before scenarios</p>
+          <h2 id="what-is-title">먼저, 이 앱이 하는 일을 잡고 갑니다</h2>
+          <p>
+            처음 보는 사람에게 중요한 것은 단축키가 아니라 화면의 역할입니다. cokacmux는
+            대화 목록을 찾는 화면과 실제 agent를 실행하는 화면을 오가며 쓰는 앱입니다.
+          </p>
+        </div>
+
+        <div className="primerGrid">
+          {primerItems.map((item) => {
+            const Icon = item.icon;
+            return (
+              <article className="primerCard" key={item.title}>
+                <Icon size={24} />
+                <h3>{item.title}</h3>
+                <p>{item.text}</p>
+              </article>
+            );
+          })}
+        </div>
+
+        <div className="firstRun">
+          <div>
+            <p className="eyebrow">first run</p>
+            <h2>처음 켰을 때의 흐름</h2>
+          </div>
+          <ol>
+            {firstRunSteps.map(([number, title, text]) => (
+              <li key={number}>
+                <strong>{number}</strong>
+                <span>
+                  <b>{title}</b>
+                  {text}
+                </span>
+              </li>
+            ))}
+          </ol>
+        </div>
+      </section>
+
       <section className="overview" id="keys" aria-labelledby="keys-title">
         <div>
           <p className="eyebrow">first 10 minutes</p>
-          <h2 id="keys-title">처음 익힐 키는 여섯 개면 충분합니다</h2>
+          <h2 id="keys-title">화면 구조를 이해한 뒤에는 여섯 키면 충분합니다</h2>
         </div>
         <div className="keyGrid">
           {quickKeys.map(([label, key]) => (
@@ -327,9 +399,9 @@ function App() {
         </div>
       </section>
 
-      <section className="workflowShell" aria-label="튜토리얼 구성">
+      <section className="workflowShell" id="practice" aria-label="튜토리얼 구성">
         <aside className="scenarioNav">
-          <p className="navTitle">상황별 목차</p>
+          <p className="navTitle">실습 목차</p>
           {chapters.map((chapter) => (
             <a href={`#${chapter.id}`} key={chapter.id}>
               {chapter.eyebrow}
