@@ -39,6 +39,12 @@ Thumbs.db
 *.err
 *.png
 !docs/assets/*.png
+!website/src/assets/*.png
+!assets/*.png
+
+# Frontend build dependencies
+/website/node_modules/
+/website/dist/
 
 # Environment
 .env
