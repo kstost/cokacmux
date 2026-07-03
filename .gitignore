@@ -38,6 +38,7 @@ Thumbs.db
 *.out
 *.err
 *.png
+!docs/assets/*.png
 
 # Environment
 .env

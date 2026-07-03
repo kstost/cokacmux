@@ -1,5 +1,7 @@
 # cokacmux
 
+![cokacmux 대표 이미지](docs/assets/cokacmux-hero.png)
+
 > 여러 코딩 도구 작업을 한 화면에 모아 두고, 켜 둔 채 쉽게 오가는 앱
 
 `cokacmux`는 Claude Code, Codex, OpenCode, Pi, GJC가 저장해 둔 대화를 한곳에 모아 보여줍니다.
