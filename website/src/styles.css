@@ -50,7 +50,7 @@ main {
 .hero {
   min-height: 88vh;
   display: grid;
-  grid-template-columns: minmax(0, 0.82fr) minmax(380px, 1.18fr);
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.78fr);
   gap: clamp(28px, 5vw, 68px);
   align-items: center;
   padding: clamp(28px, 6vh, 72px) 0 34px;
@@ -150,27 +150,130 @@ h3 {
   border-color: transparent;
 }
 
-.heroVisual {
-  position: relative;
+.heroTextPanel {
+  display: grid;
+  gap: 18px;
+  padding-left: clamp(18px, 3vw, 32px);
+  border-left: 1px solid rgba(76, 199, 189, 0.34);
 }
 
-.heroVisual::before {
-  content: "";
-  position: absolute;
-  inset: -18px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 8px;
-  transform: rotate(-1.2deg);
+.panelLabel {
+  color: var(--amber);
+  font-size: 0.88rem;
+  font-weight: 850;
 }
 
-.heroVisual img {
-  display: block;
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  object-fit: cover;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+.heroTextPanel ol {
+  display: grid;
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.heroTextPanel li {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.heroTextPanel li > strong {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: rgba(76, 199, 189, 0.12);
+  color: var(--teal);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.84rem;
+}
+
+.heroTextPanel span {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  line-height: 1.62;
+}
+
+.heroTextPanel b {
+  color: var(--text);
+}
+
+.installSection {
+  display: grid;
+  gap: 24px;
+  padding: 34px 0 70px;
+  border-top: 1px solid var(--line);
+}
+
+.installGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.installCard {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid rgba(76, 199, 189, 0.24);
   border-radius: 8px;
-  box-shadow: 0 28px 80px var(--shadow);
+  background:
+    linear-gradient(135deg, rgba(76, 199, 189, 0.075), rgba(255, 255, 255, 0.025)),
+    rgba(255, 255, 255, 0.035);
+}
+
+.installCard p {
+  color: var(--muted);
+  line-height: 1.62;
+}
+
+.commandLine {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-height: 48px;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 8px;
+  background: #0b0c0d;
+}
+
+.commandLine code {
+  overflow: auto;
+  color: var(--text);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.86rem;
+  line-height: 1.45;
+  white-space: nowrap;
+}
+
+.copyCommand {
+  min-width: 86px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid rgba(76, 199, 189, 0.32);
+  border-radius: 6px;
+  background: rgba(76, 199, 189, 0.12);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.86rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.copyCommand:hover,
+.copyCommand:focus-visible {
+  outline: none;
+  border-color: rgba(76, 199, 189, 0.62);
+  background: rgba(76, 199, 189, 0.2);
 }
 
 .valueSection {
@@ -882,6 +985,7 @@ kbd {
   .promiseStrip,
   .valueGrid,
   .routeGrid,
+  .installGrid,
   .beginnerSteps,
   .workflowShell,
   .finish {
@@ -890,10 +994,6 @@ kbd {
 
   .hero {
     min-height: auto;
-  }
-
-  .heroVisual {
-    order: -1;
   }
 
   .mockBody {
@@ -930,14 +1030,24 @@ kbd {
     grid-template-columns: 1fr;
   }
 
+  .commandLine {
+    grid-template-columns: 1fr;
+  }
+
   .chapterHeader {
     grid-template-columns: 1fr;
   }
 
   .tourItem,
+  .heroTextPanel li,
   .storySteps li,
   .beginnerSteps li {
     grid-template-columns: 1fr;
+  }
+
+  .heroTextPanel {
+    padding-left: 0;
+    border-left: 0;
   }
 
   .chapterHeader h2 {

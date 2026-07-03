@@ -1,10 +1,11 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   BadgeCheck,
   ClipboardList,
   Copy,
   FolderSearch,
+  Github,
   History,
   Keyboard,
   Layers3,
@@ -15,13 +16,13 @@ import {
   TerminalSquare,
   Wand2
 } from 'lucide-react';
-import heroImage from './assets/cokacmux-hero.png';
 import './styles.css';
 
 const quickKeys = [
   ['목록 이동', '↑ / ↓'],
   ['검색', 'Ctrl+F'],
   ['다시 열기', 'e 또는 Enter'],
+  ['복제', 'c'],
   ['목록 ↔ 실행 화면', 'Ctrl+] / Ctrl+['],
   ['새 작업', 'Ctrl+N'],
   ['현재 작업 종료', 'Ctrl+K']
@@ -29,75 +30,111 @@ const quickKeys = [
 
 const valueMoments = [
   {
-    icon: Search,
-    title: '어제 고친 내용을 다시 찾을 때',
+    icon: ClipboardList,
+    title: '작업 세션 자체를 자산으로 남길 때',
     before:
-      '어느 도구에서, 어느 폴더에서, 어떤 제목의 대화였는지 기억을 더듬습니다.',
+      '코드는 남지만 어떤 판단을 거쳤는지, 어떤 프롬프트와 결과가 있었는지는 흩어집니다.',
     after:
-      '한 목록에서 시간, 폴더, 도구를 보며 후보를 줄이고, 오른쪽에서 내용만 먼저 확인합니다.'
-  },
-  {
-    icon: Play,
-    title: '중단한 작업을 이어갈 때',
-    before:
-      '새 대화를 열고 “어제 여기까지 했어”를 다시 설명하면서 시간을 씁니다.',
-    after:
-      '원래 대화를 다시 열어 그때의 맥락에서 바로 이어서 질문하고 수정합니다.'
+      '대화, 도구, 제목, 시간, 작업 폴더를 세션 단위로 모아 다음 작업의 출발점으로 씁니다.'
   },
   {
     icon: Layers3,
-    title: '여러 작업을 번갈아 볼 때',
+    title: '여러 프로젝트의 세션을 한 화면에서 관리할 때',
     before:
-      '터미널 창과 탭이 늘어나고, 어느 창이 무슨 작업인지 헷갈립니다.',
+      '프로젝트마다 터미널 창과 코딩 도구가 흩어져서 어느 작업이 살아 있는지 확인하기 어렵습니다.',
     after:
-      '실행 중인 작업을 한 화면에서 보고, 필요한 작업으로 바로 돌아갑니다.'
+      '프로젝트별 세션과 실행 중인 작업을 한 화면에서 보고, 필요한 프로젝트로 바로 돌아갑니다.'
+  },
+  {
+    icon: SplitSquareHorizontal,
+    title: '여러 프로젝트를 동시에 작업할 때',
+    before:
+      '한 프로젝트에서 테스트가 도는 동안 다른 프로젝트를 만지려면 창을 옮겨 다니며 상태를 놓치기 쉽습니다.',
+    after:
+      '한 작업은 계속 돌려 두고, 다른 agent나 terminal을 열어 병렬로 확인하고 수정합니다.'
   },
   {
     icon: Copy,
-    title: '다른 방향으로 실험할 때',
+    title: '세션을 복제해 다른 방향을 실험할 때',
     before:
-      '원래 대화나 작업 폴더를 건드릴까 봐 조심하면서 새 출발점을 직접 만듭니다.',
+      '원래 세션에 바로 이어서 실험하면 안정적인 수정과 큰 구조 변경이 한 흐름에 섞입니다.',
     after:
-      '대화를 복사하고, 필요하면 폴더도 함께 복사해서 원본과 실험을 분리합니다.'
+      '원본 세션을 보존하고, 기록만 복사하거나 작업 폴더까지 복사해 새 방향을 따로 시험합니다.'
+  },
+  {
+    icon: ShieldAlert,
+    title: '프로세스를 안전하게 백그라운드에 둘 때',
+    before:
+      '목록으로 돌아가거나 다른 일을 보려고 하다가 실행 중인 agent나 터미널을 꺼버릴까 봐 조심합니다.',
+    after:
+      '작업 프로세스는 살아 있게 두고 화면만 전환합니다. 종료할 때도 현재 작업과 전체 작업을 구분해 끕니다.'
+  },
+  {
+    icon: Search,
+    title: '예전 세션 맥락을 다시 찾아야 할 때',
+    before:
+      '어느 도구에서, 어느 폴더에서, 어떤 제목의 세션이었는지 기억을 더듬습니다.',
+    after:
+      '프로젝트, 시간, 도구를 기준으로 후보를 줄이고, 미리보기로 읽은 뒤 필요한 세션만 다시 엽니다.'
   }
 ];
 
 const threePromises = [
-  'AI 코딩 도구마다 흩어진 대화를 한곳에서 봅니다.',
-  '대화를 다시 열기 전에 내용을 먼저 읽어보고 판단합니다.',
-  '실행 중인 작업을 끄지 않고 목록으로 돌아와 다른 일을 찾습니다.'
+  '작업 중 만들어진 세션을 프로젝트와 도구 기준으로 모아 봅니다.',
+  '필요한 세션을 검색, 미리보기, 복제, 재개할 수 있게 합니다.',
+  'agent와 terminal 프로세스를 끄지 않고 백그라운드에 안전하게 둡니다.'
 ];
 
 const heroFacts = [
-  'AI 코딩 대화가 흩어져서 다시 찾기 힘들 때 씁니다.',
-  'Claude Code, Codex, OpenCode, Pi, GJC 중 하나만 써도 충분합니다.',
-  '새 AI를 배우는 앱이 아니라, 이미 쓰던 작업 맥락으로 돌아가는 앱입니다.'
+  '작업 중 만들어진 대화와 실행 상태를 세션 자산으로 남깁니다.',
+  '여러 프로젝트의 agent와 terminal을 안전하게 살려 둔 채 전환합니다.',
+  '새 AI가 아니라, 이미 쓰던 코딩 도구의 세션을 찾고 복제하고 이어 여는 앱입니다.'
+];
+
+const heroSummary = [
+  ['세션 모으기', '도구, 제목, 시간, 작업 폴더를 한 목록에서 봅니다.'],
+  ['맥락 보존', '대화와 실행 중인 agent, terminal을 끊지 않고 유지합니다.'],
+  ['복제와 재개', '필요한 세션을 복사하거나 다시 열어 다음 작업으로 이어갑니다.'],
+  ['프로젝트 전환', '여러 프로젝트를 오가도 살아 있는 작업과 기록을 잃지 않습니다.']
+];
+
+const installCommands = [
+  {
+    os: 'macOS / Linux',
+    command: 'curl -fsSL https://cokacmux.cokac.com/manage.sh | bash',
+    note: '설치가 끝나면 새 터미널을 열고 cokacmux --version으로 확인합니다.'
+  },
+  {
+    os: 'Windows PowerShell',
+    command: 'irm https://cokacmux.cokac.com/manage.ps1 | iex',
+    note: 'PowerShell에서 실행한 뒤 새 창을 열고 cokacmux --version으로 확인합니다.'
+  }
 ];
 
 const storySteps = [
   {
-    time: '어제 오후',
-    title: 'Codex로 로그인 오류를 고쳤습니다',
+    time: '오전',
+    title: '백엔드 프로젝트에서 세션이 만들어집니다',
     text:
-      '에러 메시지와 수정한 파일은 기억나지만, 정확히 어떤 대화에서 해결했는지는 흐릿합니다.'
+      'Codex agent가 API 테스트를 돌리며 실패 원인과 수정 방향을 대화 안에 쌓고 있습니다.'
   },
   {
-    time: '오늘 아침',
-    title: '같은 문제가 다시 나왔습니다',
+    time: '잠시 후',
+    title: '프론트엔드 프로젝트도 확인해야 합니다',
     text:
-      '그때의 설명, 테스트 명령, 수정 이유를 다시 보고 싶은데 터미널 기록과 대화 목록이 뒤섞여 있습니다.'
+      '터미널 창을 새로 뒤지는 대신 목록으로 돌아와 프론트엔드 프로젝트의 다른 세션을 엽니다.'
   },
   {
     time: 'cokacmux에서',
-    title: '로그인, auth, 프로젝트 폴더로 후보를 좁힙니다',
+    title: '두 프로젝트의 세션과 프로세스를 모두 살려 둡니다',
     text:
-      '왼쪽 목록에서 시간과 폴더를 보고, 오른쪽 미리보기에서 내용을 읽어 필요한 대화가 맞는지 확인합니다.'
+      '백엔드 테스트는 백그라운드에서 계속 돌고, 프론트엔드 agent에는 새 지시를 보냅니다.'
   },
   {
-    time: '결과',
-    title: '새로 설명하지 않고 그 대화를 이어서 엽니다',
+    time: '다음 날',
+    title: '코드만이 아니라 작업 맥락까지 다시 씁니다',
     text:
-      '원래 대화 맥락에서 바로 질문을 이어가고, 필요하면 오른쪽 터미널을 붙여 테스트까지 같이 봅니다.'
+      '목록에서 어제의 세션을 찾아 미리보기로 확인하고, 그대로 이어 열거나 복제해 새 실험을 시작합니다.'
   }
 ];
 
@@ -113,14 +150,14 @@ const startRoutes = [
     title: '이미 설치했다면',
     label: '상태 확인부터',
     detail:
-      '바로 앱을 열기 전에 어떤 코딩 도구의 대화를 읽을 수 있는지 확인합니다. 처음 실행 전 불안감을 줄이는 단계입니다.',
+      '바로 앱을 열기 전에 어떤 코딩 도구의 세션을 읽을 수 있는지 확인합니다. 처음 실행 전 불안감을 줄이는 단계입니다.',
     key: 'cokacmux --check'
   },
   {
-    title: '대화가 보인다면',
+    title: '세션이 보인다면',
     label: '읽기부터',
     detail:
-      '처음에는 복사나 삭제를 하지 말고, 목록 이동과 미리보기만 익힙니다. 필요한 대화인지 판단하는 감각이 먼저입니다.',
+      '처음에는 복사나 삭제를 하지 말고, 목록 이동과 미리보기만 익힙니다. 필요한 세션인지 판단하는 감각이 먼저입니다.',
     key: '↑ / ↓, Tab'
   }
 ];
@@ -130,27 +167,27 @@ const primerItems = [
     icon: Layers3,
     title: 'cokacmux는 무엇인가요?',
     text:
-      'Claude Code, Codex, OpenCode, Pi, GJC가 남긴 대화 기록을 한 화면에 모아 보여주는 터미널 앱입니다. 새 AI가 아니라, 이미 쓰는 코딩 도구의 대화를 찾고 다시 여는 작업대입니다.'
+      'Claude Code, Codex, OpenCode, Pi, GJC와 터미널 작업에서 생긴 세션을 여러 프로젝트에 걸쳐 관리하는 터미널 앱입니다. 새 AI가 아니라, 이미 쓰는 코딩 도구의 맥락을 찾고 이어 쓰는 작업대입니다.'
   },
   {
     icon: FolderSearch,
     title: '언제 필요해지나요?',
     text:
-      '어제 고친 버그 대화를 찾거나, 같은 대화를 복사해 다른 방향을 실험하거나, 여러 agent와 terminal을 켜 둔 채 번갈아 볼 때 씁니다.'
+      '여러 프로젝트를 동시에 수정하거나, 한 프로젝트에서 테스트를 돌려 둔 채 다른 프로젝트를 확인하거나, 예전 세션을 다시 찾아 이어가고 싶을 때 씁니다.'
   },
   {
     icon: TerminalSquare,
     title: '처음에는 무엇을 보나요?',
     text:
-      '왼쪽에는 대화 목록이 있고 오른쪽에는 선택한 대화 내용이 보입니다. 먼저 목록을 훑고, 필요한 대화인지 미리보기로 확인하면 됩니다.'
+      '왼쪽에는 프로젝트별 세션과 실행 중인 작업이 보이고, 오른쪽에는 선택한 세션의 내용이 보입니다. 먼저 어떤 맥락과 프로세스가 살아 있는지 훑어보면 됩니다.'
   }
 ];
 
 const firstRunSteps = [
-  ['1', 'cokacmux 실행', '터미널에서 앱을 열면 기존 코딩 도구들이 저장한 대화 목록을 읽어 옵니다.'],
-  ['2', '왼쪽 목록 확인', '도구, 제목, 시간, 작업 폴더를 보며 어떤 대화인지 먼저 구분합니다.'],
-  ['3', '오른쪽 미리보기 읽기', 'Tab으로 포커스를 옮겨 대화 내용을 열기 전에 확인합니다.'],
-  ['4', '필요할 때만 다시 열기', 'e 또는 Enter로 원래 코딩 도구의 대화를 이어서 실행합니다.']
+  ['1', 'cokacmux 실행', '터미널에서 앱을 열면 기존 코딩 도구들이 저장한 세션 목록을 읽어 옵니다.'],
+  ['2', '왼쪽 목록 확인', '도구, 제목, 시간, 작업 폴더를 보며 어떤 작업 세션인지 먼저 구분합니다.'],
+  ['3', '오른쪽 미리보기 읽기', 'Tab으로 포커스를 옮겨 세션 내용을 열기 전에 확인합니다.'],
+  ['4', '필요할 때만 다시 열기', 'e 또는 Enter로 원래 코딩 도구의 세션을 이어서 실행합니다.']
 ];
 
 const screenParts = [
@@ -164,17 +201,17 @@ const screenParts = [
   },
   {
     icon: ClipboardList,
-    name: '왼쪽 대화 목록',
+    name: '왼쪽 세션 목록',
     meaning:
-      'Claude Code, Codex 같은 코딩 도구들이 예전에 나눴던 대화를 줄 단위로 보여줍니다. 한 줄이 하나의 대화 기록입니다.',
+      'Claude Code, Codex 같은 코딩 도구들이 만든 작업 세션을 줄 단위로 보여줍니다. 한 줄이 하나의 되돌아갈 수 있는 맥락입니다.',
     action:
-      '위아래 화살표로 줄을 옮기며 제목, 시간, 작업 폴더를 훑습니다. 지금 밝게 표시된 줄이 선택된 대화입니다.'
+      '위아래 화살표로 줄을 옮기며 제목, 시간, 작업 폴더를 훑습니다. 지금 밝게 표시된 줄이 선택된 세션입니다.'
   },
   {
     icon: FolderSearch,
     name: '목록의 칸들',
     meaning:
-      '상태는 실행 중인지, 도구는 어느 AI 코딩 도구의 대화인지, 제목은 사람이 알아보기 쉬운 이름, 폴더는 그 대화가 작업하던 위치입니다.',
+      '상태는 실행 중인지, 도구는 어느 AI 코딩 도구의 세션인지, 제목은 사람이 알아보기 쉬운 이름, 폴더는 그 세션이 작업하던 위치입니다.',
     action:
       '제목만 보지 말고 폴더와 시간을 같이 봅니다. 비슷한 제목이 많을 때는 폴더가 가장 좋은 단서가 됩니다.'
   },
@@ -182,7 +219,7 @@ const screenParts = [
     icon: History,
     name: '오른쪽 미리보기',
     meaning:
-      '선택한 대화의 내용을 읽기 전용으로 보여주는 공간입니다. 여기서 읽는다고 대화가 다시 시작되지는 않습니다.',
+      '선택한 세션의 내용을 읽기 전용으로 보여주는 공간입니다. 여기서 읽는다고 세션이 다시 시작되지는 않습니다.',
     action:
       'Tab을 눌러 오른쪽으로 이동한 뒤 위아래로 읽습니다. 필요한 기록이 맞는지 확인한 다음에만 다시 엽니다.'
   },
@@ -198,7 +235,7 @@ const screenParts = [
     icon: Play,
     name: '다시 열기와 실행 화면',
     meaning:
-      '대화를 다시 열면 원래 코딩 도구가 실제로 실행됩니다. 이때부터는 AI에게 새 질문을 하거나 이어서 작업할 수 있습니다.',
+      '세션을 다시 열면 원래 코딩 도구가 실제로 실행됩니다. 이때부터는 AI에게 새 질문을 하거나 이어서 작업할 수 있습니다.',
     action:
       'e 또는 Enter로 열고, 목록으로 돌아오고 싶으면 Ctrl+] 또는 Ctrl+[를 누릅니다. 돌아와도 실행 중인 작업은 꺼지지 않습니다.'
   }
@@ -218,21 +255,21 @@ const beginnerSteps = [
     key: 'cokacmux --version'
   },
   {
-    title: '대화가 읽히는지 점검합니다',
+    title: '세션이 읽히는지 점검합니다',
     detail:
-      'cokacmux --check는 어떤 코딩 도구의 대화를 찾을 수 있는지 확인하는 명령입니다. 처음이라면 이 명령으로 상태를 먼저 보는 것이 좋습니다.',
+      'cokacmux --check는 어떤 코딩 도구의 세션을 찾을 수 있는지 확인하는 명령입니다. 처음이라면 이 명령으로 상태를 먼저 보는 것이 좋습니다.',
     key: 'cokacmux --check'
   },
   {
     title: '앱을 실행합니다',
     detail:
-      'cokacmux를 입력하면 대화 목록 화면이 열립니다. 이 화면이 앞으로 가장 자주 돌아오게 될 시작점입니다.',
+      'cokacmux를 입력하면 세션 목록 화면이 열립니다. 이 화면이 앞으로 가장 자주 돌아오게 될 시작점입니다.',
     key: 'cokacmux'
   },
   {
     title: '가장 밝게 표시된 줄을 봅니다',
     detail:
-      '밝게 표시된 줄이 현재 선택된 대화입니다. 오른쪽 미리보기는 항상 이 선택 줄을 따라 바뀝니다.',
+      '밝게 표시된 줄이 현재 선택된 세션입니다. 오른쪽 미리보기는 항상 이 선택 줄을 따라 바뀝니다.',
     key: '선택 줄'
   },
   {
@@ -244,13 +281,13 @@ const beginnerSteps = [
   {
     title: '오른쪽 내용을 읽어 봅니다',
     detail:
-      'Tab을 누르면 오른쪽 미리보기로 이동합니다. 여기서는 대화 내용만 읽는 단계라서 실수로 AI 작업이 시작되지 않습니다.',
+      'Tab을 누르면 오른쪽 미리보기로 이동합니다. 여기서는 세션 내용만 읽는 단계라서 실수로 AI 작업이 시작되지 않습니다.',
     key: 'Tab'
   },
   {
-    title: '필요한 대화가 맞는지 판단합니다',
+    title: '필요한 세션이 맞는지 판단합니다',
     detail:
-      '내가 찾던 파일명, 에러 메시지, 작업 내용이 보이면 맞는 대화일 가능성이 큽니다. 아니면 Tab으로 목록에 돌아가 다른 줄을 고릅니다.',
+      '내가 찾던 파일명, 에러 메시지, 작업 내용이 보이면 맞는 세션일 가능성이 큽니다. 아니면 Tab으로 목록에 돌아가 다른 줄을 고릅니다.',
     key: 'Tab'
   },
   {
@@ -262,7 +299,7 @@ const beginnerSteps = [
   {
     title: '정말 이어갈 때만 다시 엽니다',
     detail:
-      'e 또는 Enter를 누르면 원래 코딩 도구로 대화를 이어서 엽니다. 단순히 읽기만 할 때는 미리보기에서 멈추면 됩니다.',
+      'e 또는 Enter를 누르면 원래 코딩 도구로 세션을 이어서 엽니다. 단순히 읽기만 할 때는 미리보기에서 멈추면 됩니다.',
     key: 'e / Enter'
   }
 ];
@@ -271,33 +308,33 @@ const chapters = [
   {
     id: 'start',
     eyebrow: '실습 1',
-    title: '지난 대화를 찾아 미리보기로 확인한다',
+    title: '지난 세션을 찾아 미리보기로 확인한다',
     icon: History,
     scene:
-      'cokacmux가 무엇을 보여주는지 알았다면, 이제 저장된 대화 목록에서 필요한 작업 기록을 찾는 흐름을 익힙니다.',
+      'cokacmux가 무엇을 보여주는지 알았다면, 이제 저장된 세션 목록에서 필요한 작업 맥락을 찾는 흐름을 익힙니다.',
     steps: [
       {
         key: 'cokacmux',
         action: '터미널에서 `cokacmux`를 실행합니다.',
-        why: '여러 코딩 도구가 각자 저장한 대화를 한 화면에서 모아 보기 위해서입니다.'
+        why: '여러 코딩 도구가 각자 저장한 세션을 한 화면에서 모아 보기 위해서입니다.'
       },
       {
         key: '↑ / ↓',
         action: '목록을 위아래로 움직이며 제목, 폴더, 시간을 훑습니다.',
-        why: '대화를 열기 전에 어느 프로젝트의 어느 기록인지 빠르게 좁힐 수 있습니다.'
+        why: '세션을 열기 전에 어느 프로젝트의 어느 기록인지 빠르게 좁힐 수 있습니다.'
       },
       {
         key: 'Tab',
         action: '오른쪽 미리보기로 포커스를 옮겨 내용을 읽습니다.',
-        why: '대화를 실제로 재개하기 전에 필요한 내용인지 먼저 확인할 수 있습니다.'
+        why: '세션을 실제로 재개하기 전에 필요한 내용인지 먼저 확인할 수 있습니다.'
       },
       {
         key: 'Home / End',
         action: '목록이나 미리보기의 처음과 끝으로 이동합니다.',
-        why: '오래된 대화와 최신 대화를 빠르게 오가며 후보를 줄일 수 있습니다.'
+        why: '오래된 세션과 최신 세션을 빠르게 오가며 후보를 줄일 수 있습니다.'
       }
     ],
-    outcome: '대화를 무작정 다시 열지 않고도, 필요한 기록을 먼저 찾고 검토합니다.'
+    outcome: '세션을 무작정 다시 열지 않고도, 필요한 맥락을 먼저 찾고 검토합니다.'
   },
   {
     id: 'search',
@@ -305,7 +342,7 @@ const chapters = [
     title: '기억나는 단어가 있을 때 빠르게 검색한다',
     icon: Search,
     scene:
-      '“auth”, “snapshot”, “resume” 같은 단어만 기억나고 정확한 대화 제목은 모르는 상황입니다.',
+      '“auth”, “snapshot”, “resume” 같은 단어만 기억나고 정확한 세션 제목은 모르는 상황입니다.',
     steps: [
       {
         key: 'Ctrl+F',
@@ -319,8 +356,8 @@ const chapters = [
       },
       {
         key: '2',
-        action: 'AI 검색을 선택하고 “로그인 실패를 고친 대화”처럼 문장으로 적습니다.',
-        why: '정확한 단어가 기억나지 않아도 관련 대화를 찾을 수 있습니다.'
+        action: 'AI 검색을 선택하고 “로그인 실패를 고친 세션”처럼 문장으로 적습니다.',
+        why: '정확한 단어가 기억나지 않아도 관련 세션을 찾을 수 있습니다.'
       },
       {
         key: 'Esc',
@@ -328,20 +365,20 @@ const chapters = [
         why: '찾은 뒤에는 다시 전체 작업 흐름을 볼 수 있어야 합니다.'
       }
     ],
-    outcome: '기억나는 조각이 적어도 대화를 다시 찾을 수 있습니다.'
+    outcome: '기억나는 조각이 적어도 작업 세션을 다시 찾을 수 있습니다.'
   },
   {
     id: 'resume',
     eyebrow: '실습 3',
-    title: '대화를 다시 열어 이어서 작업한다',
+    title: '세션을 다시 열어 이어서 작업한다',
     icon: Play,
     scene:
-      '어제 멈춘 리팩터링 작업을 오늘 이어서 하고 싶습니다. 기존 대화의 맥락을 유지하는 것이 중요합니다.',
+      '어제 멈춘 리팩터링 작업을 오늘 이어서 하고 싶습니다. 기존 세션의 맥락을 유지하는 것이 중요합니다.',
     steps: [
       {
         key: 'e / Enter',
-        action: '선택한 대화를 다시 여는 창을 엽니다.',
-        why: '원래 코딩 도구의 resume 기능으로 같은 대화를 이어가기 위해서입니다.'
+        action: '선택한 세션을 다시 여는 창을 엽니다.',
+        why: '원래 코딩 도구의 resume 기능으로 같은 맥락을 이어가기 위해서입니다.'
       },
       {
         key: '1',
@@ -355,8 +392,8 @@ const chapters = [
       },
       {
         key: 'Ctrl+] / Ctrl+[',
-        action: '작업을 켜 둔 채 대화 목록으로 돌아갑니다.',
-        why: 'agent를 종료하지 않고 다른 대화를 찾아볼 수 있습니다.'
+        action: '작업을 켜 둔 채 세션 목록으로 돌아갑니다.',
+        why: 'agent를 종료하지 않고 다른 세션을 찾아볼 수 있습니다.'
       }
     ],
     outcome: '중단했던 작업을 이어가면서도 목록 화면으로 안전하게 돌아올 수 있습니다.'
@@ -426,19 +463,19 @@ const chapters = [
   {
     id: 'clone',
     eyebrow: '실습 6',
-    title: '같은 대화를 복사해 다른 방향을 실험한다',
+    title: '같은 세션을 복사해 다른 방향을 실험한다',
     icon: Copy,
     scene:
-      '한 대화에서는 안정적인 수정만 하고, 다른 대화에서는 더 큰 구조 변경을 실험하고 싶습니다.',
+      '한 세션에서는 안정적인 수정만 하고, 다른 세션에서는 더 큰 구조 변경을 실험하고 싶습니다.',
     steps: [
       {
         key: 'c',
-        action: '선택한 대화의 복사 옵션창을 엽니다.',
-        why: '원래 대화를 건드리지 않고 새 출발점을 만들기 위해서입니다.'
+        action: '선택한 세션의 복사 옵션창을 엽니다.',
+        why: '원래 세션을 건드리지 않고 새 출발점을 만들기 위해서입니다.'
       },
       {
         key: '1',
-        action: '대화 기록만 복사합니다.',
+        action: '세션 기록만 복사합니다.',
         why: '같은 맥락만 이어가고 작업 폴더는 그대로 쓰고 싶을 때 좋습니다.'
       },
       {
@@ -449,7 +486,7 @@ const chapters = [
       {
         key: 'Tab / BackTab',
         action: '복사 대상 코딩 도구를 바꿉니다.',
-        why: '예를 들어 Claude에서 하던 대화를 Codex로 이어가며 비교할 수 있습니다.'
+        why: '예를 들어 Claude에서 하던 세션을 Codex로 이어가며 비교할 수 있습니다.'
       }
     ],
     outcome: '원본을 보존하면서 새 방향의 작업을 안전하게 시도합니다.'
@@ -460,17 +497,17 @@ const chapters = [
     title: '제목을 정리하고 오래된 기록을 치운다',
     icon: ClipboardList,
     scene:
-      '프로젝트가 끝난 뒤 나중에 찾기 쉽도록 제목을 정리하고 불필요한 기록을 삭제합니다.',
+      '프로젝트가 끝난 뒤 나중에 찾기 쉽도록 세션 제목을 정리하고 불필요한 기록을 삭제합니다.',
     steps: [
       {
         key: 't',
-        action: '선택한 대화의 제목 편집창을 엽니다.',
+        action: '선택한 세션의 제목 편집창을 엽니다.',
         why: '나중에 목록에서 바로 알아볼 수 있는 이름을 붙이기 위해서입니다.'
       },
       {
         key: 'Ctrl+T',
         action: 'AI에게 제목 초안을 만들게 합니다.',
-        why: '긴 대화를 직접 읽지 않고도 핵심을 담은 제목을 얻을 수 있습니다.'
+        why: '긴 세션을 직접 읽지 않고도 핵심을 담은 제목을 얻을 수 있습니다.'
       },
       {
         key: 'Delete / d',
@@ -483,7 +520,7 @@ const chapters = [
         why: '밖에서 대화 파일이 바뀐 뒤 최신 상태를 확인할 수 있습니다.'
       }
     ],
-    outcome: '대화 목록이 다음 작업을 시작하기 쉬운 상태로 정리됩니다.'
+    outcome: '세션 목록이 다음 작업을 시작하기 쉬운 상태로 정리됩니다.'
   },
   {
     id: 'cleanup',
@@ -519,9 +556,10 @@ const chapters = [
 ];
 
 const checklist = [
-  '처음 실행하면 목록에서 대화를 훑고 Tab으로 미리보기를 읽는다.',
+  '처음 실행하면 목록에서 세션을 훑고 Tab으로 미리보기를 읽는다.',
   '기억나는 단어가 있으면 Ctrl+F로 검색한다.',
-  '대화를 이어갈 때는 e 또는 Enter로 다시 연다.',
+  '세션을 이어갈 때는 e 또는 Enter로 다시 연다.',
+  '다른 방향을 실험하기 전에는 c로 세션을 복제한다.',
   '작업을 켜 둔 채 목록으로 돌아갈 때는 Ctrl+] 또는 Ctrl+[를 쓴다.',
   '오른쪽 pane과 sidebar를 활용해 여러 작업을 동시에 본다.',
   '끝난 작업은 Ctrl+K, 전체 정리는 Ctrl+Shift+K로 확인 후 처리한다.'
@@ -533,10 +571,11 @@ function App() {
       <section className="hero" aria-labelledby="hero-title">
         <div className="heroCopy">
           <p className="eyebrow">cokacmux overview</p>
-          <h1 id="hero-title">어제 하던 AI 코딩 작업을 다시 찾는 시간을 줄입니다</h1>
+          <h1 id="hero-title">코드뿐 아니라 작업 세션까지 자산으로 관리합니다</h1>
           <p className="heroLead">
-            Claude Code, Codex 같은 도구를 쓰다 보면 대화가 도구별, 폴더별로 흩어집니다.
-            cokacmux는 그 기록을 한 화면에 모아 찾고, 읽고, 필요한 대화만 다시 열게 해줍니다.
+            cokacmux는 Claude Code, Codex 같은 코딩 도구와 터미널 작업을 세션 단위로
+            모아 둡니다. 대화 맥락과 실행 중인 프로세스를 안전하게 보존하고, 필요한
+            프로젝트의 세션을 찾고 복제하고 이어 열 수 있게 합니다.
           </p>
           <ul className="heroFacts" aria-label="cokacmux 핵심 요약">
             {heroFacts.map((fact) => (
@@ -567,21 +606,60 @@ function App() {
               <Keyboard size={18} />
               10단계 따라하기
             </a>
+            <a href="https://github.com/kstost/cokacmux/" target="_blank" rel="noreferrer">
+              <Github size={18} />
+              GitHub
+            </a>
           </div>
         </div>
-        <div className="heroVisual">
-          <img src={heroImage} alt="cokacmux의 세 개 pane UI를 보여주는 대표 이미지" />
+        <div className="heroTextPanel" aria-label="cokacmux 세션 관리 흐름">
+          <p className="panelLabel">세션을 자산처럼 다루는 흐름</p>
+          <ol>
+            {heroSummary.map(([title, text], index) => (
+              <li key={title}>
+                <strong>{String(index + 1).padStart(2, '0')}</strong>
+                <span>
+                  <b>{title}</b>
+                  {text}
+                </span>
+              </li>
+            ))}
+          </ol>
+        </div>
+      </section>
+
+      <section className="installSection" id="install" aria-labelledby="install-title">
+        <div className="sectionIntro">
+          <p className="eyebrow">install</p>
+          <h2 id="install-title">설치는 한 줄이면 됩니다</h2>
+          <p>
+            내 운영체제에 맞는 명령어를 복사해서 터미널이나 PowerShell에 붙여 넣으면 됩니다.
+            설치 뒤에는 새 창을 열어 버전을 확인하세요.
+          </p>
+        </div>
+
+        <div className="installGrid">
+          {installCommands.map((item) => (
+            <article className="installCard" key={item.os}>
+              <h3>{item.os}</h3>
+              <div className="commandLine">
+                <code>{item.command}</code>
+                <CopyCommandButton command={item.command} />
+              </div>
+              <p>{item.note}</p>
+            </article>
+          ))}
         </div>
       </section>
 
       <section className="valueSection" id="why" aria-labelledby="why-title">
         <div className="sectionIntro">
           <p className="eyebrow">why it matters</p>
-          <h2 id="why-title">좋은 점은 “새 AI”가 아니라 “잃어버린 작업 맥락”을 되찾는 것입니다</h2>
+          <h2 id="why-title">좋은 점은 작업의 맥락까지 잃지 않는 것입니다</h2>
           <p>
-            AI 코딩 도구를 하루 이틀만 쓰면 대화가 금방 쌓입니다. 문제는 나중에 “그때
-            어디서 뭘 고쳤더라?”가 되면서, 실제 수정 시간보다 기록을 찾는 시간이 더
-            피곤해진다는 점입니다.
+            AI 코딩을 오래 쓰면 프로젝트마다 agent, terminal, 테스트, 세션이 동시에
+            생깁니다. 중요한 것은 최종 코드만이 아니라 그 코드가 만들어진 세션입니다.
+            cokacmux는 세션을 찾고, 읽고, 복제하고, 이어 열 수 있게 관리합니다.
           </p>
         </div>
 
@@ -620,10 +698,10 @@ function App() {
       <section className="storySection" id="example" aria-labelledby="example-title">
         <div className="sectionIntro">
           <p className="eyebrow">one real example</p>
-          <h2 id="example-title">예를 들면, 이런 하루가 편해집니다</h2>
+          <h2 id="example-title">예를 들면, 세션을 이렇게 자산처럼 씁니다</h2>
           <p>
-            cokacmux의 장점은 큰 기능 이름보다 “어제 했던 일을 오늘 다시 이어가는 순간”에
-            가장 잘 드러납니다.
+            cokacmux의 장점은 한 프로젝트를 멈추지 않고 다른 프로젝트로 넘어가면서도,
+            각 작업의 판단 과정과 실행 상태를 다시 쓸 수 있는 형태로 남길 때 드러납니다.
           </p>
         </div>
 
@@ -669,7 +747,7 @@ function App() {
           <h2 id="what-is-title">먼저, 이 앱이 하는 일을 잡고 갑니다</h2>
           <p>
             처음 보는 사람에게 중요한 것은 단축키가 아니라 화면의 역할입니다. cokacmux는
-            대화 목록을 찾는 화면과 실제 agent를 실행하는 화면을 오가며 쓰는 앱입니다.
+            세션 목록을 찾는 화면과 실제 agent를 실행하는 화면을 오가며 쓰는 앱입니다.
           </p>
         </div>
 
@@ -710,7 +788,7 @@ function App() {
           <p className="eyebrow">first screen tour</p>
           <h2 id="screen-tour-title">처음 화면에서 보이는 것을 하나씩 해석합니다</h2>
           <p>
-            처음에는 “어떤 키를 눌러야 하지?”보다 “내가 지금 무엇을 보고 있지?”가
+            처음에는 “어떤 키를 눌러야 하지?”보다 “내가 지금 어떤 세션을 보고 있지?”가
             먼저입니다. 아래 모형은 cokacmux를 켰을 때 마주치는 기본 화면을 단순화한
             것입니다.
           </p>
@@ -725,7 +803,7 @@ function App() {
             </div>
             <div className="mockBody">
               <div className="mockList">
-                <div className="mockPanelTitle">왼쪽: 대화 목록</div>
+                <div className="mockPanelTitle">왼쪽: 세션 목록</div>
                 <div className="mockRow active">
                   <span>●</span>
                   <span>Codex</span>
@@ -743,16 +821,17 @@ function App() {
                 </div>
               </div>
               <div className="mockPreview">
-                <div className="mockPanelTitle">오른쪽: 선택한 대화 미리보기</div>
-                <p>선택한 대화에서 어떤 작업을 했는지 읽어보는 곳입니다.</p>
-                <p>여기서 읽기만 해도 원래 AI 대화가 다시 시작되지는 않습니다.</p>
+                <div className="mockPanelTitle">오른쪽: 선택한 세션 미리보기</div>
+                <p>선택한 세션에서 어떤 작업을 했는지 읽어보는 곳입니다.</p>
+                <p>여기서 읽기만 해도 원래 AI 세션이 다시 시작되지는 않습니다.</p>
               </div>
             </div>
             <div className="mockHelp">
               <span>↑↓ 이동</span>
               <span>Tab 미리보기</span>
               <span>Ctrl+F 검색</span>
-              <span>e 다시 열기</span>
+              <span>c 복제</span>
+              <span>e 이어 열기</span>
               <span>Esc 닫기</span>
             </div>
           </div>
@@ -778,7 +857,7 @@ function App() {
       <section className="overview" id="keys" aria-labelledby="keys-title">
         <div>
           <p className="eyebrow">first 10 minutes</p>
-          <h2 id="keys-title">화면 구조를 이해한 뒤에는 여섯 키면 충분합니다</h2>
+          <h2 id="keys-title">화면 구조를 이해한 뒤에는 기본 키만 익히면 됩니다</h2>
         </div>
         <div className="keyGrid">
           {quickKeys.map(([label, key]) => (
@@ -848,6 +927,39 @@ function App() {
         </ol>
       </section>
     </main>
+  );
+}
+
+function CopyCommandButton({ command }) {
+  const [copied, setCopied] = useState(false);
+
+  const copyCommand = async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(command);
+      } else {
+        const textArea = document.createElement('textarea');
+        textArea.value = command;
+        textArea.setAttribute('readonly', '');
+        textArea.style.position = 'fixed';
+        textArea.style.opacity = '0';
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <button type="button" className="copyCommand" onClick={copyCommand}>
+      <Copy size={17} />
+      {copied ? '복사됨' : '복사'}
+    </button>
   );
 }
 
