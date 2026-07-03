@@ -101,6 +101,29 @@ h3 {
   line-height: 1.75;
 }
 
+.heroFacts {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.heroFacts li {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  max-width: 650px;
+  color: #dcefd9;
+  line-height: 1.56;
+}
+
+.heroFacts svg {
+  margin-top: 2px;
+  color: var(--green);
+}
+
 .heroActions {
   display: flex;
   flex-wrap: wrap;
@@ -219,6 +242,95 @@ h3 {
 
 .beforeAfter b {
   color: var(--amber);
+}
+
+.storySection,
+.startChoice {
+  display: grid;
+  gap: 28px;
+  padding: 44px 0 70px;
+  border-top: 1px solid var(--line);
+}
+
+.storySteps {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.storySteps li {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.storyIndex {
+  width: 54px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: rgba(76, 199, 189, 0.11);
+  color: var(--teal);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-weight: 850;
+}
+
+.storySteps li div:last-child {
+  display: grid;
+  gap: 7px;
+}
+
+.storySteps span {
+  color: var(--amber);
+  font-size: 0.86rem;
+  font-weight: 800;
+}
+
+.storySteps p {
+  color: var(--muted);
+  line-height: 1.68;
+}
+
+.routeGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.routeCard {
+  min-height: 232px;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid rgba(237, 183, 94, 0.24);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(237, 183, 94, 0.085), rgba(255, 255, 255, 0.025)),
+    rgba(255, 255, 255, 0.035);
+}
+
+.routeCard span {
+  width: fit-content;
+  padding: 4px 8px;
+  border: 1px solid rgba(237, 183, 94, 0.24);
+  border-radius: 5px;
+  color: var(--amber);
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.routeCard p {
+  color: var(--muted);
+  line-height: 1.68;
 }
 
 .primer {
@@ -769,6 +881,7 @@ kbd {
   .overview,
   .promiseStrip,
   .valueGrid,
+  .routeGrid,
   .beginnerSteps,
   .workflowShell,
   .finish {
@@ -822,6 +935,7 @@ kbd {
   }
 
   .tourItem,
+  .storySteps li,
   .beginnerSteps li {
     grid-template-columns: 1fr;
   }

@@ -68,6 +68,63 @@ const threePromises = [
   '실행 중인 작업을 끄지 않고 목록으로 돌아와 다른 일을 찾습니다.'
 ];
 
+const heroFacts = [
+  'AI 코딩 대화가 흩어져서 다시 찾기 힘들 때 씁니다.',
+  'Claude Code, Codex, OpenCode, Pi, GJC 중 하나만 써도 충분합니다.',
+  '새 AI를 배우는 앱이 아니라, 이미 쓰던 작업 맥락으로 돌아가는 앱입니다.'
+];
+
+const storySteps = [
+  {
+    time: '어제 오후',
+    title: 'Codex로 로그인 오류를 고쳤습니다',
+    text:
+      '에러 메시지와 수정한 파일은 기억나지만, 정확히 어떤 대화에서 해결했는지는 흐릿합니다.'
+  },
+  {
+    time: '오늘 아침',
+    title: '같은 문제가 다시 나왔습니다',
+    text:
+      '그때의 설명, 테스트 명령, 수정 이유를 다시 보고 싶은데 터미널 기록과 대화 목록이 뒤섞여 있습니다.'
+  },
+  {
+    time: 'cokacmux에서',
+    title: '로그인, auth, 프로젝트 폴더로 후보를 좁힙니다',
+    text:
+      '왼쪽 목록에서 시간과 폴더를 보고, 오른쪽 미리보기에서 내용을 읽어 필요한 대화가 맞는지 확인합니다.'
+  },
+  {
+    time: '결과',
+    title: '새로 설명하지 않고 그 대화를 이어서 엽니다',
+    text:
+      '원래 대화 맥락에서 바로 질문을 이어가고, 필요하면 오른쪽 터미널을 붙여 테스트까지 같이 봅니다.'
+  }
+];
+
+const startRoutes = [
+  {
+    title: '아직 설치 전이라면',
+    label: '설치부터',
+    detail:
+      '먼저 README의 설치 명령을 실행한 뒤 새 터미널을 엽니다. 설치가 끝난 뒤에는 버전 확인만 하면 됩니다.',
+    key: 'cokacmux --version'
+  },
+  {
+    title: '이미 설치했다면',
+    label: '상태 확인부터',
+    detail:
+      '바로 앱을 열기 전에 어떤 코딩 도구의 대화를 읽을 수 있는지 확인합니다. 처음 실행 전 불안감을 줄이는 단계입니다.',
+    key: 'cokacmux --check'
+  },
+  {
+    title: '대화가 보인다면',
+    label: '읽기부터',
+    detail:
+      '처음에는 복사나 삭제를 하지 말고, 목록 이동과 미리보기만 익힙니다. 필요한 대화인지 판단하는 감각이 먼저입니다.',
+    key: '↑ / ↓, Tab'
+  }
+];
+
 const primerItems = [
   {
     icon: Layers3,
@@ -481,10 +538,22 @@ function App() {
             Claude Code, Codex 같은 도구를 쓰다 보면 대화가 도구별, 폴더별로 흩어집니다.
             cokacmux는 그 기록을 한 화면에 모아 찾고, 읽고, 필요한 대화만 다시 열게 해줍니다.
           </p>
+          <ul className="heroFacts" aria-label="cokacmux 핵심 요약">
+            {heroFacts.map((fact) => (
+              <li key={fact}>
+                <BadgeCheck size={18} />
+                <span>{fact}</span>
+              </li>
+            ))}
+          </ul>
           <div className="heroActions" aria-label="빠른 이동">
             <a href="#why">
               <Search size={18} />
               왜 쓰는지 보기
+            </a>
+            <a href="#example">
+              <History size={18} />
+              실제 예시
             </a>
             <a href="#what-is">
               <Play size={18} />
@@ -545,6 +614,52 @@ function App() {
               </article>
             );
           })}
+        </div>
+      </section>
+
+      <section className="storySection" id="example" aria-labelledby="example-title">
+        <div className="sectionIntro">
+          <p className="eyebrow">one real example</p>
+          <h2 id="example-title">예를 들면, 이런 하루가 편해집니다</h2>
+          <p>
+            cokacmux의 장점은 큰 기능 이름보다 “어제 했던 일을 오늘 다시 이어가는 순간”에
+            가장 잘 드러납니다.
+          </p>
+        </div>
+
+        <ol className="storySteps">
+          {storySteps.map((step, index) => (
+            <li key={step.title}>
+              <div className="storyIndex">{String(index + 1).padStart(2, '0')}</div>
+              <div>
+                <span>{step.time}</span>
+                <h3>{step.title}</h3>
+                <p>{step.text}</p>
+              </div>
+            </li>
+          ))}
+        </ol>
+      </section>
+
+      <section className="startChoice" id="start-choice" aria-labelledby="start-choice-title">
+        <div className="sectionIntro">
+          <p className="eyebrow">where to start</p>
+          <h2 id="start-choice-title">내가 어디서 시작해야 하는지도 나눠 둡니다</h2>
+          <p>
+            처음 보는 사람이 가장 자주 막히는 지점은 “설치해야 하나, 바로 실행해야 하나,
+            뭘 누르면 위험한가”입니다. 아래 순서대로 들어오면 됩니다.
+          </p>
+        </div>
+
+        <div className="routeGrid">
+          {startRoutes.map((route) => (
+            <article className="routeCard" key={route.title}>
+              <span>{route.label}</span>
+              <h3>{route.title}</h3>
+              <p>{route.detail}</p>
+              <kbd>{route.key}</kbd>
+            </article>
+          ))}
         </div>
       </section>
 
