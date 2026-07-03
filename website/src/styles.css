@@ -43,7 +43,7 @@ a {
 }
 
 main {
-  width: min(1180px, calc(100% - 32px));
+  width: min(1440px, calc(100% - 48px));
   margin: 0 auto;
 }
 
@@ -78,10 +78,13 @@ p {
 }
 
 h1 {
-  max-width: 980px;
   font-size: clamp(2.45rem, 6vw, 5.8rem);
   line-height: 0.98;
   font-weight: 860;
+}
+
+.hero h1 {
+  max-width: none;
 }
 
 h2 {
@@ -95,7 +98,7 @@ h3 {
 }
 
 .heroLead {
-  max-width: 760px;
+  max-width: none;
   color: var(--muted);
   font-size: clamp(1.04rem, 2vw, 1.25rem);
   line-height: 1.75;
@@ -114,7 +117,7 @@ h3 {
   grid-template-columns: 24px minmax(0, 1fr);
   gap: 9px;
   align-items: start;
-  max-width: 760px;
+  max-width: none;
   color: #dcefd9;
   line-height: 1.56;
 }
@@ -393,7 +396,7 @@ h3 {
 }
 
 .sectionIntro {
-  max-width: 780px;
+  max-width: none;
   display: grid;
   gap: 12px;
 }
@@ -830,7 +833,7 @@ kbd {
 }
 
 .chapterHeader p:last-child {
-  max-width: 760px;
+  max-width: none;
   margin-top: 14px;
   color: var(--muted);
   line-height: 1.72;
@@ -924,7 +927,7 @@ kbd {
 
 @media (max-width: 940px) {
   main {
-    width: min(100% - 24px, 760px);
+    width: calc(100% - 24px);
   }
 
   .hero,
@@ -966,7 +969,7 @@ kbd {
 
 @media (max-width: 680px) {
   main {
-    width: min(100% - 18px, 560px);
+    width: calc(100% - 18px);
   }
 
   .heroActions a {
