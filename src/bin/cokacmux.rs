@@ -261,6 +261,7 @@ const SESSION_FILTER_DEFAULTS: &[&str] = &["ctrl+f"];
 const SESSION_AI_SEARCH_DEFAULTS: &[&str] = &[];
 const SESSION_AI_TITLE_SETTINGS_DEFAULTS: &[&str] = &["comma"];
 const SESSION_TOGGLE_FOCUS_DEFAULTS: &[&str] = &["tab"];
+const SESSION_KILL_ALL_DEFAULTS: &[&str] = &["ctrl+shift+k", "shift+k"];
 const SESSION_MOVE_NEXT_DEFAULTS: &[&str] = &["down"];
 const SESSION_MOVE_PREV_DEFAULTS: &[&str] = &["up"];
 const SEARCH_CHOICE_NEXT_DEFAULTS: &[&str] = &["down", "tab"];
@@ -280,6 +281,7 @@ const PREVIOUS_SESSION_AI_SEARCH_DEFAULTS: &[&str] = &["ctrl+s"];
 const PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS: &[&str] = &["ctrl+t"];
 const PREVIOUS_SESSION_AI_TITLE_SETTINGS_WITH_COMMA_DEFAULTS: &[&str] = &["comma", "ctrl+t"];
 const PREVIOUS_SESSION_TOGGLE_FOCUS_DEFAULTS: &[&str] = &["tab", "esc"];
+const PREVIOUS_SESSION_KILL_ALL_DEFAULTS: &[&str] = &["ctrl+shift+k"];
 const PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e"];
 const PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS: &[&str] = &["enter"];
 const PREVIOUS_SESSION_MOVE_NEXT_DEFAULTS: &[&str] = &["down", "j"];
@@ -917,7 +919,7 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     (
         "sessions.kill_all",
         KeyAction::SessionKillAll,
-        &["ctrl+shift+k"],
+        SESSION_KILL_ALL_DEFAULTS,
     ),
     (
         "sessions.new_shell",
@@ -1854,6 +1856,13 @@ fn migrate_legacy_keybinding_defaults(root: &mut serde_json::Value) -> bool {
         nested_keybinding_json_value_mut(root, &["sessions", "toggle_focus"]),
         &[PREVIOUS_SESSION_TOGGLE_FOCUS_DEFAULTS],
         SESSION_TOGGLE_FOCUS_DEFAULTS,
+    );
+    migrated |= migrate_generated_keybinding_paths(
+        root,
+        "sessions.kill_all",
+        &["sessions", "kill_all"],
+        &[PREVIOUS_SESSION_KILL_ALL_DEFAULTS],
+        SESSION_KILL_ALL_DEFAULTS,
     );
     migrated |= migrate_generated_keybinding_value(
         flat_keybinding_json_value_mut(root, "sessions.launch_agent"),
@@ -3471,6 +3480,7 @@ enum CloneWorkerOutcome {
         copy_folder_data: bool,
         data_stats: Option<session::data::CopyStats>,
         data_snapshot_error: Option<String>,
+        title_override_error: Option<String>,
         clone_tree_error: Option<String>,
     },
     Cancelled {
@@ -9845,14 +9855,22 @@ impl App {
     }
 
     fn cycle_agent_focus_pane(&mut self, delta: i32) {
-        let mut panes = vec![AgentFocusPane::Sidebar, AgentFocusPane::Main];
+        let mut panes = Vec::new();
+        if self.settings.cokacmux.agent_sidebar_visible {
+            panes.push(AgentFocusPane::Sidebar);
+        }
+        panes.push(AgentFocusPane::Main);
         if self.agent_aux.is_some() {
             panes.push(AgentFocusPane::Auxiliary);
         }
+        let main_index = panes
+            .iter()
+            .position(|pane| *pane == AgentFocusPane::Main)
+            .unwrap_or(0);
         let current_index = panes
             .iter()
             .position(|pane| *pane == self.agent_focus)
-            .unwrap_or(1.min(panes.len().saturating_sub(1)));
+            .unwrap_or(main_index);
         let next_index = next_agent_candidate_index(panes.len(), current_index, delta, true);
         debug_log(
             "agent_focus_cycle",
@@ -9864,6 +9882,7 @@ impl App {
                 "current": format!("{:?}", self.agent_focus),
                 "next": format!("{:?}", panes[next_index]),
                 "auxiliary_open": self.agent_aux.is_some(),
+                "sidebar_visible": self.settings.cokacmux.agent_sidebar_visible,
             }),
         );
         match panes[next_index] {
@@ -19203,6 +19222,7 @@ impl App {
                 copy_folder_data,
                 data_stats,
                 data_snapshot_error,
+                title_override_error,
                 clone_tree_error,
             } => {
                 let mut status = format!(
@@ -19223,6 +19243,9 @@ impl App {
                 }
                 if let Some(e) = data_snapshot_error.as_ref() {
                     status.push_str(&format!(" (folder data copy failed: {})", e));
+                }
+                if let Some(e) = title_override_error.as_ref() {
+                    status.push_str(&format!(" (title override copy failed: {})", e));
                 }
                 if let Some(e) = clone_tree_error.as_ref() {
                     status.push_str(&format!(" (clone tree save failed: {})", e));
@@ -19257,6 +19280,7 @@ impl App {
                         "clone_tree_error": clone_tree_error,
                         "copy_folder_data": copy_folder_data,
                         "data_snapshot_error": data_snapshot_error,
+                        "title_override_error": title_override_error,
                         "focused_index": focused_index,
                     }),
                 );
@@ -19475,6 +19499,36 @@ fn run_clone_worker(
                 };
             }
             let data_snapshot_error = None;
+            let cloned_info = session_info_from_clone_report(&source, &report);
+            let title_override_error = match session::title::copy_override(&source, &cloned_info) {
+                Ok(copied) => {
+                    debug_log(
+                        "clone_title_override_copy",
+                        serde_json::json!({
+                            "source_provider": source.provider.as_str(),
+                            "source_session_id": &source.session_id,
+                            "target_provider": report.target_provider.as_str(),
+                            "target_session_id": &report.new_session_id,
+                            "copied": copied,
+                        }),
+                    );
+                    None
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    debug_log(
+                        "clone_title_override_copy_failed",
+                        serde_json::json!({
+                            "source_provider": source.provider.as_str(),
+                            "source_session_id": &source.session_id,
+                            "target_provider": report.target_provider.as_str(),
+                            "target_session_id": &report.new_session_id,
+                            "error": &error,
+                        }),
+                    );
+                    Some(error)
+                }
+            };
             progress.send_now(
                 "recording clone tree",
                 None,
@@ -19508,6 +19562,7 @@ fn run_clone_worker(
                 copy_folder_data,
                 data_stats,
                 data_snapshot_error,
+                title_override_error,
                 clone_tree_error,
             }
         }
@@ -19638,6 +19693,9 @@ fn cancel_clone_after_report(
     let snapshot_cleanup_error = session::data::remove_snapshot_for_session(&cloned_info)
         .err()
         .map(|error| error.to_string());
+    let title_override_cleanup_error = session::title::remove_override(&cloned_info)
+        .err()
+        .map(|error| error.to_string());
     let folder_cleanup_error = cloned_working_dir.as_ref().and_then(|path| {
         session::data::remove_cloned_working_dir(path)
             .err()
@@ -19653,6 +19711,7 @@ fn cancel_clone_after_report(
             cleanup_error: join_cleanup_errors([
                 clone_tree_cleanup_error,
                 snapshot_cleanup_error,
+                title_override_cleanup_error,
                 folder_cleanup_error,
             ]),
         },
@@ -19660,6 +19719,7 @@ fn cancel_clone_after_report(
             let cleanup_error = join_cleanup_errors([
                 clone_tree_cleanup_error,
                 snapshot_cleanup_error,
+                title_override_cleanup_error,
                 folder_cleanup_error,
                 Some(format!("clone cleanup failed: {remove_error}")),
             ]);
@@ -32252,6 +32312,10 @@ fn new_session_cwd_text_key(selected: usize, key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+fn plain_escape_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Esc && key.modifiers.is_empty()
+}
+
 fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_rows: u16) {
     if handle_ai_search_locked_key(app, key) {
         debug_log_agent_key_outcome(app, key, "ai_search_locked");
@@ -32320,6 +32384,20 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         );
         app.show_sessions_view = true;
         debug_log_agent_key_outcome(app, key, "toggle_to_sessions");
+        return;
+    }
+    if app.agent_focus == AgentFocusPane::Sidebar && plain_escape_key(key) {
+        debug_log_agent_key(key, "sidebar_escape_toggle_to_sessions");
+        debug_log(
+            "agent_sidebar_escape_toggle_to_sessions",
+            serde_json::json!({
+                "active_agent": app.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                "show_sessions_view_before": app.show_sessions_view,
+                "agent_states_before": agent_state_entries_debug_value(&app.agent_states),
+            }),
+        );
+        app.show_sessions_view = true;
+        debug_log_agent_key_outcome(app, key, "sidebar_escape_toggle_to_sessions");
         return;
     }
     if keybindings.matches(KeyAction::AgentKillAll, key) {
@@ -33518,6 +33596,7 @@ fn render_agent_startup_spinner(
     area: Rect,
     info: &SessionInfo,
     started_at: Instant,
+    focused: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -33541,10 +33620,13 @@ fn render_agent_startup_spinner(
         y,
         label,
         available,
-        Style::default()
-            .fg(THEME_SHORTCUT)
-            .bg(AGENT_DEFAULT_BG)
-            .add_modifier(Modifier::BOLD),
+        agent_pane_style_for_focus(
+            Style::default()
+                .fg(THEME_SHORTCUT)
+                .bg(AGENT_DEFAULT_BG)
+                .add_modifier(Modifier::BOLD),
+            focused,
+        ),
     );
 }
 
@@ -33674,12 +33756,12 @@ fn render_agent_client_pane(
             let lines = agent
                 .screen_history
                 .visible_lines(history_scroll_offset, content_area.height as usize);
-            render_plain_agent_history(buf, content_area, &lines);
+            render_plain_agent_history(buf, content_area, &lines, focused);
         } else {
-            render_vt100_screen(buf, screen, content_area);
+            render_vt100_screen(buf, screen, content_area, focused);
         }
         if let Some(started_at) = startup_spinner_started_at {
-            render_agent_startup_spinner(buf, content_area, &agent.info, started_at);
+            render_agent_startup_spinner(buf, content_area, &agent.info, started_at, focused);
         }
         (
             cursor,
@@ -33800,6 +33882,29 @@ fn main_agent_title(info: &SessionInfo) -> String {
         .unwrap_or_else(|| live_agent_status_label(info))
 }
 
+fn main_agent_title_bar_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(THEME_FG_STRONG)
+            .bg(THEME_SELECTED_BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        main_agent_title_bar_inactive_style()
+    }
+}
+
+fn main_agent_title_bar_inactive_style() -> Style {
+    Style::default().fg(THEME_FG_DIM).bg(THEME_STATUS_BG)
+}
+
+fn agent_sidebar_highlight_style(focused: bool) -> Style {
+    if focused {
+        theme_selected_style()
+    } else {
+        main_agent_title_bar_inactive_style()
+    }
+}
+
 fn render_main_agent_title_bar(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -33810,14 +33915,7 @@ fn render_main_agent_title_bar(
         return;
     }
     let bar_area = Rect::new(area.x, area.y, area.width, 1);
-    let style = if focused {
-        Style::default()
-            .fg(THEME_FG_STRONG)
-            .bg(THEME_SELECTED_BG)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(THEME_FG_DIM).bg(THEME_STATUS_BG)
-    };
+    let style = main_agent_title_bar_style(focused);
     fill_area(f.buffer_mut(), bar_area, style);
     let title = truncate_width(
         &main_agent_title(info),
@@ -35304,18 +35402,18 @@ fn draw_agent_sidebar(
     );
     let list = List::new(items)
         .style(theme_base_style())
-        .highlight_style(theme_selected_style())
+        .highlight_style(agent_sidebar_highlight_style(focused))
         .highlight_symbol(UI_SELECTED_MARKER);
     f.render_stateful_widget(list, inner, &mut state);
 }
 
-fn render_vt100_screen(buf: &mut Buffer, screen: &vt100::Screen, area: Rect) {
+fn render_vt100_screen(buf: &mut Buffer, screen: &vt100::Screen, area: Rect, focused: bool) {
     for row in 0..area.height {
         for col in 0..area.width {
             let Some(cell) = screen.cell(row, col) else {
-                buf[(area.x + col, area.y + row)]
-                    .set_symbol(" ")
-                    .set_style(Style::default().bg(AGENT_DEFAULT_BG));
+                buf[(area.x + col, area.y + row)].set_symbol(" ").set_style(
+                    agent_pane_style_for_focus(Style::default().bg(AGENT_DEFAULT_BG), focused),
+                );
                 continue;
             };
             if cell.is_wide_continuation() {
@@ -35328,13 +35426,14 @@ fn render_vt100_screen(buf: &mut Buffer, screen: &vt100::Screen, area: Rect) {
             };
             buf[(area.x + col, area.y + row)]
                 .set_symbol(symbol)
-                .set_style(vt100_cell_style(cell));
+                .set_style(agent_pane_style_for_focus(vt100_cell_style(cell), focused));
         }
     }
 }
 
-fn render_plain_agent_history(buf: &mut Buffer, area: Rect, lines: &[String]) {
-    let style = Style::default().fg(THEME_FG).bg(AGENT_DEFAULT_BG);
+fn render_plain_agent_history(buf: &mut Buffer, area: Rect, lines: &[String], focused: bool) {
+    let style =
+        agent_pane_style_for_focus(Style::default().fg(THEME_FG).bg(AGENT_DEFAULT_BG), focused);
     for (row, line) in lines.iter().take(area.height as usize).enumerate() {
         let y = area.y + row as u16;
         buf.set_stringn(
@@ -35344,6 +35443,62 @@ fn render_plain_agent_history(buf: &mut Buffer, area: Rect, lines: &[String]) {
             area.width as usize,
             style,
         );
+    }
+}
+
+fn agent_pane_style_for_focus(style: Style, focused: bool) -> Style {
+    if focused {
+        style
+    } else {
+        grayscale_style(style)
+    }
+}
+
+fn grayscale_style(mut style: Style) -> Style {
+    style.fg = style.fg.map(grayscale_color);
+    style.bg = style.bg.map(grayscale_color);
+    style
+}
+
+fn grayscale_color(color: Color) -> Color {
+    let Some((r, g, b)) = color_rgb(color) else {
+        return color;
+    };
+    Color::Indexed(grayscale_ansi256_index(r, g, b))
+}
+
+fn grayscale_ansi256_index(r: u16, g: u16, b: u16) -> u8 {
+    let (r, g, b) = (u32::from(r), u32::from(g), u32::from(b));
+    let luminance = ((r * 299 + g * 587 + b * 114 + 500) / 1000).min(255);
+    let step = if luminance <= 8 {
+        0
+    } else {
+        ((luminance - 8 + 5) / 10).min(23)
+    };
+    232 + step as u8
+}
+
+fn color_rgb(color: Color) -> Option<(u16, u16, u16)> {
+    match color {
+        Color::Reset => None,
+        Color::Black => Some(ansi256_rgb(0)),
+        Color::Red => Some(ansi256_rgb(1)),
+        Color::Green => Some(ansi256_rgb(2)),
+        Color::Yellow => Some(ansi256_rgb(3)),
+        Color::Blue => Some(ansi256_rgb(4)),
+        Color::Magenta => Some(ansi256_rgb(5)),
+        Color::Cyan => Some(ansi256_rgb(6)),
+        Color::Gray => Some(ansi256_rgb(7)),
+        Color::DarkGray => Some(ansi256_rgb(8)),
+        Color::LightRed => Some(ansi256_rgb(9)),
+        Color::LightGreen => Some(ansi256_rgb(10)),
+        Color::LightYellow => Some(ansi256_rgb(11)),
+        Color::LightBlue => Some(ansi256_rgb(12)),
+        Color::LightMagenta => Some(ansi256_rgb(13)),
+        Color::LightCyan => Some(ansi256_rgb(14)),
+        Color::White => Some(ansi256_rgb(15)),
+        Color::Rgb(r, g, b) => Some((u16::from(r), u16::from(g), u16::from(b))),
+        Color::Indexed(index) => Some(ansi256_rgb(index)),
     }
 }
 
@@ -35401,6 +35556,9 @@ fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
 }
 
 fn ansi256_rgb(index: u8) -> (u16, u16, u16) {
+    if index < 16 {
+        return ansi16_rgb(index);
+    }
     if index >= 232 {
         let shade = 8 + u16::from(index - 232) * 10;
         return (shade, shade, shade);
@@ -35415,6 +35573,27 @@ fn ansi256_rgb(index: u8) -> (u16, u16, u16) {
         ansi256_cube_component(g),
         ansi256_cube_component(b),
     )
+}
+
+fn ansi16_rgb(index: u8) -> (u16, u16, u16) {
+    match index {
+        0 => (0, 0, 0),
+        1 => (128, 0, 0),
+        2 => (0, 128, 0),
+        3 => (128, 128, 0),
+        4 => (0, 0, 128),
+        5 => (128, 0, 128),
+        6 => (0, 128, 128),
+        7 => (192, 192, 192),
+        8 => (128, 128, 128),
+        9 => (255, 0, 0),
+        10 => (0, 255, 0),
+        11 => (255, 255, 0),
+        12 => (0, 0, 255),
+        13 => (255, 0, 255),
+        14 => (0, 255, 255),
+        _ => (255, 255, 255),
+    }
 }
 
 fn ansi256_cube_component(value: u8) -> u16 {
@@ -39833,8 +40012,15 @@ fn quit_help_item(keybindings: &KeyBindings) -> HelpItem {
 
 fn help_items(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Vec<HelpItem> {
     match focus {
-        FocusPane::Sessions if width >= 132 => vec![
+        FocusPane::Sessions if width >= 200 => vec![
             help_item(keybindings, KeyAction::SessionToggleFocus, "Tab", "preview"),
+            help_item(
+                keybindings,
+                KeyAction::SessionToggleAgent,
+                "Ctrl+]",
+                "agent",
+            ),
+            help_item(keybindings, KeyAction::SessionKillAgent, "Ctrl+K", "kill"),
             help_pair_item(
                 keybindings,
                 KeyAction::SessionMovePrev,
@@ -39860,8 +40046,42 @@ fn help_items(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Vec<
             ),
             quit_help_item(keybindings),
         ],
+        FocusPane::Sessions if width >= 132 => vec![
+            help_item(keybindings, KeyAction::SessionToggleFocus, "Tab", "preview"),
+            help_item(
+                keybindings,
+                KeyAction::SessionToggleAgent,
+                "Ctrl+]",
+                "agent",
+            ),
+            help_item(keybindings, KeyAction::SessionKillAgent, "Ctrl+K", "kill"),
+            help_pair_item(
+                keybindings,
+                KeyAction::SessionMovePrev,
+                KeyAction::SessionMoveNext,
+                "↑",
+                "↓",
+                "move",
+            ),
+            help_item(keybindings, KeyAction::SessionNewShell, "Ctrl+N", "new"),
+            help_item(keybindings, KeyAction::SessionFilter, "Ctrl+F", "search"),
+            help_item(keybindings, KeyAction::SessionToggleView, "v", "view"),
+            help_item(keybindings, KeyAction::SessionRefresh, "r", "refresh"),
+            help_item(keybindings, KeyAction::SessionEditTitle, "t", "title"),
+            help_item(keybindings, KeyAction::SessionClone, "c", "clone"),
+            help_item(keybindings, KeyAction::SessionDelete, "Delete/d", "delete"),
+            help_item(keybindings, KeyAction::SessionLaunchAgent, "e", "launch"),
+            quit_help_item(keybindings),
+        ],
         FocusPane::Sessions if width >= 104 => vec![
             help_item(keybindings, KeyAction::SessionToggleFocus, "Tab", "preview"),
+            help_item(
+                keybindings,
+                KeyAction::SessionToggleAgent,
+                "Ctrl+]",
+                "agent",
+            ),
+            help_item(keybindings, KeyAction::SessionKillAgent, "Ctrl+K", "kill"),
             help_pair_item(
                 keybindings,
                 KeyAction::SessionMovePrev,
@@ -39881,6 +40101,13 @@ fn help_items(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Vec<
         ],
         FocusPane::Sessions if width >= 68 => vec![
             help_item(keybindings, KeyAction::SessionToggleFocus, "Tab", "preview"),
+            help_item(
+                keybindings,
+                KeyAction::SessionToggleAgent,
+                "Ctrl+]",
+                "agent",
+            ),
+            help_item(keybindings, KeyAction::SessionKillAgent, "Ctrl+K", "kill"),
             help_pair_item(
                 keybindings,
                 KeyAction::SessionMovePrev,
@@ -39896,6 +40123,13 @@ fn help_items(focus: FocusPane, width: usize, keybindings: &KeyBindings) -> Vec<
         ],
         FocusPane::Sessions => vec![
             help_item(keybindings, KeyAction::SessionToggleFocus, "Tab", "preview"),
+            help_item(
+                keybindings,
+                KeyAction::SessionToggleAgent,
+                "Ctrl+]",
+                "agent",
+            ),
+            help_item(keybindings, KeyAction::SessionKillAgent, "Ctrl+K", "kill"),
             help_pair_item(
                 keybindings,
                 KeyAction::SessionMovePrev,
@@ -42259,7 +42493,7 @@ mod tests {
         );
         assert_eq!(
             value["sessions"]["kill_all"],
-            serde_json::json!(["ctrl+shift+k"])
+            serde_json::json!(["ctrl+shift+k", "shift+k"])
         );
         assert_eq!(value["sessions"]["move_next"], serde_json::json!(["down"]));
         assert_eq!(value["sessions"]["move_prev"], serde_json::json!(["up"]));
@@ -42400,6 +42634,34 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(value["sessions"]["filter"], serde_json::json!(["ctrl+f"]));
         assert_eq!(value["sessions"]["ai_search"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn legacy_generated_session_killall_binding_gains_shift_k_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybinding.json");
+        fs::write(
+            &path,
+            r#"{
+  "sessions": {
+    "kill_all": ["ctrl+shift+k"]
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
+        let shift_k = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT);
+
+        assert!(keybindings.matches(KeyAction::SessionKillAll, shift_k));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            value["sessions"]["kill_all"],
+            serde_json::json!(["ctrl+shift+k", "shift+k"])
+        );
     }
 
     #[test]
@@ -48393,6 +48655,76 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn grayscale_color_maps_ansi_and_rgb_colors_to_gray_ramp() {
+        let red = grayscale_color(Color::Indexed(196));
+        let blue = grayscale_color(Color::Rgb(0, 0, 255));
+
+        assert!(matches!(red, Color::Indexed(232..=255)));
+        assert!(matches!(blue, Color::Indexed(232..=255)));
+        assert_ne!(red, Color::Indexed(196));
+        assert_ne!(blue, Color::Rgb(0, 0, 255));
+        assert_eq!(grayscale_color(Color::Reset), Color::Reset);
+        assert!(matches!(
+            grayscale_color(Color::Red),
+            Color::Indexed(232..=255)
+        ));
+    }
+
+    #[test]
+    fn inactive_agent_pane_vt100_render_grayscales_cell_colors() {
+        let mut parser = vt100::Parser::new(1, 1, AGENT_SCROLLBACK_LINES);
+        parser.process(b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255mX");
+        let area = Rect::new(0, 0, 1, 1);
+
+        let mut focused = Buffer::empty(area);
+        render_vt100_screen(&mut focused, parser.screen(), area, true);
+        let focused_cell = &focused[(0, 0)];
+        assert_eq!(focused_cell.symbol(), "X");
+        assert_eq!(focused_cell.fg, vt100_color(vt100::Color::Rgb(255, 0, 0)));
+        assert_eq!(
+            focused_cell.bg,
+            vt100_bg_color(vt100::Color::Rgb(0, 0, 255))
+        );
+
+        let mut inactive = Buffer::empty(area);
+        render_vt100_screen(&mut inactive, parser.screen(), area, false);
+        let inactive_cell = &inactive[(0, 0)];
+        assert_eq!(inactive_cell.symbol(), "X");
+        assert_eq!(inactive_cell.fg, grayscale_color(focused_cell.fg));
+        assert_eq!(inactive_cell.bg, grayscale_color(focused_cell.bg));
+        assert_ne!(inactive_cell.fg, focused_cell.fg);
+        assert_ne!(inactive_cell.bg, focused_cell.bg);
+    }
+
+    #[test]
+    fn inactive_agent_client_pane_grayscales_pty_output() {
+        fn rendered_cell(focused: bool) -> (Color, Color) {
+            let mut client = buffered_output_test_client("pane-grayscale", 292);
+            client
+                .parser
+                .process(b"\x1b[38;2;255;0;0m\x1b[48;2;0;0;255mX");
+            let backend = ratatui::backend::TestBackend::new(80, 8);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    render_agent_client_pane(f, &mut client, Rect::new(0, 0, 80, 8), None, focused);
+                })
+                .unwrap();
+            let cell = &terminal.backend().buffer()[(0, 0)];
+            assert_eq!(cell.symbol(), "X");
+            (cell.fg, cell.bg)
+        }
+
+        let focused = rendered_cell(true);
+        let inactive = rendered_cell(false);
+
+        assert_eq!(focused.0, vt100_color(vt100::Color::Rgb(255, 0, 0)));
+        assert_eq!(focused.1, vt100_bg_color(vt100::Color::Rgb(0, 0, 255)));
+        assert_eq!(inactive.0, grayscale_color(focused.0));
+        assert_eq!(inactive.1, grayscale_color(focused.1));
+    }
+
+    #[test]
     fn blank_vt100_screen_has_no_visible_content() {
         let mut parser = vt100::Parser::new(5, 20, AGENT_SCROLLBACK_LINES);
         assert!(!screen_has_visible_content(parser.screen()));
@@ -49036,6 +49368,61 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn agent_sidebar_inactive_cursor_matches_main_agent_inactive_title_bar() {
+        assert_eq!(
+            agent_sidebar_highlight_style(false),
+            main_agent_title_bar_style(false)
+        );
+        assert_eq!(
+            agent_sidebar_highlight_style(false),
+            main_agent_title_bar_inactive_style()
+        );
+        assert_eq!(agent_sidebar_highlight_style(true), theme_selected_style());
+        assert_ne!(
+            agent_sidebar_highlight_style(true),
+            agent_sidebar_highlight_style(false)
+        );
+    }
+
+    #[test]
+    fn agent_sidebar_rendered_cursor_style_reflects_focus() {
+        fn marker_cell_style(focused: bool) -> (String, Color, Color, Modifier) {
+            let app = app_for_key_tests();
+            let info = session_info(Provider::Codex, "sidebar-style-agent", "/repo");
+            let active_key = AgentKey::new(&info);
+            let candidates = vec![info];
+            let backend = ratatui::backend::TestBackend::new(32, 5);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    draw_agent_sidebar(
+                        f,
+                        &app,
+                        Rect::new(0, 0, 32, 5),
+                        &candidates,
+                        &active_key,
+                        focused,
+                    );
+                })
+                .unwrap();
+            let cell = &terminal.backend().buffer()[(1, 1)];
+            (cell.symbol().to_string(), cell.fg, cell.bg, cell.modifier)
+        }
+
+        let inactive = marker_cell_style(false);
+        assert_eq!(inactive.0, "›");
+        assert_eq!(inactive.1, THEME_FG_DIM);
+        assert_eq!(inactive.2, THEME_STATUS_BG);
+        assert!(!inactive.3.contains(Modifier::BOLD));
+
+        let focused = marker_cell_style(true);
+        assert_eq!(focused.0, "›");
+        assert_eq!(focused.1, THEME_SELECTED_TEXT);
+        assert_eq!(focused.2, THEME_SELECTED_BG);
+        assert!(focused.3.contains(Modifier::BOLD));
+    }
+
+    #[test]
     fn agent_resize_right_shows_hidden_sidebar_one_step_from_zero() {
         let mut app = app_for_key_tests();
         app.settings.cokacmux.agent_sidebar_visible = false;
@@ -49099,6 +49486,8 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     fn status_help_updates_stale_session_labels() {
         let help = help_text(FocusPane::Sessions, 180, &KeyBindings::default());
         assert!(help.contains("Tab preview"));
+        assert!(help.contains("Ctrl+]/Ctrl+[ agent"));
+        assert!(help.contains("Ctrl+k kill"));
         assert!(help.contains("Esc/q/Ctrl+q quit"));
         assert!(help.contains("↑/↓ move"));
         assert!(help.contains("move"));
@@ -50622,7 +51011,7 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn killall_key_accepts_ctrl_shift_k_without_shadowing_ctrl_k() {
+    fn killall_key_accepts_session_shift_k_without_shadowing_ctrl_k() {
         let ctrl_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
         let raw_ctrl_k = KeyEvent::new(KeyCode::Char('\u{b}'), KeyModifiers::NONE);
         let ctrl_shift_k = KeyEvent::new(
@@ -50633,10 +51022,16 @@ IF EXIST "%~dp0\node.exe" (
             KeyCode::Char('k'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         );
+        let shift_k = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT);
+        let shift_lower_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SHIFT);
 
         assert!(is_agent_killall_key(ctrl_shift_k));
         assert!(is_agent_killall_key(ctrl_shift_lower_k));
         assert!(is_session_killall_key(ctrl_shift_k));
+        assert!(is_session_killall_key(shift_k));
+        assert!(is_session_killall_key(shift_lower_k));
+        assert!(!is_agent_killall_key(shift_k));
+        assert!(!is_agent_killall_key(shift_lower_k));
         assert!(!is_agent_killall_key(ctrl_k));
         assert!(!is_session_killall_key(ctrl_k));
         assert!(!is_agent_killall_key(raw_ctrl_k));
@@ -51534,6 +51929,25 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
+    fn session_shift_k_opens_killall_confirm_with_cancel_default() {
+        let mut app = app_for_key_tests();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(
+            app.input_mode,
+            InputMode::KillAllConfirm {
+                selected: KILLALL_OPTION_CANCEL
+            }
+        ));
+    }
+
+    #[test]
     fn agent_ctrl_shift_k_opens_killall_confirm() {
         let mut app = app_for_key_tests();
         app.show_sessions_view = false;
@@ -51555,6 +51969,33 @@ IF EXIST "%~dp0\node.exe" (
                 selected: KILLALL_OPTION_CANCEL
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_main_shift_k_is_forwarded_instead_of_killall() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let (client, rx) = buffered_output_test_client_with_requests("agent-main-shift-k", 282);
+        app.set_active_agent(client);
+        app.agent_focus = AgentFocusPane::Main;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            100,
+            24,
+        );
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        let input = rx
+            .try_iter()
+            .find_map(|request| match request.request {
+                AgentDaemonRequest::Input { data } => Some(data),
+                _ => None,
+            })
+            .expect("main agent should receive Shift+K as input");
+        assert_eq!(input, b"K".to_vec());
     }
 
     #[test]
@@ -51966,6 +52407,114 @@ IF EXIST "%~dp0\node.exe" (
             30,
         );
         assert_eq!(app.agent_focus, AgentFocusPane::Auxiliary);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_focus_cycle_skips_hidden_sidebar_without_right_pane() {
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.agent_sidebar_visible = false;
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("focus-cycle-main-only", 103));
+        app.agent_focus = AgentFocusPane::Main;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+        assert!(!app.settings.cokacmux.agent_sidebar_visible);
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+        assert!(!app.settings.cokacmux.agent_sidebar_visible);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_focus_cycle_skips_hidden_sidebar_with_right_pane() {
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.agent_sidebar_visible = false;
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("focus-cycle-main", 104));
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: buffered_output_test_client("focus-cycle-aux", 105),
+        });
+        app.agent_focus = AgentFocusPane::Main;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+        assert_eq!(app.agent_focus, AgentFocusPane::Auxiliary);
+        assert!(!app.settings.cokacmux.agent_sidebar_visible);
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+        assert!(!app.settings.cokacmux.agent_sidebar_visible);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_sidebar_escape_toggles_to_sessions_like_bracket_shortcut() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("sidebar-escape-main", 106));
+        app.agent_focus = AgentFocusPane::Sidebar;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            120,
+            30,
+        );
+
+        assert!(app.show_sessions_view);
+        assert!(app.active_agent.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_main_escape_still_forwards_to_agent() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let (client, rx) = buffered_output_test_client_with_requests("main-escape", 107);
+        app.set_active_agent(client);
+        app.agent_focus = AgentFocusPane::Main;
+
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            120,
+            30,
+        );
+
+        assert!(!app.show_sessions_view);
+        let input = rx
+            .try_iter()
+            .find_map(|request| match request.request {
+                AgentDaemonRequest::Input { data } => Some(data),
+                _ => None,
+            })
+            .expect("main agent should receive Esc as input");
+        assert_eq!(input, vec![0x1b]);
     }
 
     #[cfg(unix)]

@@ -106,6 +106,74 @@ pub fn title_override(info: &SessionInfo) -> Option<Option<String>> {
 }
 
 #[cfg(feature = "discovery")]
+pub fn copy_override(source: &SessionInfo, target: &SessionInfo) -> Result<bool> {
+    crate::debug::log(
+        "title_override_copy_start",
+        serde_json::json!({
+            "source_provider": source.provider.as_str(),
+            "source_session_id": &source.session_id,
+            "target_provider": target.provider.as_str(),
+            "target_session_id": &target.session_id,
+        }),
+    );
+    let result = copy_override_in_store(&title_store_path()?, source, target);
+    match &result {
+        Ok(copied) => crate::debug::log(
+            "title_override_copy_ok",
+            serde_json::json!({
+                "source_provider": source.provider.as_str(),
+                "source_session_id": &source.session_id,
+                "target_provider": target.provider.as_str(),
+                "target_session_id": &target.session_id,
+                "copied": copied,
+            }),
+        ),
+        Err(error) => crate::debug::log(
+            "title_override_copy_error",
+            serde_json::json!({
+                "source_provider": source.provider.as_str(),
+                "source_session_id": &source.session_id,
+                "target_provider": target.provider.as_str(),
+                "target_session_id": &target.session_id,
+                "error": error.to_string(),
+            }),
+        ),
+    }
+    result
+}
+
+#[cfg(feature = "discovery")]
+pub fn remove_override(info: &SessionInfo) -> Result<bool> {
+    crate::debug::log(
+        "title_override_remove_start",
+        serde_json::json!({
+            "provider": info.provider.as_str(),
+            "session_id": &info.session_id,
+        }),
+    );
+    let result = remove_override_in_store(&title_store_path()?, info);
+    match &result {
+        Ok(removed) => crate::debug::log(
+            "title_override_remove_ok",
+            serde_json::json!({
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "removed": removed,
+            }),
+        ),
+        Err(error) => crate::debug::log(
+            "title_override_remove_error",
+            serde_json::json!({
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "error": error.to_string(),
+            }),
+        ),
+    }
+    result
+}
+
+#[cfg(feature = "discovery")]
 fn title_store_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(APP_DIR_NAME).join(TITLE_STORE_FILE))
 }
@@ -117,6 +185,32 @@ fn set_title_in_store(path: &Path, info: &SessionInfo, title: &str) -> Result<()
         .titles
         .insert(title_key(info), title.trim().to_string());
     write_title_store(path, &store)
+}
+
+#[cfg(feature = "discovery")]
+fn copy_override_in_store(path: &Path, source: &SessionInfo, target: &SessionInfo) -> Result<bool> {
+    let mut store = read_title_store(path)?;
+    let source_key = title_key(source);
+    let target_key = title_key(target);
+    if source_key == target_key {
+        return Ok(false);
+    }
+    let Some(title) = store.titles.get(&source_key).cloned() else {
+        return Ok(false);
+    };
+    store.titles.insert(target_key, title);
+    write_title_store(path, &store)?;
+    Ok(true)
+}
+
+#[cfg(feature = "discovery")]
+fn remove_override_in_store(path: &Path, info: &SessionInfo) -> Result<bool> {
+    let mut store = read_title_store(path)?;
+    let removed = store.titles.remove(&title_key(info)).is_some();
+    if removed {
+        write_title_store(path, &store)?;
+    }
+    Ok(removed)
 }
 
 #[cfg(feature = "discovery")]
@@ -222,5 +316,61 @@ mod tests {
         apply_overrides_from_store(&store, &mut sessions);
 
         assert_eq!(sessions[0].title, None);
+    }
+
+    #[test]
+    fn copy_override_copies_only_explicit_cokacmux_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(APP_DIR_NAME).join(TITLE_STORE_FILE);
+        let source = session_info(Provider::OpenCode, "source", Some("Native Title"));
+        let target = session_info(Provider::OpenCode, "target", None);
+
+        assert!(!copy_override_in_store(&path, &source, &target).unwrap());
+
+        set_title_in_store(&path, &source, " Custom Title ").unwrap();
+        assert!(copy_override_in_store(&path, &source, &target).unwrap());
+
+        let store = read_title_store(&path).unwrap();
+        assert_eq!(
+            store.titles.get("opencode:target").map(String::as_str),
+            Some("Custom Title")
+        );
+    }
+
+    #[test]
+    fn copy_override_preserves_empty_title_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(APP_DIR_NAME).join(TITLE_STORE_FILE);
+        let source = session_info(Provider::Codex, "source", Some("Native Title"));
+        let target = session_info(Provider::Codex, "target", Some("Native Title"));
+        set_title_in_store(&path, &source, "").unwrap();
+
+        assert!(copy_override_in_store(&path, &source, &target).unwrap());
+
+        let store = read_title_store(&path).unwrap();
+        assert_eq!(
+            store.titles.get("codex:target").map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn remove_override_deletes_only_matching_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(APP_DIR_NAME).join(TITLE_STORE_FILE);
+        let keep = session_info(Provider::Claude, "keep", None);
+        let remove = session_info(Provider::Claude, "remove", None);
+        set_title_in_store(&path, &keep, "Keep").unwrap();
+        set_title_in_store(&path, &remove, "Remove").unwrap();
+
+        assert!(remove_override_in_store(&path, &remove).unwrap());
+        assert!(!remove_override_in_store(&path, &remove).unwrap());
+
+        let store = read_title_store(&path).unwrap();
+        assert_eq!(
+            store.titles.get("claude:keep").map(String::as_str),
+            Some("Keep")
+        );
+        assert!(!store.titles.contains_key("claude:remove"));
     }
 }
