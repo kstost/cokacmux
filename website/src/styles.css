@@ -150,6 +150,77 @@ h3 {
   box-shadow: 0 28px 80px var(--shadow);
 }
 
+.valueSection {
+  display: grid;
+  gap: 24px;
+  padding: 44px 0 70px;
+  border-top: 1px solid var(--line);
+}
+
+.promiseStrip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.promiseItem {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  min-height: 92px;
+  padding: 16px;
+  border: 1px solid rgba(122, 203, 120, 0.24);
+  border-radius: 8px;
+  background: rgba(122, 203, 120, 0.075);
+  color: #dcefd9;
+  line-height: 1.58;
+}
+
+.promiseItem svg {
+  margin-top: 2px;
+  color: var(--green);
+}
+
+.valueGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.valueCard {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-height: 254px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(76, 199, 189, 0.075), rgba(255, 255, 255, 0.025)),
+    rgba(255, 255, 255, 0.035);
+}
+
+.valueCard svg {
+  color: var(--teal);
+}
+
+.beforeAfter {
+  display: grid;
+  gap: 10px;
+}
+
+.beforeAfter p {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  line-height: 1.66;
+}
+
+.beforeAfter b {
+  color: var(--amber);
+}
+
 .primer {
   display: grid;
   gap: 26px;
@@ -696,6 +767,8 @@ kbd {
   .firstRun,
   .screenTourGrid,
   .overview,
+  .promiseStrip,
+  .valueGrid,
   .beginnerSteps,
   .workflowShell,
   .finish {

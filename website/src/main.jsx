@@ -27,6 +27,47 @@ const quickKeys = [
   ['현재 작업 종료', 'Ctrl+K']
 ];
 
+const valueMoments = [
+  {
+    icon: Search,
+    title: '어제 고친 내용을 다시 찾을 때',
+    before:
+      '어느 도구에서, 어느 폴더에서, 어떤 제목의 대화였는지 기억을 더듬습니다.',
+    after:
+      '한 목록에서 시간, 폴더, 도구를 보며 후보를 줄이고, 오른쪽에서 내용만 먼저 확인합니다.'
+  },
+  {
+    icon: Play,
+    title: '중단한 작업을 이어갈 때',
+    before:
+      '새 대화를 열고 “어제 여기까지 했어”를 다시 설명하면서 시간을 씁니다.',
+    after:
+      '원래 대화를 다시 열어 그때의 맥락에서 바로 이어서 질문하고 수정합니다.'
+  },
+  {
+    icon: Layers3,
+    title: '여러 작업을 번갈아 볼 때',
+    before:
+      '터미널 창과 탭이 늘어나고, 어느 창이 무슨 작업인지 헷갈립니다.',
+    after:
+      '실행 중인 작업을 한 화면에서 보고, 필요한 작업으로 바로 돌아갑니다.'
+  },
+  {
+    icon: Copy,
+    title: '다른 방향으로 실험할 때',
+    before:
+      '원래 대화나 작업 폴더를 건드릴까 봐 조심하면서 새 출발점을 직접 만듭니다.',
+    after:
+      '대화를 복사하고, 필요하면 폴더도 함께 복사해서 원본과 실험을 분리합니다.'
+  }
+];
+
+const threePromises = [
+  'AI 코딩 도구마다 흩어진 대화를 한곳에서 봅니다.',
+  '대화를 다시 열기 전에 내용을 먼저 읽어보고 판단합니다.',
+  '실행 중인 작업을 끄지 않고 목록으로 돌아와 다른 일을 찾습니다.'
+];
+
 const primerItems = [
   {
     icon: Layers3,
@@ -435,12 +476,16 @@ function App() {
       <section className="hero" aria-labelledby="hero-title">
         <div className="heroCopy">
           <p className="eyebrow">cokacmux overview</p>
-          <h1 id="hero-title">AI 코딩 대화를 한곳에서 찾고 다시 여는 터미널 작업대</h1>
+          <h1 id="hero-title">어제 하던 AI 코딩 작업을 다시 찾는 시간을 줄입니다</h1>
           <p className="heroLead">
-            cokacmux는 Claude Code, Codex, OpenCode, Pi, GJC의 대화 기록을 모아
-            보여주고, 필요한 대화를 원래 도구로 다시 이어서 열 수 있게 해줍니다.
+            Claude Code, Codex 같은 도구를 쓰다 보면 대화가 도구별, 폴더별로 흩어집니다.
+            cokacmux는 그 기록을 한 화면에 모아 찾고, 읽고, 필요한 대화만 다시 열게 해줍니다.
           </p>
           <div className="heroActions" aria-label="빠른 이동">
+            <a href="#why">
+              <Search size={18} />
+              왜 쓰는지 보기
+            </a>
             <a href="#what-is">
               <Play size={18} />
               먼저 이해하기
@@ -457,6 +502,49 @@ function App() {
         </div>
         <div className="heroVisual">
           <img src={heroImage} alt="cokacmux의 세 개 pane UI를 보여주는 대표 이미지" />
+        </div>
+      </section>
+
+      <section className="valueSection" id="why" aria-labelledby="why-title">
+        <div className="sectionIntro">
+          <p className="eyebrow">why it matters</p>
+          <h2 id="why-title">좋은 점은 “새 AI”가 아니라 “잃어버린 작업 맥락”을 되찾는 것입니다</h2>
+          <p>
+            AI 코딩 도구를 하루 이틀만 쓰면 대화가 금방 쌓입니다. 문제는 나중에 “그때
+            어디서 뭘 고쳤더라?”가 되면서, 실제 수정 시간보다 기록을 찾는 시간이 더
+            피곤해진다는 점입니다.
+          </p>
+        </div>
+
+        <div className="promiseStrip" aria-label="cokacmux가 줄여주는 일">
+          {threePromises.map((promise) => (
+            <div className="promiseItem" key={promise}>
+              <BadgeCheck size={19} />
+              <span>{promise}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="valueGrid">
+          {valueMoments.map((moment) => {
+            const Icon = moment.icon;
+            return (
+              <article className="valueCard" key={moment.title}>
+                <Icon size={24} />
+                <h3>{moment.title}</h3>
+                <div className="beforeAfter">
+                  <p>
+                    <b>없으면</b>
+                    {moment.before}
+                  </p>
+                  <p>
+                    <b>있으면</b>
+                    {moment.after}
+                  </p>
+                </div>
+              </article>
+            );
+          })}
         </div>
       </section>
 
