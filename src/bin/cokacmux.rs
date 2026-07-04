@@ -12,7 +12,9 @@ use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{self, ErrorKind, Read, Stdout, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Stdout, Write};
+#[cfg(unix)]
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(windows)]
@@ -23,8 +25,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(any(target_os = "macos", test))]
+use chrono::{Local, LocalResult, NaiveDateTime, TimeZone};
 #[cfg(windows)]
-use std::net::{TcpListener as AgentListener, TcpStream as AgentStream};
+use std::net::{SocketAddr, TcpListener as AgentListener, TcpStream as AgentStream};
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -118,6 +126,8 @@ const WINDOWS_DETACHED_PROCESS: u32 = 0x0000_0008;
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const WINDOWS_CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+#[cfg(any(windows, test))]
+const WINDOWS_ERROR_ACCESS_DENIED: i32 = 5;
 const AI_TITLE_OUTPUT_SCHEMA: &str = r#"{
   "type": "object",
   "properties": {
@@ -181,8 +191,19 @@ const AGENT_OUTPUT_POLL_LIMIT: usize = 256;
 const AGENT_OUTPUT_DRAIN_BUDGET_MS: u64 = 8;
 const TERMINAL_RESPONSE_SCAN_TAIL_BYTES: usize = 4;
 const AGENT_DAEMON_ARG: &str = "--agent-daemon";
+const AGENT_DAEMON_READY_ENV: &str = "COKACMUX_DAEMON_READY_STDOUT";
+const AGENT_DAEMON_READY_KIND: &str = "cokacmux_agent_daemon_ready";
+const AGENT_DAEMON_START_LOCK_VERSION: u32 = 1;
+/// Poll a concrete start-lock file while another live cokacmux client is
+/// starting the same daemon. This does not infer readiness from elapsed time:
+/// it only waits for the lock owner to release or become provably dead.
+const AGENT_DAEMON_START_LOCK_POLL_MS: u64 = 50;
 const AGENT_DAEMON_START_TIMEOUT_MS: u64 = 3_000;
 const AGENT_ATTACH_WRITE_TIMEOUT_MS: u64 = 3_000;
+/// Bound a discovery identity query to a live daemon socket. This is an I/O
+/// timeout for non-responsive or older daemons, not a startup race delay: a
+/// timeout preserves the runtime files instead of declaring the process dead.
+const AGENT_IDENTITY_QUERY_TIMEOUT_MS: u64 = 1_000;
 /// Accepted daemon connections wait this long for an attach request before
 /// being dropped. Liveness probes connect and close without attaching.
 const DAEMON_PENDING_ATTACH_TIMEOUT_MS: u64 = 3_000;
@@ -216,6 +237,13 @@ const DAEMON_EXIT_FLUSH_TIMEOUT_MS: u64 = 2_000;
 #[cfg(windows)]
 const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS: u64 = 2_000;
 const AGENT_DETACH_WRITE_TIMEOUT_MS: u64 = 300;
+/// Grace period for explicit user-requested termination before escalating
+/// from SIGTERM to SIGKILL. This is not used to infer startup readiness or
+/// liveness; the process/group is polled and SIGKILL is skipped if it exits.
+#[cfg(unix)]
+const PROCESS_TERMINATE_GRACE_MS: u64 = 1_000;
+#[cfg(unix)]
+const PROCESS_TERMINATE_POLL_MS: u64 = 10;
 const AGENT_STATE_POLL_INTERVAL_MS: u64 = 500;
 const UI_ANIMATION_TICK_MS: u64 = STARTUP_SPINNER_TICK_MS as u64;
 const AGENT_EXIT_REQUEST_OVERLAY_TIMEOUT_MS: u64 = 15_000;
@@ -228,7 +256,8 @@ const LIVE_SHELL_DISCOVERY_INTERVAL_MS: u64 = 10_000;
 const LIVE_SHELL_DISCOVERY_PRESERVE_MISS_LIMIT: u8 = 2;
 const LIVE_SHELL_DISCOVERY_SLOW_LOG_MS: u64 = 2_000;
 const LIVE_SHELL_DISCOVERY_SLOW_LOG_INTERVAL_MS: u64 = 10_000;
-const PENDING_RUNTIME_ACTION_MAX_WAIT_MS: u64 = 500;
+const PENDING_RUNTIME_ACTION_SLOW_LOG_MS: u64 = 2_000;
+const PENDING_RUNTIME_ACTION_SLOW_LOG_INTERVAL_MS: u64 = 10_000;
 const AGENT_BUSY_GRACE_MS: u64 = 3_000;
 const AGENT_ACTIVITY_META_WRITE_INTERVAL_MS: u64 = 750;
 const NEW_AGENT_BACKING_PROBE_INTERVAL_MS: u64 = 5_000;
@@ -4091,7 +4120,6 @@ fn attach_ui_ctx_debug_value(ctx: &AttachUiCtx) -> serde_json::Value {
         "target": attach_target_debug_value(&ctx.target),
         "focus_auxiliary_on_ready": ctx.focus_auxiliary_on_ready,
         "main_focus_override_on_ready": ctx.main_focus_override_on_ready.map(|focus| format!("{:?}", focus)),
-        "terminate_auxiliary_on_stale": ctx.terminate_auxiliary_on_stale,
         "select_visible": ctx.select_visible,
         "cokacdir_dialog_on_error": ctx.cokacdir_dialog_on_error,
         "remove_dead_on_notfound": ctx.remove_dead_on_notfound,
@@ -4163,6 +4191,7 @@ fn agent_kill_worker_result_debug_value(result: &AgentKillWorkerResult) -> serde
             "daemon_pid": outcome.pid,
             "child_pid": outcome.child_pid,
             "pty_log_deleted": outcome.pty_log_deleted,
+            "skipped_unverified": outcome.skipped_unverified,
         })),
         "error": result.outcome.as_ref().err(),
         "queued_at_epoch_ms": result.queued_at_epoch_ms,
@@ -4174,6 +4203,7 @@ fn killall_report_debug_value(report: &KillAllCokacmuxReport) -> serde_json::Val
     serde_json::json!({
         "agents_killed": report.killall.killed,
         "stale_agents": report.killall.stale,
+        "agents_skipped_unverified": report.killall.skipped_unverified,
         "child_processes_terminated": report.killall.child_processes_terminated,
         "runtime_files_removed": report.killall.runtime_files_removed,
         "pty_logs_deleted": report.killall.pty_logs_deleted,
@@ -4230,15 +4260,20 @@ fn killall_status_summary(report: &KillAllCokacmuxReport) -> String {
         .errors
         .saturating_add(report.client_process_errors)
         .saturating_add(report.untracked_daemon_process_errors);
+    let skipped_unverified = report
+        .killall
+        .skipped_unverified
+        .saturating_add(report.client_processes_skipped_unverified)
+        .saturating_add(report.untracked_daemon_processes_skipped_unverified);
     if errors > 0 {
         format!(
-            "killall finished with {} error(s): turned off {}, cleaned {}",
-            errors, terminated, cleaned
+            "killall finished with {} error(s): turned off {}, cleaned {}, skipped unverified {}",
+            errors, terminated, cleaned, skipped_unverified
         )
     } else {
         format!(
-            "killall complete: turned off {}, cleaned {}",
-            terminated, cleaned
+            "killall complete: turned off {}, cleaned {}, skipped unverified {}",
+            terminated, cleaned, skipped_unverified
         )
     }
 }
@@ -4512,6 +4547,14 @@ fn app_runtime_snapshot_debug_value(app: &App, verbose: bool) -> serde_json::Val
         serde_json::json!(app.runtime_refresh_queued),
     );
     snapshot.insert(
+        "runtime_refresh_pending_discover_live_shells".into(),
+        serde_json::json!(app.runtime_refresh_pending_discover_live_shells),
+    );
+    snapshot.insert(
+        "runtime_refresh_queued_discover_live_shells".into(),
+        serde_json::json!(app.runtime_refresh_queued_discover_live_shells),
+    );
+    snapshot.insert(
         "runtime_refresh_pending_elapsed_ms".into(),
         serde_json::json!(app
             .runtime_refresh_started_at
@@ -4691,6 +4734,42 @@ fn input_event_debug_value(event: &Event) -> serde_json::Value {
 
 fn agent_daemon_event_debug_value(event: &AgentDaemonEvent) -> serde_json::Value {
     match event {
+        AgentDaemonEvent::Identity {
+            provider,
+            session_id,
+            cwd,
+            source,
+            command,
+            daemon_pid,
+            daemon_pid_start_ticks,
+            child_pid,
+            child_pid_start_ticks,
+            attached,
+            attached_client_pid,
+            attached_client_instance_id,
+            last_screen_change_epoch_ms,
+            last_output_epoch_ms,
+            last_input_epoch_ms,
+            updated_at_epoch_s,
+        } => serde_json::json!({
+            "kind": "identity",
+            "provider": provider.as_str(),
+            "session_id": session_id,
+            "cwd": cwd,
+            "source": source,
+            "command": command,
+            "daemon_pid": daemon_pid,
+            "daemon_pid_start_ticks": daemon_pid_start_ticks,
+            "child_pid": child_pid,
+            "child_pid_start_ticks": child_pid_start_ticks,
+            "attached": attached,
+            "attached_client_pid": attached_client_pid,
+            "attached_client_instance_id": attached_client_instance_id.as_deref(),
+            "last_screen_change_epoch_ms": last_screen_change_epoch_ms,
+            "last_output_epoch_ms": last_output_epoch_ms,
+            "last_input_epoch_ms": last_input_epoch_ms,
+            "updated_at_epoch_s": updated_at_epoch_s,
+        }),
         AgentDaemonEvent::Attached {
             provider,
             session_id,
@@ -5370,6 +5449,48 @@ impl ScreenHistory {
     }
 }
 
+fn terminate_spawned_agent_child_on_setup_failure(
+    child: &mut dyn Child,
+    key: &AgentKey,
+    reason: &'static str,
+) {
+    let child_pid = child.process_id();
+    debug_log(
+        "agent_spawn_setup_failed_child_cleanup_start",
+        serde_json::json!({
+            "reason": reason,
+            "key": agent_key_debug_value(key),
+            "child_pid": child_pid,
+            "child_alive": child_pid.map(process_is_alive),
+        }),
+    );
+    if let Some(pid) = child_pid {
+        terminate_process_group(pid);
+    } else if let Err(error) = child.kill() {
+        debug_log(
+            "agent_spawn_setup_failed_child_kill_failed",
+            serde_json::json!({
+                "reason": reason,
+                "key": agent_key_debug_value(key),
+                "error": error.to_string(),
+            }),
+        );
+    }
+    let wait_result = child.wait();
+    debug_log(
+        "agent_spawn_setup_failed_child_cleanup_done",
+        serde_json::json!({
+            "reason": reason,
+            "key": agent_key_debug_value(key),
+            "child_pid": child_pid,
+            "child_alive_after": child_pid.map(process_is_alive),
+            "wait_ok": wait_result.is_ok(),
+            "wait_status": wait_result.as_ref().ok().map(|status| status.to_string()),
+            "wait_error": wait_result.as_ref().err().map(|error| error.to_string()),
+        }),
+    );
+}
+
 impl AgentSession {
     fn spawn(
         info: SessionInfo,
@@ -5429,7 +5550,7 @@ impl AgentSession {
                 "pty_rows": pty_size.rows,
             }),
         );
-        let child = match pair.slave.spawn_command(command) {
+        let mut child = match pair.slave.spawn_command(command) {
             Ok(child) => child,
             Err(e) => {
                 debug_log(
@@ -5448,6 +5569,7 @@ impl AgentSession {
                 return Err(e.into());
             }
         };
+        let key = AgentKey::new(&info);
         let child_pid = child.process_id();
         let child_pid_start_ticks = child_pid.and_then(process_start_ticks);
         debug_log(
@@ -5474,6 +5596,11 @@ impl AgentSession {
                         "error": e.to_string(),
                     }),
                 );
+                terminate_spawned_agent_child_on_setup_failure(
+                    child.as_mut(),
+                    &key,
+                    "agent_spawn_reader_clone_failed",
+                );
                 return Err(e.into());
             }
         };
@@ -5488,6 +5615,11 @@ impl AgentSession {
                         "child_pid": child_pid,
                         "error": e.to_string(),
                     }),
+                );
+                terminate_spawned_agent_child_on_setup_failure(
+                    child.as_mut(),
+                    &key,
+                    "agent_spawn_writer_take_failed",
                 );
                 return Err(e.into());
             }
@@ -5583,7 +5715,7 @@ impl AgentSession {
         let (disk_tx, disk_rx) = mpsc::sync_channel::<DaemonDiskJob>(DAEMON_DISK_QUEUE_MAX_JOBS);
         let disk_provider = info.provider;
         let disk_session_id = info.session_id.clone();
-        let agent_key = AgentKey::new(&info);
+        let agent_key = key.clone();
         let runtime_paths = match (agent_meta_path(&agent_key), agent_socket_path(&agent_key)) {
             (Ok(meta_path), Ok(socket_path)) => Some((meta_path, socket_path)),
             _ => None,
@@ -6685,6 +6817,7 @@ fn open_agent_pty_log_for_new_run(path: &Path, info: &SessionInfo) -> Option<fs:
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AgentDaemonRequest {
+    Identify,
     Attach {
         cols: u16,
         rows: u16,
@@ -6721,6 +6854,35 @@ struct AgentWriterRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AgentDaemonEvent {
+    Identity {
+        provider: Provider,
+        session_id: String,
+        cwd: String,
+        source: String,
+        command: String,
+        #[serde(default)]
+        daemon_pid: u32,
+        #[serde(default)]
+        daemon_pid_start_ticks: Option<u64>,
+        #[serde(default)]
+        child_pid: Option<u32>,
+        #[serde(default)]
+        child_pid_start_ticks: Option<u64>,
+        #[serde(default)]
+        attached: bool,
+        #[serde(default)]
+        attached_client_pid: Option<u32>,
+        #[serde(default)]
+        attached_client_instance_id: Option<String>,
+        #[serde(default)]
+        last_screen_change_epoch_ms: u64,
+        #[serde(default)]
+        last_output_epoch_ms: u64,
+        #[serde(default)]
+        last_input_epoch_ms: u64,
+        #[serde(default)]
+        updated_at_epoch_s: u64,
+    },
     Attached {
         provider: Provider,
         session_id: String,
@@ -7060,9 +7222,9 @@ impl AgentClient {
                     }),
                 );
                 validate_session_launch_cwd(&info)?;
-                start_agent_daemon(&info, launch_mode)?;
+                let stream = start_agent_daemon(&info, launch_mode)?;
                 started = true;
-                wait_for_agent_daemon(&key)?
+                stream
             }
         };
         let mut client =
@@ -7264,6 +7426,15 @@ impl AgentClient {
     /// which performed its own non-blocking socket read.
     fn process_agent_event(&mut self, event: AgentDaemonEvent) {
         match event {
+            AgentDaemonEvent::Identity { .. } => {
+                debug_log(
+                    "agent_client_event_identity_ignored",
+                    serde_json::json!({
+                        "provider": self.info.provider.as_str(),
+                        "session_id": &self.info.session_id,
+                    }),
+                );
+            }
             AgentDaemonEvent::Attached {
                 command,
                 daemon_pid,
@@ -8149,6 +8320,7 @@ impl AgentClient {
 
 fn agent_daemon_request_kind(request: &AgentDaemonRequest) -> &'static str {
     match request {
+        AgentDaemonRequest::Identify => "identify",
         AgentDaemonRequest::Attach { .. } => "attach",
         AgentDaemonRequest::Resize { .. } => "resize",
         AgentDaemonRequest::Input { .. } => "input",
@@ -8649,7 +8821,6 @@ struct AttachUiCtx {
     /// Main-agent switches normally restore that agent's remembered focus.
     /// Sidebar-driven navigation overrides it so list focus can stay put.
     main_focus_override_on_ready: Option<AgentFocusPane>,
-    terminate_auxiliary_on_stale: bool,
     select_visible: bool,
     cokacdir_dialog_on_error: bool,
     /// Remove the target from live runtime caches when the daemon socket is
@@ -8973,6 +9144,83 @@ fn debug_log_attach_worker_job_done(
     );
 }
 
+fn should_remove_dead_live_shell_after_notfound<F>(
+    key: &AgentKey,
+    mut live_meta_snapshot: F,
+) -> bool
+where
+    F: FnMut(&AgentKey) -> Option<AgentMetaSnapshot>,
+{
+    live_meta_snapshot(key).is_none()
+}
+
+struct VerifiedMissingLiveShell {
+    info: SessionInfo,
+    state: AgentListState,
+    meta: AgentMetaSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentMetaLivenessKind {
+    Verified,
+    Possible,
+}
+
+impl AgentMetaLivenessKind {
+    fn label(self) -> &'static str {
+        match self {
+            AgentMetaLivenessKind::Verified => "verified",
+            AgentMetaLivenessKind::Possible => "possible",
+        }
+    }
+}
+
+fn agent_meta_info_and_state_for_key(
+    key: &AgentKey,
+    fallback_info: Option<&SessionInfo>,
+    meta: &AgentMetaSnapshot,
+    current_pid: u32,
+    current_client_instance_id: Option<&str>,
+    now_epoch_ms: u64,
+) -> Option<(SessionInfo, AgentListState)> {
+    if agent_key_from_meta(meta).as_ref() != Some(key) {
+        return None;
+    }
+    let info = session_info_from_agent_meta_snapshot(meta)
+        .filter(|info| AgentKey::new(info) == *key)
+        .or_else(|| {
+            fallback_info
+                .cloned()
+                .filter(|info| AgentKey::new(info) == *key)
+        })?;
+    let state =
+        meta.list_state_with_client_identity(current_pid, current_client_instance_id, now_epoch_ms);
+    Some((info, state))
+}
+
+fn verified_missing_live_shell_from_meta<F>(
+    key: &AgentKey,
+    fallback_info: &SessionInfo,
+    current_pid: u32,
+    current_client_instance_id: Option<&str>,
+    now_epoch_ms: u64,
+    live_meta_snapshot: &mut F,
+) -> Option<VerifiedMissingLiveShell>
+where
+    F: FnMut(&AgentKey) -> Option<AgentMetaSnapshot>,
+{
+    let meta = live_meta_snapshot(key)?;
+    let (info, state) = agent_meta_info_and_state_for_key(
+        key,
+        Some(fallback_info),
+        &meta,
+        current_pid,
+        current_client_instance_id,
+        now_epoch_ms,
+    )?;
+    Some(VerifiedMissingLiveShell { info, state, meta })
+}
+
 fn run_new_session_prepare(
     seq: u64,
     kind: NewSessionKind,
@@ -9132,8 +9380,11 @@ struct App {
     runtime_refresh_applied_seq: u64,
     runtime_refresh_pending: bool,
     runtime_refresh_started_at: Option<Instant>,
+    runtime_refresh_pending_discover_live_shells: bool,
     runtime_refresh_queued: bool,
+    runtime_refresh_queued_discover_live_shells: bool,
     pending_runtime_action: Option<PendingRuntimeAction>,
+    pending_runtime_action_last_slow_log_at: Option<Instant>,
     live_shell_discovery_seq: u64,
     live_shell_discovery_pending: bool,
     live_shell_discovery_started_at: Option<Instant>,
@@ -9290,8 +9541,11 @@ impl App {
             runtime_refresh_applied_seq: 0,
             runtime_refresh_pending: false,
             runtime_refresh_started_at: None,
+            runtime_refresh_pending_discover_live_shells: false,
             runtime_refresh_queued: false,
+            runtime_refresh_queued_discover_live_shells: false,
             pending_runtime_action: None,
+            pending_runtime_action_last_slow_log_at: None,
             live_shell_discovery_seq: 0,
             live_shell_discovery_pending: false,
             live_shell_discovery_started_at: None,
@@ -9986,6 +10240,7 @@ impl App {
                         "daemon_pid": outcome.pid,
                         "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
+                        "skipped_unverified": outcome.skipped_unverified,
                     }),
                     Err(e) => serde_json::json!({
                         "ok": false,
@@ -10144,7 +10399,7 @@ impl App {
             if aux.kind == kind && self.agent_aux_parent_matches(&aux.parent, parent) {
                 removed = removed.saturating_add(1);
                 removed_keys.push(AgentKey::new(&aux.agent.info));
-                let _ = self.close_auxiliary_pane(aux, "hidden_replaced", true, false);
+                let _ = self.release_auxiliary_pane(aux, "hidden_replaced", false);
             } else {
                 kept.push(aux);
             }
@@ -10162,6 +10417,95 @@ impl App {
             }),
         );
         removed
+    }
+
+    fn release_auxiliary_info_locally(
+        &mut self,
+        key: &AgentKey,
+        info: &SessionInfo,
+        activity: AgentActivity,
+        reason: &'static str,
+    ) {
+        self.remove_persisted_agent_auxiliary(key, reason);
+        self.remember_live_info_locally(info);
+        self.mark_agent_live_locally(key.clone(), activity);
+        self.live_shell_missing_strikes.remove(key);
+        debug_log(
+            "agent_auxiliary_released_live",
+            serde_json::json!({
+                "reason": reason,
+                "key": agent_key_debug_value(key),
+                "info": session_info_debug_value(info),
+                "activity": activity.label(),
+                "live_shells_len": self.live_shells.len(),
+                "agent_states_len": self.agent_states.len(),
+                "persisted_after": persisted_agent_auxiliary_entries_debug_value(&self.persisted_agent_aux),
+            }),
+        );
+    }
+
+    fn release_auxiliary_pane(
+        &mut self,
+        aux: AgentAuxPane,
+        reason: &'static str,
+        update_focus: bool,
+    ) -> AgentKey {
+        let key = AgentKey::new(&aux.agent.info);
+        let info = aux.agent.info.clone();
+        let kind = aux.kind;
+        let parent = aux.parent.clone();
+        let activity = aux.agent.activity();
+        if update_focus && self.agent_focus == AgentFocusPane::Auxiliary {
+            self.set_agent_focus(AgentFocusPane::Main);
+        }
+        self.release_auxiliary_info_locally(&key, &info, activity, reason);
+        drop(aux);
+        debug_log(
+            "agent_auxiliary_pane_released",
+            serde_json::json!({
+                "reason": reason,
+                "kind": kind.label(),
+                "parent": agent_key_debug_value(&parent),
+                "key": agent_key_debug_value(&key),
+                "update_focus": update_focus,
+                "focus_after": format!("{:?}", self.agent_focus),
+                "snapshot": app_runtime_snapshot_debug_value(self, false),
+            }),
+        );
+        key
+    }
+
+    fn release_hidden_auxiliaries_for_parent(
+        &mut self,
+        parent: &AgentKey,
+        reason: &'static str,
+    ) -> usize {
+        let hidden = std::mem::take(&mut self.hidden_agent_aux);
+        let mut kept = Vec::new();
+        let mut released = 0usize;
+        let mut released_keys = Vec::new();
+        for aux in hidden {
+            if self.agent_aux_parent_matches(&aux.parent, parent) {
+                released = released.saturating_add(1);
+                released_keys.push(AgentKey::new(&aux.agent.info));
+                let _ = self.release_auxiliary_pane(aux, reason, false);
+            } else {
+                kept.push(aux);
+            }
+        }
+        self.hidden_agent_aux = kept;
+        debug_log(
+            "agent_hidden_auxiliaries_released_for_parent",
+            serde_json::json!({
+                "reason": reason,
+                "parent": agent_key_debug_value(parent),
+                "released": released,
+                "released_keys": agent_keys_debug_value(&released_keys),
+                "hidden_after": self.hidden_agent_aux.len(),
+                "persisted_after": self.persisted_agent_aux.len(),
+            }),
+        );
+        released
     }
 
     fn terminate_hidden_auxiliaries_for_parent(
@@ -10408,7 +10752,7 @@ impl App {
             }),
         );
         for key in keys {
-            self.terminate_persisted_auxiliary_key(&key, reason);
+            self.release_persisted_auxiliary_key(&key, reason);
         }
     }
 
@@ -10508,6 +10852,7 @@ impl App {
                         "daemon_pid": outcome.pid,
                         "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
+                        "skipped_unverified": outcome.skipped_unverified,
                     })
                 }),
                 "error": result.err().map(|e| e.to_string()),
@@ -10518,6 +10863,164 @@ impl App {
                 "snapshot": app_runtime_snapshot_debug_value(self, false),
             }),
         );
+    }
+
+    fn release_persisted_auxiliary_key(&mut self, key: &AgentKey, reason: &'static str) -> bool {
+        self.release_persisted_auxiliary_key_with_meta(
+            key,
+            reason,
+            live_or_possible_agent_meta_snapshot,
+        )
+    }
+
+    fn release_persisted_auxiliary_key_with_meta<F>(
+        &mut self,
+        key: &AgentKey,
+        reason: &'static str,
+        mut meta_snapshot: F,
+    ) -> bool
+    where
+        F: FnMut(&AgentKey) -> Option<(AgentMetaSnapshot, AgentMetaLivenessKind)>,
+    {
+        let Some(entry) = self.persisted_agent_aux.get(key).cloned() else {
+            debug_log(
+                "agent_auxiliary_release_key_miss",
+                serde_json::json!({
+                    "reason": reason,
+                    "key": agent_key_debug_value(key),
+                    "persisted": persisted_agent_auxiliary_entries_debug_value(&self.persisted_agent_aux),
+                }),
+            );
+            return false;
+        };
+        let existing_live_info = self
+            .live_shells
+            .iter()
+            .find(|info| AgentKey::new(info) == *key)
+            .cloned();
+        let meta_live = meta_snapshot(key).and_then(|(meta, liveness)| {
+            let (info, state) = agent_meta_info_and_state_for_key(
+                key,
+                None,
+                &meta,
+                std::process::id(),
+                Some(agent_client_instance_id()),
+                current_epoch_ms(),
+            )?;
+            Some((info, state, meta, liveness))
+        });
+        if let Some((info, state, meta, liveness)) = meta_live {
+            self.remove_persisted_agent_auxiliary(key, reason);
+            self.remember_live_info_locally(&info);
+            if is_switchable_agent_state(state) {
+                self.agent_states.insert(key.clone(), state);
+            } else {
+                self.mark_agent_live_locally(key.clone(), state.activity());
+            }
+            self.live_shell_missing_strikes.remove(key);
+            debug_log(
+                if liveness == AgentMetaLivenessKind::Verified {
+                    "agent_auxiliary_registry_released_verified_live"
+                } else {
+                    "agent_auxiliary_registry_released_possible_live"
+                },
+                serde_json::json!({
+                    "reason": reason,
+                    "key": agent_key_debug_value(key),
+                    "liveness": liveness.label(),
+                    "entry": persisted_agent_auxiliary_entry_debug_value(&entry),
+                    "info": session_info_debug_value(&info),
+                    "state": agent_list_state_debug_value(state),
+                    "meta": agent_meta_snapshot_debug_value(&meta),
+                    "snapshot": app_runtime_snapshot_debug_value(self, false),
+                }),
+            );
+            return true;
+        }
+        if let Some(info) = existing_live_info {
+            self.release_auxiliary_info_locally(key, &info, AgentActivity::Quiet, reason);
+            debug_log(
+                "agent_auxiliary_registry_released_known_live",
+                serde_json::json!({
+                    "reason": reason,
+                    "key": agent_key_debug_value(key),
+                    "entry": persisted_agent_auxiliary_entry_debug_value(&entry),
+                    "info": session_info_debug_value(&info),
+                    "snapshot": app_runtime_snapshot_debug_value(self, false),
+                }),
+            );
+            return true;
+        }
+        self.remove_persisted_agent_auxiliary(key, reason);
+        self.agent_states.remove(key);
+        self.live_shell_missing_strikes.remove(key);
+        debug_log(
+            "agent_auxiliary_registry_removed_without_live_runtime",
+            serde_json::json!({
+                "reason": reason,
+                "key": agent_key_debug_value(key),
+                "entry": persisted_agent_auxiliary_entry_debug_value(&entry),
+                "snapshot": app_runtime_snapshot_debug_value(self, false),
+            }),
+        );
+        true
+    }
+
+    fn release_persisted_auxiliaries_for_parent(
+        &mut self,
+        parent: &AgentKey,
+        reason: &'static str,
+    ) -> usize {
+        let keys = self
+            .persisted_agent_aux
+            .iter()
+            .filter(|(_, entry)| self.persisted_auxiliary_parent_matches_key(entry, parent))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        debug_log(
+            "agent_auxiliary_registry_parent_release_candidates",
+            serde_json::json!({
+                "reason": reason,
+                "parent": agent_key_debug_value(parent),
+                "keys": agent_keys_debug_value(&keys),
+                "count": keys.len(),
+                "persisted": persisted_agent_auxiliary_entries_debug_value(&self.persisted_agent_aux),
+            }),
+        );
+        let mut released = 0usize;
+        for key in keys {
+            if self.release_persisted_auxiliary_key(&key, reason) {
+                released = released.saturating_add(1);
+            }
+        }
+        released
+    }
+
+    fn release_auxiliaries_for_parent(&mut self, parent: &AgentKey, reason: &'static str) -> usize {
+        let mut released = 0usize;
+        if self
+            .agent_aux
+            .as_ref()
+            .is_some_and(|aux| self.agent_aux_parent_matches(&aux.parent, parent))
+        {
+            if let Some(aux) = self.agent_aux.take() {
+                released = released.saturating_add(1);
+                let _ = self.release_auxiliary_pane(aux, reason, true);
+            }
+        }
+        released =
+            released.saturating_add(self.release_hidden_auxiliaries_for_parent(parent, reason));
+        released =
+            released.saturating_add(self.release_persisted_auxiliaries_for_parent(parent, reason));
+        debug_log(
+            "agent_auxiliaries_released_for_parent",
+            serde_json::json!({
+                "reason": reason,
+                "parent": agent_key_debug_value(parent),
+                "count": released,
+            }),
+        );
+        released
     }
 
     fn terminate_auxiliaries_for_parent(
@@ -10658,8 +11161,9 @@ impl App {
         );
         let mut normalized = 0usize;
         for key in keys {
-            normalized = normalized.saturating_add(1);
-            self.terminate_persisted_auxiliary_key(&key, reason);
+            if self.release_persisted_auxiliary_key(&key, reason) {
+                normalized = normalized.saturating_add(1);
+            }
         }
         if normalized > 0 {
             debug_log(
@@ -10686,7 +11190,7 @@ impl App {
         })
     }
 
-    fn terminate_orphan_persisted_auxiliaries(&mut self, reason: &'static str) -> usize {
+    fn release_orphan_persisted_auxiliaries(&mut self, reason: &'static str) -> usize {
         let keys = self
             .persisted_agent_aux
             .iter()
@@ -10704,21 +11208,22 @@ impl App {
                 "live_shells_len": self.live_shells.len(),
             }),
         );
-        let mut terminated = 0usize;
+        let mut released = 0usize;
         for key in keys {
-            terminated = terminated.saturating_add(1);
-            self.terminate_persisted_auxiliary_key(&key, reason);
+            if self.release_persisted_auxiliary_key(&key, reason) {
+                released = released.saturating_add(1);
+            }
         }
-        if terminated > 0 {
+        if released > 0 {
             debug_log(
-                "agent_auxiliary_orphans_terminated",
+                "agent_auxiliary_orphans_released",
                 serde_json::json!({
                     "reason": reason,
-                    "count": terminated,
+                    "count": released,
                 }),
             );
         }
-        terminated
+        released
     }
 
     fn persisted_auxiliary_parent_has_live_runtime(
@@ -10771,7 +11276,7 @@ impl App {
         })
     }
 
-    fn terminate_orphan_persisted_auxiliaries_without_live_runtime(
+    fn release_orphan_persisted_auxiliaries_without_live_runtime(
         &mut self,
         reason: &'static str,
     ) -> usize {
@@ -10796,21 +11301,22 @@ impl App {
                 "agent_states": agent_state_entries_debug_value(&self.agent_states),
             }),
         );
-        let mut terminated = 0usize;
+        let mut released = 0usize;
         for key in keys {
-            terminated = terminated.saturating_add(1);
-            self.terminate_persisted_auxiliary_key(&key, reason);
+            if self.release_persisted_auxiliary_key(&key, reason) {
+                released = released.saturating_add(1);
+            }
         }
-        if terminated > 0 {
+        if released > 0 {
             debug_log(
-                "agent_auxiliary_runtime_orphans_terminated",
+                "agent_auxiliary_runtime_orphans_released",
                 serde_json::json!({
                     "reason": reason,
-                    "count": terminated,
+                    "count": released,
                 }),
             );
         }
-        terminated
+        released
     }
 
     fn remove_persisted_agent_auxiliary(&mut self, key: &AgentKey, reason: &'static str) {
@@ -11325,7 +11831,6 @@ impl App {
                 status_prepare_err_prefix: format!("right {} restore failed: ", kind.label()),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -11546,7 +12051,6 @@ impl App {
                 status_prepare_err_prefix: format!("right {} prepare failed: ", kind.label()),
                 focus_auxiliary_on_ready: true,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: true,
                 select_visible: false,
                 cokacdir_dialog_on_error: kind == AgentAuxKind::Cokacdir,
                 remove_dead_on_notfound: false,
@@ -13182,7 +13686,7 @@ impl App {
     }
 
     fn poll_agent_runtime_states(&mut self) {
-        self.continue_timed_out_pending_runtime_action();
+        self.maybe_log_slow_pending_runtime_action();
         if self.last_agent_state_poll.elapsed()
             < Duration::from_millis(AGENT_STATE_POLL_INTERVAL_MS)
         {
@@ -13303,11 +13807,20 @@ impl App {
     }
 
     fn refresh_agent_runtime_states(&mut self) {
+        self.refresh_agent_runtime_states_with_discovery(false);
+    }
+
+    fn refresh_agent_runtime_states_discovering_live_shells(&mut self) {
+        self.refresh_agent_runtime_states_with_discovery(true);
+    }
+
+    fn refresh_agent_runtime_states_with_discovery(&mut self, discover_live_shells: bool) {
         self.last_agent_state_poll = Instant::now();
         let Some(tx) = self.runtime_tx.clone() else {
             debug_log(
                 "agent_runtime_refresh_fallback_without_worker",
                 serde_json::json!({
+                    "discover_live_shells": discover_live_shells,
                     "snapshot_before": app_runtime_snapshot_debug_value(self, false),
                 }),
             );
@@ -13326,11 +13839,28 @@ impl App {
             return;
         };
         if self.runtime_refresh_pending {
+            if self.runtime_refresh_pending_discover_live_shells && discover_live_shells {
+                debug_log(
+                    "agent_runtime_refresh_covered_by_pending_discovery",
+                    serde_json::json!({
+                        "seq": self.runtime_refresh_seq,
+                        "discover_live_shells": discover_live_shells,
+                        "pending_discover_live_shells": self.runtime_refresh_pending_discover_live_shells,
+                        "queued_discover_live_shells": self.runtime_refresh_queued_discover_live_shells,
+                        "pending_elapsed_ms": self.runtime_refresh_started_at.map(|started| started.elapsed().as_millis()),
+                        "snapshot": app_runtime_snapshot_debug_value(self, false),
+                    }),
+                );
+                return;
+            }
             self.runtime_refresh_queued = true;
+            self.runtime_refresh_queued_discover_live_shells |= discover_live_shells;
             debug_log(
                 "agent_runtime_refresh_queued",
                 serde_json::json!({
                     "seq": self.runtime_refresh_seq,
+                    "discover_live_shells": discover_live_shells,
+                    "queued_discover_live_shells": self.runtime_refresh_queued_discover_live_shells,
                     "pending_elapsed_ms": self.runtime_refresh_started_at.map(|started| started.elapsed().as_millis()),
                     "snapshot": app_runtime_snapshot_debug_value(self, false),
                 }),
@@ -13340,16 +13870,17 @@ impl App {
 
         self.runtime_refresh_seq = self.runtime_refresh_seq.saturating_add(1);
         let seq = self.runtime_refresh_seq;
-        let request = self.agent_runtime_refresh_request(seq, false);
+        let request = self.agent_runtime_refresh_request(seq, discover_live_shells);
         match tx.send(request) {
             Ok(()) => {
                 self.runtime_refresh_pending = true;
                 self.runtime_refresh_started_at = Some(self.last_agent_state_poll);
+                self.runtime_refresh_pending_discover_live_shells = discover_live_shells;
                 debug_log(
                     "agent_runtime_refresh_requested",
                     serde_json::json!({
                         "seq": seq,
-                        "discover_live_shells": false,
+                        "discover_live_shells": discover_live_shells,
                         "snapshot": app_runtime_snapshot_debug_value(self, false),
                     }),
                 );
@@ -13358,11 +13889,14 @@ impl App {
                 self.runtime_tx = None;
                 self.runtime_refresh_pending = false;
                 self.runtime_refresh_started_at = None;
+                self.runtime_refresh_pending_discover_live_shells = false;
                 self.runtime_refresh_queued = false;
+                self.runtime_refresh_queued_discover_live_shells = false;
                 debug_log(
                     "agent_runtime_refresh_request_failed",
                     serde_json::json!({
                         "seq": seq,
+                        "discover_live_shells": discover_live_shells,
                         "error": e.to_string(),
                     }),
                 );
@@ -13473,8 +14007,11 @@ impl App {
     fn on_runtime_state_result(&mut self, result: AgentRuntimeRefreshResult) {
         self.runtime_refresh_pending = false;
         self.runtime_refresh_started_at = None;
+        self.runtime_refresh_pending_discover_live_shells = false;
         let refresh_queued = self.runtime_refresh_queued;
+        let refresh_queued_discover_live_shells = self.runtime_refresh_queued_discover_live_shells;
         self.runtime_refresh_queued = false;
+        self.runtime_refresh_queued_discover_live_shells = false;
         let result_seq = result.seq;
         debug_log(
             "agent_runtime_refresh_result_received",
@@ -13482,12 +14019,15 @@ impl App {
                 "seq": result_seq,
                 "applied_seq": self.runtime_refresh_applied_seq,
                 "refresh_queued": refresh_queued,
+                "refresh_queued_discover_live_shells": refresh_queued_discover_live_shells,
                 "discover_live_shells": result.discover_live_shells,
                 "live_shells_len": result.live_shells.len(),
                 "agent_states_len": result.agent_states.len(),
                 "snapshot_before": app_runtime_snapshot_debug_value(self, false),
             }),
         );
+        let continue_pending_action = !refresh_queued
+            || (result.discover_live_shells && !refresh_queued_discover_live_shells);
         if result.seq < self.runtime_refresh_applied_seq {
             debug_log(
                 "agent_runtime_refresh_result_stale",
@@ -13497,7 +14037,7 @@ impl App {
                 }),
             );
         } else {
-            self.apply_agent_runtime_refresh_result_with_pending(result, !refresh_queued);
+            self.apply_agent_runtime_refresh_result_with_pending(result, continue_pending_action);
         }
         if refresh_queued && !self.runtime_refresh_pending {
             debug_log(
@@ -13505,12 +14045,14 @@ impl App {
                 serde_json::json!({
                     "seq": result_seq,
                     "reason": "queued_while_result_pending",
+                    "discover_live_shells": refresh_queued_discover_live_shells,
                     "snapshot": app_runtime_snapshot_debug_value(self, false),
                 }),
             );
-            self.refresh_agent_runtime_states();
+            self.refresh_agent_runtime_states_with_discovery(refresh_queued_discover_live_shells);
         } else if refresh_queued {
             self.runtime_refresh_queued = true;
+            self.runtime_refresh_queued_discover_live_shells |= refresh_queued_discover_live_shells;
         }
         debug_log(
             "agent_runtime_refresh_result_done",
@@ -13525,6 +14067,16 @@ impl App {
     }
 
     fn on_live_shell_discovery_result(&mut self, result: LiveShellDiscoveryResult) {
+        self.on_live_shell_discovery_result_with_meta(result, possibly_live_agent_meta_snapshot);
+    }
+
+    fn on_live_shell_discovery_result_with_meta<F>(
+        &mut self,
+        result: LiveShellDiscoveryResult,
+        mut live_meta_snapshot: F,
+    ) where
+        F: FnMut(&AgentKey) -> Option<AgentMetaSnapshot>,
+    {
         self.live_shell_discovery_pending = false;
         self.live_shell_discovery_started_at = None;
         self.live_shell_discovery_last_slow_log_at = None;
@@ -13559,6 +14111,34 @@ impl App {
                     "state": optional_agent_list_state_debug_value(self.agent_states.get(&key).copied()),
                     "missing_strikes": self.live_shell_missing_strikes.get(&key).copied(),
                 }));
+                continue;
+            }
+            if let Some(verified) = verified_missing_live_shell_from_meta(
+                &key,
+                &info,
+                std::process::id(),
+                Some(agent_client_instance_id()),
+                current_epoch_ms(),
+                &mut live_meta_snapshot,
+            ) {
+                let missing_strikes_before = self.live_shell_missing_strikes.get(&key).copied();
+                self.live_shell_missing_strikes.remove(&key);
+                if verified.state != AgentListState::Idle {
+                    self.agent_states.insert(key.clone(), verified.state);
+                }
+                seen.insert(key.clone());
+                preserved_keys.push(key.clone());
+                missing_decisions.push(serde_json::json!({
+                    "key": agent_key_debug_value(&key),
+                    "info": session_info_debug_value(&info),
+                    "verified_info": session_info_debug_value(&verified.info),
+                    "decision": "preserved_missing_verified_runtime",
+                    "state": optional_agent_list_state_debug_value(self.agent_states.get(&key).copied()),
+                    "verified_state": agent_list_state_debug_value(verified.state),
+                    "verified_meta": agent_meta_snapshot_debug_value(&verified.meta),
+                    "missing_strikes_before": missing_strikes_before,
+                }));
+                next_live_shells.push(verified.info);
                 continue;
             }
             if self
@@ -13658,7 +14238,7 @@ impl App {
         let normalized_auxiliaries =
             self.normalize_persisted_agent_auxiliaries("live_shell_discovery_normalize");
         let orphaned_auxiliaries =
-            self.terminate_orphan_persisted_auxiliaries("orphan_parent_missing");
+            self.release_orphan_persisted_auxiliaries("orphan_parent_missing");
 
         debug_log(
             "live_shell_discovery_applied",
@@ -13681,7 +14261,7 @@ impl App {
                     })
                 }).collect::<Vec<_>>(),
                 "normalized_auxiliaries": normalized_auxiliaries,
-                "orphaned_auxiliaries_terminated": orphaned_auxiliaries,
+                "orphaned_auxiliaries_released": orphaned_auxiliaries,
                 "next_live_shells": self.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
                 "agent_states": agent_state_entries_debug_value(&self.agent_states),
                 "persisted_agent_auxiliaries": persisted_agent_auxiliary_entries_debug_value(&self.persisted_agent_aux),
@@ -14091,7 +14671,8 @@ impl App {
                             let stale_info = agent.info.clone();
                             let stale_key = AgentKey::new(&stale_info);
                             let stale_activity = agent.activity();
-                            if !ctx.terminate_auxiliary_on_stale {
+                            let parent_live = self.auxiliary_parent_is_live(&parent);
+                            if parent_live {
                                 self.remember_persisted_agent_auxiliary(
                                     kind,
                                     &parent,
@@ -14101,18 +14682,19 @@ impl App {
                                 );
                                 self.remember_live_info_locally(&stale_info);
                                 self.mark_agent_live_locally(stale_key.clone(), stale_activity);
+                            } else {
+                                self.release_auxiliary_info_locally(
+                                    &stale_key,
+                                    &stale_info,
+                                    stale_activity,
+                                    "stale_released",
+                                );
                             }
                             drop(agent);
-                            let terminated = if ctx.terminate_auxiliary_on_stale {
-                                self.remove_persisted_agent_auxiliary(
-                                    &stale_key,
-                                    "stale_terminated",
-                                );
-                                terminate_agent_daemon_for_info(&stale_key, &stale_info).is_ok()
-                            } else {
-                                false
-                            };
-                            self.status = format!("discarded stale right {} panel", kind.label());
+                            self.status = format!(
+                                "detached stale right {} panel; kept running",
+                                kind.label()
+                            );
                             self.discard_pending_agent_runtime_refresh();
                             self.refresh_agent_runtime_states();
                             debug_log(
@@ -14121,8 +14703,8 @@ impl App {
                                     "kind": kind.label(),
                                     "requested_parent": agent_key_debug_value(&parent),
                                     "active_parent": active_parent.as_ref().map(agent_key_debug_value),
-                                    "terminated": terminated,
-                                    "preserved_live": !ctx.terminate_auxiliary_on_stale,
+                                    "parent_live": parent_live,
+                                    "preserved_live": true,
                                     "snapshot": app_runtime_snapshot_debug_value(self, false),
                                 }),
                             );
@@ -14209,10 +14791,8 @@ impl App {
                 let daemon_gone = ctx.remove_dead_on_notfound
                     && matches!(stage, AttachFailStage::Attach)
                     && error_kind == Some(ErrorKind::NotFound);
-                if daemon_gone {
-                    self.remove_dead_live_shell(&ctx.key);
-                    self.discard_pending_agent_runtime_refresh();
-                }
+                let daemon_gone_removed =
+                    daemon_gone && self.remove_dead_live_shell_if_not_unreachable_live(&ctx.key);
                 self.status = match stage {
                     AttachFailStage::Prepare => {
                         format!("{}{}", ctx.status_prepare_err_prefix, message)
@@ -14222,7 +14802,11 @@ impl App {
                 if ctx.cokacdir_dialog_on_error {
                     self.show_cokacdir_error_dialog(self.status.clone());
                 }
-                self.refresh_agent_runtime_states();
+                if matches!(stage, AttachFailStage::Attach) {
+                    self.refresh_agent_runtime_states_discovering_live_shells();
+                } else {
+                    self.refresh_agent_runtime_states();
+                }
                 debug_log(
                     ctx.failed_event,
                     serde_json::json!({
@@ -14231,7 +14815,9 @@ impl App {
                         "stage": format!("{:?}", stage),
                         "error": message,
                         "origin": ctx.log_origin,
-                        "daemon_gone_removed": daemon_gone,
+                        "daemon_gone": daemon_gone,
+                        "daemon_gone_removed": daemon_gone_removed,
+                        "unreachable_live_preserved": daemon_gone && !daemon_gone_removed,
                         "attach_elapsed_ms": elapsed_ms,
                         "snapshot": app_runtime_snapshot_debug_value(self, false),
                     }),
@@ -14253,44 +14839,25 @@ impl App {
         };
         let info = agent.info.clone();
         let key = AgentKey::new(&info);
-        let terminate_stale =
-            result.ctx.terminate_auxiliary_on_stale || !self.auxiliary_parent_is_live(parent);
-        if !terminate_stale {
-            let activity = agent.activity();
+        let activity = agent.activity();
+        let parent_live = self.auxiliary_parent_is_live(parent);
+        if parent_live {
             self.remember_persisted_agent_auxiliary(*kind, parent, &info, true, reason);
             self.remember_live_info_locally(&info);
             self.mark_agent_live_locally(key.clone(), activity);
-            self.discard_pending_agent_runtime_refresh();
-            self.refresh_agent_runtime_states();
-            debug_log(
-                "agent_auxiliary_attach_preserved",
-                serde_json::json!({
-                    "reason": reason,
-                    "kind": kind.label(),
-                    "requested_parent": agent_key_debug_value(parent),
-                    "key": agent_key_debug_value(&key),
-                    "snapshot": app_runtime_snapshot_debug_value(self, false),
-                }),
-            );
-            return;
+        } else {
+            self.release_auxiliary_info_locally(&key, &info, activity, reason);
         }
-        self.remove_persisted_agent_auxiliary(&key, reason);
-        let _ = terminate_agent_daemon_for_info(&key, &info);
-        self.live_shells.retain(|info| AgentKey::new(info) != key);
-        self.agent_states.remove(&key);
-        self.live_shell_missing_strikes.remove(&key);
-        self.new_agent_backing_aliases.remove(&key);
-        self.new_agent_backing_probe_after.remove(&key);
         self.discard_pending_agent_runtime_refresh();
         self.refresh_agent_runtime_states();
         debug_log(
-            "agent_auxiliary_attach_discarded",
+            "agent_auxiliary_attach_preserved",
             serde_json::json!({
                 "reason": reason,
                 "kind": kind.label(),
                 "requested_parent": agent_key_debug_value(parent),
                 "key": agent_key_debug_value(&key),
-                "parent_live": self.auxiliary_parent_is_live(parent),
+                "parent_live": parent_live,
                 "snapshot": app_runtime_snapshot_debug_value(self, false),
             }),
         );
@@ -14313,7 +14880,7 @@ impl App {
         let info = agent.info.clone();
         self.remember_active_auxiliary_parent_info(&parent);
         self.remember_live_info_locally(&info);
-        self.terminate_hidden_auxiliaries_for_parent(&parent, reason);
+        self.release_hidden_auxiliaries_for_parent(&parent, reason);
         self.remember_persisted_agent_auxiliary(kind, &parent, &info, true, reason);
         self.hidden_agent_aux.push(AgentAuxPane {
             kind,
@@ -14330,6 +14897,41 @@ impl App {
                 "snapshot": app_runtime_snapshot_debug_value(self, false),
             }),
         );
+    }
+
+    fn remove_dead_live_shell_if_not_unreachable_live(&mut self, key: &AgentKey) -> bool {
+        let mut unreachable_live_meta = None;
+        if should_remove_dead_live_shell_after_notfound(key, |probe_key| {
+            unreachable_live_meta = possibly_live_agent_meta_snapshot(probe_key);
+            unreachable_live_meta.clone()
+        }) {
+            let reachable_daemon = agent_runtime_dir().ok().is_some_and(|runtime_dir| {
+                agent_runtime_key_has_reachable_daemon_at(
+                    &runtime_dir,
+                    key,
+                    "dead_live_shell_remove_notfound",
+                )
+            });
+            if reachable_daemon {
+                debug_log(
+                    "dead_live_shell_remove_skipped_reachable_daemon",
+                    serde_json::json!({
+                        "key": agent_key_debug_value(key),
+                    }),
+                );
+                return false;
+            }
+            self.remove_dead_live_shell(key);
+            return true;
+        }
+        debug_log(
+            "dead_live_shell_remove_skipped_unreachable_live",
+            serde_json::json!({
+                "key": agent_key_debug_value(key),
+                "meta": unreachable_live_meta.as_ref().map(agent_meta_snapshot_debug_value),
+            }),
+        );
+        false
     }
 
     /// Drop a daemon proven dead (its socket file is gone) from the live
@@ -14370,12 +14972,18 @@ impl App {
         let was_refresh_pending = self.runtime_refresh_pending;
         let previous_applied_seq = self.runtime_refresh_applied_seq;
         let previous_queued = self.runtime_refresh_queued;
+        let previous_pending_discover_live_shells =
+            self.runtime_refresh_pending_discover_live_shells;
+        let previous_queued_discover_live_shells = self.runtime_refresh_queued_discover_live_shells;
         self.pending_runtime_action = None;
+        self.pending_runtime_action_last_slow_log_at = None;
         if self.runtime_refresh_pending {
             self.runtime_refresh_applied_seq = self
                 .runtime_refresh_applied_seq
                 .max(self.runtime_refresh_seq.saturating_add(1));
             self.runtime_refresh_queued = true;
+            self.runtime_refresh_queued_discover_live_shells |=
+                self.runtime_refresh_pending_discover_live_shells;
         }
         debug_log(
             "agent_runtime_refresh_discard_pending",
@@ -14386,6 +14994,9 @@ impl App {
                 "applied_seq_after": self.runtime_refresh_applied_seq,
                 "queued_before": previous_queued,
                 "queued_after": self.runtime_refresh_queued,
+                "pending_discover_live_shells_before": previous_pending_discover_live_shells,
+                "queued_discover_live_shells_before": previous_queued_discover_live_shells,
+                "queued_discover_live_shells_after": self.runtime_refresh_queued_discover_live_shells,
                 "pending_runtime_action_before": pending_before,
                 "snapshot": app_runtime_snapshot_debug_value(self, false),
             }),
@@ -14396,26 +15007,44 @@ impl App {
         self.runtime_refresh_pending || self.runtime_refresh_queued
     }
 
-    fn continue_timed_out_pending_runtime_action(&mut self) {
+    fn set_pending_runtime_action(&mut self, action: PendingRuntimeAction) {
+        self.pending_runtime_action = Some(action);
+        self.pending_runtime_action_last_slow_log_at = None;
+    }
+
+    fn maybe_log_slow_pending_runtime_action(&mut self) {
         if self.pending_runtime_action.is_none() {
+            self.pending_runtime_action_last_slow_log_at = None;
             return;
         }
         let Some(started_at) = self.runtime_refresh_started_at else {
             return;
         };
         let elapsed = started_at.elapsed();
-        if elapsed < Duration::from_millis(PENDING_RUNTIME_ACTION_MAX_WAIT_MS) {
+        if elapsed < Duration::from_millis(PENDING_RUNTIME_ACTION_SLOW_LOG_MS) {
             return;
         }
+        if self
+            .pending_runtime_action_last_slow_log_at
+            .is_some_and(|last| {
+                last.elapsed() < Duration::from_millis(PENDING_RUNTIME_ACTION_SLOW_LOG_INTERVAL_MS)
+            })
+        {
+            return;
+        }
+        self.pending_runtime_action_last_slow_log_at = Some(Instant::now());
         debug_log(
-            "pending_runtime_action_timeout",
+            "pending_runtime_action_still_waiting",
             serde_json::json!({
                 "runtime_refresh_seq": self.runtime_refresh_seq,
+                "runtime_refresh_pending": self.runtime_refresh_pending,
+                "runtime_refresh_queued": self.runtime_refresh_queued,
+                "runtime_refresh_pending_discover_live_shells": self.runtime_refresh_pending_discover_live_shells,
+                "runtime_refresh_queued_discover_live_shells": self.runtime_refresh_queued_discover_live_shells,
                 "elapsed_ms": elapsed.as_millis(),
                 "pending_runtime_action": pending_runtime_action_debug_value(self.pending_runtime_action.as_ref()),
             }),
         );
-        self.continue_pending_runtime_action();
     }
 
     fn apply_agent_runtime_refresh_result_with_pending(
@@ -14443,7 +15072,7 @@ impl App {
             &mut self.agent_states,
         );
         let orphaned_auxiliaries = if self.active_agent.is_some() || !self.live_shells.is_empty() {
-            self.terminate_orphan_persisted_auxiliaries_without_live_runtime(
+            self.release_orphan_persisted_auxiliaries_without_live_runtime(
                 "orphan_parent_runtime_missing",
             )
         } else {
@@ -14465,7 +15094,7 @@ impl App {
                     "live_shells_preserved": live_shells_preserved,
                     "live_shells_len": self.live_shells.len(),
                     "agent_states_len": self.agent_states.len(),
-                    "orphaned_auxiliaries_terminated": orphaned_auxiliaries,
+                    "orphaned_auxiliaries_released": orphaned_auxiliaries,
                     "live_shells": self.live_shells.iter().map(session_info_debug_value).collect::<Vec<_>>(),
                     "agent_states": agent_state_entries_debug_value(&self.agent_states),
                     "new_agent_backing_aliases": agent_alias_entries_debug_value(&self.new_agent_backing_aliases),
@@ -14586,6 +15215,7 @@ impl App {
         let Some(action) = self.pending_runtime_action.take() else {
             return;
         };
+        self.pending_runtime_action_last_slow_log_at = None;
         debug_log(
             "pending_runtime_action_continue",
             pending_runtime_action_debug_value(Some(&action)),
@@ -14840,10 +15470,27 @@ impl App {
     fn live_coding_agent_cwd_conflict_with_runtime<F>(
         &mut self,
         target: &SessionInfo,
-        mut runtime_state: F,
+        runtime_state: F,
     ) -> Option<SessionInfo>
     where
         F: FnMut(&AgentKey) -> AgentListState,
+    {
+        self.live_coding_agent_cwd_conflict_with_runtime_and_meta(
+            target,
+            runtime_state,
+            live_agent_meta_snapshot,
+        )
+    }
+
+    fn live_coding_agent_cwd_conflict_with_runtime_and_meta<F, G>(
+        &mut self,
+        target: &SessionInfo,
+        mut runtime_state: F,
+        mut live_meta_snapshot: G,
+    ) -> Option<SessionInfo>
+    where
+        F: FnMut(&AgentKey) -> AgentListState,
+        G: FnMut(&AgentKey) -> Option<AgentMetaSnapshot>,
     {
         let target_key = AgentKey::new(target);
         if let Some(active_info) = self
@@ -14881,6 +15528,37 @@ impl App {
 
             let observed_state = runtime_state(&candidate_key);
             if observed_state == AgentListState::Idle {
+                if let Some(verified) = verified_missing_live_shell_from_meta(
+                    &candidate_key,
+                    &candidate,
+                    std::process::id(),
+                    Some(agent_client_instance_id()),
+                    current_epoch_ms(),
+                    &mut live_meta_snapshot,
+                ) {
+                    let verified_state = verified.state;
+                    self.remember_live_info_locally(&verified.info);
+                    if verified_state != AgentListState::Idle {
+                        self.agent_states
+                            .insert(candidate_key.clone(), verified_state);
+                    }
+                    self.live_shell_missing_strikes.remove(&candidate_key);
+                    debug_log(
+                        "agent_launch_preserved_verified_cwd_conflict",
+                        serde_json::json!({
+                            "target": session_info_debug_value(target),
+                            "candidate": session_info_debug_value(&candidate),
+                            "verified_info": session_info_debug_value(&verified.info),
+                            "target_key": agent_key_debug_value(&target_key),
+                            "candidate_key": agent_key_debug_value(&candidate_key),
+                            "cached_state": agent_list_state_debug_value(cached_state),
+                            "observed_state": agent_list_state_debug_value(observed_state),
+                            "verified_state": agent_list_state_debug_value(verified_state),
+                            "verified_meta": agent_meta_snapshot_debug_value(&verified.meta),
+                        }),
+                    );
+                    return Some(verified.info);
+                }
                 self.remove_dead_live_shell(&candidate_key);
                 debug_log(
                     "agent_launch_ignored_stale_cwd_conflict",
@@ -15833,7 +16511,8 @@ impl App {
                     provider,
                     session_id: session_id.clone(),
                 };
-                self.terminate_auxiliaries_for_parent(&exited_key, "main_agent_exit");
+                let released_auxiliaries =
+                    self.release_auxiliaries_for_parent(&exited_key, "main_agent_exit");
                 self.agent_states.remove(&exited_key);
                 self.live_shells
                     .retain(|info| AgentKey::new(info) != exited_key);
@@ -15854,6 +16533,7 @@ impl App {
                         "exit_status": exit_status,
                         "reader_id": reader_id,
                         "auto_switch": next_info.as_ref().map(session_info_debug_value),
+                        "released_auxiliaries": released_auxiliaries,
                         "snapshot": app_runtime_snapshot_debug_value(self, false),
                     }),
                 );
@@ -16245,7 +16925,6 @@ impl App {
                 status_prepare_err_prefix: "shell open failed: ".to_string(),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready,
-                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: false,
@@ -16656,7 +17335,7 @@ impl App {
             AgentListState::Idle => {}
         }
         if allow_defer && self.agent_runtime_refresh_in_flight() {
-            self.pending_runtime_action = Some(PendingRuntimeAction::LaunchSelected {
+            self.set_pending_runtime_action(PendingRuntimeAction::LaunchSelected {
                 info: info.clone(),
                 cols,
                 rows,
@@ -16746,7 +17425,6 @@ impl App {
                 status_prepare_err_prefix: format!("switch to live {} failed: ", label),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: false,
@@ -17146,7 +17824,6 @@ impl App {
                 status_prepare_err_prefix,
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready,
-                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: is_cokacdir,
                 remove_dead_on_notfound: false,
@@ -17227,7 +17904,7 @@ impl App {
                 "no active agent to switch to; press e/Enter to start selected agent".into();
             return;
         }
-        self.refresh_agent_runtime_states();
+        self.refresh_agent_runtime_states_discovering_live_shells();
         let selected_key = self.current().map(AgentKey::new);
         self.resolve_restore_live_agent(selected_key.as_ref(), cols, rows, true);
     }
@@ -17274,7 +17951,7 @@ impl App {
                 }),
             );
             if will_defer {
-                self.pending_runtime_action = Some(PendingRuntimeAction::RestoreLive {
+                self.set_pending_runtime_action(PendingRuntimeAction::RestoreLive {
                     selected_key: selected_key.cloned(),
                     cols,
                     rows,
@@ -17328,7 +18005,6 @@ impl App {
                 status_prepare_err_prefix: format!("switch to live {} failed: ", label),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -17437,6 +18113,7 @@ impl App {
                         "daemon_pid": outcome.pid,
                         "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
+                        "skipped_unverified": outcome.skipped_unverified,
                         "terminated_auxiliaries": terminated_auxiliaries,
                         "has_next": next_info.is_some(),
                     }),
@@ -17682,6 +18359,7 @@ impl App {
                         "daemon_pid": outcome.pid,
                         "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
+                        "skipped_unverified": outcome.skipped_unverified,
                         "terminated_auxiliaries": terminated_auxiliaries,
                         "has_next": next_info.is_some(),
                     }),
@@ -17797,6 +18475,7 @@ impl App {
                         "daemon_pid": outcome.pid,
                         "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
+                        "skipped_unverified": outcome.skipped_unverified,
                         "snapshot": app_runtime_snapshot_debug_value(self, false),
                     }),
                 );
@@ -17859,6 +18538,7 @@ impl App {
                         "daemon_pid": outcome.pid,
                         "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
+                        "skipped_unverified": outcome.skipped_unverified,
                     }),
                 );
             }
@@ -17988,7 +18668,11 @@ impl App {
         self.killall_pending = None;
         match result.outcome {
             Ok(report) => {
-                self.clear_live_runtime_after_killall();
+                if report.killall.skipped_unverified > 0 {
+                    self.refresh_agent_runtime_states_discovering_live_shells();
+                } else {
+                    self.clear_live_runtime_after_killall();
+                }
                 self.status = killall_status_summary(&report);
                 debug_log(
                     "killall_complete",
@@ -18021,6 +18705,7 @@ impl App {
         self.queued_attach = None;
         self.new_session_launch = None;
         self.pending_runtime_action = None;
+        self.pending_runtime_action_last_slow_log_at = None;
         self.active_agent = None;
         self.agent_aux = None;
         self.hidden_agent_aux.clear();
@@ -18045,7 +18730,9 @@ impl App {
         }
         self.runtime_refresh_pending = false;
         self.runtime_refresh_started_at = None;
+        self.runtime_refresh_pending_discover_live_shells = false;
         self.runtime_refresh_queued = false;
+        self.runtime_refresh_queued_discover_live_shells = false;
         self.live_shell_discovery_seq = self.live_shell_discovery_seq.saturating_add(1);
         self.live_shell_discovery_pending = false;
         self.live_shell_discovery_started_at = None;
@@ -18057,7 +18744,7 @@ impl App {
     fn next_agent_after_current(&mut self) -> Option<SessionInfo> {
         let active_agent = self.active_agent.as_ref()?;
         let current_key = AgentKey::new(&active_agent.info);
-        self.refresh_agent_runtime_states();
+        self.refresh_agent_runtime_states_discovering_live_shells();
         let candidates = self.live_agent_switch_candidates();
         if candidates.len() <= 1 {
             return None;
@@ -18137,7 +18824,6 @@ impl App {
                 ),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -18199,7 +18885,6 @@ impl App {
                 ),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -18296,6 +18981,7 @@ impl App {
                         "daemon_pid": outcome.pid,
                         "child_pid": outcome.child_pid,
                         "pty_log_deleted": outcome.pty_log_deleted,
+                        "skipped_unverified": outcome.skipped_unverified,
                         "terminated_auxiliaries": terminated_auxiliaries,
                     }),
                 );
@@ -18343,7 +19029,7 @@ impl App {
             .pending_main_attach_key()
             .unwrap_or_else(|| AgentKey::new(&active_agent.info));
 
-        self.refresh_agent_runtime_states();
+        self.refresh_agent_runtime_states_discovering_live_shells();
         self.resolve_switch_active_agent(
             current_key,
             delta,
@@ -18411,7 +19097,7 @@ impl App {
         }
         if candidates.len() <= 1 {
             if allow_defer && self.agent_runtime_refresh_in_flight() {
-                self.pending_runtime_action = Some(PendingRuntimeAction::SwitchActive {
+                self.set_pending_runtime_action(PendingRuntimeAction::SwitchActive {
                     current_key: current_key.clone(),
                     delta,
                     wrap,
@@ -18508,7 +19194,6 @@ impl App {
                 status_prepare_err_prefix: format!("switch to live {} failed: ", next_label),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: focus_override,
-                terminate_auxiliary_on_stale: false,
                 select_visible: should_select_visible,
                 cokacdir_dialog_on_error: false,
                 // A NotFound connect error means the daemon's socket file is
@@ -18689,7 +19374,7 @@ fn is_routine_attach_success_status(message: &str) -> bool {
         || lower.starts_with("attached ")
         || lower.starts_with("switched to ")
         || lower.starts_with("restored right ")
-        || lower.starts_with("discarded stale right ")
+        || lower.starts_with("detached stale right ")
 }
 
 fn is_low_value_confirmation_status(message: &str) -> bool {
@@ -22385,9 +23070,10 @@ fn cokacmux_main() -> Result<()> {
     if matches!(command_args.as_slice(), ["reset"]) {
         let report = reset_cokacmux()?;
         println!(
-            "reset cokacmux: killed={} stale={} child_processes_terminated={} runtime_files_removed={} pty_logs_deleted={} cwd_locks_removed={} untracked_daemons_scanned={} untracked_daemons_terminated={} untracked_daemons_skipped_self={} untracked_daemons_skipped_unverified={} clients_scanned={} clients_terminated={} clients_skipped_self={} clients_skipped_unverified={} errors={} removed={}{}",
+            "reset cokacmux: killed={} stale={} skipped_unverified={} child_processes_terminated={} runtime_files_removed={} pty_logs_deleted={} cwd_locks_removed={} untracked_daemons_scanned={} untracked_daemons_terminated={} untracked_daemons_skipped_self={} untracked_daemons_skipped_unverified={} clients_scanned={} clients_terminated={} clients_skipped_self={} clients_skipped_unverified={} errors={} removed={}{}",
             report.killall.killed,
             report.killall.stale,
+            report.killall.skipped_unverified,
             report.killall.child_processes_terminated,
             report.killall.runtime_files_removed,
             report.killall.pty_logs_deleted,
@@ -22417,9 +23103,10 @@ fn cokacmux_main() -> Result<()> {
     if matches!(command_args.as_slice(), ["killall"] | ["agents", "killall"]) {
         let report = killall_cokacmux()?;
         println!(
-            "killall cokacmux: killed={} stale={} child_processes_terminated={} runtime_files_removed={} pty_logs_deleted={} cwd_locks_removed={} untracked_daemons_scanned={} untracked_daemons_terminated={} untracked_daemons_skipped_self={} untracked_daemons_skipped_unverified={} clients_scanned={} clients_terminated={} clients_skipped_self={} clients_skipped_unverified={} errors={} agents_removed={}{} debug_removed={}{}",
+            "killall cokacmux: killed={} stale={} skipped_unverified={} child_processes_terminated={} runtime_files_removed={} pty_logs_deleted={} cwd_locks_removed={} untracked_daemons_scanned={} untracked_daemons_terminated={} untracked_daemons_skipped_self={} untracked_daemons_skipped_unverified={} clients_scanned={} clients_terminated={} clients_skipped_self={} clients_skipped_unverified={} errors={} agents_removed={}{} debug_removed={}{}",
             report.killall.killed,
             report.killall.stale,
+            report.killall.skipped_unverified,
             report.killall.child_processes_terminated,
             report.killall.runtime_files_removed,
             report.killall.pty_logs_deleted,
@@ -23376,7 +24063,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
     let (main_tx, main_rx) = mpsc::channel::<MainEvent>();
     app.main_tx = Some(main_tx.clone());
     app.runtime_tx = Some(spawn_agent_runtime_worker(main_tx.clone())?);
-    app.refresh_agent_runtime_states();
+    app.refresh_agent_runtime_states_discovering_live_shells();
     record_main_loop_heartbeat();
     let _ui_stall_watchdog_thread = spawn_ui_stall_watchdog()?;
     let _keybindings_watcher_thread = spawn_keybindings_watcher(
@@ -23721,6 +24408,53 @@ fn handle_daemon_client_request(
         }),
     );
     match request {
+        AgentDaemonRequest::Identify => {
+            let meta_write = write_agent_meta(
+                meta_path,
+                agent,
+                attached_client_pid.is_some(),
+                *attached_client_pid,
+                attached_client_instance_id.as_deref(),
+            );
+            let meta_write_ok = meta_write.is_ok();
+            let meta_write_error = meta_write.as_ref().err().map(|e| e.to_string());
+            let send_result = send_daemon_identity(
+                conn,
+                agent,
+                attached_client_pid.is_some(),
+                *attached_client_pid,
+                attached_client_instance_id.as_deref(),
+            );
+            let send_ok = send_result.is_ok();
+            let send_error = send_result.as_ref().err().map(|e| e.to_string());
+            debug_log(
+                "daemon_identify_request",
+                serde_json::json!({
+                    "provider": agent.info.provider.as_str(),
+                    "session_id": &agent.info.session_id,
+                    "attached_client_pid": *attached_client_pid,
+                    "attached_client_instance_id": attached_client_instance_id.as_deref(),
+                    "child_pid": agent.child.process_id(),
+                    "meta_write_ok": meta_write_ok,
+                    "meta_write_error": meta_write_error,
+                    "identity_send_ok": send_ok,
+                    "identity_send_error": send_error,
+                }),
+            );
+            debug_log(
+                "daemon_request_apply_done",
+                serde_json::json!({
+                    "provider": agent.info.provider.as_str(),
+                    "session_id": &agent.info.session_id,
+                    "request_kind": request_kind,
+                    "outcome": "continue",
+                    "attached_client_pid_after": *attached_client_pid,
+                    "attached_client_instance_id_after": attached_client_instance_id.as_deref(),
+                    "child_pid": agent.child.process_id(),
+                }),
+            );
+            DaemonRequestOutcome::Continue
+        }
         AgentDaemonRequest::Attach {
             cols,
             rows,
@@ -23895,6 +24629,33 @@ fn handle_daemon_client_request(
     }
 }
 
+fn notify_agent_daemon_ready(key: &AgentKey, socket_path: &Path) {
+    if std::env::var_os(AGENT_DAEMON_READY_ENV).is_none() {
+        return;
+    }
+    let ready = AgentDaemonReady {
+        kind: AGENT_DAEMON_READY_KIND.to_string(),
+        provider: key.provider,
+        session_id: key.session_id.clone(),
+        pid: std::process::id(),
+        socket: socket_path.display().to_string(),
+    };
+    let mut stdout = io::stdout().lock();
+    let result = serde_json::to_writer(&mut stdout, &ready)
+        .map_err(io::Error::other)
+        .and_then(|_| stdout.write_all(b"\n"))
+        .and_then(|_| stdout.flush());
+    debug_log(
+        "daemon_ready_notify",
+        serde_json::json!({
+            "key": agent_key_debug_value(key),
+            "socket": socket_path.display().to_string(),
+            "ok": result.is_ok(),
+            "error": result.err().map(|e| e.to_string()),
+        }),
+    );
+}
+
 fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<()> {
     prepare_agent_daemon_process();
     let key = AgentKey::new(&info);
@@ -24002,6 +24763,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             "child_pid": agent.child.process_id(),
         }),
     );
+    notify_agent_daemon_ready(&key, &socket_path);
     let mut client: Option<DaemonConnection> = None;
     // Accepted connections wait here until they identify themselves with an
     // attach request; only then do they receive a snapshot and replace the
@@ -24120,6 +24882,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             enum PendingAction {
                 Keep,
                 Drop(&'static str, Option<String>),
+                Identify(Vec<AgentDaemonRequest>),
                 Promote(Vec<AgentDaemonRequest>),
             }
             let action = {
@@ -24143,8 +24906,13 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                         let has_attach = requests
                             .iter()
                             .any(|request| matches!(request, AgentDaemonRequest::Attach { .. }));
+                        let has_identify = requests
+                            .iter()
+                            .any(|request| matches!(request, AgentDaemonRequest::Identify));
                         if has_attach {
                             PendingAction::Promote(requests)
+                        } else if has_identify {
+                            PendingAction::Identify(requests)
                         } else if timed_out {
                             PendingAction::Drop("attach_timeout", None)
                         } else {
@@ -24172,6 +24940,39 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                             "session_id": &agent.info.session_id,
                             "reason": reason,
                             "error": error,
+                        }),
+                    );
+                }
+                PendingAction::Identify(requests) => {
+                    let (mut conn, _) = pending_conns.remove(pending_index);
+                    let request_count = requests.len();
+                    let mut handled = 0usize;
+                    for request in requests {
+                        if !matches!(request, AgentDaemonRequest::Identify) {
+                            continue;
+                        }
+                        handled = handled.saturating_add(1);
+                        let _ = handle_daemon_client_request(
+                            request,
+                            &mut conn,
+                            &mut agent,
+                            &meta_path,
+                            &mut attached_client_pid,
+                            &mut attached_client_instance_id,
+                        );
+                    }
+                    let flush_result = conn.flush_outbound();
+                    debug_log(
+                        "daemon_pending_conn_identified",
+                        serde_json::json!({
+                            "provider": agent.info.provider.as_str(),
+                            "session_id": &agent.info.session_id,
+                            "request_count": request_count,
+                            "identify_requests": handled,
+                            "flush_ok": flush_result.is_ok(),
+                            "flush_error": flush_result.as_ref().err().map(|e| e.to_string()),
+                            "pending_outbound_after": conn.has_pending_outbound(),
+                            "attached_client_pid": attached_client_pid,
                         }),
                     );
                 }
@@ -24613,6 +25414,34 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     Ok(())
 }
 
+fn send_daemon_identity(
+    conn: &mut DaemonConnection,
+    agent: &AgentSession,
+    attached: bool,
+    attached_client_pid: Option<u32>,
+    attached_client_instance_id: Option<&str>,
+) -> io::Result<()> {
+    let daemon_pid = std::process::id();
+    conn.send_event(&AgentDaemonEvent::Identity {
+        provider: agent.info.provider,
+        session_id: agent.info.session_id.clone(),
+        cwd: agent.info.cwd.clone(),
+        source: agent.info.source.display().to_string(),
+        command: agent.spec.command_line(),
+        daemon_pid,
+        daemon_pid_start_ticks: process_start_ticks(daemon_pid),
+        child_pid: agent.child.process_id(),
+        child_pid_start_ticks: agent.child.process_id().and_then(process_start_ticks),
+        attached,
+        attached_client_pid,
+        attached_client_instance_id: attached_client_instance_id.map(str::to_string),
+        last_screen_change_epoch_ms: agent.last_screen_change_epoch_ms,
+        last_output_epoch_ms: agent.last_output_epoch_ms,
+        last_input_epoch_ms: agent.last_input_epoch_ms,
+        updated_at_epoch_s: current_epoch_s(),
+    })
+}
+
 fn send_daemon_attached(
     conn: &mut DaemonConnection,
     agent: &mut AgentSession,
@@ -24776,12 +25605,14 @@ fn render_agent_meta_parts(
     activity: AgentActivity,
     child_pid: Option<u32>,
 ) -> io::Result<String> {
+    let daemon_pid = std::process::id();
     let value = serde_json::json!({
-            "pid": std::process::id(),
-            "child_pid": child_pid,
-            "child_pid_start_ticks": child_pid.and_then(process_start_ticks),
-            "provider": info.provider.as_str(),
-            "session_id": &info.session_id,
+        "pid": daemon_pid,
+        "pid_start_ticks": process_start_ticks(daemon_pid),
+        "child_pid": child_pid,
+        "child_pid_start_ticks": child_pid.and_then(process_start_ticks),
+        "provider": info.provider.as_str(),
+        "session_id": &info.session_id,
         "cwd": &info.cwd,
         "source": info.source.display().to_string(),
         "command": spec.command_line(),
@@ -25045,6 +25876,8 @@ struct AgentMetaSnapshot {
     #[serde(default)]
     pid: u32,
     #[serde(default)]
+    pid_start_ticks: Option<u64>,
+    #[serde(default)]
     child_pid: Option<u32>,
     #[serde(default)]
     child_pid_start_ticks: Option<u64>,
@@ -25081,7 +25914,7 @@ fn read_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
 }
 
 fn live_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
-    read_agent_meta_snapshot(key).filter(|meta| {
+    if let Some(meta) = read_agent_meta_snapshot(key).filter(|meta| {
         if meta.pid == 0
             || !process_is_alive(meta.pid)
             || agent_key_from_meta(meta).as_ref() != Some(key)
@@ -25089,13 +25922,72 @@ fn live_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
             return false;
         }
         let identity = agent_daemon_process_identity(meta.pid, key);
-        agent_daemon_identity_matches_or_runtime_reachable(
-            meta.pid,
+        agent_daemon_identity_matches_meta_or_runtime_reachable(
+            meta,
             key,
             identity,
             "live_agent_meta_snapshot",
         )
-    })
+    }) {
+        return Some(meta);
+    }
+    let runtime_dir = agent_runtime_dir().ok()?;
+    agent_daemon_identity_snapshot_for_key_at(&runtime_dir, key, "live_agent_meta_snapshot")
+}
+
+fn possibly_live_agent_meta_snapshot(key: &AgentKey) -> Option<AgentMetaSnapshot> {
+    if let Some(meta) = read_agent_meta_snapshot(key).filter(|meta| {
+        if agent_key_from_meta(meta).as_ref() != Some(key) || !agent_meta_daemon_pid_matches(meta) {
+            return false;
+        }
+        agent_daemon_process_identity(meta.pid, key) != AgentDaemonProcessIdentity::Other
+    }) {
+        return Some(meta);
+    }
+    let runtime_dir = agent_runtime_dir().ok()?;
+    agent_daemon_identity_snapshot_for_key_at(
+        &runtime_dir,
+        key,
+        "possibly_live_agent_meta_snapshot",
+    )
+}
+
+fn live_or_possible_agent_meta_snapshot(
+    key: &AgentKey,
+) -> Option<(AgentMetaSnapshot, AgentMetaLivenessKind)> {
+    live_agent_meta_snapshot(key)
+        .map(|meta| (meta, AgentMetaLivenessKind::Verified))
+        .or_else(|| {
+            possibly_live_agent_meta_snapshot(key)
+                .map(|meta| (meta, AgentMetaLivenessKind::Possible))
+        })
+}
+
+fn agent_runtime_meta_liveness_for_stem_at(
+    runtime_dir: &Path,
+    meta: &AgentMetaSnapshot,
+    stem: &str,
+    reason: &str,
+) -> Option<AgentMetaLivenessKind> {
+    if meta.pid == 0 || !process_is_alive(meta.pid) {
+        return None;
+    }
+    let key = agent_key_from_meta(meta)?;
+    if agent_file_stem(&key) != stem {
+        return None;
+    }
+    let identity = agent_daemon_process_identity(meta.pid, &key);
+    if agent_daemon_identity_matches_meta_or_runtime_reachable_at(
+        runtime_dir,
+        meta,
+        &key,
+        identity,
+        reason,
+    ) {
+        return Some(AgentMetaLivenessKind::Verified);
+    }
+    (agent_meta_daemon_pid_matches(meta) && identity != AgentDaemonProcessIdentity::Other)
+        .then_some(AgentMetaLivenessKind::Possible)
 }
 
 fn agent_runtime_meta_has_live_daemon_for_stem(meta: &AgentMetaSnapshot, stem: &str) -> bool {
@@ -25109,29 +26001,96 @@ fn agent_runtime_meta_has_live_daemon_for_stem(meta: &AgentMetaSnapshot, stem: &
         return false;
     }
     let identity = agent_daemon_process_identity(meta.pid, &key);
-    agent_daemon_identity_matches_or_runtime_reachable(
-        meta.pid,
+    agent_daemon_identity_matches_meta_or_runtime_reachable(
+        meta,
         &key,
         identity,
         "agent_runtime_meta_has_live_daemon_for_stem",
     )
 }
 
+fn agent_runtime_meta_has_possible_live_daemon_for_stem(
+    meta: &AgentMetaSnapshot,
+    stem: &str,
+) -> bool {
+    if !agent_meta_daemon_pid_matches(meta) {
+        return false;
+    }
+    let Some(key) = agent_key_from_meta(meta) else {
+        return false;
+    };
+    if agent_file_stem(&key) != stem {
+        return false;
+    }
+    agent_daemon_process_identity(meta.pid, &key) != AgentDaemonProcessIdentity::Other
+}
+
+fn agent_meta_daemon_pid_matches(meta: &AgentMetaSnapshot) -> bool {
+    if meta.pid == 0 || !process_is_alive(meta.pid) {
+        return false;
+    }
+    if let Some(expected) = meta.pid_start_ticks {
+        if let Some(matches) = process_start_token_matches(expected, process_start_ticks(meta.pid))
+        {
+            return matches;
+        }
+        if let Some(started_at_epoch_s) = process_start_epoch_s(meta.pid) {
+            return meta.updated_at_epoch_s == 0
+                || started_at_epoch_s <= meta.updated_at_epoch_s.saturating_add(1);
+        }
+        return true;
+    }
+    if let Some(started_at_epoch_s) = process_start_epoch_s(meta.pid) {
+        return meta.updated_at_epoch_s == 0
+            || started_at_epoch_s <= meta.updated_at_epoch_s.saturating_add(1);
+    }
+    true
+}
+
+fn agent_meta_daemon_pid_start_token_matches(meta: &AgentMetaSnapshot) -> Option<bool> {
+    meta.pid_start_ticks
+        .and_then(|expected| process_start_token_matches(expected, process_start_ticks(meta.pid)))
+}
+
 fn agent_meta_child_pid_matches(meta: &AgentMetaSnapshot) -> bool {
+    agent_meta_child_pid_liveness(meta).is_some()
+}
+
+fn agent_meta_child_pid_liveness(meta: &AgentMetaSnapshot) -> Option<AgentMetaLivenessKind> {
+    let Some(child_pid) = meta.child_pid else {
+        return None;
+    };
+    if child_pid == 0 || !process_is_alive(child_pid) {
+        return None;
+    }
+    if let Some(expected) = meta.child_pid_start_ticks {
+        match process_start_token_matches(expected, process_start_ticks(child_pid)) {
+            Some(true) => return Some(AgentMetaLivenessKind::Verified),
+            Some(false) => return None,
+            None => {}
+        }
+    }
+    if let Some(started_at_epoch_s) = process_start_epoch_s(child_pid) {
+        if meta.updated_at_epoch_s != 0
+            && started_at_epoch_s > meta.updated_at_epoch_s.saturating_add(1)
+        {
+            return None;
+        }
+    }
+    Some(AgentMetaLivenessKind::Possible)
+}
+
+fn agent_meta_child_pid_verified_for_termination(meta: &AgentMetaSnapshot) -> bool {
     let Some(child_pid) = meta.child_pid else {
         return false;
     };
     if child_pid == 0 || !process_is_alive(child_pid) {
         return false;
     }
-    if let Some(expected) = meta.child_pid_start_ticks {
-        return process_start_ticks(child_pid) == Some(expected);
-    }
-    if let Some(started_at_epoch_s) = process_start_epoch_s(child_pid) {
-        return meta.updated_at_epoch_s == 0
-            || started_at_epoch_s <= meta.updated_at_epoch_s.saturating_add(1);
-    }
-    true
+    let Some(expected) = meta.child_pid_start_ticks else {
+        return false;
+    };
+    process_start_token_matches(expected, process_start_ticks(child_pid)) == Some(true)
 }
 
 fn terminate_agent_meta_child_process(
@@ -25140,7 +26099,7 @@ fn terminate_agent_meta_child_process(
     reason: &str,
 ) -> Option<u32> {
     let child_pid = meta.child_pid?;
-    if !agent_meta_child_pid_matches(meta) {
+    if !agent_meta_child_pid_verified_for_termination(meta) {
         debug_log(
             "kill_agent_child_process_skipped",
             serde_json::json!({
@@ -25150,25 +26109,30 @@ fn terminate_agent_meta_child_process(
                 "child_pid": child_pid,
                 "child_pid_start_ticks": meta.child_pid_start_ticks,
                 "child_alive": process_is_alive(child_pid),
-                "child_pid_matches": false,
+                "child_pid_matches": agent_meta_child_pid_matches(meta),
+                "child_pid_verified_for_termination": false,
             }),
         );
         return None;
     }
-    let terminated = terminate_agent_child_process(Some(child_pid), meta.pid, key);
-    if let Some(pid) = terminated {
-        debug_log(
-            "kill_agent_meta_child_process",
-            serde_json::json!({
-                "reason": reason,
-                "key": agent_key_debug_value(key),
-                "daemon_pid": meta.pid,
-                "child_pid": pid,
-                "child_pid_start_ticks": meta.child_pid_start_ticks,
-            }),
-        );
+    if !terminate_process_group_if_start_token_matches(
+        child_pid,
+        meta.child_pid_start_ticks,
+        "kill_agent_meta_child_process",
+    ) {
+        return None;
     }
-    terminated
+    debug_log(
+        "kill_agent_meta_child_process",
+        serde_json::json!({
+            "reason": reason,
+            "key": agent_key_debug_value(key),
+            "daemon_pid": meta.pid,
+            "child_pid": child_pid,
+            "child_pid_start_ticks": meta.child_pid_start_ticks,
+        }),
+    );
+    Some(child_pid)
 }
 
 const CODING_AGENT_CWD_LOCK_VERSION: u32 = 1;
@@ -25301,12 +26265,26 @@ fn live_coding_agent_cwd_meta_conflict_inner(
     target: &SessionInfo,
     include_target_key: bool,
 ) -> Option<SessionInfo> {
+    let dir = agent_runtime_dir().ok()?;
+    live_coding_agent_cwd_meta_conflict_inner_at(&dir, target, include_target_key, |pid, key| {
+        agent_daemon_process_identity(pid, key)
+    })
+}
+
+fn live_coding_agent_cwd_meta_conflict_inner_at<F>(
+    runtime_dir: &Path,
+    target: &SessionInfo,
+    include_target_key: bool,
+    mut identity_for: F,
+) -> Option<SessionInfo>
+where
+    F: FnMut(u32, &AgentKey) -> AgentDaemonProcessIdentity,
+{
     if !is_coding_agent_session_info(target) || target.cwd.trim().is_empty() {
         return None;
     }
     let target_key = AgentKey::new(target);
-    let dir = agent_runtime_dir().ok()?;
-    let read_dir = fs::read_dir(dir).ok()?;
+    let read_dir = fs::read_dir(runtime_dir).ok()?;
     for entry in read_dir.flatten() {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
@@ -25321,9 +26299,14 @@ fn live_coding_agent_cwd_meta_conflict_inner(
         let Some(key) = agent_key_from_meta(&meta) else {
             continue;
         };
-        if agent_daemon_process_identity(meta.pid, &key)
-            != AgentDaemonProcessIdentity::CokacmuxDaemon
-        {
+        let identity = identity_for(meta.pid, &key);
+        if !agent_daemon_identity_matches_meta_or_runtime_reachable_at(
+            runtime_dir,
+            &meta,
+            &key,
+            identity,
+            "live_coding_agent_cwd_meta_conflict",
+        ) {
             continue;
         }
         let Some(candidate) = session_info_from_agent_meta_snapshot(&meta) else {
@@ -25535,6 +26518,14 @@ fn cleanup_stale_coding_agent_cwd_locks(reason: &str) -> usize {
 }
 
 fn cleanup_stale_coding_agent_cwd_locks_at(runtime_dir: &Path, reason: &str) -> usize {
+    cleanup_stale_coding_agent_cwd_locks_at_except(runtime_dir, reason, &HashSet::new())
+}
+
+fn cleanup_stale_coding_agent_cwd_locks_at_except(
+    runtime_dir: &Path,
+    reason: &str,
+    preserved_keys: &HashSet<AgentKey>,
+) -> usize {
     let Ok(read_dir) = fs::read_dir(runtime_dir) else {
         return 0;
     };
@@ -25555,10 +26546,22 @@ fn cleanup_stale_coding_agent_cwd_locks_at(runtime_dir: &Path, reason: &str) -> 
             }
             continue;
         };
-        if coding_agent_cwd_lock_is_live(&lock) {
+        if coding_agent_cwd_lock_is_live_at(&lock, Some(runtime_dir)) {
             continue;
         }
         let key = coding_agent_cwd_lock_key(&lock);
+        if key.as_ref().is_some_and(|key| preserved_keys.contains(key)) {
+            debug_log(
+                "coding_agent_cwd_lock_preserved_for_child",
+                serde_json::json!({
+                    "reason": reason,
+                    "path": path.display().to_string(),
+                    "key": key.as_ref().map(agent_key_debug_value),
+                    "lock": coding_agent_cwd_lock_debug_value(&lock),
+                }),
+            );
+            continue;
+        }
         if remove_agent_runtime_file_logged(reason, key.as_ref(), None, "cwd_lock", &path) {
             removed = removed.saturating_add(1);
         }
@@ -25592,6 +26595,14 @@ fn cleanup_stale_agent_runtime_files_at(
     runtime_dir: &Path,
     reason: &str,
 ) -> AgentRuntimeSweepReport {
+    cleanup_stale_agent_runtime_files_at_except(runtime_dir, reason, &HashSet::new())
+}
+
+fn cleanup_stale_agent_runtime_files_at_except(
+    runtime_dir: &Path,
+    reason: &str,
+    preserved_stems: &HashSet<String>,
+) -> AgentRuntimeSweepReport {
     let read_dir = match fs::read_dir(runtime_dir) {
         Ok(read_dir) => read_dir,
         Err(e) => {
@@ -25616,6 +26627,9 @@ fn cleanup_stale_agent_runtime_files_at(
     );
     let mut report = AgentRuntimeSweepReport::default();
     let mut live_stems = HashSet::new();
+    let mut preserved_child_stems = HashSet::new();
+    let mut preserved_child_keys = HashSet::new();
+    let mut preserved_pty_stems = preserved_stems.clone();
     let entries = read_dir
         .flatten()
         .map(|entry| entry.path())
@@ -25642,7 +26656,42 @@ fn cleanup_stale_agent_runtime_files_at(
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
+        if preserved_stems.contains(stem) {
+            live_stems.insert(stem.to_string());
+            if let Some(key) = read_agent_meta_snapshot_at(path)
+                .and_then(|meta| agent_key_from_meta(&meta))
+                .filter(|key| agent_file_stem(key) == stem)
+            {
+                preserved_child_keys.insert(key);
+            }
+            debug_log(
+                "agent_runtime_sweep_keep_preserved_meta",
+                serde_json::json!({
+                    "reason": reason,
+                    "runtime_dir": runtime_dir.display().to_string(),
+                    "stem": stem,
+                    "path": path.display().to_string(),
+                }),
+            );
+            continue;
+        }
         let Some(meta) = read_agent_meta_snapshot_at(path) else {
+            let reachable_daemon = agent_runtime_stem_has_reachable_daemon(runtime_dir, stem);
+            if reachable_daemon {
+                live_stems.insert(stem.to_string());
+                preserved_pty_stems.insert(stem.to_string());
+                debug_log(
+                    "agent_runtime_sweep_keep_unreadable_reachable_meta",
+                    serde_json::json!({
+                        "reason": reason,
+                        "runtime_dir": runtime_dir.display().to_string(),
+                        "stem": stem,
+                        "path": path.display().to_string(),
+                        "reachable_daemon": reachable_daemon,
+                    }),
+                );
+                continue;
+            }
             debug_log(
                 "agent_runtime_sweep_remove_unreadable_meta",
                 serde_json::json!({
@@ -25657,10 +26706,34 @@ fn cleanup_stale_agent_runtime_files_at(
             }
             continue;
         };
-        if agent_runtime_meta_has_live_daemon_for_stem(&meta, stem) {
+        let live_daemon = agent_runtime_meta_has_live_daemon_for_stem(&meta, stem);
+        let possible_live_daemon =
+            !live_daemon && agent_runtime_meta_has_possible_live_daemon_for_stem(&meta, stem);
+        if live_daemon || possible_live_daemon {
             live_stems.insert(stem.to_string());
             debug_log(
-                "agent_runtime_sweep_keep_live_meta",
+                if live_daemon {
+                    "agent_runtime_sweep_keep_live_meta"
+                } else {
+                    "agent_runtime_sweep_keep_possible_live_meta"
+                },
+                serde_json::json!({
+                    "reason": reason,
+                    "runtime_dir": runtime_dir.display().to_string(),
+                    "stem": stem,
+                    "path": path.display().to_string(),
+                    "live_daemon": live_daemon,
+                    "possible_live_daemon": possible_live_daemon,
+                    "meta": agent_meta_snapshot_debug_value(&meta),
+                }),
+            );
+            continue;
+        }
+        if agent_runtime_stem_has_reachable_daemon(runtime_dir, stem) {
+            live_stems.insert(stem.to_string());
+            preserved_pty_stems.insert(stem.to_string());
+            debug_log(
+                "agent_runtime_sweep_keep_stale_meta_reachable_daemon",
                 serde_json::json!({
                     "reason": reason,
                     "runtime_dir": runtime_dir.display().to_string(),
@@ -25681,21 +26754,51 @@ fn cleanup_stale_agent_runtime_files_at(
                 "meta": agent_meta_snapshot_debug_value(&meta),
             }),
         );
-        if let Some(key) = agent_key_from_meta(&meta).filter(|key| agent_file_stem(key) == stem) {
-            if terminate_agent_meta_child_process(&meta, &key, reason).is_some() {
-                report.child_processes_terminated =
-                    report.child_processes_terminated.saturating_add(1);
+        let stale_key = agent_key_from_meta(&meta).filter(|key| agent_file_stem(key) == stem);
+        let child_process_preserved = stale_key.is_some() && agent_meta_child_pid_matches(&meta);
+        if child_process_preserved {
+            preserved_child_stems.insert(stem.to_string());
+            preserved_pty_stems.insert(stem.to_string());
+        }
+        if let Some(key) = stale_key {
+            debug_log(
+                "agent_runtime_sweep_preserve_stale_child",
+                serde_json::json!({
+                    "reason": reason,
+                    "key": agent_key_debug_value(&key),
+                    "daemon_pid": meta.pid,
+                    "child_pid": meta.child_pid,
+                    "child_pid_start_ticks": meta.child_pid_start_ticks,
+                    "child_alive": meta.child_pid.map(process_is_alive),
+                    "child_pid_matches": agent_meta_child_pid_matches(&meta),
+                }),
+            );
+            if child_process_preserved {
+                live_stems.insert(stem.to_string());
+                preserved_child_keys.insert(key);
+                continue;
             }
         }
-        if remove_agent_runtime_files_by_stem(runtime_dir, stem, reason) {
+        if remove_agent_runtime_files_by_stem_with_policy(
+            runtime_dir,
+            stem,
+            reason,
+            child_process_preserved,
+        ) {
             report.pty_logs_deleted = report.pty_logs_deleted.saturating_add(1);
         }
     }
 
-    report.cwd_locks_removed = cleanup_stale_coding_agent_cwd_locks_at(runtime_dir, reason);
+    report.cwd_locks_removed =
+        cleanup_stale_coding_agent_cwd_locks_at_except(runtime_dir, reason, &preserved_child_keys);
+    let orphan_pty_logs_deleted = if preserved_pty_stems.is_empty() {
+        cleanup_orphan_agent_pty_logs_at(runtime_dir)
+    } else {
+        cleanup_orphan_agent_pty_logs_at_except(runtime_dir, &preserved_pty_stems)
+    };
     report.pty_logs_deleted = report
         .pty_logs_deleted
-        .saturating_add(cleanup_orphan_agent_pty_logs_at(runtime_dir));
+        .saturating_add(orphan_pty_logs_deleted);
 
     let mut orphan_runtime_candidates = 0usize;
     let mut orphan_runtime_kept = 0usize;
@@ -25761,6 +26864,9 @@ fn cleanup_stale_agent_runtime_files_at(
             "entries": entry_count,
             "meta_candidates": meta_candidate_count,
             "live_stems": live_stems.len(),
+            "preserved_child_stems": preserved_child_stems.len(),
+            "preserved_child_keys": preserved_child_keys.len(),
+            "preserved_stems": preserved_stems.len(),
             "orphan_runtime_candidates": orphan_runtime_candidates,
             "orphan_runtime_kept": orphan_runtime_kept,
             "orphan_runtime_remove_attempts": orphan_runtime_remove_attempts,
@@ -25787,18 +26893,22 @@ fn orphan_agent_runtime_file_stem(path: &Path) -> Option<String> {
     }
 }
 
-#[cfg(unix)]
 fn agent_runtime_stem_has_reachable_daemon(runtime_dir: &Path, stem: &str) -> bool {
-    let socket_path = runtime_dir.join(format!("{stem}.sock"));
-    let result = AgentStream::connect(&socket_path);
+    #[cfg(unix)]
+    let endpoint_path = runtime_dir.join(format!("{stem}.sock"));
+    #[cfg(windows)]
+    let endpoint_path = runtime_dir.join(format!("{stem}.tcp"));
+    let timeout = Duration::from_millis(AGENT_IDENTITY_QUERY_TIMEOUT_MS);
+    let result = connect_agent_daemon_stem_at(runtime_dir, stem, timeout);
     let reachable = result.is_ok();
     debug_log(
         "agent_runtime_stem_reachable_probe",
         serde_json::json!({
             "runtime_dir": runtime_dir.display().to_string(),
             "stem": stem,
-            "socket_path": socket_path.display().to_string(),
+            "endpoint_path": endpoint_path.display().to_string(),
             "reachable": reachable,
+            "timeout_ms": timeout.as_millis(),
             "error_kind": result.as_ref().err().map(|e| format!("{:?}", e.kind())),
             "error": result.as_ref().err().map(|e| e.to_string()),
         }),
@@ -25806,46 +26916,67 @@ fn agent_runtime_stem_has_reachable_daemon(runtime_dir: &Path, stem: &str) -> bo
     reachable
 }
 
-#[cfg(windows)]
-fn agent_runtime_stem_has_reachable_daemon(runtime_dir: &Path, stem: &str) -> bool {
-    let marker_path = runtime_dir.join(format!("{stem}.tcp"));
-    let result = read_agent_tcp_addr(&marker_path).and_then(|addr| AgentStream::connect(addr));
-    let reachable = result.is_ok();
-    debug_log(
-        "agent_runtime_stem_reachable_probe",
-        serde_json::json!({
-            "runtime_dir": runtime_dir.display().to_string(),
-            "stem": stem,
-            "marker_path": marker_path.display().to_string(),
-            "reachable": reachable,
-            "error_kind": result.as_ref().err().map(|e| format!("{:?}", e.kind())),
-            "error": result.as_ref().err().map(|e| e.to_string()),
-        }),
-    );
-    reachable
-}
-
-fn agent_daemon_identity_matches_or_runtime_reachable(
-    pid: u32,
+fn agent_daemon_identity_matches_meta_or_runtime_reachable(
+    meta: &AgentMetaSnapshot,
     key: &AgentKey,
     identity: AgentDaemonProcessIdentity,
     reason: &str,
 ) -> bool {
+    let Ok(runtime_dir) = agent_runtime_dir() else {
+        return agent_daemon_identity_matches_meta_without_runtime(meta, identity);
+    };
+    agent_daemon_identity_matches_meta_or_runtime_reachable_at(
+        &runtime_dir,
+        meta,
+        key,
+        identity,
+        reason,
+    )
+}
+
+fn agent_daemon_identity_matches_meta_without_runtime(
+    meta: &AgentMetaSnapshot,
+    identity: AgentDaemonProcessIdentity,
+) -> bool {
+    let start_token_matches = agent_meta_daemon_pid_start_token_matches(meta);
     match identity {
-        AgentDaemonProcessIdentity::CokacmuxDaemon => true,
+        AgentDaemonProcessIdentity::CokacmuxDaemon => start_token_matches == Some(true),
+        AgentDaemonProcessIdentity::Other => false,
+        AgentDaemonProcessIdentity::Unknown => start_token_matches == Some(true),
+    }
+}
+
+fn agent_daemon_identity_matches_meta_or_runtime_reachable_at(
+    runtime_dir: &Path,
+    meta: &AgentMetaSnapshot,
+    key: &AgentKey,
+    identity: AgentDaemonProcessIdentity,
+    reason: &str,
+) -> bool {
+    let start_token_matches = agent_meta_daemon_pid_start_token_matches(meta);
+    match identity {
+        AgentDaemonProcessIdentity::CokacmuxDaemon => start_token_matches != Some(false),
         AgentDaemonProcessIdentity::Other => false,
         AgentDaemonProcessIdentity::Unknown => {
-            agent_daemon_identity_unknown_runtime_reachable(pid, key, reason)
+            if start_token_matches == Some(true) {
+                return true;
+            }
+            if start_token_matches == Some(false) {
+                return false;
+            }
+            agent_daemon_identity_unknown_runtime_reachable_at(runtime_dir, meta.pid, key, reason)
         }
     }
 }
 
-fn agent_daemon_identity_unknown_runtime_reachable(pid: u32, key: &AgentKey, reason: &str) -> bool {
-    let Ok(runtime_dir) = agent_runtime_dir() else {
-        return false;
-    };
+fn agent_daemon_identity_unknown_runtime_reachable_at(
+    runtime_dir: &Path,
+    pid: u32,
+    key: &AgentKey,
+    reason: &str,
+) -> bool {
     let stem = agent_file_stem(key);
-    let reachable = agent_runtime_stem_has_reachable_daemon(&runtime_dir, &stem);
+    let reachable = agent_runtime_stem_has_reachable_daemon(runtime_dir, &stem);
     debug_log(
         "agent_daemon_identity_unknown_runtime_probe",
         serde_json::json!({
@@ -25853,6 +26984,7 @@ fn agent_daemon_identity_unknown_runtime_reachable(pid: u32, key: &AgentKey, rea
             "key": agent_key_debug_value(key),
             "pid": pid,
             "stem": stem,
+            "runtime_dir": runtime_dir.display().to_string(),
             "reachable": reachable,
         }),
     );
@@ -25860,15 +26992,27 @@ fn agent_daemon_identity_unknown_runtime_reachable(pid: u32, key: &AgentKey, rea
 }
 
 fn coding_agent_cwd_lock_is_live(lock: &CodingAgentCwdLock) -> bool {
+    let runtime_dir = agent_runtime_dir().ok();
+    coding_agent_cwd_lock_is_live_at(lock, runtime_dir.as_deref())
+}
+
+fn coding_agent_cwd_lock_is_live_at(lock: &CodingAgentCwdLock, runtime_dir: Option<&Path>) -> bool {
+    let Some(key) = coding_agent_cwd_lock_key(lock) else {
+        return false;
+    };
+    if lock.owner_kind == CODING_AGENT_CWD_LOCK_OWNER_AGENT
+        && runtime_dir.is_some_and(|runtime_dir| {
+            coding_agent_cwd_lock_has_reachable_daemon_runtime_at(lock, &key, runtime_dir)
+        })
+    {
+        return true;
+    }
     if lock.pid == 0 || !process_is_alive(lock.pid) {
         return false;
     }
     if !coding_agent_cwd_lock_pid_matches(lock) {
         return false;
     }
-    let Some(key) = coding_agent_cwd_lock_key(lock) else {
-        return false;
-    };
     if lock.owner_kind == CODING_AGENT_CWD_LOCK_OWNER_RESTORE {
         if lock.pid == std::process::id() {
             return true;
@@ -25879,21 +27023,19 @@ fn coding_agent_cwd_lock_is_live(lock: &CodingAgentCwdLock) -> bool {
     match agent_daemon_process_identity(lock.pid, &key) {
         AgentDaemonProcessIdentity::CokacmuxDaemon => true,
         AgentDaemonProcessIdentity::Other => false,
-        AgentDaemonProcessIdentity::Unknown => {
-            coding_agent_cwd_lock_has_reachable_daemon_runtime(lock, &key)
-        }
+        AgentDaemonProcessIdentity::Unknown => runtime_dir.is_some_and(|runtime_dir| {
+            coding_agent_cwd_lock_has_reachable_daemon_runtime_at(lock, &key, runtime_dir)
+        }),
     }
 }
 
-fn coding_agent_cwd_lock_has_reachable_daemon_runtime(
+fn coding_agent_cwd_lock_has_reachable_daemon_runtime_at(
     lock: &CodingAgentCwdLock,
     key: &AgentKey,
+    runtime_dir: &Path,
 ) -> bool {
-    let Ok(runtime_dir) = agent_runtime_dir() else {
-        return false;
-    };
     let stem = agent_file_stem(key);
-    let reachable = agent_runtime_stem_has_reachable_daemon(&runtime_dir, &stem);
+    let reachable = agent_runtime_stem_has_reachable_daemon(runtime_dir, &stem);
     debug_log(
         "coding_agent_cwd_lock_identity_unknown_runtime_probe",
         serde_json::json!({
@@ -25901,6 +27043,7 @@ fn coding_agent_cwd_lock_has_reachable_daemon_runtime(
             "pid": lock.pid,
             "cwd": &lock.cwd,
             "stem": stem,
+            "runtime_dir": runtime_dir.display().to_string(),
             "reachable": reachable,
         }),
     );
@@ -25909,12 +27052,52 @@ fn coding_agent_cwd_lock_has_reachable_daemon_runtime(
 
 fn coding_agent_cwd_lock_pid_matches(lock: &CodingAgentCwdLock) -> bool {
     if let Some(expected) = lock.pid_start_ticks {
-        return process_start_ticks(lock.pid) == Some(expected);
+        if let Some(matches) = process_start_token_matches(expected, process_start_ticks(lock.pid))
+        {
+            return matches;
+        }
+        if let Some(started_at_epoch_s) = process_start_epoch_s(lock.pid) {
+            return started_at_epoch_s <= lock.created_at_epoch_s.saturating_add(1);
+        }
+        return true;
     }
     if let Some(started_at_epoch_s) = process_start_epoch_s(lock.pid) {
         return started_at_epoch_s <= lock.created_at_epoch_s.saturating_add(1);
     }
     true
+}
+
+fn process_start_token_matches(expected: u64, actual: Option<u64>) -> Option<bool> {
+    actual.map(|actual| actual == expected)
+}
+
+fn process_start_token_still_matches(pid: u32, expected: Option<u64>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    process_start_token_matches(expected, process_start_ticks(pid)) == Some(true)
+}
+
+fn terminate_process_group_if_start_token_matches(
+    pid: u32,
+    expected_start_ticks: Option<u64>,
+    reason: &str,
+) -> bool {
+    if process_start_token_still_matches(pid, expected_start_ticks) {
+        terminate_process_group(pid);
+        return true;
+    }
+    debug_log(
+        "process_group_terminate_unverified_skipped",
+        serde_json::json!({
+            "reason": reason,
+            "pid": pid,
+            "expected_start_ticks": expected_start_ticks,
+            "actual_start_ticks": process_start_ticks(pid),
+            "alive": process_is_alive(pid),
+        }),
+    );
+    false
 }
 
 fn coding_agent_cwd_lock_path(info: &SessionInfo) -> Result<Option<PathBuf>> {
@@ -26179,6 +27362,8 @@ fn agent_meta_snapshot_debug_value(meta: &AgentMetaSnapshot) -> serde_json::Valu
         "session_id": meta.session_id.as_deref(),
         "pid": meta.pid,
         "pid_alive": process_is_alive(meta.pid),
+        "pid_start_ticks": meta.pid_start_ticks,
+        "pid_matches": agent_meta_daemon_pid_matches(meta),
         "child_pid": meta.child_pid,
         "child_pid_alive": meta.child_pid.map(process_is_alive),
         "child_pid_start_ticks": meta.child_pid_start_ticks,
@@ -26343,6 +27528,8 @@ fn agent_runtime_probe_debug_value(key: &AgentKey, current_pid: u32) -> serde_js
         "meta_key_matches_expected": meta_key.as_ref() == Some(key),
         "daemon_pid": meta.pid,
         "daemon_alive": daemon_alive,
+        "daemon_pid_start_ticks": meta.pid_start_ticks,
+        "daemon_pid_matches": agent_meta_daemon_pid_matches(&meta),
         "daemon_identity": daemon_identity,
         "child_pid": meta.child_pid,
         "child_pid_start_ticks": meta.child_pid_start_ticks,
@@ -26431,6 +27618,82 @@ fn read_agent_runtime_state_at_for_key(
     let daemon_alive = process_is_alive(meta.pid);
     if !daemon_alive {
         let meta_json = serde_json::from_str::<serde_json::Value>(&content).ok();
+        if let Some(key) = expected_key {
+            if let Some(runtime_dir) = meta_path.parent() {
+                if let Some(identity_meta) = agent_daemon_identity_snapshot_for_key_at(
+                    runtime_dir,
+                    key,
+                    "agent_runtime_state_stale_meta_identity",
+                ) {
+                    let state = identity_meta.list_state_with_client_identity(
+                        current_pid,
+                        Some(agent_client_instance_id()),
+                        current_epoch_ms(),
+                    );
+                    if debug_enabled {
+                        debug_log(
+                            "agent_meta_stale_preserved_by_daemon_identity",
+                            serde_json::json!({
+                                "key": agent_key_debug_value(key),
+                                "current_pid": current_pid,
+                                "meta_path": meta_path.display().to_string(),
+                                "socket_path": socket_path.display().to_string(),
+                                "stale_meta": agent_meta_snapshot_debug_value(&meta),
+                                "identity_meta": agent_meta_snapshot_debug_value(&identity_meta),
+                                "state": agent_list_state_debug_value(state),
+                            }),
+                        );
+                    }
+                    return state;
+                }
+                if agent_runtime_key_has_reachable_daemon_at(
+                    runtime_dir,
+                    key,
+                    "agent_runtime_state_stale_meta_reachable",
+                ) {
+                    if debug_enabled {
+                        debug_log(
+                            "agent_meta_stale_preserved_by_reachable_daemon",
+                            serde_json::json!({
+                                "key": agent_key_debug_value(key),
+                                "current_pid": current_pid,
+                                "meta_path": meta_path.display().to_string(),
+                                "socket_path": socket_path.display().to_string(),
+                                "stale_meta": agent_meta_snapshot_debug_value(&meta),
+                            }),
+                        );
+                    }
+                    return AgentListState::Idle;
+                }
+            }
+        }
+        let child_process_preserved = expected_key.is_some_and(|key| {
+            agent_key_from_meta(&meta).as_ref() == Some(key) && agent_meta_child_pid_matches(&meta)
+        });
+        if child_process_preserved {
+            if debug_enabled {
+                debug_log(
+                    "agent_meta_stale_child_preserved",
+                    serde_json::json!({
+                        "provider": meta.provider.as_deref(),
+                        "session_id": meta.session_id.as_deref(),
+                        "daemon_pid": meta.pid,
+                        "current_pid": current_pid,
+                        "meta_path": meta_path.display().to_string(),
+                        "socket_path": socket_path.display().to_string(),
+                        "meta_child_pid": meta.child_pid,
+                        "meta_child_alive": meta.child_pid.map(process_is_alive),
+                        "meta_child_pid_start_ticks": meta.child_pid_start_ticks,
+                        "meta_phase": meta_json.as_ref().and_then(|value| value.get("phase")).and_then(serde_json::Value::as_str),
+                        "meta_activity": meta_json.as_ref().and_then(|value| value.get("activity")).and_then(serde_json::Value::as_str),
+                        "meta_attached": meta.attached,
+                        "meta_attached_client_pid": meta.attached_client_pid,
+                        "meta_attached_client_alive": meta.attached_client_pid.map(process_is_alive),
+                    }),
+                );
+            }
+            return AgentListState::Idle;
+        }
         let meta_updated_at_epoch_s = meta_json
             .as_ref()
             .and_then(|value| value.get("updated_at_epoch_s"))
@@ -26458,16 +27721,10 @@ fn read_agent_runtime_state_at_for_key(
                 CODING_AGENT_CWD_LOCK_OWNER_AGENT,
             )
         });
-        let child_process_terminated = expected_key.and_then(|key| {
-            (agent_key_from_meta(&meta).as_ref() == Some(key))
-                .then(|| {
-                    terminate_agent_meta_child_process(&meta, key, "agent_runtime_stale_cleanup")
-                })
-                .flatten()
-        });
-        let pty_log_deleted = remove_agent_runtime_extra_files_for_meta_path(
+        let pty_log_deleted = remove_agent_runtime_extra_files_for_meta_path_with_policy(
             meta_path,
             "agent_runtime_stale_cleanup",
+            child_process_preserved,
         );
         if debug_enabled {
             debug_log(
@@ -26482,7 +27739,7 @@ fn read_agent_runtime_state_at_for_key(
                     "meta_removed": meta_removed,
                     "socket_removed": socket_removed,
                     "cwd_lock_removed": cwd_lock_removed,
-                    "child_process_terminated": child_process_terminated,
+                    "child_process_preserved": child_process_preserved,
                     "pty_log_deleted": pty_log_deleted,
                     "meta_child_pid": meta.child_pid,
                     "meta_child_alive": meta.child_pid.map(process_is_alive),
@@ -26506,23 +27763,106 @@ fn read_agent_runtime_state_at_for_key(
     if let Some(expected_key) = expected_key {
         let meta_key = agent_key_from_meta(&meta);
         let daemon_identity = agent_daemon_process_identity(meta.pid, expected_key);
-        let daemon_verified = agent_daemon_identity_matches_or_runtime_reachable(
-            meta.pid,
+        let daemon_verified = agent_daemon_identity_matches_meta_or_runtime_reachable(
+            &meta,
             expected_key,
             daemon_identity,
             "agent_runtime_identity_check",
         );
-        let identity_mismatch = meta_key.as_ref() != Some(expected_key) || !daemon_verified;
+        let daemon_possibly_live = meta_key.as_ref() == Some(expected_key)
+            && daemon_identity == AgentDaemonProcessIdentity::Unknown
+            && agent_meta_daemon_pid_matches(&meta);
+        let identity_mismatch =
+            meta_key.as_ref() != Some(expected_key) || !(daemon_verified || daemon_possibly_live);
         if identity_mismatch {
-            let child_process_terminated = (meta_key.as_ref() == Some(expected_key))
-                .then(|| {
-                    terminate_agent_meta_child_process(
-                        &meta,
-                        expected_key,
-                        "agent_runtime_identity_mismatch_cleanup",
-                    )
-                })
-                .flatten();
+            if let Some(runtime_dir) = meta_path.parent() {
+                if let Some(identity_meta) = agent_daemon_identity_snapshot_for_key_at(
+                    runtime_dir,
+                    expected_key,
+                    "agent_runtime_state_identity_mismatch_daemon_identity",
+                ) {
+                    let state = identity_meta.list_state_with_client_identity(
+                        current_pid,
+                        Some(agent_client_instance_id()),
+                        current_epoch_ms(),
+                    );
+                    if debug_enabled {
+                        debug_log(
+                            "agent_meta_identity_mismatch_preserved_by_daemon_identity",
+                            serde_json::json!({
+                                "expected": agent_key_debug_value(expected_key),
+                                "meta_key": meta_key.as_ref().map(agent_key_debug_value),
+                                "daemon_identity": format!("{:?}", daemon_identity),
+                                "daemon_verified": daemon_verified,
+                                "daemon_possibly_live": daemon_possibly_live,
+                                "daemon_pid": meta.pid,
+                                "daemon_pid_start_ticks": meta.pid_start_ticks,
+                                "current_pid": current_pid,
+                                "meta_path": meta_path.display().to_string(),
+                                "socket_path": socket_path.display().to_string(),
+                                "stale_meta": agent_meta_snapshot_debug_value(&meta),
+                                "identity_meta": agent_meta_snapshot_debug_value(&identity_meta),
+                                "state": agent_list_state_debug_value(state),
+                            }),
+                        );
+                    }
+                    return state;
+                }
+                if agent_runtime_key_has_reachable_daemon_at(
+                    runtime_dir,
+                    expected_key,
+                    "agent_runtime_state_identity_mismatch_reachable",
+                ) {
+                    if debug_enabled {
+                        debug_log(
+                            "agent_meta_identity_mismatch_preserved_by_reachable_daemon",
+                            serde_json::json!({
+                                "expected": agent_key_debug_value(expected_key),
+                                "meta_key": meta_key.as_ref().map(agent_key_debug_value),
+                                "daemon_identity": format!("{:?}", daemon_identity),
+                                "daemon_verified": daemon_verified,
+                                "daemon_possibly_live": daemon_possibly_live,
+                                "daemon_pid": meta.pid,
+                                "daemon_pid_start_ticks": meta.pid_start_ticks,
+                                "current_pid": current_pid,
+                                "meta_path": meta_path.display().to_string(),
+                                "socket_path": socket_path.display().to_string(),
+                                "stale_meta": agent_meta_snapshot_debug_value(&meta),
+                            }),
+                        );
+                    }
+                    return AgentListState::Idle;
+                }
+            }
+            let child_process_preserved =
+                meta_key.as_ref() == Some(expected_key) && agent_meta_child_pid_matches(&meta);
+            if child_process_preserved {
+                if debug_enabled {
+                    debug_log(
+                        "agent_meta_identity_mismatch_child_preserved",
+                        serde_json::json!({
+                            "expected": agent_key_debug_value(expected_key),
+                            "meta_key": meta_key.as_ref().map(agent_key_debug_value),
+                            "daemon_identity": format!("{:?}", daemon_identity),
+                            "daemon_verified": daemon_verified,
+                            "daemon_possibly_live": daemon_possibly_live,
+                            "daemon_pid": meta.pid,
+                            "daemon_pid_start_ticks": meta.pid_start_ticks,
+                            "daemon_pid_matches": agent_meta_daemon_pid_matches(&meta),
+                            "current_pid": current_pid,
+                            "meta_path": meta_path.display().to_string(),
+                            "socket_path": socket_path.display().to_string(),
+                            "meta_child_pid": meta.child_pid,
+                            "meta_child_alive": meta.child_pid.map(process_is_alive),
+                            "meta_child_pid_start_ticks": meta.child_pid_start_ticks,
+                            "meta_attached": meta.attached,
+                            "meta_attached_client_pid": meta.attached_client_pid,
+                            "meta_attached_client_alive": meta.attached_client_pid.map(process_is_alive),
+                        }),
+                    );
+                }
+                return AgentListState::Idle;
+            }
             let meta_removed = remove_agent_runtime_file_logged(
                 "agent_runtime_identity_mismatch_cleanup",
                 Some(expected_key),
@@ -26545,9 +27885,10 @@ fn read_agent_runtime_state_at_for_key(
                         CODING_AGENT_CWD_LOCK_OWNER_AGENT,
                     )
                 });
-            let pty_log_deleted = remove_agent_runtime_extra_files_for_meta_path(
+            let pty_log_deleted = remove_agent_runtime_extra_files_for_meta_path_with_policy(
                 meta_path,
                 "agent_runtime_identity_mismatch_cleanup",
+                child_process_preserved,
             );
             if debug_enabled {
                 debug_log(
@@ -26556,14 +27897,18 @@ fn read_agent_runtime_state_at_for_key(
                         "expected": agent_key_debug_value(expected_key),
                         "meta_key": meta_key.as_ref().map(agent_key_debug_value),
                         "daemon_identity": format!("{:?}", daemon_identity),
+                        "daemon_verified": daemon_verified,
+                        "daemon_possibly_live": daemon_possibly_live,
                         "daemon_pid": meta.pid,
+                        "daemon_pid_start_ticks": meta.pid_start_ticks,
+                        "daemon_pid_matches": agent_meta_daemon_pid_matches(&meta),
                         "current_pid": current_pid,
                         "meta_path": meta_path.display().to_string(),
                         "socket_path": socket_path.display().to_string(),
                         "meta_removed": meta_removed,
                         "socket_removed": socket_removed,
                         "cwd_lock_removed": cwd_lock_removed,
-                        "child_process_terminated": child_process_terminated,
+                        "child_process_preserved": child_process_preserved,
                         "pty_log_deleted": pty_log_deleted,
                         "meta_child_pid": meta.child_pid,
                         "meta_child_alive": meta.child_pid.map(process_is_alive),
@@ -26574,6 +27919,21 @@ fn read_agent_runtime_state_at_for_key(
                 );
             }
             return AgentListState::Idle;
+        } else if daemon_possibly_live && !daemon_verified && debug_enabled {
+            debug_log(
+                "agent_meta_identity_unknown_preserved",
+                serde_json::json!({
+                    "expected": agent_key_debug_value(expected_key),
+                    "meta_key": meta_key.as_ref().map(agent_key_debug_value),
+                    "daemon_identity": format!("{:?}", daemon_identity),
+                    "daemon_pid": meta.pid,
+                    "daemon_pid_start_ticks": meta.pid_start_ticks,
+                    "daemon_pid_matches": agent_meta_daemon_pid_matches(&meta),
+                    "current_pid": current_pid,
+                    "meta_path": meta_path.display().to_string(),
+                    "socket_path": socket_path.display().to_string(),
+                }),
+            );
         }
     }
     let now_epoch_ms = current_epoch_ms();
@@ -26654,7 +28014,12 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
     windows_process_creation_filetime(pid)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    macos_process_start_token(pid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
@@ -26679,9 +28044,115 @@ fn process_start_epoch_s(pid: u32) -> Option<u64> {
     (filetime / WINDOWS_TICKS_PER_SECOND).checked_sub(WINDOWS_TO_UNIX_EPOCH_SECONDS)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn process_start_epoch_s(pid: u32) -> Option<u64> {
+    macos_process_start_token(pid)
+        .map(|token| token / 1_000_000)
+        .or_else(|| macos_process_start_epoch_s_from_ps(pid))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn process_start_epoch_s(_pid: u32) -> Option<u64> {
     None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_bsdinfo(pid: u32, event: &'static str) -> Option<libc::proc_bsdinfo> {
+    use std::mem;
+
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let mut info = unsafe { mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = mem::size_of::<libc::proc_bsdinfo>();
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast::<libc::c_void>(),
+            size as libc::c_int,
+        )
+    };
+    if result != size as libc::c_int {
+        let error = io::Error::last_os_error();
+        debug_log(
+            "macos_process_bsdinfo_probe_failed",
+            serde_json::json!({
+                "event": event,
+                "pid": pid,
+                "result": result,
+                "expected_size": size,
+                "raw_os_error": error.raw_os_error(),
+                "error": error.to_string(),
+            }),
+        );
+        return None;
+    }
+    Some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_start_token(pid: u32) -> Option<u64> {
+    let info = macos_process_bsdinfo(pid, "macos_process_start_token")?;
+    macos_process_start_token_from_parts(info.pbi_start_tvsec, info.pbi_start_tvusec)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_process_start_token_from_parts(seconds: u64, microseconds: u64) -> Option<u64> {
+    if microseconds >= 1_000_000 {
+        return None;
+    }
+    seconds
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(microseconds))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_start_epoch_s_from_ps(pid: u32) -> Option<u64> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        debug_log(
+            "macos_process_start_probe_failed",
+            serde_json::json!({
+                "pid": pid,
+                "status": output.status.to_string(),
+                "stderr": truncate_width(&String::from_utf8_lossy(&output.stderr), 512),
+            }),
+        );
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let parsed = parse_macos_lstart_epoch_s(&raw);
+    if parsed.is_none() {
+        debug_log(
+            "macos_process_start_parse_failed",
+            serde_json::json!({
+                "pid": pid,
+                "stdout": truncate_width(raw.trim(), 128),
+            }),
+        );
+    }
+    parsed
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_lstart_epoch_s(raw: &str) -> Option<u64> {
+    let parsed = NaiveDateTime::parse_from_str(raw.trim(), "%a %b %e %H:%M:%S %Y").ok()?;
+    let local = match Local.from_local_datetime(&parsed) {
+        LocalResult::Single(value) => value,
+        LocalResult::Ambiguous(earlier, _) => earlier,
+        LocalResult::None => return None,
+    };
+    u64::try_from(local.timestamp()).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -26746,7 +28217,43 @@ fn windows_process_creation_filetime(pid: u32) -> Option<u64> {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    if macos_process_is_zombie(pid) {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_is_zombie(pid: u32) -> bool {
+    macos_process_bsdinfo(pid, "macos_process_is_zombie")
+        .is_some_and(|info| macos_process_status_is_zombie(info.pbi_status))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_process_status_is_zombie(status: u32) -> bool {
+    status == macos_zombie_status_value()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_zombie_status_value() -> u32 {
+    libc::SZOMB
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn macos_zombie_status_value() -> u32 {
+    5
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn process_is_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
@@ -26780,6 +28287,7 @@ fn process_is_alive(pid: u32) -> bool {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
             let error = io::Error::last_os_error();
+            let treated_alive = windows_process_probe_error_means_alive(error.raw_os_error());
             debug_log(
                 "process_is_alive_windows_open_failed",
                 serde_json::json!({
@@ -26787,14 +28295,17 @@ fn process_is_alive(pid: u32) -> bool {
                     "current_pid": std::process::id(),
                     "raw_os_error": error.raw_os_error(),
                     "error": error.to_string(),
+                    "treated_alive": treated_alive,
                 }),
             );
-            return false;
+            return treated_alive;
         }
         let mut exit_code = 0;
         let ok = GetExitCodeProcess(handle, &mut exit_code);
+        let mut alive = false;
         if ok == 0 {
             let error = io::Error::last_os_error();
+            alive = windows_process_probe_error_means_alive(error.raw_os_error());
             debug_log(
                 "process_is_alive_windows_exit_code_failed",
                 serde_json::json!({
@@ -26802,6 +28313,7 @@ fn process_is_alive(pid: u32) -> bool {
                     "current_pid": std::process::id(),
                     "raw_os_error": error.raw_os_error(),
                     "error": error.to_string(),
+                    "treated_alive": alive,
                 }),
             );
         } else if exit_code != STILL_ACTIVE {
@@ -26813,10 +28325,17 @@ fn process_is_alive(pid: u32) -> bool {
                     "exit_code": exit_code,
                 }),
             );
+        } else {
+            alive = true;
         }
         let _ = CloseHandle(handle);
-        ok != 0 && exit_code == STILL_ACTIVE
+        alive
     }
+}
+
+#[cfg(any(windows, test))]
+fn windows_process_probe_error_means_alive(raw_os_error: Option<i32>) -> bool {
+    raw_os_error == Some(WINDOWS_ERROR_ACCESS_DENIED)
 }
 
 #[cfg(target_os = "linux")]
@@ -28333,6 +29852,9 @@ fn read_agent_daemon_requests(
 
 fn agent_daemon_request_debug_value(request: &AgentDaemonRequest) -> serde_json::Value {
     match request {
+        AgentDaemonRequest::Identify => serde_json::json!({
+            "type": "identify",
+        }),
         AgentDaemonRequest::Attach {
             cols,
             rows,
@@ -28363,13 +29885,6 @@ fn agent_daemon_request_debug_value(request: &AgentDaemonRequest) -> serde_json:
             "type": "detach",
         }),
     }
-}
-
-fn agent_daemon_requests_are_input_only(requests: &[AgentDaemonRequest]) -> bool {
-    !requests.is_empty()
-        && requests
-            .iter()
-            .all(|request| matches!(request, AgentDaemonRequest::Input { .. }))
 }
 
 #[cfg(unix)]
@@ -28434,79 +29949,35 @@ fn bind_agent_listener(key: &AgentKey, socket_path: &Path) -> io::Result<AgentLi
 }
 
 fn connect_agent_daemon(key: &AgentKey) -> io::Result<AgentStream> {
-    #[cfg(unix)]
-    {
-        let socket_path = agent_socket_path(key).map_err(io::Error::other)?;
-        match AgentStream::connect(&socket_path) {
-            Ok(stream) => {
-                debug_log(
-                    "agent_daemon_connect_ok",
-                    serde_json::json!({
-                        "key": agent_key_debug_value(key),
-                        "socket_path": socket_path.display().to_string(),
-                    }),
-                );
-                Ok(stream)
-            }
-            Err(e) => {
-                debug_log(
-                    "agent_daemon_connect_failed",
-                    serde_json::json!({
-                        "key": agent_key_debug_value(key),
-                        "socket_path": socket_path.display().to_string(),
-                        "socket_exists": socket_path.exists(),
-                        "error_kind": format!("{:?}", e.kind()),
-                        "error": e.to_string(),
-                    }),
-                );
-                Err(e)
-            }
+    let runtime_dir = agent_runtime_dir().map_err(io::Error::other)?;
+    let endpoint_path = agent_socket_path(key).map_err(io::Error::other)?;
+    let stem = agent_file_stem(key);
+    let timeout = Duration::from_millis(AGENT_IDENTITY_QUERY_TIMEOUT_MS);
+    match connect_agent_daemon_stem_at(&runtime_dir, &stem, timeout) {
+        Ok(stream) => {
+            debug_log(
+                "agent_daemon_connect_ok",
+                serde_json::json!({
+                    "key": agent_key_debug_value(key),
+                    "endpoint_path": endpoint_path.display().to_string(),
+                    "timeout_ms": timeout.as_millis(),
+                }),
+            );
+            Ok(stream)
         }
-    }
-    #[cfg(windows)]
-    {
-        let socket_path = agent_socket_path(key).map_err(io::Error::other)?;
-        let addr = match read_agent_tcp_addr(&socket_path) {
-            Ok(addr) => addr,
-            Err(e) => {
-                debug_log(
-                    "agent_daemon_connect_marker_failed",
-                    serde_json::json!({
-                        "key": agent_key_debug_value(key),
-                        "socket_path": socket_path.display().to_string(),
-                        "socket_exists": socket_path.exists(),
-                        "error_kind": format!("{:?}", e.kind()),
-                        "error": e.to_string(),
-                    }),
-                );
-                return Err(e);
-            }
-        };
-        match AgentStream::connect(&addr) {
-            Ok(stream) => {
-                debug_log(
-                    "agent_daemon_connect_ok",
-                    serde_json::json!({
-                        "key": agent_key_debug_value(key),
-                        "socket_path": socket_path.display().to_string(),
-                        "addr": &addr,
-                    }),
-                );
-                Ok(stream)
-            }
-            Err(e) => {
-                debug_log(
-                    "agent_daemon_connect_failed",
-                    serde_json::json!({
-                        "key": agent_key_debug_value(key),
-                        "socket_path": socket_path.display().to_string(),
-                        "addr": &addr,
-                        "error_kind": format!("{:?}", e.kind()),
-                        "error": e.to_string(),
-                    }),
-                );
-                Err(e)
-            }
+        Err(e) => {
+            debug_log(
+                "agent_daemon_connect_failed",
+                serde_json::json!({
+                    "key": agent_key_debug_value(key),
+                    "endpoint_path": endpoint_path.display().to_string(),
+                    "endpoint_exists": endpoint_path.exists(),
+                    "timeout_ms": timeout.as_millis(),
+                    "error_kind": format!("{:?}", e.kind()),
+                    "error": e.to_string(),
+                }),
+            );
+            Err(e)
         }
     }
 }
@@ -28514,20 +29985,17 @@ fn connect_agent_daemon(key: &AgentKey) -> io::Result<AgentStream> {
 #[cfg(windows)]
 fn read_agent_tcp_addr(socket_path: &Path) -> io::Result<String> {
     let marker = fs::read_to_string(socket_path)?;
-    let addr = marker.trim().strip_prefix("tcp ").unwrap_or(marker.trim());
-    if !addr.starts_with("127.0.0.1:") {
+    let addr = parse_agent_tcp_marker(&marker).map_err(|e| {
         debug_log(
             "agent_tcp_marker_invalid",
             serde_json::json!({
                 "socket_path": socket_path.display().to_string(),
                 "marker": truncate_width(&marker, 256),
+                "error": e.to_string(),
             }),
         );
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "invalid agent tcp marker",
-        ));
-    }
+        e
+    })?;
     debug_log(
         "agent_tcp_marker_read",
         serde_json::json!({
@@ -28538,66 +30006,259 @@ fn read_agent_tcp_addr(socket_path: &Path) -> io::Result<String> {
     Ok(addr.to_string())
 }
 
-fn wait_for_agent_daemon(key: &AgentKey) -> Result<AgentStream> {
-    let started = Instant::now();
-    let timeout = Duration::from_millis(AGENT_DAEMON_START_TIMEOUT_MS);
-    let mut last_error: Option<io::Error> = None;
-    let mut attempt = 0u32;
-    debug_log(
-        "daemon_wait_start",
-        serde_json::json!({
-            "key": agent_key_debug_value(key),
-            "timeout_ms": AGENT_DAEMON_START_TIMEOUT_MS,
-        }),
-    );
-    while started.elapsed() < timeout {
-        attempt = attempt.saturating_add(1);
-        match connect_agent_daemon(key) {
-            Ok(stream) => {
+#[cfg(any(windows, test))]
+fn parse_agent_tcp_marker(marker: &str) -> io::Result<String> {
+    let addr = marker.trim().strip_prefix("tcp ").unwrap_or(marker.trim());
+    let parsed = addr
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    match parsed {
+        std::net::SocketAddr::V4(v4)
+            if *v4.ip() == std::net::Ipv4Addr::new(127, 0, 0, 1) && v4.port() != 0 =>
+        {
+            Ok(parsed.to_string())
+        }
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid agent tcp marker",
+        )),
+    }
+}
+
+fn stale_child_replacement_error(
+    info: &SessionInfo,
+    key: &AgentKey,
+    stem: &str,
+    meta: &AgentMetaSnapshot,
+) -> Option<anyhow::Error> {
+    if agent_key_from_meta(meta).as_ref() != Some(key)
+        || agent_runtime_meta_has_live_daemon_for_stem(meta, stem)
+        || !agent_meta_child_pid_matches(meta)
+    {
+        return None;
+    }
+    Some(anyhow::anyhow!(
+        "previous {} is still running as child pid {}, but its daemon is not attachable; refusing to replace a background process",
+        live_agent_status_label(info),
+        meta.child_pid.unwrap_or_default()
+    ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AgentDaemonStartLock {
+    version: u32,
+    pid: u32,
+    pid_start_ticks: Option<u64>,
+    provider: String,
+    session_id: String,
+    created_at_epoch_s: u64,
+}
+
+struct AgentDaemonStartLockGuard {
+    key: AgentKey,
+    path: PathBuf,
+    lock: AgentDaemonStartLock,
+}
+
+impl Drop for AgentDaemonStartLockGuard {
+    fn drop(&mut self) {
+        let Some(current) = read_agent_daemon_start_lock(&self.path) else {
+            return;
+        };
+        if current != self.lock {
+            debug_log(
+                "daemon_start_lock_release_skipped",
+                serde_json::json!({
+                    "key": agent_key_debug_value(&self.key),
+                    "path": self.path.display().to_string(),
+                    "reason": "lock_replaced",
+                    "expected": agent_daemon_start_lock_debug_value(&self.lock),
+                    "actual": agent_daemon_start_lock_debug_value(&current),
+                }),
+            );
+            return;
+        }
+        let _ = remove_agent_runtime_file_logged(
+            "daemon_start_lock_release",
+            Some(&self.key),
+            None,
+            "daemon_start_lock",
+            &self.path,
+        );
+    }
+}
+
+fn agent_daemon_start_lock_for_key(key: &AgentKey) -> AgentDaemonStartLock {
+    AgentDaemonStartLock {
+        version: AGENT_DAEMON_START_LOCK_VERSION,
+        pid: std::process::id(),
+        pid_start_ticks: process_start_ticks(std::process::id()),
+        provider: key.provider.as_str().to_string(),
+        session_id: key.session_id.clone(),
+        created_at_epoch_s: current_epoch_s(),
+    }
+}
+
+fn agent_daemon_start_lock_debug_value(lock: &AgentDaemonStartLock) -> serde_json::Value {
+    serde_json::json!({
+        "version": lock.version,
+        "pid": lock.pid,
+        "pid_start_ticks": lock.pid_start_ticks,
+        "provider": &lock.provider,
+        "session_id": &lock.session_id,
+        "created_at_epoch_s": lock.created_at_epoch_s,
+    })
+}
+
+fn agent_daemon_start_lock_key(lock: &AgentDaemonStartLock) -> Option<AgentKey> {
+    Some(AgentKey {
+        provider: Provider::parse(&lock.provider)?,
+        session_id: lock.session_id.clone(),
+    })
+}
+
+fn agent_daemon_start_lock_path_at(runtime_dir: &Path, key: &AgentKey) -> PathBuf {
+    runtime_dir.join(format!("{}.start.lock", agent_file_stem(key)))
+}
+
+fn read_agent_daemon_start_lock(path: &Path) -> Option<AgentDaemonStartLock> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+}
+
+fn write_agent_daemon_start_lock_temp_at(
+    runtime_dir: &Path,
+    key: &AgentKey,
+    content: &[u8],
+) -> io::Result<PathBuf> {
+    let temp_path = runtime_dir.join(format!(
+        ".{}.start.{}.{}.tmp",
+        agent_file_stem(key),
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
+    if let Err(error) = file
+        .write_all(content)
+        .and_then(|_| file.write_all(b"\n"))
+        .and_then(|_| file.flush())
+    {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    Ok(temp_path)
+}
+
+fn agent_daemon_start_lock_is_live_for_key(lock: &AgentDaemonStartLock, key: &AgentKey) -> bool {
+    if lock.version != AGENT_DAEMON_START_LOCK_VERSION
+        || agent_daemon_start_lock_key(lock).as_ref() != Some(key)
+        || lock.pid == 0
+        || !process_is_alive(lock.pid)
+    {
+        return false;
+    }
+    if let Some(expected) = lock.pid_start_ticks {
+        if process_start_token_matches(expected, process_start_ticks(lock.pid)) == Some(false) {
+            return false;
+        }
+    }
+    if lock.pid == std::process::id() {
+        return true;
+    }
+    agent_client_process_identity(lock.pid) != AgentClientProcessIdentity::Other
+}
+
+fn acquire_agent_daemon_start_lock_at(
+    runtime_dir: &Path,
+    key: &AgentKey,
+) -> Result<AgentDaemonStartLockGuard> {
+    fs::create_dir_all(runtime_dir)?;
+    let path = agent_daemon_start_lock_path_at(runtime_dir, key);
+    loop {
+        let lock = agent_daemon_start_lock_for_key(key);
+        let content = serde_json::to_vec_pretty(&lock)?;
+        let temp_path = write_agent_daemon_start_lock_temp_at(runtime_dir, key, &content)?;
+        match fs::hard_link(&temp_path, &path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&temp_path);
                 debug_log(
-                    "daemon_wait_connected",
+                    "daemon_start_lock_acquired",
                     serde_json::json!({
                         "key": agent_key_debug_value(key),
-                        "attempt": attempt,
-                        "elapsed_ms": started.elapsed().as_millis(),
+                        "path": path.display().to_string(),
+                        "lock": agent_daemon_start_lock_debug_value(&lock),
                     }),
                 );
-                return Ok(stream);
+                return Ok(AgentDaemonStartLockGuard {
+                    key: key.clone(),
+                    path,
+                    lock,
+                });
             }
-            Err(e) => {
-                if attempt <= 10 || attempt % 10 == 0 {
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temp_path);
+                let Some(existing) = read_agent_daemon_start_lock(&path) else {
+                    let _ = remove_agent_runtime_file_logged(
+                        "daemon_start_lock_unreadable_cleanup",
+                        Some(key),
+                        None,
+                        "daemon_start_lock",
+                        &path,
+                    );
+                    continue;
+                };
+                if agent_daemon_start_lock_is_live_for_key(&existing, key) {
                     debug_log(
-                        "daemon_wait_retry",
+                        "daemon_start_lock_wait",
                         serde_json::json!({
                             "key": agent_key_debug_value(key),
-                            "attempt": attempt,
-                            "elapsed_ms": started.elapsed().as_millis(),
-                            "error_kind": format!("{:?}", e.kind()),
-                            "error": e.to_string(),
+                            "path": path.display().to_string(),
+                            "lock": agent_daemon_start_lock_debug_value(&existing),
                         }),
                     );
+                    wait_for_agent_daemon_start_lock_release(&path, key);
+                    continue;
                 }
-                last_error = Some(e);
-                thread::sleep(Duration::from_millis(50));
+                let _ = remove_agent_runtime_file_logged(
+                    "daemon_start_lock_stale_cleanup",
+                    Some(key),
+                    None,
+                    "daemon_start_lock",
+                    &path,
+                );
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error.into());
             }
         }
     }
-    let error =
-        last_error.unwrap_or_else(|| io::Error::new(ErrorKind::TimedOut, "daemon did not start"));
-    debug_log(
-        "daemon_wait_failed",
-        serde_json::json!({
-            "key": agent_key_debug_value(key),
-            "attempts": attempt,
-            "elapsed_ms": started.elapsed().as_millis(),
-            "error_kind": format!("{:?}", error.kind()),
-            "error": error.to_string(),
-        }),
-    );
-    Err(error.into())
 }
 
-fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Result<()> {
+fn wait_for_agent_daemon_start_lock_release(path: &Path, key: &AgentKey) {
+    loop {
+        let Some(existing) = read_agent_daemon_start_lock(path) else {
+            return;
+        };
+        if !agent_daemon_start_lock_is_live_for_key(&existing, key) {
+            let _ = remove_agent_runtime_file_logged(
+                "daemon_start_lock_stale_cleanup_after_wait",
+                Some(key),
+                None,
+                "daemon_start_lock",
+                path,
+            );
+            return;
+        }
+        thread::sleep(Duration::from_millis(AGENT_DAEMON_START_LOCK_POLL_MS));
+    }
+}
+
+fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Result<AgentStream> {
     let key = AgentKey::new(info);
     debug_log(
         "daemon_start_check",
@@ -28607,7 +30268,7 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
         }),
     );
     match connect_agent_daemon(&key) {
-        Ok(_) => {
+        Ok(stream) => {
             debug_log(
                 "daemon_reuse_existing",
                 serde_json::json!({
@@ -28616,7 +30277,7 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
                     "launch_mode": launch_mode.as_str(),
                 }),
             );
-            return Ok(());
+            return Ok(stream);
         }
         Err(e) => {
             debug_log(
@@ -28629,13 +30290,41 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
             );
         }
     }
-    if let Some(meta) = live_agent_meta_snapshot(&key) {
+    let runtime_dir = agent_runtime_dir()?;
+    let _start_lock = acquire_agent_daemon_start_lock_at(&runtime_dir, &key)?;
+    match connect_agent_daemon(&key) {
+        Ok(stream) => {
+            debug_log(
+                "daemon_reuse_existing_after_start_lock",
+                serde_json::json!({
+                    "provider": key.provider.as_str(),
+                    "session_id": &key.session_id,
+                    "launch_mode": launch_mode.as_str(),
+                }),
+            );
+            return Ok(stream);
+        }
+        Err(e) => {
+            debug_log(
+                "daemon_existing_connect_after_start_lock_unavailable",
+                serde_json::json!({
+                    "key": agent_key_debug_value(&key),
+                    "error_kind": format!("{:?}", e.kind()),
+                    "error": e.to_string(),
+                }),
+            );
+        }
+    }
+    if let Some(meta) = possibly_live_agent_meta_snapshot(&key) {
         debug_log(
             "daemon_start_blocked_unreachable_live",
             serde_json::json!({
                 "provider": key.provider.as_str(),
                 "session_id": &key.session_id,
                 "daemon_pid": meta.pid,
+                "daemon_pid_start_ticks": meta.pid_start_ticks,
+                "daemon_pid_matches": agent_meta_daemon_pid_matches(&meta),
+                "daemon_identity": format!("{:?}", agent_daemon_process_identity(meta.pid, &key)),
             }),
         );
         if is_plain_pty_tool_session_info(info) {
@@ -28647,6 +30336,31 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
         }
         return Err(anyhow::anyhow!(
             "live {} agent {} is already running as pid {}, but its socket is unreachable; refusing to replace a background process",
+            key.provider.as_str(),
+            truncate_width(&key.session_id, 14),
+            meta.pid
+        ));
+    }
+    if let Some(meta) = possible_agent_daemon_meta_from_os_process(&key) {
+        debug_log(
+            "daemon_start_blocked_os_live_daemon",
+            serde_json::json!({
+                "provider": key.provider.as_str(),
+                "session_id": &key.session_id,
+                "daemon_pid": meta.pid,
+                "daemon_pid_start_ticks": meta.pid_start_ticks,
+                "reason": "os_process_table_matched_daemon_key",
+            }),
+        );
+        if is_plain_pty_tool_session_info(info) {
+            return Err(anyhow::anyhow!(
+                "live {} is already running as pid {}, but its runtime files are missing or unreachable; refusing to replace a background process",
+                live_agent_status_label(info),
+                meta.pid
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "live {} agent {} is already running as pid {}, but its runtime files are missing or unreachable; refusing to replace a background process",
             key.provider.as_str(),
             truncate_width(&key.session_id, 14),
             meta.pid
@@ -28674,8 +30388,21 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
         if !agent_runtime_meta_has_live_daemon_for_stem(&meta, &stem)
             && agent_key_from_meta(&meta).as_ref() == Some(&key)
         {
-            let _ =
-                terminate_agent_meta_child_process(&meta, &key, "daemon_start_stale_child_cleanup");
+            let child_pid_matches = agent_meta_child_pid_matches(&meta);
+            debug_log(
+                "daemon_start_stale_child_preserved",
+                serde_json::json!({
+                    "key": agent_key_debug_value(&key),
+                    "daemon_pid": meta.pid,
+                    "child_pid": meta.child_pid,
+                    "child_pid_start_ticks": meta.child_pid_start_ticks,
+                    "child_alive": meta.child_pid.map(process_is_alive),
+                    "child_pid_matches": child_pid_matches,
+                }),
+            );
+            if let Some(error) = stale_child_replacement_error(info, &key, &stem, &meta) {
+                return Err(error);
+            }
         }
     }
     if meta_path.exists() {
@@ -28716,7 +30443,7 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
             "windows_breakaway_requested": daemon_uses_windows_breakaway(),
         }),
     );
-    let (child, windows_breakaway_used) =
+    let (mut child, windows_breakaway_used) =
         match spawn_agent_daemon_process(command, &current_exe, info, launch_mode, &key) {
             Ok(result) => result,
             Err(e) => {
@@ -28747,7 +30474,131 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
             "windows_breakaway_used": windows_breakaway_used,
         }),
     );
-    Ok(())
+    wait_for_agent_daemon_ready(
+        &mut child,
+        &key,
+        Duration::from_millis(AGENT_DAEMON_START_TIMEOUT_MS),
+    )?;
+    connect_agent_daemon(&key).map_err(Into::into)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentDaemonReady {
+    kind: String,
+    provider: Provider,
+    session_id: String,
+    pid: u32,
+    socket: String,
+}
+
+fn wait_for_agent_daemon_ready(
+    child: &mut std::process::Child,
+    key: &AgentKey,
+    timeout: Duration,
+) -> Result<()> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("daemon readiness pipe unavailable"))?;
+    let (tx, rx) = mpsc::channel();
+    let expected_key = key.clone();
+    thread::Builder::new()
+        .name("cokacmux-daemon-ready".into())
+        .spawn(move || {
+            let result = read_agent_daemon_ready(stdout, &expected_key);
+            let _ = tx.send(result);
+        })
+        .map_err(|e| anyhow::anyhow!("daemon readiness reader failed: {}", e))?;
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(ready)) => {
+            debug_log(
+                "daemon_ready_received",
+                serde_json::json!({
+                    "key": agent_key_debug_value(key),
+                    "daemon_pid": ready.pid,
+                    "socket": ready.socket,
+                }),
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            let exited = child
+                .try_wait()
+                .ok()
+                .flatten()
+                .map(|status| status.to_string());
+            debug_log(
+                "daemon_ready_failed",
+                serde_json::json!({
+                    "key": agent_key_debug_value(key),
+                    "daemon_pid": child.id(),
+                    "child_status": exited.as_deref(),
+                    "error": e.to_string(),
+                }),
+            );
+            Err(e.into())
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let exited = child
+                .try_wait()
+                .ok()
+                .flatten()
+                .map(|status| status.to_string());
+            debug_log(
+                "daemon_ready_timeout",
+                serde_json::json!({
+                    "key": agent_key_debug_value(key),
+                    "daemon_pid": child.id(),
+                    "child_status": exited.as_deref(),
+                    "timeout_ms": timeout.as_millis(),
+                }),
+            );
+            Err(anyhow::anyhow!(
+                "daemon did not report readiness within {}ms",
+                timeout.as_millis()
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+            "daemon readiness reader ended before reporting readiness"
+        )),
+    }
+}
+
+fn read_agent_daemon_ready(
+    stdout: std::process::ChildStdout,
+    expected_key: &AgentKey,
+) -> io::Result<AgentDaemonReady> {
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let len = reader.read_line(&mut line)?;
+    if len == 0 {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "daemon exited before readiness",
+        ));
+    }
+    parse_agent_daemon_ready_line(line.trim_end(), expected_key)
+}
+
+fn parse_agent_daemon_ready_line(
+    line: &str,
+    expected_key: &AgentKey,
+) -> io::Result<AgentDaemonReady> {
+    let ready = serde_json::from_str::<AgentDaemonReady>(line)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    if ready.kind != AGENT_DAEMON_READY_KIND {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "daemon reported invalid readiness kind",
+        ));
+    }
+    if ready.provider != expected_key.provider || ready.session_id != expected_key.session_id {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "daemon readiness key mismatch",
+        ));
+    }
+    Ok(ready)
 }
 
 fn build_agent_daemon_command(
@@ -28764,8 +30615,9 @@ fn build_agent_daemon_command(
         .arg(info.source.as_os_str())
         .arg(launch_mode.as_str())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    command.env(AGENT_DAEMON_READY_ENV, "1");
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         command.env("COKACMUX_DEBUG", "1");
     } else {
@@ -28796,8 +30648,8 @@ fn spawn_agent_daemon_process(
 #[cfg(windows)]
 fn spawn_agent_daemon_process(
     mut command: Command,
-    current_exe: &Path,
-    info: &SessionInfo,
+    _current_exe: &Path,
+    _info: &SessionInfo,
     launch_mode: AgentLaunchMode,
     key: &AgentKey,
 ) -> io::Result<(std::process::Child, bool)> {
@@ -28806,43 +30658,16 @@ fn spawn_agent_daemon_process(
         Ok(child) => Ok((child, true)),
         Err(e) => {
             debug_log(
-                "daemon_spawn_breakaway_failed",
+                "daemon_spawn_breakaway_required_failed",
                 serde_json::json!({
                     "key": agent_key_debug_value(key),
                     "launch_mode": launch_mode.as_str(),
                     "error_kind": format!("{:?}", e.kind()),
                     "error": e.to_string(),
+                    "reason": "refusing_to_start_without_breakaway",
                 }),
             );
-            let breakaway_error = e;
-            let mut fallback = build_agent_daemon_command(current_exe, info, launch_mode);
-            configure_daemon_command(&mut fallback, false);
-            match fallback.spawn() {
-                Ok(child) => {
-                    debug_log(
-                        "daemon_spawn_without_breakaway",
-                        serde_json::json!({
-                            "key": agent_key_debug_value(key),
-                            "launch_mode": launch_mode.as_str(),
-                        }),
-                    );
-                    Ok((child, false))
-                }
-                Err(fallback_error) => {
-                    debug_log(
-                        "daemon_spawn_without_breakaway_failed",
-                        serde_json::json!({
-                            "key": agent_key_debug_value(key),
-                            "launch_mode": launch_mode.as_str(),
-                            "breakaway_error_kind": format!("{:?}", breakaway_error.kind()),
-                            "breakaway_error": breakaway_error.to_string(),
-                            "error_kind": format!("{:?}", fallback_error.kind()),
-                            "error": fallback_error.to_string(),
-                        }),
-                    );
-                    Err(fallback_error)
-                }
-            }
+            Err(e)
         }
     }
 }
@@ -28885,6 +30710,7 @@ struct AgentTermination {
     pid: Option<u32>,
     child_pid: Option<u32>,
     pty_log_deleted: bool,
+    skipped_unverified: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -28893,6 +30719,7 @@ struct KillAllAgentsReport {
     killed: usize,
     stale: usize,
     skipped_self: usize,
+    skipped_unverified: usize,
     errors: usize,
     child_processes_terminated: usize,
     runtime_files_removed: usize,
@@ -28966,10 +30793,8 @@ fn terminate_cokacmux_processes_at(
     let runtime_dir = config_dir.join("agents");
     let client_pids = cokacmux_client_pids_for_reset(&runtime_dir, current_pid);
     let killall = kill_all_agent_daemons_at(&runtime_dir, current_pid);
-    let untracked_daemon_report = terminate_cokacmux_daemon_pids_for_reset(
-        os_cokacmux_daemon_pids_for_reset(current_pid),
-        current_pid,
-    );
+    let untracked_daemon_report =
+        terminate_cokacmux_daemon_pids_for_reset(os_cokacmux_daemon_pids(current_pid), current_pid);
     let client_report = terminate_cokacmux_client_pids_for_reset(client_pids, current_pid);
 
     CokacmuxProcessTerminationReport {
@@ -28993,11 +30818,25 @@ fn reset_cokacmux() -> Result<ResetReport> {
     };
     let process_report = terminate_cokacmux_processes_at(&config_dir, std::process::id());
 
-    // Give just-killed clients and daemon log writers a brief chance to drop
-    // file handles before removing the config tree, especially on Windows.
-    thread::sleep(Duration::from_millis(200));
-    let config_removal = remove_cokacmux_path_for_cleanup(&config_dir)
-        .map_err(|e| anyhow::anyhow!("remove {} failed: {}", config_dir.display(), e))?;
+    let preserve_config = process_report.killall.skipped_unverified > 0
+        || process_report.untracked_daemon_processes_skipped_unverified > 0;
+    let config_removal = if preserve_config {
+        debug_log(
+            "reset_config_cleanup_preserved",
+            serde_json::json!({
+                "config_dir": config_dir.display().to_string(),
+                "agents_skipped_unverified": process_report.killall.skipped_unverified,
+                "untracked_daemons_skipped_unverified": process_report.untracked_daemon_processes_skipped_unverified,
+            }),
+        );
+        ResetConfigRemoval {
+            removed: false,
+            missing: !config_dir.exists(),
+        }
+    } else {
+        remove_cokacmux_path_for_cleanup(&config_dir)
+            .map_err(|e| anyhow::anyhow!("remove {} failed: {}", config_dir.display(), e))?
+    };
 
     Ok(ResetReport {
         killall: process_report.killall,
@@ -29028,10 +30867,9 @@ fn killall_cokacmux() -> Result<KillAllCokacmuxReport> {
 fn killall_cokacmux_at(config_dir: &Path, current_pid: u32) -> Result<KillAllCokacmuxReport> {
     let process_report = terminate_cokacmux_processes_at(config_dir, current_pid);
 
-    // Give just-killed clients and daemon log writers a brief chance to drop
-    // file handles before removing runtime/debug trees, especially on Windows.
-    thread::sleep(Duration::from_millis(200));
-    let removal_report = remove_killall_config_dirs_at(config_dir)?;
+    let preserve_agents = process_report.killall.skipped_unverified > 0
+        || process_report.untracked_daemon_processes_skipped_unverified > 0;
+    let removal_report = remove_killall_config_dirs_at_with_policy(config_dir, preserve_agents)?;
 
     Ok(KillAllCokacmuxReport {
         killall: process_report.killall,
@@ -29054,11 +30892,28 @@ fn killall_cokacmux_at(config_dir: &Path, current_pid: u32) -> Result<KillAllCok
     })
 }
 
-fn remove_killall_config_dirs_at(config_dir: &Path) -> Result<KillAllConfigRemovalReport> {
+fn remove_killall_config_dirs_at_with_policy(
+    config_dir: &Path,
+    preserve_agents: bool,
+) -> Result<KillAllConfigRemovalReport> {
     let agents_dir = config_dir.join("agents");
     let debug_dir = config_dir.join("debug");
-    let agents_removal = remove_cokacmux_path_for_cleanup(&agents_dir)
-        .map_err(|e| anyhow::anyhow!("remove {} failed: {}", agents_dir.display(), e))?;
+    let agents_removal = if preserve_agents {
+        debug_log(
+            "killall_agents_config_cleanup_preserved",
+            serde_json::json!({
+                "config_dir": config_dir.display().to_string(),
+                "agents_dir": agents_dir.display().to_string(),
+            }),
+        );
+        ResetConfigRemoval {
+            removed: false,
+            missing: !agents_dir.exists(),
+        }
+    } else {
+        remove_cokacmux_path_for_cleanup(&agents_dir)
+            .map_err(|e| anyhow::anyhow!("remove {} failed: {}", agents_dir.display(), e))?
+    };
     let debug_removal = remove_cokacmux_path_for_cleanup(&debug_dir)
         .map_err(|e| anyhow::anyhow!("remove {} failed: {}", debug_dir.display(), e))?;
 
@@ -29095,11 +30950,27 @@ fn terminate_cokacmux_client_pids_for_reset(
         if !process_is_alive(pid) {
             continue;
         }
+        let start_ticks = process_start_ticks(pid);
+        if start_ticks.is_none() {
+            report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+            debug_log(
+                "reset_client_termination_unverified_skipped",
+                serde_json::json!({
+                    "pid": pid,
+                    "reason": "missing_start_token",
+                }),
+            );
+            continue;
+        }
         if agent_client_process_identity(pid) != AgentClientProcessIdentity::CokacmuxClient {
             report.skipped_unverified = report.skipped_unverified.saturating_add(1);
             continue;
         }
-        terminate_process_group(pid);
+        if !terminate_process_group_if_start_token_matches(pid, start_ticks, "reset_client_process")
+        {
+            report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+            continue;
+        }
         if process_is_alive(pid) {
             report.errors = report.errors.saturating_add(1);
         } else {
@@ -29129,11 +31000,30 @@ fn terminate_cokacmux_daemon_pids_for_reset(
         if !process_is_alive(pid) {
             continue;
         }
+        let start_ticks = process_start_ticks(pid);
+        if start_ticks.is_none() {
+            report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+            debug_log(
+                "reset_daemon_termination_unverified_skipped",
+                serde_json::json!({
+                    "pid": pid,
+                    "reason": "missing_start_token",
+                }),
+            );
+            continue;
+        }
         if !agent_daemon_process_has_agent_arg(pid) {
             report.skipped_unverified = report.skipped_unverified.saturating_add(1);
             continue;
         }
-        terminate_process_group(pid);
+        if !terminate_process_group_if_start_token_matches(
+            pid,
+            start_ticks,
+            "reset_untracked_daemon",
+        ) {
+            report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+            continue;
+        }
         if process_is_alive(pid) {
             report.errors = report.errors.saturating_add(1);
         } else {
@@ -29232,8 +31122,30 @@ fn os_cokacmux_client_pids_for_reset(current_pid: u32) -> Vec<u32> {
         .collect()
 }
 
+fn possible_agent_daemon_meta_from_os_process(key: &AgentKey) -> Option<AgentMetaSnapshot> {
+    os_cokacmux_daemon_pids(std::process::id())
+        .into_iter()
+        .find(|pid| {
+            process_is_alive(*pid)
+                && agent_daemon_process_identity(*pid, key)
+                    == AgentDaemonProcessIdentity::CokacmuxDaemon
+        })
+        .map(|pid| agent_daemon_meta_snapshot_from_os_pid(pid, key))
+}
+
+fn agent_daemon_meta_snapshot_from_os_pid(pid: u32, key: &AgentKey) -> AgentMetaSnapshot {
+    AgentMetaSnapshot {
+        pid,
+        pid_start_ticks: process_start_ticks(pid),
+        provider: Some(key.provider.as_str().to_string()),
+        session_id: Some(key.session_id.clone()),
+        updated_at_epoch_s: current_epoch_s(),
+        ..Default::default()
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn os_cokacmux_daemon_pids_for_reset(current_pid: u32) -> Vec<u32> {
+fn os_cokacmux_daemon_pids(current_pid: u32) -> Vec<u32> {
     let Ok(read_dir) = fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -29250,7 +31162,7 @@ fn os_cokacmux_daemon_pids_for_reset(current_pid: u32) -> Vec<u32> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn os_cokacmux_daemon_pids_for_reset(current_pid: u32) -> Vec<u32> {
+fn os_cokacmux_daemon_pids(current_pid: u32) -> Vec<u32> {
     let output = Command::new("ps")
         .args(["-axo", "pid="])
         .stdin(Stdio::null())
@@ -29270,7 +31182,7 @@ fn os_cokacmux_daemon_pids_for_reset(current_pid: u32) -> Vec<u32> {
 }
 
 #[cfg(windows)]
-fn os_cokacmux_daemon_pids_for_reset(current_pid: u32) -> Vec<u32> {
+fn os_cokacmux_daemon_pids(current_pid: u32) -> Vec<u32> {
     windows_process_command_lines_for_reset()
         .into_iter()
         .filter(|(pid, _)| *pid != current_pid)
@@ -29284,6 +31196,103 @@ fn os_cokacmux_daemon_pids_for_reset(current_pid: u32) -> Vec<u32> {
 
 #[cfg(windows)]
 fn windows_process_command_lines_for_reset() -> Vec<(u32, String)> {
+    let direct = windows_process_command_lines_direct("windows_process_scan_direct");
+    if !direct.is_empty() {
+        debug_log(
+            "windows_process_scan_direct",
+            serde_json::json!({
+                "count": direct.len(),
+            }),
+        );
+        return direct;
+    }
+    debug_log(
+        "windows_process_scan_direct_empty_fallback",
+        serde_json::json!({
+            "fallback": "powershell_cim",
+        }),
+    );
+    windows_process_command_lines_from_powershell()
+}
+
+#[cfg(windows)]
+fn windows_process_command_lines_direct(event: &'static str) -> Vec<(u32, String)> {
+    let Some(pids) = windows_process_ids_from_toolhelp(event) else {
+        return Vec::new();
+    };
+    pids.into_iter()
+        .filter_map(|pid| windows_process_command_line_direct(pid, event).map(|line| (pid, line)))
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_process_ids_from_toolhelp(event: &'static str) -> Option<Vec<u32>> {
+    #[repr(C)]
+    struct ProcessEntry32W {
+        size: u32,
+        usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        threads: u32,
+        parent_process_id: u32,
+        pri_class_base: i32,
+        flags: u32,
+        exe_file: [u16; 260],
+    }
+
+    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+    const INVALID_HANDLE_VALUE: WinHandle = (-1isize) as WinHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> WinHandle;
+        fn Process32FirstW(hSnapshot: WinHandle, lppe: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(hSnapshot: WinHandle, lppe: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(hObject: WinHandle) -> i32;
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
+        let error = io::Error::last_os_error();
+        debug_log(
+            "windows_process_snapshot_failed",
+            serde_json::json!({
+                "event": event,
+                "raw_os_error": error.raw_os_error(),
+                "error": error.to_string(),
+            }),
+        );
+        return None;
+    }
+
+    let mut entry = ProcessEntry32W {
+        size: std::mem::size_of::<ProcessEntry32W>() as u32,
+        usage: 0,
+        process_id: 0,
+        default_heap_id: 0,
+        module_id: 0,
+        threads: 0,
+        parent_process_id: 0,
+        pri_class_base: 0,
+        flags: 0,
+        exe_file: [0; 260],
+    };
+    let mut pids = Vec::new();
+    unsafe {
+        let mut ok = Process32FirstW(snapshot, &mut entry);
+        while ok != 0 {
+            pids.push(entry.process_id);
+            entry.size = std::mem::size_of::<ProcessEntry32W>() as u32;
+            ok = Process32NextW(snapshot, &mut entry);
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    Some(pids)
+}
+
+#[cfg(windows)]
+fn windows_process_command_lines_from_powershell() -> Vec<(u32, String)> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct WindowsProcessInfo {
@@ -29344,18 +31353,7 @@ struct ResetConfigRemoval {
 }
 
 fn remove_cokacmux_path_for_cleanup(path: &Path) -> io::Result<ResetConfigRemoval> {
-    match remove_cokacmux_path_once(path) {
-        Ok(result) => Ok(result),
-        Err(first_error) => {
-            thread::sleep(Duration::from_millis(300));
-            remove_cokacmux_path_once(path).map_err(|second_error| {
-                io::Error::new(
-                    second_error.kind(),
-                    format!("{}; retry failed: {}", first_error, second_error),
-                )
-            })
-        }
-    }
+    remove_cokacmux_path_once(path)
 }
 
 fn remove_cokacmux_path_once(path: &Path) -> io::Result<ResetConfigRemoval> {
@@ -29400,6 +31398,7 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
         }),
     );
     let mut report = KillAllAgentsReport::default();
+    let mut preserved_unverified_stems = HashSet::new();
     for entry in read_dir.flatten() {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
@@ -29456,14 +31455,51 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
         let is_current_process_meta = meta.pid == current_pid;
         if !process_is_alive(meta.pid) {
             report.stale = report.stale.saturating_add(1);
-            if let Some(key) = agent_key_from_meta(&meta).filter(|key| agent_file_stem(key) == stem)
-            {
+            let key = agent_key_from_meta(&meta).filter(|key| agent_file_stem(key) == stem);
+            let child_liveness = agent_meta_child_pid_liveness(&meta);
+            let mut child_terminated = false;
+            if agent_runtime_stem_has_reachable_daemon(runtime_dir, stem) {
+                report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+                preserved_unverified_stems.insert(stem.to_string());
+                debug_log(
+                    "killall_stale_meta_reachable_daemon_preserved",
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "stem": stem,
+                        "key": key.as_ref().map(agent_key_debug_value),
+                        "daemon_pid": meta.pid,
+                        "child_pid": meta.child_pid,
+                        "reason": "stale_meta_has_reachable_daemon_socket",
+                    }),
+                );
+                continue;
+            }
+            if let Some(key) = key.as_ref() {
                 if terminate_agent_meta_child_process(&meta, &key, "killall_stale_daemon_cleanup")
                     .is_some()
                 {
+                    child_terminated = true;
                     report.child_processes_terminated =
                         report.child_processes_terminated.saturating_add(1);
                 }
+            }
+            if !child_terminated && child_liveness.is_some() {
+                report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+                preserved_unverified_stems.insert(stem.to_string());
+                debug_log(
+                    "killall_stale_child_unverified_preserved",
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "stem": stem,
+                        "key": key.as_ref().map(agent_key_debug_value),
+                        "daemon_pid": meta.pid,
+                        "child_pid": meta.child_pid,
+                        "child_pid_start_ticks": meta.child_pid_start_ticks,
+                        "child_liveness": child_liveness.map(|liveness| liveness.label()),
+                        "reason": "stale_daemon_child_not_verified_for_termination",
+                    }),
+                );
+                continue;
             }
             if remove_agent_runtime_files_by_stem(runtime_dir, stem, "killall_stale_daemon_cleanup")
             {
@@ -29479,14 +31515,10 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             continue;
         }
         let Some(key) = agent_key_from_meta(&meta) else {
-            report.stale = report.stale.saturating_add(1);
-            let _ = remove_agent_runtime_files_by_stem(
-                runtime_dir,
-                stem,
-                "killall_missing_key_cleanup",
-            );
+            report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+            preserved_unverified_stems.insert(stem.to_string());
             debug_log(
-                "killall_agent_unverified",
+                "killall_agent_unverified_preserved",
                 serde_json::json!({
                     "path": path.display().to_string(),
                     "daemon_pid": meta.pid,
@@ -29496,37 +31528,18 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             continue;
         };
         let stem_matches_key = agent_file_stem(&key) == stem;
-        if !stem_matches_key || !verify_agent_daemon_identity(&key, meta.pid) {
-            report.stale = report.stale.saturating_add(1);
-            let child_process_terminated = if stem_matches_key {
-                terminate_agent_meta_child_process(&meta, &key, "killall_identity_failed_cleanup")
-            } else {
-                None
-            };
-            if child_process_terminated.is_some() {
-                report.child_processes_terminated =
-                    report.child_processes_terminated.saturating_add(1);
-            }
-            let _ = remove_agent_runtime_files_by_stem(
-                runtime_dir,
-                stem,
-                "killall_identity_failed_cleanup",
-            );
-            if let Some(info) = session_info_from_agent_meta_snapshot(&meta) {
-                let _ = remove_coding_agent_cwd_lock_for_info(
-                    &info,
-                    "killall_identity_failed_cleanup",
-                    CODING_AGENT_CWD_LOCK_OWNER_AGENT,
-                );
-            }
+        if !stem_matches_key || !verify_agent_daemon_meta_identity(&key, &meta) {
+            report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+            preserved_unverified_stems.insert(stem.to_string());
             debug_log(
-                "killall_agent_unverified",
+                "killall_agent_unverified_preserved",
                 serde_json::json!({
                     "path": path.display().to_string(),
                     "daemon_pid": meta.pid,
                     "provider": meta.provider.as_deref(),
                     "session_id": meta.session_id.as_deref(),
-                    "child_pid": child_process_terminated,
+                    "child_pid": meta.child_pid,
+                    "stem_matches_key": stem_matches_key,
                     "reason": "identity_check_failed",
                 }),
             );
@@ -29536,13 +31549,37 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             report.skipped_self = report.skipped_self.saturating_add(1);
             continue;
         }
+        if !process_start_token_still_matches(meta.pid, meta.pid_start_ticks) {
+            report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+            preserved_unverified_stems.insert(stem.to_string());
+            debug_log(
+                "killall_agent_unverified_preserved",
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "daemon_pid": meta.pid,
+                    "provider": meta.provider.as_deref(),
+                    "session_id": meta.session_id.as_deref(),
+                    "daemon_pid_start_ticks": meta.pid_start_ticks,
+                    "reason": "daemon_start_token_changed_before_termination",
+                }),
+            );
+            continue;
+        }
 
         let terminated_child_pid =
             terminate_agent_meta_child_process(&meta, &key, "killall_killed_cleanup");
         if terminated_child_pid.is_some() {
             report.child_processes_terminated = report.child_processes_terminated.saturating_add(1);
         }
-        terminate_process_group(meta.pid);
+        if !terminate_process_group_if_start_token_matches(
+            meta.pid,
+            meta.pid_start_ticks,
+            "killall_agent_daemon",
+        ) {
+            report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+            preserved_unverified_stems.insert(stem.to_string());
+            continue;
+        }
         if process_is_alive(meta.pid) {
             report.errors = report.errors.saturating_add(1);
             debug_log(
@@ -29576,7 +31613,15 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             }),
         );
     }
-    let sweep = cleanup_stale_agent_runtime_files_at(runtime_dir, "killall_stale_runtime_sweep");
+    let sweep = if preserved_unverified_stems.is_empty() {
+        cleanup_stale_agent_runtime_files_at(runtime_dir, "killall_stale_runtime_sweep")
+    } else {
+        cleanup_stale_agent_runtime_files_at_except(
+            runtime_dir,
+            "killall_stale_runtime_sweep",
+            &preserved_unverified_stems,
+        )
+    };
     report.runtime_files_removed = report
         .runtime_files_removed
         .saturating_add(sweep.runtime_files_removed);
@@ -29597,6 +31642,7 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             "scanned": report.scanned,
             "killed": report.killed,
             "stale": report.stale,
+            "skipped_unverified": report.skipped_unverified,
             "skipped_self": report.skipped_self,
             "errors": report.errors,
             "child_processes_terminated": report.child_processes_terminated,
@@ -29609,6 +31655,15 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
 }
 
 fn remove_agent_runtime_files_by_stem(runtime_dir: &Path, stem: &str, reason: &str) -> bool {
+    remove_agent_runtime_files_by_stem_with_policy(runtime_dir, stem, reason, false)
+}
+
+fn remove_agent_runtime_files_by_stem_with_policy(
+    runtime_dir: &Path,
+    stem: &str,
+    reason: &str,
+    preserve_pty_log: bool,
+) -> bool {
     let meta_removed = remove_agent_runtime_file_logged(
         reason,
         None,
@@ -29623,7 +31678,12 @@ fn remove_agent_runtime_files_by_stem(runtime_dir: &Path, stem: &str, reason: &s
         "socket",
         &runtime_dir.join(format!("{}.sock", stem)),
     );
-    let pty_log_deleted = remove_agent_runtime_extra_files_by_stem(runtime_dir, stem, reason);
+    let pty_log_deleted = remove_agent_runtime_extra_files_by_stem_with_policy(
+        runtime_dir,
+        stem,
+        reason,
+        preserve_pty_log,
+    );
     debug_log(
         "agent_runtime_files_by_stem_remove_done",
         serde_json::json!({
@@ -29633,12 +31693,17 @@ fn remove_agent_runtime_files_by_stem(runtime_dir: &Path, stem: &str, reason: &s
             "meta_removed": meta_removed,
             "socket_removed": socket_removed,
             "pty_log_deleted": pty_log_deleted,
+            "pty_log_preserved": preserve_pty_log,
         }),
     );
     pty_log_deleted
 }
 
-fn remove_agent_runtime_extra_files_for_meta_path(meta_path: &Path, reason: &str) -> bool {
+fn remove_agent_runtime_extra_files_for_meta_path_with_policy(
+    meta_path: &Path,
+    reason: &str,
+    preserve_pty_log: bool,
+) -> bool {
     let Some(runtime_dir) = meta_path.parent() else {
         debug_log(
             "agent_runtime_extra_files_remove_skipped",
@@ -29662,10 +31727,20 @@ fn remove_agent_runtime_extra_files_for_meta_path(meta_path: &Path, reason: &str
         );
         return false;
     };
-    remove_agent_runtime_extra_files_by_stem(runtime_dir, stem, reason)
+    remove_agent_runtime_extra_files_by_stem_with_policy(
+        runtime_dir,
+        stem,
+        reason,
+        preserve_pty_log,
+    )
 }
 
-fn remove_agent_runtime_extra_files_by_stem(runtime_dir: &Path, stem: &str, reason: &str) -> bool {
+fn remove_agent_runtime_extra_files_by_stem_with_policy(
+    runtime_dir: &Path,
+    stem: &str,
+    reason: &str,
+    preserve_pty_log: bool,
+) -> bool {
     let tcp_marker_removed = remove_agent_runtime_file_logged(
         reason,
         None,
@@ -29673,15 +31748,23 @@ fn remove_agent_runtime_extra_files_by_stem(runtime_dir: &Path, stem: &str, reas
         "tcp_marker",
         &runtime_dir.join(format!("{}.tcp", stem)),
     );
-    let pty_log_deleted = remove_agent_runtime_file_logged(
-        reason,
-        None,
-        Some(stem),
-        "pty_log",
-        &runtime_dir
-            .join("scrollback")
-            .join(format!("{}.ptylog", stem)),
-    );
+    let pty_log_path = runtime_dir
+        .join("scrollback")
+        .join(format!("{}.ptylog", stem));
+    let pty_log_deleted = if preserve_pty_log {
+        debug_log(
+            "agent_runtime_extra_files_keep_pty_log",
+            serde_json::json!({
+                "reason": reason,
+                "runtime_dir": runtime_dir.display().to_string(),
+                "stem": stem,
+                "path": pty_log_path.display().to_string(),
+            }),
+        );
+        false
+    } else {
+        remove_agent_runtime_file_logged(reason, None, Some(stem), "pty_log", &pty_log_path)
+    };
     debug_log(
         "agent_runtime_extra_files_remove_done",
         serde_json::json!({
@@ -29690,6 +31773,7 @@ fn remove_agent_runtime_extra_files_by_stem(runtime_dir: &Path, stem: &str, reas
             "stem": stem,
             "tcp_marker_removed": tcp_marker_removed,
             "pty_log_deleted": pty_log_deleted,
+            "pty_log_preserved": preserve_pty_log,
         }),
     );
     pty_log_deleted
@@ -29731,32 +31815,94 @@ fn terminate_agent_daemon_with_info(
     let mut daemon_identity = None;
     let mut daemon_verified = false;
     let mut meta_key = None;
+    let mut skipped_unverified = false;
+    let mut preserve_runtime_files = false;
     if let Some(meta) = meta.as_ref() {
         meta_key = agent_key_from_meta(meta);
         let daemon_alive = process_is_alive(meta.pid);
         daemon_identity = daemon_alive.then(|| agent_daemon_process_identity(meta.pid, key));
-        daemon_verified = daemon_identity == Some(AgentDaemonProcessIdentity::CokacmuxDaemon);
+        daemon_verified = daemon_identity.is_some_and(|identity| {
+            agent_daemon_identity_matches_meta_without_runtime(meta, identity)
+        });
         if daemon_alive && daemon_verified {
-            let pid = meta.pid;
-            terminated_child_pid =
-                terminate_agent_meta_child_process(meta, key, "terminate_agent_cleanup");
-            terminate_process_group(pid);
-            debug_log(
-                "kill_agent_processes",
-                serde_json::json!({
-                    "provider": key.provider.as_str(),
-                    "session_id": &key.session_id,
-                    "daemon_pid": pid,
-                    "child_pid": terminated_child_pid,
-                }),
-            );
-            terminated_pid = Some(pid);
+            if !process_start_token_still_matches(meta.pid, meta.pid_start_ticks) {
+                skipped_unverified = true;
+                preserve_runtime_files = true;
+                debug_log(
+                    "terminate_agent_unverified_runtime_preserved",
+                    serde_json::json!({
+                        "key": agent_key_debug_value(key),
+                        "expected_info": expected_info.map(session_info_debug_value),
+                        "daemon_pid": meta.pid,
+                        "daemon_pid_start_ticks": meta.pid_start_ticks,
+                        "daemon_identity": daemon_identity.map(|identity| format!("{:?}", identity)),
+                        "reason": "daemon_start_token_changed_before_termination",
+                    }),
+                );
+            } else {
+                let pid = meta.pid;
+                terminated_child_pid =
+                    terminate_agent_meta_child_process(meta, key, "terminate_agent_cleanup");
+                if !terminate_process_group_if_start_token_matches(
+                    pid,
+                    meta.pid_start_ticks,
+                    "terminate_agent_daemon",
+                ) {
+                    skipped_unverified = true;
+                    preserve_runtime_files = true;
+                    debug_log(
+                        "terminate_agent_unverified_runtime_preserved",
+                        serde_json::json!({
+                            "key": agent_key_debug_value(key),
+                            "expected_info": expected_info.map(session_info_debug_value),
+                            "daemon_pid": meta.pid,
+                            "daemon_pid_start_ticks": meta.pid_start_ticks,
+                            "daemon_identity": daemon_identity.map(|identity| format!("{:?}", identity)),
+                            "reason": "daemon_start_token_changed_during_termination",
+                        }),
+                    );
+                } else {
+                    debug_log(
+                        "kill_agent_processes",
+                        serde_json::json!({
+                            "provider": key.provider.as_str(),
+                            "session_id": &key.session_id,
+                            "daemon_pid": pid,
+                            "child_pid": terminated_child_pid,
+                        }),
+                    );
+                    terminated_pid = Some(pid);
+                }
+            }
         } else if meta_key.as_ref() == Some(key) {
+            let child_liveness = agent_meta_child_pid_liveness(meta);
             terminated_child_pid = terminate_agent_meta_child_process(
                 meta,
                 key,
                 "terminate_agent_stale_child_cleanup",
             );
+            let possible_live_daemon = daemon_alive
+                && daemon_identity != Some(AgentDaemonProcessIdentity::Other)
+                && agent_meta_daemon_pid_matches(meta);
+            if terminated_child_pid.is_none() && (child_liveness.is_some() || possible_live_daemon)
+            {
+                skipped_unverified = true;
+                preserve_runtime_files = true;
+                debug_log(
+                    "terminate_agent_unverified_runtime_preserved",
+                    serde_json::json!({
+                        "key": agent_key_debug_value(key),
+                        "expected_info": expected_info.map(session_info_debug_value),
+                        "daemon_pid": meta.pid,
+                        "daemon_alive": daemon_alive,
+                        "daemon_identity": daemon_identity.map(|identity| format!("{:?}", identity)),
+                        "daemon_verified": daemon_verified,
+                        "daemon_pid_matches": agent_meta_daemon_pid_matches(meta),
+                        "child_pid": meta.child_pid,
+                        "child_liveness": child_liveness.map(|liveness| liveness.label()),
+                    }),
+                );
+            }
         } else if meta.pid > 0 {
             debug_log(
                 "kill_agent_unverified",
@@ -29771,39 +31917,53 @@ fn terminate_agent_daemon_with_info(
             );
         }
     }
-    let _ = remove_agent_runtime_file_logged(
-        "terminate_agent_cleanup",
-        Some(key),
-        None,
-        "meta",
-        &meta_path,
-    );
-    let _ = remove_agent_runtime_file_logged(
-        "terminate_agent_cleanup",
-        Some(key),
-        None,
-        "socket",
-        &socket_path,
-    );
     let mut cwd_lock_removed = false;
-    if let Some(info) = meta
-        .as_ref()
-        .and_then(session_info_from_agent_meta_snapshot)
-    {
-        cwd_lock_removed |= remove_coding_agent_cwd_lock_for_info(
-            &info,
+    let pty_log_deleted = if preserve_runtime_files {
+        debug_log(
+            "terminate_agent_runtime_files_preserved",
+            serde_json::json!({
+                "key": agent_key_debug_value(key),
+                "expected_info": expected_info.map(session_info_debug_value),
+                "meta_path": meta_path.display().to_string(),
+                "socket_path": socket_path.display().to_string(),
+                "reason": "unverified_live_process",
+            }),
+        );
+        false
+    } else {
+        let _ = remove_agent_runtime_file_logged(
             "terminate_agent_cleanup",
-            CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            Some(key),
+            None,
+            "meta",
+            &meta_path,
         );
-    }
-    if let Some(info) = expected_info {
-        cwd_lock_removed |= remove_coding_agent_cwd_lock_for_info(
-            info,
-            "terminate_agent_cleanup_expected_info",
-            CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+        let _ = remove_agent_runtime_file_logged(
+            "terminate_agent_cleanup",
+            Some(key),
+            None,
+            "socket",
+            &socket_path,
         );
-    }
-    let pty_log_deleted = remove_agent_pty_log(key);
+        if let Some(info) = meta
+            .as_ref()
+            .and_then(session_info_from_agent_meta_snapshot)
+        {
+            cwd_lock_removed |= remove_coding_agent_cwd_lock_for_info(
+                &info,
+                "terminate_agent_cleanup",
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            );
+        }
+        if let Some(info) = expected_info {
+            cwd_lock_removed |= remove_coding_agent_cwd_lock_for_info(
+                info,
+                "terminate_agent_cleanup_expected_info",
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            );
+        }
+        remove_agent_pty_log(key)
+    };
     if cwd_lock_removed {
         debug_log(
             "kill_agent_cwd_lock_removed",
@@ -29825,6 +31985,8 @@ fn terminate_agent_daemon_with_info(
             "daemon_verified": daemon_verified,
             "terminated_pid": terminated_pid,
             "terminated_child_pid": terminated_child_pid,
+            "skipped_unverified": skipped_unverified,
+            "runtime_files_preserved": preserve_runtime_files,
             "cwd_lock_removed": cwd_lock_removed,
             "pty_log_deleted": pty_log_deleted,
             "meta_exists_after": meta_path.exists(),
@@ -29835,54 +31997,26 @@ fn terminate_agent_daemon_with_info(
         pid: terminated_pid,
         child_pid: terminated_child_pid,
         pty_log_deleted,
+        skipped_unverified,
     })
 }
 
-fn terminate_agent_child_process(
-    child_pid: Option<u32>,
-    daemon_pid: u32,
-    key: &AgentKey,
-) -> Option<u32> {
-    let child_pid = child_pid?;
-    if child_pid == 0 || child_pid == daemon_pid || !process_is_alive(child_pid) {
-        return None;
-    }
-    debug_log(
-        "kill_agent_child_process",
-        serde_json::json!({
-            "provider": key.provider.as_str(),
-            "session_id": &key.session_id,
-            "daemon_pid": daemon_pid,
-            "child_pid": child_pid,
-        }),
-    );
-    terminate_process_group(child_pid);
-    debug_log(
-        "kill_agent_child_process_done",
-        serde_json::json!({
-            "provider": key.provider.as_str(),
-            "session_id": &key.session_id,
-            "daemon_pid": daemon_pid,
-            "child_pid": child_pid,
-            "child_alive_after": process_is_alive(child_pid),
-        }),
-    );
-    Some(child_pid)
-}
-
-fn verify_agent_daemon_identity(key: &AgentKey, expected_pid: u32) -> bool {
-    if expected_pid == 0 || !process_is_alive(expected_pid) {
+fn verify_agent_daemon_meta_identity(key: &AgentKey, meta: &AgentMetaSnapshot) -> bool {
+    if meta.pid == 0 || !process_is_alive(meta.pid) {
         return false;
     }
-    let identity = agent_daemon_process_identity(expected_pid, key);
-    let verified = identity == AgentDaemonProcessIdentity::CokacmuxDaemon;
+    let identity = agent_daemon_process_identity(meta.pid, key);
+    let start_token_matches = agent_meta_daemon_pid_start_token_matches(meta);
+    let verified = agent_daemon_identity_matches_meta_without_runtime(meta, identity);
     if !verified {
         debug_log(
-            "agent_daemon_identity_cmdline_failed",
+            "agent_daemon_meta_identity_failed",
             serde_json::json!({
                 "provider": key.provider.as_str(),
                 "session_id": &key.session_id,
-                "daemon_pid": expected_pid,
+                "daemon_pid": meta.pid,
+                "daemon_pid_start_ticks": meta.pid_start_ticks,
+                "daemon_pid_start_token_matches": start_token_matches,
                 "identity": format!("{:?}", identity),
             }),
         );
@@ -29917,7 +32051,14 @@ fn agent_client_process_identity(pid: u32) -> AgentClientProcessIdentity {
     agent_client_args_identity(&args)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn agent_client_process_identity(pid: u32) -> AgentClientProcessIdentity {
+    macos_process_args(pid)
+        .map(|args| agent_client_args_identity(&args))
+        .unwrap_or(AgentClientProcessIdentity::Unknown)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn agent_client_process_identity(pid: u32) -> AgentClientProcessIdentity {
     Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
@@ -30005,6 +32146,255 @@ fn windows_powershell_output(command: &str, event: &'static str) -> Option<std::
 
 #[cfg(windows)]
 fn windows_process_command_line(pid: u32, event: &'static str) -> Option<String> {
+    if let Some(command_line) = windows_process_command_line_direct(pid, event) {
+        return Some(command_line);
+    }
+    windows_process_command_line_from_powershell(pid, event)
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WindowsProcessBasicInformation {
+    reserved1: WinHandle,
+    peb_base_address: *mut WindowsPeb,
+    reserved2: [WinHandle; 2],
+    unique_process_id: usize,
+    reserved3: WinHandle,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WindowsPeb {
+    reserved1: [u8; 2],
+    being_debugged: u8,
+    reserved2: [u8; 1],
+    reserved3: [WinHandle; 2],
+    ldr: WinHandle,
+    process_parameters: *mut WindowsRtlUserProcessParameters,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WindowsUnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WindowsRtlUserProcessParameters {
+    reserved1: [u8; 16],
+    reserved2: [WinHandle; 10],
+    image_path_name: WindowsUnicodeString,
+    command_line: WindowsUnicodeString,
+}
+
+#[cfg(windows)]
+fn windows_process_command_line_direct(pid: u32, event: &'static str) -> Option<String> {
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const PROCESS_VM_READ: u32 = 0x0010;
+    const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
+    const MAX_COMMAND_LINE_BYTES: usize = 64 * 1024;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> WinHandle;
+        fn ReadProcessMemory(
+            hProcess: WinHandle,
+            lpBaseAddress: *const std::ffi::c_void,
+            lpBuffer: *mut std::ffi::c_void,
+            nSize: usize,
+            lpNumberOfBytesRead: *mut usize,
+        ) -> i32;
+        fn CloseHandle(hObject: WinHandle) -> i32;
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            ProcessHandle: WinHandle,
+            ProcessInformationClass: u32,
+            ProcessInformation: *mut std::ffi::c_void,
+            ProcessInformationLength: u32,
+            ReturnLength: *mut u32,
+        ) -> i32;
+    }
+
+    if pid == 0 {
+        return None;
+    }
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+        trace_log(
+            "windows_process_command_line_direct_open_failed",
+            serde_json::json!({
+                "event": event,
+                "pid": pid,
+                "raw_os_error": error.raw_os_error(),
+                "error": error.to_string(),
+            }),
+        );
+        return None;
+    }
+
+    let result = (|| {
+        let mut info = std::mem::MaybeUninit::<WindowsProcessBasicInformation>::zeroed();
+        let mut return_len = 0u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                PROCESS_BASIC_INFORMATION_CLASS,
+                info.as_mut_ptr().cast(),
+                std::mem::size_of::<WindowsProcessBasicInformation>() as u32,
+                &mut return_len,
+            )
+        };
+        if status < 0 {
+            trace_log(
+                "windows_process_command_line_direct_basic_info_failed",
+                serde_json::json!({
+                    "event": event,
+                    "pid": pid,
+                    "status": status,
+                    "return_len": return_len,
+                }),
+            );
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        let peb = windows_read_remote_struct::<WindowsPeb>(
+            handle,
+            info.peb_base_address.cast(),
+            pid,
+            event,
+            "peb",
+        )?;
+        let params = windows_read_remote_struct::<WindowsRtlUserProcessParameters>(
+            handle,
+            peb.process_parameters.cast(),
+            pid,
+            event,
+            "process_parameters",
+        )?;
+        let command = params.command_line;
+        if command.length == 0 || command.buffer.is_null() {
+            return None;
+        }
+        let byte_len = usize::from(command.length);
+        if byte_len % 2 != 0 || byte_len > MAX_COMMAND_LINE_BYTES {
+            debug_log(
+                "windows_process_command_line_direct_invalid_length",
+                serde_json::json!({
+                    "event": event,
+                    "pid": pid,
+                    "length": command.length,
+                    "maximum_length": command.maximum_length,
+                }),
+            );
+            return None;
+        }
+        let mut buffer = vec![0u16; byte_len / 2];
+        let mut bytes_read = 0usize;
+        let ok = unsafe {
+            ReadProcessMemory(
+                handle,
+                command.buffer.cast(),
+                buffer.as_mut_ptr().cast(),
+                byte_len,
+                &mut bytes_read,
+            )
+        };
+        if ok == 0 || bytes_read != byte_len {
+            let error = io::Error::last_os_error();
+            trace_log(
+                "windows_process_command_line_direct_read_failed",
+                serde_json::json!({
+                    "event": event,
+                    "pid": pid,
+                    "raw_os_error": error.raw_os_error(),
+                    "error": error.to_string(),
+                    "expected_bytes": byte_len,
+                    "bytes_read": bytes_read,
+                }),
+            );
+            return None;
+        }
+        Some(OsString::from_wide(&buffer).to_string_lossy().into_owned())
+    })();
+
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn windows_read_remote_struct<T: Copy>(
+    handle: WinHandle,
+    address: *const T,
+    pid: u32,
+    event: &'static str,
+    label: &'static str,
+) -> Option<T> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReadProcessMemory(
+            hProcess: WinHandle,
+            lpBaseAddress: *const std::ffi::c_void,
+            lpBuffer: *mut std::ffi::c_void,
+            nSize: usize,
+            lpNumberOfBytesRead: *mut usize,
+        ) -> i32;
+    }
+
+    if address.is_null() {
+        return None;
+    }
+    let mut value = std::mem::MaybeUninit::<T>::uninit();
+    let mut bytes_read = 0usize;
+    let expected = std::mem::size_of::<T>();
+    let ok = unsafe {
+        ReadProcessMemory(
+            handle,
+            address.cast(),
+            value.as_mut_ptr().cast(),
+            expected,
+            &mut bytes_read,
+        )
+    };
+    if ok == 0 || bytes_read != expected {
+        let error = io::Error::last_os_error();
+        trace_log(
+            "windows_process_remote_struct_read_failed",
+            serde_json::json!({
+                "event": event,
+                "pid": pid,
+                "label": label,
+                "raw_os_error": error.raw_os_error(),
+                "error": error.to_string(),
+                "expected_bytes": expected,
+                "bytes_read": bytes_read,
+            }),
+        );
+        return None;
+    }
+    Some(unsafe { value.assume_init() })
+}
+
+#[cfg(windows)]
+fn windows_process_command_line_from_powershell(pid: u32, event: &'static str) -> Option<String> {
     let command = format!(
         "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {}\"; if ($p) {{ $p.CommandLine }}",
         pid
@@ -30045,7 +32435,12 @@ fn agent_daemon_process_has_agent_arg(pid: u32) -> bool {
     agent_daemon_args_have_agent_arg(&args)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn agent_daemon_process_has_agent_arg(pid: u32) -> bool {
+    macos_process_args(pid).is_some_and(|args| agent_daemon_args_have_agent_arg(&args))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn agent_daemon_process_has_agent_arg(pid: u32) -> bool {
     Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
@@ -30077,7 +32472,14 @@ fn agent_daemon_process_identity(pid: u32, key: &AgentKey) -> AgentDaemonProcess
     agent_daemon_args_identity(&args, key)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn agent_daemon_process_identity(pid: u32, key: &AgentKey) -> AgentDaemonProcessIdentity {
+    macos_process_args(pid)
+        .map(|args| agent_daemon_args_identity(&args, key))
+        .unwrap_or(AgentDaemonProcessIdentity::Unknown)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn agent_daemon_process_identity(pid: u32, key: &AgentKey) -> AgentDaemonProcessIdentity {
     Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
@@ -30134,15 +32536,9 @@ fn agent_daemon_args_identity(args: &[String], key: &AgentKey) -> AgentDaemonPro
     if !program_looks_like_current_app(program) {
         return AgentDaemonProcessIdentity::Other;
     }
-    let Some(pos) = args.iter().position(|arg| arg == AGENT_DAEMON_ARG) else {
-        return AgentDaemonProcessIdentity::Other;
-    };
-    if args.get(pos + 1).map(String::as_str) == Some(key.provider.as_str())
-        && args.get(pos + 2).map(String::as_str) == Some(key.session_id.as_str())
-    {
-        AgentDaemonProcessIdentity::CokacmuxDaemon
-    } else {
-        AgentDaemonProcessIdentity::Other
+    match agent_daemon_key_from_args(args) {
+        Some(candidate) if candidate == *key => AgentDaemonProcessIdentity::CokacmuxDaemon,
+        _ => AgentDaemonProcessIdentity::Other,
     }
 }
 
@@ -30158,10 +32554,26 @@ fn agent_client_args_identity(args: &[String]) -> AgentClientProcessIdentity {
 }
 
 fn agent_daemon_args_have_agent_arg(args: &[String]) -> bool {
+    agent_daemon_key_from_args(args).is_some()
+}
+
+fn agent_daemon_key_from_args(args: &[String]) -> Option<AgentKey> {
     let Some(program) = args.first() else {
-        return false;
+        return None;
     };
-    program_looks_like_current_app(program) && args.iter().any(|arg| arg == AGENT_DAEMON_ARG)
+    if !program_looks_like_current_app(program) {
+        return None;
+    }
+    let pos = args.iter().position(|arg| arg == AGENT_DAEMON_ARG)?;
+    let provider = Provider::parse(args.get(pos + 1)?.as_str())?;
+    let session_id = args.get(pos + 2)?.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    Some(AgentKey {
+        provider,
+        session_id: session_id.to_string(),
+    })
 }
 
 #[cfg(windows)]
@@ -30224,7 +32636,7 @@ fn windows_command_line_to_args(command: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn process_command_string_agent_daemon_identity(
     command: &str,
     key: &AgentKey,
@@ -30234,14 +32646,14 @@ fn process_command_string_agent_daemon_identity(
         .unwrap_or(AgentDaemonProcessIdentity::Unknown)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn process_command_string_agent_client_identity(command: &str) -> AgentClientProcessIdentity {
     command_string_to_args(command)
         .map(|args| agent_client_args_identity(&args))
         .unwrap_or(AgentClientProcessIdentity::Unknown)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn command_string_to_args(command: &str) -> Option<Vec<String>> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -30269,6 +32681,87 @@ fn command_string_to_args(command: &str) -> Option<Vec<String>> {
     }
     if !current.is_empty() {
         args.push(current);
+    }
+    Some(args)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_args(pid: u32) -> Option<Vec<String>> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+    if arg_max <= 0 {
+        return None;
+    }
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut buffer = vec![0u8; arg_max as usize];
+    let mut size = buffer.len();
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buffer.as_mut_ptr().cast::<libc::c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        debug_log(
+            "macos_process_args_probe_failed",
+            serde_json::json!({
+                "pid": pid,
+                "raw_os_error": error.raw_os_error(),
+                "error": error.to_string(),
+            }),
+        );
+        return None;
+    }
+    buffer.truncate(size);
+    parse_macos_kern_procargs2(&buffer)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_kern_procargs2(buffer: &[u8]) -> Option<Vec<String>> {
+    let argc_size = std::mem::size_of::<libc::c_int>();
+    if buffer.len() < argc_size {
+        return None;
+    }
+    let mut argc_bytes = [0u8; std::mem::size_of::<libc::c_int>()];
+    argc_bytes.copy_from_slice(&buffer[..argc_size]);
+    let argc = libc::c_int::from_ne_bytes(argc_bytes);
+    if argc <= 0 {
+        return None;
+    }
+    let argc = usize::try_from(argc).ok()?;
+
+    let mut offset = argc_size;
+    while offset < buffer.len() && buffer[offset] != 0 {
+        offset = offset.saturating_add(1);
+    }
+    while offset < buffer.len() && buffer[offset] == 0 {
+        offset = offset.saturating_add(1);
+    }
+
+    let mut args = Vec::with_capacity(argc);
+    while args.len() < argc {
+        while offset < buffer.len() && buffer[offset] == 0 {
+            offset = offset.saturating_add(1);
+        }
+        if offset >= buffer.len() {
+            return None;
+        }
+        let start = offset;
+        while offset < buffer.len() && buffer[offset] != 0 {
+            offset = offset.saturating_add(1);
+        }
+        if offset >= buffer.len() {
+            return None;
+        }
+        args.push(String::from_utf8_lossy(&buffer[start..offset]).into_owned());
+        offset = offset.saturating_add(1);
     }
     Some(args)
 }
@@ -30359,6 +32852,13 @@ fn remove_agent_pty_log_file(key: &AgentKey, path: &Path) -> bool {
 }
 
 fn cleanup_orphan_agent_pty_logs_at(runtime_dir: &Path) -> usize {
+    cleanup_orphan_agent_pty_logs_at_except(runtime_dir, &HashSet::new())
+}
+
+fn cleanup_orphan_agent_pty_logs_at_except(
+    runtime_dir: &Path,
+    preserved_stems: &HashSet<String>,
+) -> usize {
     let scrollback_dir = runtime_dir.join("scrollback");
     let Ok(read_dir) = fs::read_dir(&scrollback_dir) else {
         return 0;
@@ -30372,11 +32872,21 @@ fn cleanup_orphan_agent_pty_logs_at(runtime_dir: &Path) -> usize {
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
+        if preserved_stems.contains(stem) {
+            debug_log(
+                "agent_orphan_pty_log_preserved",
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "stem": stem,
+                }),
+            );
+            continue;
+        }
         let meta_path = runtime_dir.join(format!("{}.json", stem));
         let has_live_meta = fs::read_to_string(&meta_path)
             .ok()
             .and_then(|content| serde_json::from_str::<AgentMetaSnapshot>(&content).ok())
-            .map(|meta| agent_runtime_meta_has_live_daemon_for_stem(&meta, stem))
+            .map(|meta| agent_runtime_meta_has_possible_live_daemon_for_stem(&meta, stem))
             .unwrap_or(false);
         if has_live_meta {
             continue;
@@ -30418,6 +32928,123 @@ fn agent_history_deleted_suffix(deleted: bool) -> &'static str {
 }
 
 #[cfg(unix)]
+fn unix_signal_target_exists(target: i32) -> bool {
+    if target == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(target as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "linux")]
+fn unix_process_group_has_live_member(pgid: i32) -> bool {
+    linux_process_group_has_live_member(pgid)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_has_live_member(pgid: i32) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return unix_signal_target_exists(-pgid);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.parse::<u32>().is_err() {
+            continue;
+        }
+        let stat_path = entry.path().join("stat");
+        let Ok(stat) = fs::read_to_string(stat_path) else {
+            continue;
+        };
+        let Some((candidate_pgid, state)) = linux_process_stat_group_and_state(&stat) else {
+            continue;
+        };
+        if candidate_pgid == pgid && state != 'Z' {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_process_stat_group_and_state(stat: &str) -> Option<(i32, char)> {
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let mut parts = after_comm.split_whitespace();
+    let state = parts.next()?.chars().next()?;
+    let _ppid = parts.next()?;
+    let pgid = parts.next()?.parse().ok()?;
+    Some((pgid, state))
+}
+
+#[cfg(target_os = "macos")]
+fn unix_process_group_has_live_member(pgid: i32) -> bool {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,pgid=,stat="])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return unix_signal_target_exists(-pgid);
+    };
+    if !output.status.success() {
+        return unix_signal_target_exists(-pgid);
+    }
+    parse_ps_process_group_has_live_member(&String::from_utf8_lossy(&output.stdout), pgid)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps_process_group_has_live_member(raw: &str, pgid: i32) -> bool {
+    raw.lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        let _pid = parts.next();
+        let Some(raw_pgid) = parts.next() else {
+            return false;
+        };
+        let Some(stat) = parts.next() else {
+            return false;
+        };
+        raw_pgid.parse::<i32>().ok() == Some(pgid) && !stat.starts_with('Z')
+    })
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn unix_process_group_has_live_member(pgid: i32) -> bool {
+    unix_signal_target_exists(-pgid)
+}
+
+#[cfg(unix)]
+fn unix_process_or_group_has_live_member(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    process_is_alive(pid as u32) || unix_process_group_has_live_member(pid)
+}
+
+#[cfg(unix)]
+fn wait_for_unix_process_group_exit(pid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !unix_process_or_group_has_live_member(pid) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(PROCESS_TERMINATE_POLL_MS)),
+        );
+    }
+}
+
+#[cfg(unix)]
 fn terminate_process_group(pid: u32) {
     if pid == 0 || pid > i32::MAX as u32 {
         debug_log(
@@ -30436,21 +33063,33 @@ fn terminate_process_group(pid: u32) {
             "pid": pid,
             "platform": "unix",
             "alive_before": process_is_alive(pid),
+            "group_live_before": unix_process_group_has_live_member(pid as i32),
         }),
     );
     let pid = pid as i32;
     let pgid = -pid;
-    unsafe {
-        let _ = libc::kill(pgid, libc::SIGTERM);
-        let _ = libc::kill(pid, libc::SIGTERM);
-    }
-    thread::sleep(Duration::from_millis(150));
-    unsafe {
-        let _ = libc::kill(pgid, libc::SIGKILL);
-    }
-    if process_is_alive(pid as u32) {
-        unsafe {
-            let _ = libc::kill(pid, libc::SIGKILL);
+    let term_group_result = unsafe { libc::kill(pgid, libc::SIGTERM) };
+    let term_group_error = (term_group_result != 0).then(|| io::Error::last_os_error().to_string());
+    let term_pid_result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    let term_pid_error = (term_pid_result != 0).then(|| io::Error::last_os_error().to_string());
+    let exited_after_term =
+        wait_for_unix_process_group_exit(pid, Duration::from_millis(PROCESS_TERMINATE_GRACE_MS));
+    let mut kill_group_result = None;
+    let mut kill_group_error = None;
+    let mut kill_pid_result = None;
+    let mut kill_pid_error = None;
+    if !exited_after_term {
+        let result = unsafe { libc::kill(pgid, libc::SIGKILL) };
+        kill_group_result = Some(result);
+        if result != 0 {
+            kill_group_error = Some(io::Error::last_os_error().to_string());
+        }
+        if process_is_alive(pid as u32) {
+            let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+            kill_pid_result = Some(result);
+            if result != 0 {
+                kill_pid_error = Some(io::Error::last_os_error().to_string());
+            }
         }
     }
     debug_log(
@@ -30458,7 +33097,17 @@ fn terminate_process_group(pid: u32) {
         serde_json::json!({
             "pid": pid,
             "platform": "unix",
+            "term_group_status": term_group_result,
+            "term_group_error": term_group_error,
+            "term_pid_status": term_pid_result,
+            "term_pid_error": term_pid_error,
+            "exited_after_term": exited_after_term,
+            "kill_group_status": kill_group_result,
+            "kill_group_error": kill_group_error,
+            "kill_pid_status": kill_pid_result,
+            "kill_pid_error": kill_pid_error,
             "alive_after": process_is_alive(pid as u32),
+            "group_live_after": unix_process_group_has_live_member(pid),
         }),
     );
 }
@@ -30545,6 +33194,18 @@ fn discover_live_shell_infos() -> Vec<SessionInfo> {
 }
 
 fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
+    discover_live_shell_infos_at_with_liveness(dir, |runtime_dir, meta, stem| {
+        agent_runtime_meta_liveness_for_stem_at(runtime_dir, meta, stem, "live_shell_discover")
+    })
+}
+
+fn discover_live_shell_infos_at_with_liveness<F>(
+    dir: &Path,
+    mut meta_liveness: F,
+) -> Vec<SessionInfo>
+where
+    F: FnMut(&Path, &AgentMetaSnapshot, &str) -> Option<AgentMetaLivenessKind>,
+{
     let Ok(read_dir) = fs::read_dir(dir) else {
         debug_log(
             "live_shell_discover_failed",
@@ -30565,6 +33226,8 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
         );
     }
     let mut out: Vec<SessionInfo> = Vec::new();
+    let mut json_stems: HashSet<String> = HashSet::new();
+    let mut identity_queried_stems: HashSet<String> = HashSet::new();
     for entry in read_dir.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -30580,6 +33243,17 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
             }
             continue;
         }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            debug_log(
+                "live_shell_discover_skip",
+                serde_json::json!({
+                    "reason": "missing_stem",
+                    "path": path.display().to_string(),
+                }),
+            );
+            continue;
+        };
+        json_stems.insert(stem.to_string());
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) => {
@@ -30591,6 +33265,15 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
                         "error": e.to_string(),
                     }),
                 );
+                identity_queried_stems.insert(stem.to_string());
+                if let Some(info) = discover_live_shell_info_from_daemon_identity_at(
+                    dir,
+                    stem,
+                    &path,
+                    "meta_read_failed",
+                ) {
+                    out.push(info);
+                }
                 continue;
             }
         };
@@ -30606,8 +33289,38 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
                         "content_sample": truncate_width(&content, 512),
                     }),
                 );
+                identity_queried_stems.insert(stem.to_string());
+                if let Some(info) = discover_live_shell_info_from_daemon_identity_at(
+                    dir,
+                    stem,
+                    &path,
+                    "meta_parse_failed",
+                ) {
+                    out.push(info);
+                }
                 continue;
             }
+        };
+        let Some(liveness) = meta_liveness(dir, &meta, stem) else {
+            debug_log(
+                "live_shell_discover_skip",
+                serde_json::json!({
+                    "reason": "not_live_daemon",
+                    "path": path.display().to_string(),
+                    "stem": stem,
+                    "meta": agent_meta_snapshot_debug_value(&meta),
+                }),
+            );
+            identity_queried_stems.insert(stem.to_string());
+            if let Some(info) = discover_live_shell_info_from_daemon_identity_at(
+                dir,
+                stem,
+                &path,
+                "not_live_daemon",
+            ) {
+                out.push(info);
+            }
+            continue;
         };
         let source = meta.source.as_deref().unwrap_or("");
         let Some(info) = session_info_from_agent_meta_snapshot(&meta) else {
@@ -30622,6 +33335,12 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
                     "session_id": meta.session_id.as_deref(),
                 }),
             );
+            identity_queried_stems.insert(stem.to_string());
+            if let Some(info) =
+                discover_live_shell_info_from_daemon_identity_at(dir, stem, &path, "invalid_meta")
+            {
+                out.push(info);
+            }
             continue;
         };
         let is_synthetic = source == SHELL_SESSION_SOURCE_MARKER
@@ -30634,6 +33353,7 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
                     "path": path.display().to_string(),
                     "source": source,
                     "synthetic": is_synthetic,
+                    "liveness": liveness.label(),
                     "meta": agent_meta_snapshot_debug_value(&meta),
                     "daemon_pid": meta.pid,
                     "daemon_alive": process_is_alive(meta.pid),
@@ -30647,6 +33367,37 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
         }
         out.push(info);
     }
+    match fs::read_dir(dir) {
+        Ok(read_dir) => {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                let Some(stem) = agent_daemon_endpoint_file_stem(&path) else {
+                    continue;
+                };
+                if json_stems.contains(&stem) || identity_queried_stems.contains(&stem) {
+                    continue;
+                }
+                identity_queried_stems.insert(stem.clone());
+                if let Some(info) = discover_live_shell_info_from_daemon_identity_at(
+                    dir,
+                    &stem,
+                    &path,
+                    "missing_meta_endpoint",
+                ) {
+                    out.push(info);
+                }
+            }
+        }
+        Err(e) => {
+            debug_log(
+                "live_shell_discover_endpoint_scan_failed",
+                serde_json::json!({
+                    "dir": dir.display().to_string(),
+                    "error": e.to_string(),
+                }),
+            );
+        }
+    }
     if debug_enabled {
         debug_log(
             "live_shell_discover_done",
@@ -30657,6 +33408,499 @@ fn discover_live_shell_infos_at(dir: &Path) -> Vec<SessionInfo> {
         );
     }
     out
+}
+
+#[cfg(unix)]
+fn connect_agent_daemon_stem_at(
+    runtime_dir: &Path,
+    stem: &str,
+    timeout: Duration,
+) -> io::Result<AgentStream> {
+    let socket_path = runtime_dir.join(format!("{stem}.sock"));
+    connect_unix_stream_with_timeout(&socket_path, timeout)
+}
+
+#[cfg(windows)]
+fn connect_agent_daemon_stem_at(
+    runtime_dir: &Path,
+    stem: &str,
+    timeout: Duration,
+) -> io::Result<AgentStream> {
+    let marker_path = runtime_dir.join(format!("{stem}.tcp"));
+    let addr = read_agent_tcp_addr(&marker_path)?;
+    let addr = addr
+        .parse::<SocketAddr>()
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    AgentStream::connect_timeout(&addr, timeout)
+}
+
+fn agent_daemon_endpoint_file_stem(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    let endpoint_ext = "sock";
+    #[cfg(windows)]
+    let endpoint_ext = "tcp";
+
+    if path.extension().and_then(|ext| ext.to_str()) != Some(endpoint_ext) {
+        return None;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_string())
+}
+
+#[cfg(unix)]
+fn connect_unix_stream_with_timeout(path: &Path, timeout: Duration) -> io::Result<AgentStream> {
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.contains(&0) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "unix socket path contains nul byte",
+        ));
+    }
+    let mut addr = unsafe { mem::zeroed::<libc::sockaddr_un>() };
+    if path_bytes.len() >= addr.sun_path.len() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "unix socket path is too long",
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in addr.sun_path.iter_mut().zip(path_bytes.iter().copied()) {
+        *slot = byte as libc::c_char;
+    }
+    let addr_len = (mem::size_of::<libc::sa_family_t>() + path_bytes.len() + 1) as libc::socklen_t;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if fd_flags != -1 {
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) };
+    }
+    let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if original_flags == -1 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(error);
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } == -1 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(error);
+    }
+    let connect_result = unsafe {
+        libc::connect(
+            fd,
+            (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            addr_len,
+        )
+    };
+    if connect_result == -1 {
+        let error = io::Error::last_os_error();
+        if !unix_connect_in_progress(&error) {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error);
+        }
+        if let Err(error) = wait_for_unix_connect(fd, timeout) {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error);
+        }
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags) } == -1 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(error);
+    }
+    Ok(unsafe { AgentStream::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn unix_connect_in_progress(error: &io::Error) -> bool {
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    code == libc::EINPROGRESS || code == libc::EAGAIN || code == libc::EWOULDBLOCK
+}
+
+#[cfg(unix)]
+fn wait_for_unix_connect(fd: libc::c_int, timeout: Duration) -> io::Result<()> {
+    let started = Instant::now();
+    loop {
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, "unix socket connect timed out"))?;
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "unix socket connect timed out",
+            ));
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pollfd, 1, duration_to_poll_timeout_ms(remaining)) };
+        if rc == 0 {
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "unix socket connect timed out",
+            ));
+        }
+        if rc == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let mut socket_error: libc::c_int = 0;
+        let mut socket_error_len = mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut socket_error as *mut libc::c_int).cast::<libc::c_void>(),
+                &mut socket_error_len,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if socket_error != 0 {
+            return Err(io::Error::from_raw_os_error(socket_error));
+        }
+        return Ok(());
+    }
+}
+
+#[cfg(unix)]
+fn duration_to_poll_timeout_ms(duration: Duration) -> libc::c_int {
+    let millis = duration.as_millis();
+    if millis == 0 && !duration.is_zero() {
+        1
+    } else if millis > libc::c_int::MAX as u128 {
+        libc::c_int::MAX
+    } else {
+        millis as libc::c_int
+    }
+}
+
+fn write_json_line_with_timeout<T: Serialize>(
+    writer: &mut AgentStream,
+    value: &T,
+    timeout: Duration,
+) -> io::Result<()> {
+    writer.set_write_timeout(Some(timeout))?;
+    let mut bytes =
+        serde_json::to_vec(value).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    bytes.push(b'\n');
+    writer.write_all(&bytes)?;
+    writer.flush()
+}
+
+fn read_agent_daemon_event_with_timeout(
+    stream: &mut AgentStream,
+    timeout: Duration,
+) -> io::Result<AgentDaemonEvent> {
+    let started = Instant::now();
+    let mut buf = Vec::with_capacity(1024);
+    let mut tmp = [0u8; 1024];
+    loop {
+        if let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
+            let line = &buf[..pos];
+            return serde_json::from_slice::<AgentDaemonEvent>(line)
+                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e));
+        }
+        if buf.len() > 64 * 1024 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "daemon identity event exceeded maximum frame size",
+            ));
+        }
+        let remaining = match timeout.checked_sub(started.elapsed()) {
+            Some(remaining) if !remaining.is_zero() => remaining,
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "daemon identity response timed out",
+                ))
+            }
+        };
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(&mut tmp) {
+            Ok(0) => return Err(io::Error::new(ErrorKind::BrokenPipe, "socket closed")),
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "daemon identity response timed out",
+                ))
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn agent_meta_snapshot_from_identity_event(event: AgentDaemonEvent) -> Option<AgentMetaSnapshot> {
+    let AgentDaemonEvent::Identity {
+        provider,
+        session_id,
+        cwd,
+        source,
+        daemon_pid,
+        daemon_pid_start_ticks,
+        child_pid,
+        child_pid_start_ticks,
+        attached,
+        attached_client_pid,
+        attached_client_instance_id,
+        last_screen_change_epoch_ms,
+        last_output_epoch_ms,
+        last_input_epoch_ms,
+        updated_at_epoch_s,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some(AgentMetaSnapshot {
+        pid: daemon_pid,
+        pid_start_ticks: daemon_pid_start_ticks,
+        child_pid,
+        child_pid_start_ticks,
+        provider: Some(provider.as_str().to_string()),
+        session_id: Some(session_id),
+        cwd: Some(cwd),
+        source: Some(source),
+        attached,
+        attached_client_pid,
+        attached_client_instance_id,
+        last_screen_change_epoch_ms,
+        last_output_epoch_ms,
+        last_input_epoch_ms,
+        updated_at_epoch_s,
+    })
+}
+
+fn query_agent_daemon_identity_at(
+    runtime_dir: &Path,
+    stem: &str,
+    reason: &str,
+) -> Option<AgentMetaSnapshot> {
+    let timeout = Duration::from_millis(AGENT_IDENTITY_QUERY_TIMEOUT_MS);
+    let started = Instant::now();
+    let mut stream = match connect_agent_daemon_stem_at(runtime_dir, stem, timeout) {
+        Ok(stream) => stream,
+        Err(e) => {
+            debug_log(
+                "agent_daemon_identity_connect_failed",
+                serde_json::json!({
+                    "reason": reason,
+                    "runtime_dir": runtime_dir.display().to_string(),
+                    "stem": stem,
+                    "error_kind": format!("{:?}", e.kind()),
+                    "error": e.to_string(),
+                }),
+            );
+            return None;
+        }
+    };
+    let write_timeout = match timeout.checked_sub(started.elapsed()) {
+        Some(remaining) if !remaining.is_zero() => remaining,
+        _ => {
+            debug_log(
+                "agent_daemon_identity_request_failed",
+                serde_json::json!({
+                    "reason": reason,
+                    "runtime_dir": runtime_dir.display().to_string(),
+                    "stem": stem,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "error_kind": "TimedOut",
+                    "error": "daemon identity query timed out before request write",
+                }),
+            );
+            return None;
+        }
+    };
+    if let Err(e) =
+        write_json_line_with_timeout(&mut stream, &AgentDaemonRequest::Identify, write_timeout)
+    {
+        debug_log(
+            "agent_daemon_identity_request_failed",
+            serde_json::json!({
+                "reason": reason,
+                "runtime_dir": runtime_dir.display().to_string(),
+                "stem": stem,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "error_kind": format!("{:?}", e.kind()),
+                "error": e.to_string(),
+            }),
+        );
+        return None;
+    }
+    let read_timeout = match timeout.checked_sub(started.elapsed()) {
+        Some(remaining) if !remaining.is_zero() => remaining,
+        _ => {
+            debug_log(
+                "agent_daemon_identity_read_failed",
+                serde_json::json!({
+                    "reason": reason,
+                    "runtime_dir": runtime_dir.display().to_string(),
+                    "stem": stem,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "error_kind": "TimedOut",
+                    "error": "daemon identity query timed out before response read",
+                }),
+            );
+            return None;
+        }
+    };
+    let event = match read_agent_daemon_event_with_timeout(&mut stream, read_timeout) {
+        Ok(event) => event,
+        Err(e) => {
+            debug_log(
+                "agent_daemon_identity_read_failed",
+                serde_json::json!({
+                    "reason": reason,
+                    "runtime_dir": runtime_dir.display().to_string(),
+                    "stem": stem,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "error_kind": format!("{:?}", e.kind()),
+                    "error": e.to_string(),
+                }),
+            );
+            return None;
+        }
+    };
+    let meta = agent_meta_snapshot_from_identity_event(event)?;
+    debug_log(
+        "agent_daemon_identity_received",
+        serde_json::json!({
+            "reason": reason,
+            "runtime_dir": runtime_dir.display().to_string(),
+            "stem": stem,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "meta": agent_meta_snapshot_debug_value(&meta),
+        }),
+    );
+    Some(meta)
+}
+
+fn discover_live_shell_info_from_daemon_identity_at(
+    runtime_dir: &Path,
+    stem: &str,
+    path: &Path,
+    reason: &str,
+) -> Option<SessionInfo> {
+    let meta = query_agent_daemon_identity_at(runtime_dir, stem, reason)?;
+    let Some(key) = agent_key_from_meta(&meta) else {
+        debug_log(
+            "live_shell_discover_identity_skip",
+            serde_json::json!({
+                "reason": reason,
+                "skip_reason": "missing_key",
+                "path": path.display().to_string(),
+                "stem": stem,
+                "meta": agent_meta_snapshot_debug_value(&meta),
+            }),
+        );
+        return None;
+    };
+    if agent_file_stem(&key) != stem {
+        debug_log(
+            "live_shell_discover_identity_skip",
+            serde_json::json!({
+                "reason": reason,
+                "skip_reason": "stem_mismatch",
+                "path": path.display().to_string(),
+                "stem": stem,
+                "key": agent_key_debug_value(&key),
+                "key_stem": agent_file_stem(&key),
+                "meta": agent_meta_snapshot_debug_value(&meta),
+            }),
+        );
+        return None;
+    }
+    let Some(info) = session_info_from_agent_meta_snapshot(&meta) else {
+        debug_log(
+            "live_shell_discover_identity_skip",
+            serde_json::json!({
+                "reason": reason,
+                "skip_reason": "invalid_identity",
+                "path": path.display().to_string(),
+                "stem": stem,
+                "meta": agent_meta_snapshot_debug_value(&meta),
+            }),
+        );
+        return None;
+    };
+    debug_log(
+        "live_shell_discover_add_identity",
+        serde_json::json!({
+            "reason": reason,
+            "path": path.display().to_string(),
+            "stem": stem,
+            "info": session_info_debug_value(&info),
+            "meta": agent_meta_snapshot_debug_value(&meta),
+        }),
+    );
+    Some(info)
+}
+
+fn agent_daemon_identity_snapshot_for_key_at(
+    runtime_dir: &Path,
+    key: &AgentKey,
+    reason: &str,
+) -> Option<AgentMetaSnapshot> {
+    let stem = agent_file_stem(key);
+    let meta = query_agent_daemon_identity_at(runtime_dir, &stem, reason)?;
+    if agent_key_from_meta(&meta).as_ref() != Some(key) {
+        debug_log(
+            "agent_daemon_identity_key_mismatch",
+            serde_json::json!({
+                "reason": reason,
+                "runtime_dir": runtime_dir.display().to_string(),
+                "key": agent_key_debug_value(key),
+                "stem": stem,
+                "meta": agent_meta_snapshot_debug_value(&meta),
+            }),
+        );
+        return None;
+    }
+    Some(meta)
+}
+
+fn agent_runtime_key_has_reachable_daemon_at(
+    runtime_dir: &Path,
+    key: &AgentKey,
+    reason: &str,
+) -> bool {
+    let stem = agent_file_stem(key);
+    let reachable = agent_runtime_stem_has_reachable_daemon(runtime_dir, &stem);
+    debug_log(
+        "agent_runtime_key_reachable_probe",
+        serde_json::json!({
+            "reason": reason,
+            "runtime_dir": runtime_dir.display().to_string(),
+            "key": agent_key_debug_value(key),
+            "stem": stem,
+            "reachable": reachable,
+        }),
+    );
+    reachable
 }
 
 fn agent_file_stem(key: &AgentKey) -> String {
@@ -42287,8 +45531,11 @@ mod tests {
             runtime_refresh_applied_seq: 0,
             runtime_refresh_pending: false,
             runtime_refresh_started_at: None,
+            runtime_refresh_pending_discover_live_shells: false,
             runtime_refresh_queued: false,
+            runtime_refresh_queued_discover_live_shells: false,
             pending_runtime_action: None,
+            pending_runtime_action_last_slow_log_at: None,
             live_shell_discovery_seq: 0,
             live_shell_discovery_pending: false,
             live_shell_discovery_started_at: None,
@@ -46673,6 +49920,358 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn ctrl_bracket_restore_requests_live_discovery_without_active_agent() {
+        let mut app = app_for_key_tests();
+        let (main_tx, _main_rx) = mpsc::channel::<MainEvent>();
+        let (runtime_tx, runtime_rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+        app.main_tx = Some(main_tx);
+        app.runtime_tx = Some(runtime_tx);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        let request = runtime_rx
+            .try_recv()
+            .expect("Ctrl+] restore should request a runtime refresh");
+        assert!(
+            request.discover_live_shells,
+            "restore from a cold sessions view must scan runtime meta"
+        );
+        assert!(matches!(
+            app.pending_runtime_action,
+            Some(PendingRuntimeAction::RestoreLive { .. })
+        ));
+    }
+
+    #[test]
+    fn ctrl_bracket_restore_continues_from_inflight_startup_discovery() {
+        let mut app = app_for_key_tests();
+        let (main_tx, _main_rx) = mpsc::channel::<MainEvent>();
+        let (runtime_tx, runtime_rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+        app.main_tx = Some(main_tx);
+        app.runtime_tx = Some(runtime_tx);
+        app.runtime_refresh_seq = 1;
+        app.runtime_refresh_pending = true;
+        app.runtime_refresh_started_at = Some(Instant::now());
+        app.runtime_refresh_pending_discover_live_shells = true;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        assert!(
+            runtime_rx.try_recv().is_err(),
+            "Ctrl+] should not queue a duplicate discovery when startup discovery is already pending"
+        );
+        assert!(!app.runtime_refresh_queued);
+        assert!(matches!(
+            app.pending_runtime_action,
+            Some(PendingRuntimeAction::RestoreLive { .. })
+        ));
+
+        let live = shell_session_info_for_cwd("/repo".into());
+        let live_key = AgentKey::new(&live);
+        app.on_runtime_state_result(AgentRuntimeRefreshResult {
+            seq: 1,
+            discover_live_shells: true,
+            live_shells: vec![live],
+            agent_states: HashMap::from([(
+                live_key.clone(),
+                AgentListState::Live {
+                    activity: AgentActivity::Quiet,
+                },
+            )]),
+            new_agent_backing_aliases: HashMap::new(),
+            new_agent_backing_probe_after: HashMap::new(),
+        });
+
+        assert!(app.pending_runtime_action.is_none());
+        assert_eq!(
+            app.attach_in_flight
+                .as_ref()
+                .map(|attach| attach.key.clone()),
+            Some(live_key),
+            "the first startup discovery result should immediately continue the Ctrl+] restore"
+        );
+    }
+
+    #[test]
+    fn ctrl_bracket_restore_waits_for_slow_startup_discovery_result() {
+        let mut app = app_for_key_tests();
+        let (main_tx, _main_rx) = mpsc::channel::<MainEvent>();
+        let (runtime_tx, runtime_rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+        app.main_tx = Some(main_tx);
+        app.runtime_tx = Some(runtime_tx);
+        app.runtime_refresh_seq = 1;
+        app.runtime_refresh_pending = true;
+        app.runtime_refresh_started_at =
+            Some(Instant::now() - Duration::from_millis(PENDING_RUNTIME_ACTION_SLOW_LOG_MS + 1));
+        app.runtime_refresh_pending_discover_live_shells = true;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+        assert!(
+            runtime_rx.try_recv().is_err(),
+            "Ctrl+] should not queue a duplicate discovery when startup discovery is already pending"
+        );
+
+        app.poll_agent_runtime_states();
+
+        assert!(
+            app.attach_in_flight.is_none(),
+            "a slow discovery must not be bypassed with stale runtime state"
+        );
+        assert!(matches!(
+            app.pending_runtime_action,
+            Some(PendingRuntimeAction::RestoreLive { .. })
+        ));
+
+        let live = shell_session_info_for_cwd("/repo".into());
+        let live_key = AgentKey::new(&live);
+        app.on_runtime_state_result(AgentRuntimeRefreshResult {
+            seq: 1,
+            discover_live_shells: true,
+            live_shells: vec![live],
+            agent_states: HashMap::from([(
+                live_key.clone(),
+                AgentListState::Live {
+                    activity: AgentActivity::Quiet,
+                },
+            )]),
+            new_agent_backing_aliases: HashMap::new(),
+            new_agent_backing_probe_after: HashMap::new(),
+        });
+
+        assert!(app.pending_runtime_action.is_none());
+        assert_eq!(
+            app.attach_in_flight
+                .as_ref()
+                .map(|attach| attach.key.clone()),
+            Some(live_key),
+            "the delayed discovery result should still continue the original Ctrl+] restore"
+        );
+    }
+
+    #[test]
+    fn attach_stage_failure_requests_live_discovery_refresh() {
+        let mut app = app_for_key_tests();
+        let (runtime_tx, runtime_rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+        app.runtime_tx = Some(runtime_tx);
+        let info = shell_session_info_for_cwd("/repo/attach-failed".into());
+        let key = AgentKey::new(&info);
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 9,
+            key: key.clone(),
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+
+        app.on_attach_result(Box::new(AttachWorkerResult {
+            seq: 9,
+            info,
+            cols: 100,
+            rows: 30,
+            ctx: AttachUiCtx {
+                key,
+                target: AttachTarget::MainAgent,
+                status_attached: "attached".into(),
+                status_started: "started".into(),
+                status_err_prefix: "switch failed: ".into(),
+                status_prepare_err_prefix: "prepare failed: ".into(),
+                focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: false,
+                log_origin: None,
+                ready_event: "agent_switch_ready",
+                failed_event: "agent_switch_failed",
+            },
+            outcome: AttachWorkOutcome::Failed {
+                stage: AttachFailStage::Attach,
+                message: "daemon did not report readiness".into(),
+                error_kind: Some(ErrorKind::TimedOut),
+            },
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 0,
+        }));
+
+        let request = runtime_rx
+            .try_recv()
+            .expect("attach-stage failure should refresh live runtime discovery");
+        assert!(
+            request.discover_live_shells,
+            "attach-stage failure may leave a newly spawned daemon alive, so it must discover live shells"
+        );
+        assert!(app.runtime_refresh_pending);
+        assert!(app.runtime_refresh_pending_discover_live_shells);
+    }
+
+    #[test]
+    fn prepare_stage_failure_keeps_runtime_refresh_non_discovering() {
+        let mut app = app_for_key_tests();
+        let (runtime_tx, runtime_rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+        app.runtime_tx = Some(runtime_tx);
+        let info = shell_session_info_for_cwd("/repo/prepare-failed".into());
+        let key = AgentKey::new(&info);
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 10,
+            key: key.clone(),
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+
+        app.on_attach_result(Box::new(AttachWorkerResult {
+            seq: 10,
+            info,
+            cols: 100,
+            rows: 30,
+            ctx: AttachUiCtx {
+                key,
+                target: AttachTarget::MainAgent,
+                status_attached: "attached".into(),
+                status_started: "started".into(),
+                status_err_prefix: "switch failed: ".into(),
+                status_prepare_err_prefix: "prepare failed: ".into(),
+                focus_auxiliary_on_ready: false,
+                main_focus_override_on_ready: None,
+                select_visible: false,
+                cokacdir_dialog_on_error: false,
+                remove_dead_on_notfound: false,
+                log_origin: None,
+                ready_event: "agent_switch_ready",
+                failed_event: "agent_switch_failed",
+            },
+            outcome: AttachWorkOutcome::Failed {
+                stage: AttachFailStage::Prepare,
+                message: "precheck failed".into(),
+                error_kind: None,
+            },
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 0,
+        }));
+
+        let request = runtime_rx
+            .try_recv()
+            .expect("prepare failure should keep the ordinary runtime refresh behavior");
+        assert!(
+            !request.discover_live_shells,
+            "prepare-stage failure did not spawn or attach a daemon, so live discovery should not be forced"
+        );
+        assert!(app.runtime_refresh_pending);
+        assert!(!app.runtime_refresh_pending_discover_live_shells);
+    }
+
+    #[test]
+    fn ctrl_bracket_restore_does_not_wait_for_queued_normal_refresh_after_startup_discovery() {
+        let mut app = app_for_key_tests();
+        let (main_tx, _main_rx) = mpsc::channel::<MainEvent>();
+        let (runtime_tx, runtime_rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+        app.main_tx = Some(main_tx);
+        app.runtime_tx = Some(runtime_tx);
+        app.runtime_refresh_seq = 1;
+        app.runtime_refresh_pending = true;
+        app.runtime_refresh_started_at = Some(Instant::now());
+        app.runtime_refresh_pending_discover_live_shells = true;
+        app.runtime_refresh_queued = true;
+        app.runtime_refresh_queued_discover_live_shells = false;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            100,
+            80,
+            20,
+        );
+
+        assert!(matches!(
+            app.pending_runtime_action,
+            Some(PendingRuntimeAction::RestoreLive { .. })
+        ));
+
+        let live = shell_session_info_for_cwd("/repo".into());
+        let live_key = AgentKey::new(&live);
+        app.on_runtime_state_result(AgentRuntimeRefreshResult {
+            seq: 1,
+            discover_live_shells: true,
+            live_shells: vec![live],
+            agent_states: HashMap::from([(
+                live_key.clone(),
+                AgentListState::Live {
+                    activity: AgentActivity::Quiet,
+                },
+            )]),
+            new_agent_backing_aliases: HashMap::new(),
+            new_agent_backing_probe_after: HashMap::new(),
+        });
+
+        assert!(app.pending_runtime_action.is_none());
+        assert_eq!(
+            app.attach_in_flight
+                .as_ref()
+                .map(|attach| attach.key.clone()),
+            Some(live_key),
+            "queued normal refresh must not force the user to press Ctrl+] a second time"
+        );
+        let request = runtime_rx
+            .try_recv()
+            .expect("queued normal refresh should still run after restore starts");
+        assert!(
+            !request.discover_live_shells,
+            "the queued normal refresh should remain a normal refresh"
+        );
+    }
+
+    #[test]
+    fn queued_discovery_refresh_is_preserved_after_pending_result() {
+        let mut app = app_for_key_tests();
+        let (runtime_tx, runtime_rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+        app.runtime_tx = Some(runtime_tx);
+        app.runtime_refresh_seq = 1;
+        app.runtime_refresh_pending = true;
+
+        app.refresh_agent_runtime_states_discovering_live_shells();
+
+        assert!(app.runtime_refresh_queued);
+        assert!(app.runtime_refresh_queued_discover_live_shells);
+        assert!(
+            runtime_rx.try_recv().is_err(),
+            "pending refresh should queue instead of sending immediately"
+        );
+
+        app.on_runtime_state_result(AgentRuntimeRefreshResult {
+            seq: 1,
+            discover_live_shells: false,
+            live_shells: Vec::new(),
+            agent_states: HashMap::new(),
+            new_agent_backing_aliases: HashMap::new(),
+            new_agent_backing_probe_after: HashMap::new(),
+        });
+
+        let request = runtime_rx
+            .try_recv()
+            .expect("queued refresh should be sent after the pending result");
+        assert!(
+            request.discover_live_shells,
+            "queued discovery intent must not be downgraded to a normal refresh"
+        );
+    }
+
+    #[test]
     fn e_opens_agent_launch_mode_selector() {
         let mut app = app_for_key_tests();
         app.sessions
@@ -46808,6 +50407,155 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             Some(AgentListState::Live {
                 activity: AgentActivity::Quiet,
             })
+        );
+    }
+
+    #[test]
+    fn cached_same_cwd_idle_runtime_still_blocks_when_live_meta_is_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap().display().to_string();
+        let alias = dir.path().join(".").display().to_string();
+        assert!(session_cwd_same_folder(&canonical, &alias));
+
+        let mut app = app_for_key_tests();
+        let live = session_info(Provider::Claude, "live-claude-verified", &canonical);
+        let live_key = AgentKey::new(&live);
+        let target = session_info(Provider::Codex, "target-codex", &alias);
+        app.agent_states.insert(
+            live_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.sessions.push(live.clone());
+        app.sessions.push(target.clone());
+        let verified_meta = AgentMetaSnapshot {
+            pid: 123,
+            pid_start_ticks: None,
+            child_pid: Some(456),
+            child_pid_start_ticks: Some(789),
+            provider: Some(live_key.provider.as_str().into()),
+            session_id: Some(live_key.session_id.clone()),
+            cwd: Some(canonical.clone()),
+            source: Some(live.source.display().to_string()),
+            attached: false,
+            attached_client_pid: None,
+            attached_client_instance_id: None,
+            last_screen_change_epoch_ms: 0,
+            last_output_epoch_ms: 0,
+            last_input_epoch_ms: 0,
+            updated_at_epoch_s: current_epoch_s(),
+        };
+
+        let conflict = app
+            .live_coding_agent_cwd_conflict_with_runtime_and_meta(
+                &target,
+                |key| {
+                    assert_eq!(key, &live_key);
+                    AgentListState::Idle
+                },
+                |key| {
+                    assert_eq!(key, &live_key);
+                    Some(verified_meta.clone())
+                },
+            )
+            .expect("verified live metadata must still block duplicate same-cwd launch");
+
+        assert_eq!(conflict.provider, Provider::Claude);
+        assert_eq!(conflict.session_id, "live-claude-verified");
+        assert_eq!(
+            app.agent_states.get(&live_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cwd_meta_conflict_uses_reachable_socket_when_identity_is_unknown() {
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let canonical = cwd_dir.path().canonicalize().unwrap().display().to_string();
+        let alias = cwd_dir.path().join(".").display().to_string();
+        assert!(session_cwd_same_folder(&canonical, &alias));
+
+        let live = session_info(Provider::Codex, "unknown-identity-live", &canonical);
+        let target = session_info(Provider::Claude, "target-claude", &alias);
+        let live_key = AgentKey::new(&live);
+        let stem = agent_file_stem(&live_key);
+        let socket = runtime_dir.path().join(format!("{stem}.sock"));
+        let _listener = AgentListener::bind(&socket).unwrap();
+        fs::write(
+            runtime_dir.path().join(format!("{stem}.json")),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "provider": live.provider.as_str(),
+                "session_id": &live.session_id,
+                "cwd": &live.cwd,
+                "source": live.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let conflict = live_coding_agent_cwd_meta_conflict_inner_at(
+            runtime_dir.path(),
+            &target,
+            false,
+            |pid, key| {
+                assert_eq!(pid, std::process::id());
+                assert_eq!(key, &live_key);
+                AgentDaemonProcessIdentity::Unknown
+            },
+        )
+        .expect("reachable daemon socket should verify an otherwise unknown live daemon");
+
+        assert_eq!(conflict.provider, live.provider);
+        assert_eq!(conflict.session_id, live.session_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cwd_meta_conflict_rejects_unknown_identity_without_reachable_socket() {
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let canonical = cwd_dir.path().canonicalize().unwrap().display().to_string();
+        let alias = cwd_dir.path().join(".").display().to_string();
+        assert!(session_cwd_same_folder(&canonical, &alias));
+
+        let live = session_info(Provider::Codex, "unknown-identity-stale", &canonical);
+        let target = session_info(Provider::Claude, "target-claude", &alias);
+        let live_key = AgentKey::new(&live);
+        let stem = agent_file_stem(&live_key);
+        fs::write(
+            runtime_dir.path().join(format!("{stem}.json")),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "provider": live.provider.as_str(),
+                "session_id": &live.session_id,
+                "cwd": &live.cwd,
+                "source": live.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let conflict = live_coding_agent_cwd_meta_conflict_inner_at(
+            runtime_dir.path(),
+            &target,
+            false,
+            |_, key| {
+                assert_eq!(key, &live_key);
+                AgentDaemonProcessIdentity::Unknown
+            },
+        );
+
+        assert!(
+            conflict.is_none(),
+            "unknown identity should not be treated as live without runtime reachability"
         );
     }
 
@@ -47114,7 +50862,288 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(!is_live);
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn macos_lstart_parser_accepts_ps_lstart_output_shape() {
+        assert!(parse_macos_lstart_epoch_s("Sat Jul  4 12:34:56 2026\n").is_some());
+        assert!(parse_macos_lstart_epoch_s("Mon Jan 12 01:02:03 2026").is_some());
+        assert!(parse_macos_lstart_epoch_s("not a timestamp").is_none());
+    }
+
+    #[test]
+    fn macos_process_start_token_combines_seconds_and_microseconds() {
+        assert_eq!(
+            macos_process_start_token_from_parts(1_725_000_000, 123_456),
+            Some(1_725_000_000_123_456)
+        );
+        assert_eq!(macos_process_start_token_from_parts(1, 1_000_000), None);
+        assert_eq!(
+            macos_process_start_token_from_parts(u64::MAX, 999_999),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_process_status_detects_zombies() {
+        assert!(macos_process_status_is_zombie(macos_zombie_status_value()));
+        assert!(!macos_process_status_is_zombie(0));
+        assert!(!macos_process_status_is_zombie(
+            macos_zombie_status_value().saturating_add(1)
+        ));
+    }
+
+    #[test]
+    fn macos_kern_procargs2_parser_preserves_argv_boundaries() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(5 as libc::c_int).to_ne_bytes());
+        raw.extend_from_slice(b"/tmp/cokacmux\0\0\0");
+        raw.extend_from_slice(b"/tmp/cokacmux\0");
+        raw.extend_from_slice(AGENT_DAEMON_ARG.as_bytes());
+        raw.push(0);
+        raw.extend_from_slice(b"codex\0");
+        raw.extend_from_slice(b"session with spaces\0");
+        raw.extend_from_slice(b"/repo/with spaces\0");
+        raw.extend_from_slice(b"PATH=/ignored/env\0");
+
+        assert_eq!(
+            parse_macos_kern_procargs2(&raw),
+            Some(vec![
+                "/tmp/cokacmux".to_string(),
+                AGENT_DAEMON_ARG.to_string(),
+                "codex".to_string(),
+                "session with spaces".to_string(),
+                "/repo/with spaces".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn process_start_token_match_distinguishes_unknown_from_mismatch() {
+        assert_eq!(process_start_token_matches(42, Some(42)), Some(true));
+        assert_eq!(process_start_token_matches(42, Some(43)), Some(false));
+        assert_eq!(process_start_token_matches(42, None), None);
+    }
+
+    #[test]
+    fn linux_process_stat_group_parser_extracts_state_and_pgid() {
+        assert_eq!(
+            linux_process_stat_group_and_state("123 (sleep worker) S 1 456 456 0"),
+            Some((456, 'S'))
+        );
+        assert_eq!(
+            linux_process_stat_group_and_state("124 (gone) Z 1 456 456 0"),
+            Some((456, 'Z'))
+        );
+        assert_eq!(linux_process_stat_group_and_state("bad stat"), None);
+    }
+
+    #[test]
+    fn ps_process_group_parser_excludes_zombies() {
+        let raw = " 100 777 Ss\n 101 778 Z\n 102 778 S+\n";
+
+        assert!(parse_ps_process_group_has_live_member(raw, 777));
+        assert!(parse_ps_process_group_has_live_member(raw, 778));
+        assert!(!parse_ps_process_group_has_live_member(" 101 778 Z\n", 778));
+        assert!(!parse_ps_process_group_has_live_member(raw, 999));
+    }
+
+    #[test]
+    fn windows_access_denied_process_probe_is_possible_live() {
+        assert!(windows_process_probe_error_means_alive(Some(
+            WINDOWS_ERROR_ACCESS_DENIED
+        )));
+        assert!(!windows_process_probe_error_means_alive(Some(87)));
+        assert!(!windows_process_probe_error_means_alive(None));
+    }
+
+    #[test]
+    fn windows_agent_tcp_marker_requires_localhost_nonzero_port() {
+        assert_eq!(
+            parse_agent_tcp_marker("tcp 127.0.0.1:49152\n").unwrap(),
+            "127.0.0.1:49152"
+        );
+        assert_eq!(
+            parse_agent_tcp_marker("127.0.0.1:49153").unwrap(),
+            "127.0.0.1:49153"
+        );
+        assert!(parse_agent_tcp_marker("tcp 0.0.0.0:49152").is_err());
+        assert!(parse_agent_tcp_marker("tcp 127.0.0.1:0").is_err());
+        assert!(parse_agent_tcp_marker("tcp [::1]:49152").is_err());
+        assert!(parse_agent_tcp_marker("not an address").is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn agent_meta_daemon_rejects_pid_start_tick_mismatch() {
+        let current_pid = std::process::id();
+        let actual_start_ticks =
+            process_start_ticks(current_pid).expect("process start ticks should be available");
+        let matching = AgentMetaSnapshot {
+            pid: current_pid,
+            pid_start_ticks: Some(actual_start_ticks),
+            provider: Some("codex".into()),
+            session_id: Some("daemon-token-match".into()),
+            updated_at_epoch_s: current_epoch_s(),
+            ..Default::default()
+        };
+        let mismatched = AgentMetaSnapshot {
+            pid: current_pid,
+            pid_start_ticks: Some(actual_start_ticks.saturating_add(1)),
+            provider: Some("codex".into()),
+            session_id: Some("daemon-token-mismatch".into()),
+            updated_at_epoch_s: current_epoch_s(),
+            ..Default::default()
+        };
+
+        assert!(agent_meta_daemon_pid_matches(&matching));
+        assert!(!agent_meta_daemon_pid_matches(&mismatched));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn unknown_daemon_identity_can_be_verified_by_daemon_start_token() {
+        let current_pid = std::process::id();
+        let actual_start_ticks =
+            process_start_ticks(current_pid).expect("process start ticks should be available");
+        let matching = AgentMetaSnapshot {
+            pid: current_pid,
+            pid_start_ticks: Some(actual_start_ticks),
+            provider: Some("codex".into()),
+            session_id: Some("unknown-token-match".into()),
+            updated_at_epoch_s: current_epoch_s(),
+            ..Default::default()
+        };
+        let mismatched = AgentMetaSnapshot {
+            pid: current_pid,
+            pid_start_ticks: Some(actual_start_ticks.saturating_add(1)),
+            provider: Some("codex".into()),
+            session_id: Some("unknown-token-mismatch".into()),
+            updated_at_epoch_s: current_epoch_s(),
+            ..Default::default()
+        };
+
+        assert!(agent_daemon_identity_matches_meta_without_runtime(
+            &matching,
+            AgentDaemonProcessIdentity::Unknown
+        ));
+        assert!(!agent_daemon_identity_matches_meta_without_runtime(
+            &mismatched,
+            AgentDaemonProcessIdentity::Unknown
+        ));
+        assert!(!agent_daemon_identity_matches_meta_without_runtime(
+            &matching,
+            AgentDaemonProcessIdentity::Other
+        ));
+        assert!(!agent_daemon_identity_matches_meta_without_runtime(
+            &mismatched,
+            AgentDaemonProcessIdentity::CokacmuxDaemon
+        ));
+        let missing_start_token = AgentMetaSnapshot {
+            pid: current_pid,
+            provider: Some("codex".into()),
+            session_id: Some("unknown-token-missing".into()),
+            updated_at_epoch_s: current_epoch_s(),
+            ..Default::default()
+        };
+        assert!(
+            !agent_daemon_identity_matches_meta_without_runtime(
+                &missing_start_token,
+                AgentDaemonProcessIdentity::CokacmuxDaemon
+            ),
+            "destructive identity checks must not treat an unknown start token as a match"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn daemon_start_refuses_to_replace_matching_stale_child() {
+        let current_pid = std::process::id();
+        let actual_start_ticks =
+            process_start_ticks(current_pid).expect("process start ticks should be available");
+        let info = session_info(Provider::Codex, "stale-child-replacement", "/repo");
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let meta = AgentMetaSnapshot {
+            pid: 3_000_000_000,
+            child_pid: Some(current_pid),
+            child_pid_start_ticks: Some(actual_start_ticks),
+            provider: Some(info.provider.as_str().into()),
+            session_id: Some(info.session_id.clone()),
+            cwd: Some(info.cwd.clone()),
+            updated_at_epoch_s: current_epoch_s(),
+            ..Default::default()
+        };
+
+        let error = stale_child_replacement_error(&info, &key, &stem, &meta)
+            .expect("matching live child should block replacement");
+        let message = error.to_string();
+        assert!(message.contains("still running as child pid"));
+        assert!(message.contains("refusing to replace a background process"));
+
+        let mismatched_child = AgentMetaSnapshot {
+            child_pid_start_ticks: Some(actual_start_ticks.saturating_add(1)),
+            ..meta
+        };
+        assert!(
+            stale_child_replacement_error(&info, &key, &stem, &mismatched_child).is_none(),
+            "pid reuse must not make a stale child block replacement unless its start token matches"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn rendered_agent_meta_records_daemon_start_token() {
+        let info = session_info(Provider::Codex, "daemon-token-render", "/repo");
+        let spec = default_agent_launch_spec(&info, AgentLaunchMode::Normal);
+        let content = render_agent_meta_parts(
+            &info,
+            &spec,
+            AgentLaunchMode::Normal,
+            false,
+            None,
+            None,
+            "live",
+            0,
+            0,
+            0,
+            AgentActivity::Quiet,
+            None,
+        )
+        .expect("agent meta should render");
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("agent meta should be valid JSON");
+
+        assert_eq!(
+            value
+                .get("pid_start_ticks")
+                .and_then(serde_json::Value::as_u64),
+            process_start_ticks(std::process::id())
+        );
+    }
+
+    #[test]
+    fn attach_notfound_removes_only_when_no_live_meta_remains() {
+        let key = AgentKey {
+            provider: Provider::Codex,
+            session_id: "attach-notfound-live-meta".into(),
+        };
+
+        assert!(
+            !should_remove_dead_live_shell_after_notfound(&key, |probe_key| {
+                assert_eq!(probe_key, &key);
+                Some(AgentMetaSnapshot::default())
+            }),
+            "NotFound attach failure must not drop a daemon that still has verified live metadata"
+        );
+        assert!(
+            should_remove_dead_live_shell_after_notfound(&key, |probe_key| {
+                assert_eq!(probe_key, &key);
+                None
+            }),
+            "NotFound attach failure can remove the cached live entry once no live metadata remains"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn cwd_lock_rejects_pid_start_tick_mismatch() {
         let current_pid = std::process::id();
@@ -47133,7 +51162,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(!coding_agent_cwd_lock_is_live(&mismatched));
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn agent_meta_child_rejects_pid_start_tick_mismatch() {
         let current_pid = std::process::id();
@@ -47154,6 +51183,43 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(!agent_meta_child_pid_matches(&mismatched));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn spawn_setup_failure_cleanup_terminates_started_pty_child() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        let pty_system = NativePtySystem::default();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new(shell);
+        command.args(["-c", "trap '' TERM; while :; do sleep 1; done"]);
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        let child_pid = child.process_id().expect("pty child should have pid");
+        let key = AgentKey {
+            provider: Provider::Codex,
+            session_id: "spawn-setup-cleanup".into(),
+        };
+
+        terminate_spawned_agent_child_on_setup_failure(
+            child.as_mut(),
+            &key,
+            "test_spawn_setup_cleanup",
+        );
+
+        assert!(
+            !process_is_alive(child_pid),
+            "spawn setup failure cleanup left the PTY child alive"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_command_output_timeout_kills_slow_probe() {
@@ -47166,6 +51232,34 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
 
         assert!(output.is_none());
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_direct_command_line_reads_current_process() {
+        let command_line =
+            windows_process_command_line_direct(std::process::id(), "test_current_command_line")
+                .expect("direct PEB command-line read should work for the current process");
+
+        assert!(!command_line.trim().is_empty());
+        assert!(
+            windows_command_line_to_args(&command_line).is_some(),
+            "direct command line must remain parseable by CommandLineToArgvW"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_direct_process_scan_includes_current_process() {
+        let current_pid = std::process::id();
+        let entries = windows_process_command_lines_direct("test_direct_process_scan");
+
+        assert!(
+            entries
+                .iter()
+                .any(|(pid, command_line)| *pid == current_pid && !command_line.trim().is_empty()),
+            "direct process scan should include the current process with a command line"
+        );
     }
 
     #[test]
@@ -47190,7 +51284,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         }
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn legacy_restore_cwd_lock_rejects_pid_started_after_lock() {
         let current_pid = std::process::id();
@@ -47238,6 +51332,34 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(!dead_path.exists());
         assert!(!invalid_path.exists());
         assert!(other_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cwd_lock_sweep_preserves_lock_with_reachable_daemon_socket() {
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let cwd = cwd_dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(Provider::Codex, "reachable-lock-daemon", &cwd);
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let socket = runtime_dir.path().join(format!("{stem}.sock"));
+        let lock_path = runtime_dir.path().join("cwd-reachable.lock");
+        let _listener = AgentListener::bind(&socket).unwrap();
+        let lock =
+            coding_agent_cwd_lock_for_info(&info, 3_000_000_000, CODING_AGENT_CWD_LOCK_OWNER_AGENT);
+        fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+
+        assert!(coding_agent_cwd_lock_is_live_at(
+            &lock,
+            Some(runtime_dir.path())
+        ));
+
+        let removed =
+            cleanup_stale_coding_agent_cwd_locks_at(runtime_dir.path(), "test_reachable_cwd_lock");
+
+        assert_eq!(removed, 0);
+        assert!(lock_path.exists());
     }
 
     #[test]
@@ -49723,6 +53845,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         let current_pid = std::process::id();
         let meta = AgentMetaSnapshot {
             pid: current_pid,
+            pid_start_ticks: None,
             child_pid: None,
             child_pid_start_ticks: None,
             provider: Some("claude".into()),
@@ -49751,6 +53874,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         let current_pid = std::process::id();
         let mut meta = AgentMetaSnapshot {
             pid: current_pid,
+            pid_start_ticks: None,
             child_pid: None,
             child_pid_start_ticks: None,
             provider: Some("claude".into()),
@@ -49815,6 +53939,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         }
         let meta = AgentMetaSnapshot {
             pid: current_pid,
+            pid_start_ticks: None,
             child_pid: None,
             child_pid_start_ticks: None,
             provider: Some("claude".into()),
@@ -49907,7 +54032,13 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         )
         .unwrap();
 
-        let infos = discover_live_shell_infos_at(dir.path());
+        let infos =
+            discover_live_shell_infos_at_with_liveness(dir.path(), |runtime_dir, meta, stem| {
+                assert_eq!(runtime_dir, dir.path());
+                assert_eq!(stem, "codex-real-live");
+                assert_eq!(meta.session_id.as_deref(), Some("real-live"));
+                Some(AgentMetaLivenessKind::Verified)
+            });
 
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].provider, Provider::Codex);
@@ -49916,6 +54047,326 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert_eq!(infos[0].source, PathBuf::from("/tmp/rollout.jsonl"));
         assert_eq!(infos[0].updated_at_epoch_s, 123);
         assert_eq!(infos[0].title, None);
+    }
+
+    #[test]
+    fn runtime_discovery_skips_dead_daemon_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("codex-dead.json"),
+            r#"{"pid":3000000000,"provider":"codex","session_id":"dead","cwd":"/repo","source":"/tmp/rollout.jsonl","updated_at_epoch_s":123}"#,
+        )
+        .unwrap();
+
+        let infos = discover_live_shell_infos_at(dir.path());
+
+        assert!(
+            infos.is_empty(),
+            "live discovery must not turn stale metadata into a switchable sidebar candidate"
+        );
+    }
+
+    #[test]
+    fn runtime_discovery_skips_non_daemon_current_process_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("codex-not-daemon.json"),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "pid_start_ticks": process_start_ticks(std::process::id()),
+                "provider": "codex",
+                "session_id": "not-daemon",
+                "cwd": "/repo",
+                "source": "/tmp/rollout.jsonl",
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let infos = discover_live_shell_infos_at(dir.path());
+
+        assert!(
+            infos.is_empty(),
+            "a live pid is not enough; discovery needs daemon identity or possible-live evidence"
+        );
+    }
+
+    #[cfg(unix)]
+    fn spawn_identity_daemon_once(
+        socket_path: &Path,
+        info: SessionInfo,
+        updated_at_epoch_s: u64,
+    ) -> JoinHandle<()> {
+        let listener = AgentListener::bind(socket_path).unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = stream.read(&mut byte).unwrap();
+                assert_ne!(n, 0, "identity client closed before request");
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+            }
+            let request: AgentDaemonRequest = serde_json::from_slice(&buf).unwrap();
+            assert!(matches!(request, AgentDaemonRequest::Identify));
+            write_json_line(
+                &mut stream,
+                &AgentDaemonEvent::Identity {
+                    provider: info.provider,
+                    session_id: info.session_id.clone(),
+                    cwd: info.cwd.clone(),
+                    source: info.source.display().to_string(),
+                    command: "codex".into(),
+                    daemon_pid: std::process::id(),
+                    daemon_pid_start_ticks: process_start_ticks(std::process::id()),
+                    child_pid: None,
+                    child_pid_start_ticks: None,
+                    attached: false,
+                    attached_client_pid: None,
+                    attached_client_instance_id: None,
+                    last_screen_change_epoch_ms: 11,
+                    last_output_epoch_ms: 22,
+                    last_input_epoch_ms: 33,
+                    updated_at_epoch_s,
+                },
+            )
+            .unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_discovery_recovers_corrupt_meta_from_daemon_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(Provider::Codex, "identity-live", "/repo/identity");
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let meta_path = dir.path().join(format!("{stem}.json"));
+        let socket_path = dir.path().join(format!("{stem}.sock"));
+        fs::write(&meta_path, b"not json").unwrap();
+        let server = spawn_identity_daemon_once(&socket_path, info.clone(), 444);
+
+        let infos = discover_live_shell_infos_at(dir.path());
+        server.join().unwrap();
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(AgentKey::new(&infos[0]), key);
+        assert_eq!(infos[0].cwd, "/repo/identity");
+        assert_eq!(infos[0].source, info.source);
+        assert_eq!(infos[0].updated_at_epoch_s, 444);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_discovery_recovers_missing_meta_from_daemon_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(
+            Provider::Claude,
+            "identity-missing-meta",
+            "/repo/missing-meta",
+        );
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let socket_path = dir.path().join(format!("{stem}.sock"));
+        let server = spawn_identity_daemon_once(&socket_path, info.clone(), 555);
+
+        let infos = discover_live_shell_infos_at(dir.path());
+        server.join().unwrap();
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(AgentKey::new(&infos[0]), key);
+        assert_eq!(infos[0].cwd, "/repo/missing-meta");
+        assert_eq!(infos[0].source, info.source);
+        assert_eq!(infos[0].updated_at_epoch_s, 555);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_state_recovers_stale_meta_from_daemon_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(Provider::Codex, "identity-stale-meta", "/repo/stale-meta");
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let meta_path = dir.path().join(format!("{stem}.json"));
+        let socket_path = dir.path().join(format!("{stem}.sock"));
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "pid": 3_000_000_000u32,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let server = spawn_identity_daemon_once(&socket_path, info.clone(), 666);
+
+        let state = read_agent_runtime_state_at_for_key(
+            Some(&key),
+            &meta_path,
+            &socket_path,
+            std::process::id(),
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            state,
+            AgentListState::Live {
+                activity: AgentActivity::Quiet
+            }
+        ));
+        assert!(
+            meta_path.exists(),
+            "stale metadata must be preserved when daemon identity proves the runtime is live"
+        );
+        assert!(
+            socket_path.exists(),
+            "daemon socket must not be unlinked while identity is reachable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_state_recovers_reused_pid_meta_from_daemon_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(Provider::Claude, "identity-reused-pid", "/repo/reused-pid");
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let meta_path = dir.path().join(format!("{stem}.json"));
+        let socket_path = dir.path().join(format!("{stem}.sock"));
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "pid": std::process::id(),
+                "pid_start_ticks": process_start_ticks(std::process::id()),
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let server = spawn_identity_daemon_once(&socket_path, info.clone(), 777);
+
+        let state = read_agent_runtime_state_at_for_key(
+            Some(&key),
+            &meta_path,
+            &socket_path,
+            std::process::id(),
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            state,
+            AgentListState::Live {
+                activity: AgentActivity::Quiet
+            }
+        ));
+        assert!(
+            meta_path.exists(),
+            "pid reuse metadata must be preserved when daemon identity proves the runtime is live"
+        );
+        assert!(
+            socket_path.exists(),
+            "daemon socket must not be unlinked while identity is reachable"
+        );
+    }
+
+    #[test]
+    fn daemon_identity_event_reconstructs_meta_snapshot() {
+        let event = AgentDaemonEvent::Identity {
+            provider: Provider::Claude,
+            session_id: "identity-meta".into(),
+            cwd: "/repo/meta".into(),
+            source: SHELL_SESSION_SOURCE_MARKER.into(),
+            command: "zsh".into(),
+            daemon_pid: 123,
+            daemon_pid_start_ticks: Some(456),
+            child_pid: Some(789),
+            child_pid_start_ticks: Some(987),
+            attached: true,
+            attached_client_pid: Some(42),
+            attached_client_instance_id: Some("client-id".into()),
+            last_screen_change_epoch_ms: 1,
+            last_output_epoch_ms: 2,
+            last_input_epoch_ms: 3,
+            updated_at_epoch_s: 4,
+        };
+
+        let meta = agent_meta_snapshot_from_identity_event(event).unwrap();
+
+        assert_eq!(meta.provider.as_deref(), Some("claude"));
+        assert_eq!(meta.session_id.as_deref(), Some("identity-meta"));
+        assert_eq!(meta.cwd.as_deref(), Some("/repo/meta"));
+        assert_eq!(meta.source.as_deref(), Some(SHELL_SESSION_SOURCE_MARKER));
+        assert_eq!(meta.pid, 123);
+        assert_eq!(meta.pid_start_ticks, Some(456));
+        assert_eq!(meta.child_pid, Some(789));
+        assert_eq!(meta.child_pid_start_ticks, Some(987));
+        assert!(meta.attached);
+        assert_eq!(meta.attached_client_pid, Some(42));
+        assert_eq!(
+            meta.attached_client_instance_id.as_deref(),
+            Some("client-id")
+        );
+        assert_eq!(meta.updated_at_epoch_s, 4);
+        assert_eq!(
+            session_info_from_agent_meta_snapshot(&meta)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("shell @ meta")
+        );
+    }
+
+    #[test]
+    fn daemon_ready_line_requires_matching_key() {
+        let key = AgentKey {
+            provider: Provider::Codex,
+            session_id: "ready-session".into(),
+        };
+        let line = serde_json::to_string(&AgentDaemonReady {
+            kind: AGENT_DAEMON_READY_KIND.into(),
+            provider: Provider::Codex,
+            session_id: "ready-session".into(),
+            pid: 123,
+            socket: "/tmp/ready.sock".into(),
+        })
+        .unwrap();
+
+        let ready = parse_agent_daemon_ready_line(&line, &key).unwrap();
+
+        assert_eq!(ready.pid, 123);
+        assert_eq!(ready.socket, "/tmp/ready.sock");
+    }
+
+    #[test]
+    fn daemon_ready_line_rejects_mismatched_key() {
+        let key = AgentKey {
+            provider: Provider::Codex,
+            session_id: "ready-session".into(),
+        };
+        let line = serde_json::to_string(&AgentDaemonReady {
+            kind: AGENT_DAEMON_READY_KIND.into(),
+            provider: Provider::Claude,
+            session_id: "other-session".into(),
+            pid: 123,
+            socket: "/tmp/ready.sock".into(),
+        })
+        .unwrap();
+
+        let err = parse_agent_daemon_ready_line(&line, &key).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     #[test]
@@ -49963,6 +54414,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             assert_eq!(probe_key, &key);
             Some(AgentMetaSnapshot {
                 pid: 123,
+                pid_start_ticks: None,
                 child_pid: None,
                 child_pid_start_ticks: None,
                 provider: Some(key.provider.as_str().into()),
@@ -49994,6 +54446,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         let refreshed = refresh_live_shell_infos_from_meta(vec![shell.clone()], |_| {
             Some(AgentMetaSnapshot {
                 pid: 123,
+                pid_start_ticks: None,
                 child_pid: None,
                 child_pid_start_ticks: None,
                 provider: Some(key.provider.as_str().into()),
@@ -50111,6 +54564,74 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             Some(AgentListState::Live {
                 activity: AgentActivity::Busy
             })
+        );
+    }
+
+    #[test]
+    fn live_shell_discovery_result_preserves_verified_runtime_after_strike_limit() {
+        let mut app = app_for_key_tests();
+        let missing_live = shell_session_info_for_cwd("/repo".into());
+        let missing_live_key = AgentKey::new(&missing_live);
+        app.live_shells = vec![missing_live.clone()];
+        app.agent_states
+            .insert(missing_live_key.clone(), AgentListState::Idle);
+        app.live_shell_missing_strikes.insert(
+            missing_live_key.clone(),
+            LIVE_SHELL_DISCOVERY_PRESERVE_MISS_LIMIT,
+        );
+        app.live_shell_discovery_seq = 9;
+        app.live_shell_discovery_pending = true;
+
+        let mut verified_meta = AgentMetaSnapshot {
+            pid: 123,
+            pid_start_ticks: None,
+            child_pid: Some(456),
+            child_pid_start_ticks: Some(789),
+            provider: Some(missing_live_key.provider.as_str().into()),
+            session_id: Some(missing_live_key.session_id.clone()),
+            cwd: Some("/repo/sub".into()),
+            source: Some(SHELL_SESSION_SOURCE_MARKER.into()),
+            attached: false,
+            attached_client_pid: None,
+            attached_client_instance_id: None,
+            last_screen_change_epoch_ms: 0,
+            last_output_epoch_ms: 0,
+            last_input_epoch_ms: 0,
+            updated_at_epoch_s: 456,
+        };
+
+        app.on_live_shell_discovery_result_with_meta(
+            LiveShellDiscoveryResult {
+                seq: 9,
+                live_shells: Vec::new(),
+                started_at_epoch_ms: current_epoch_ms(),
+                queued_at_epoch_ms: current_epoch_ms(),
+                elapsed_ms: 1,
+            },
+            |key| {
+                assert_eq!(key, &missing_live_key);
+                Some(std::mem::take(&mut verified_meta))
+            },
+        );
+
+        let restored = app
+            .live_shells
+            .iter()
+            .find(|info| AgentKey::new(info) == missing_live_key)
+            .expect("verified live runtime must not be pruned by discovery strikes");
+        assert_eq!(restored.cwd, "/repo/sub");
+        assert_eq!(restored.title.as_deref(), Some("shell @ sub"));
+        assert_eq!(
+            app.agent_states.get(&missing_live_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet
+            }),
+            "verified runtime should restore a switchable live state immediately"
+        );
+        assert!(
+            !app.live_shell_missing_strikes
+                .contains_key(&missing_live_key),
+            "a verified runtime is not a discovery miss"
         );
     }
 
@@ -50399,7 +54920,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
 
     #[cfg(unix)]
     #[test]
-    fn reused_pid_agent_meta_terminates_matching_child() {
+    fn reused_pid_agent_meta_preserves_matching_child() {
         let mut child = match Command::new("sleep")
             .arg("30")
             .stdin(Stdio::null())
@@ -50414,6 +54935,8 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         let dir = tempfile::tempdir().unwrap();
         let meta = dir.path().join("agent.json");
         let socket = dir.path().join("agent.sock");
+        let scrollback = dir.path().join("scrollback");
+        let pty_log = scrollback.join("agent.ptylog");
         let key = AgentKey {
             provider: Provider::Codex,
             session_id: "reused-pid-child-session".into(),
@@ -50433,14 +54956,31 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         )
         .unwrap();
         fs::write(&socket, "").unwrap();
+        fs::create_dir_all(&scrollback).unwrap();
+        fs::write(&pty_log, b"OLD\n").unwrap();
 
         assert_eq!(
             read_agent_runtime_state_at_for_key(Some(&key), &meta, &socket, std::process::id()),
             AgentListState::Idle
         );
-        assert!(!meta.exists());
-        assert!(!socket.exists());
-        assert_process_exits(&mut child, "reused-pid meta child survived cleanup");
+        assert!(
+            meta.exists(),
+            "runtime-state cleanup must preserve metadata for a matching live child"
+        );
+        assert!(
+            socket.exists(),
+            "runtime-state cleanup must preserve the runtime socket marker for a matching live child"
+        );
+        assert!(
+            pty_log.exists(),
+            "runtime-state cleanup must preserve the PTY log when it preserves a matching child"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "runtime-state cleanup must not terminate a matching child without an explicit kill"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -52116,6 +56656,56 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
+    fn killall_result_with_unverified_runtime_requests_discovery_instead_of_clearing() {
+        let mut app = app_for_key_tests();
+        let (runtime_tx, runtime_rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+        app.runtime_tx = Some(runtime_tx);
+        let info = session_info(Provider::Codex, "killall-unverified", "/repo");
+        let key = AgentKey::new(&info);
+        app.live_shells.push(info.clone());
+        app.agent_states.insert(
+            key,
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+        app.killall_pending = Some(KillAllPending {
+            seq: 10,
+            started_at: Instant::now(),
+        });
+
+        let report = KillAllCokacmuxReport {
+            killall: KillAllAgentsReport {
+                skipped_unverified: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        app.on_killall_result(Box::new(KillAllWorkerResult {
+            seq: 10,
+            outcome: Ok(report),
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 5,
+        }));
+
+        assert!(app.killall_pending.is_none());
+        assert!(
+            app.live_shells
+                .iter()
+                .any(|candidate| AgentKey::new(candidate) == AgentKey::new(&info)),
+            "killall must not clear live runtime state when unverified live metadata was preserved"
+        );
+        let request = runtime_rx
+            .try_recv()
+            .expect("unverified preserved runtime must request a discovery refresh");
+        assert!(request.discover_live_shells);
+        assert!(app.runtime_refresh_pending);
+        assert!(app.runtime_refresh_pending_discover_live_shells);
+        assert!(app.status.contains("skipped unverified 1"));
+    }
+
+    #[test]
     fn parser_snapshot_rehydrates_scrollback_lines() {
         let mut source = vt100::Parser::new(5, 20, AGENT_SCROLLBACK_LINES);
         for line in 1..=12 {
@@ -52821,7 +57411,6 @@ IF EXIST "%~dp0\node.exe" (
                 status_prepare_err_prefix: "switch failed: ".into(),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -52848,7 +57437,6 @@ IF EXIST "%~dp0\node.exe" (
                 status_prepare_err_prefix: "right terminal prepare failed: ".into(),
                 focus_auxiliary_on_ready: true,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: true,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: false,
@@ -52921,7 +57509,6 @@ IF EXIST "%~dp0\node.exe" (
                 status_prepare_err_prefix: "switch failed: ".into(),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -53004,7 +57591,6 @@ IF EXIST "%~dp0\node.exe" (
                 status_prepare_err_prefix: "switch failed: ".into(),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -53118,7 +57704,6 @@ IF EXIST "%~dp0\node.exe" (
                 status_prepare_err_prefix: "switch failed: ".into(),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -53325,6 +57910,36 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
+    fn agent_switch_requests_live_discovery_refresh() {
+        let mut app = app_for_key_tests();
+        let (runtime_tx, runtime_rx) = mpsc::channel::<AgentRuntimeRefreshRequest>();
+        app.runtime_tx = Some(runtime_tx);
+        app.show_sessions_view = false;
+        let mut active_info = new_agent_info(Provider::Codex, "/repo");
+        active_info.session_id = "new-active-switch-discovery".into();
+        let active_key = AgentKey::new(&active_info);
+        let mut active = buffered_output_test_client("switch-discovery-active", 211);
+        active.info = active_info;
+        app.set_active_agent(active);
+        app.mark_agent_attached_locally(active_key);
+
+        app.switch_active_agent(1, true, 100, 40);
+
+        let request = runtime_rx
+            .try_recv()
+            .expect("agent switch should request a runtime refresh");
+        assert!(
+            request.discover_live_shells,
+            "agent switching should scan runtime meta before deciding no target exists"
+        );
+        assert!(matches!(
+            app.pending_runtime_action,
+            Some(PendingRuntimeAction::SwitchActive { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn live_restore_and_switch_candidates_exclude_hidden_right_auxiliary_panel() {
         let mut app = app_for_key_tests();
         app.show_sessions_view = false;
@@ -53461,7 +58076,7 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
-    fn persisted_auxiliary_registry_normalize_removes_older_entries_for_same_parent_and_kind() {
+    fn persisted_auxiliary_registry_normalize_releases_older_entries_for_same_parent_and_kind() {
         let mut app = app_for_key_tests();
         let parent = session_info(Provider::Codex, "stored-normalize-parent", "/repo");
 
@@ -53503,10 +58118,97 @@ IF EXIST "%~dp0\node.exe" (
         assert!(!app.persisted_agent_aux.contains_key(&older_key));
         assert!(app.persisted_agent_aux.contains_key(&latest_terminal_key));
         assert!(app.persisted_agent_aux.contains_key(&latest_cokacdir_key));
-        assert!(!app
+        assert!(app
             .live_shells
             .iter()
             .any(|info| AgentKey::new(info) == older_key));
+        assert_eq!(
+            app.agent_states.get(&older_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            }),
+            "normalizing the right-panel registry must release older live daemons, not terminate them"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_auxiliary_release_without_live_runtime_does_not_create_live_sidebar_entry() {
+        let mut app = app_for_key_tests();
+        let parent = session_info(Provider::Codex, "missing-release-parent", "/repo");
+        let mut aux = shell_session_info_for_cwd("/repo".into());
+        aux.session_id = "shell-missing-release-runtime".into();
+        let aux_key = AgentKey::new(&aux);
+        app.persisted_agent_aux.insert(
+            aux_key.clone(),
+            persisted_auxiliary_entry(&aux, AgentAuxKind::Terminal, &parent, 10),
+        );
+
+        assert_eq!(
+            app.release_orphan_persisted_auxiliaries("test_missing_release_runtime"),
+            1
+        );
+
+        assert!(!app.persisted_agent_aux.contains_key(&aux_key));
+        assert!(
+            !app.live_shells
+                .iter()
+                .any(|info| AgentKey::new(info) == aux_key),
+            "registry cleanup must not invent a live sidebar entry without live runtime evidence"
+        );
+        assert!(
+            !app.agent_states.contains_key(&aux_key),
+            "registry cleanup must not create a switchable state without live runtime evidence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_auxiliary_release_preserves_possible_live_runtime() {
+        let mut app = app_for_key_tests();
+        let parent = session_info(Provider::Codex, "possible-release-parent", "/repo");
+        let mut aux = shell_session_info_for_cwd("/repo".into());
+        aux.session_id = "shell-possible-release-runtime".into();
+        aux.updated_at_epoch_s = 12;
+        let aux_key = AgentKey::new(&aux);
+        app.persisted_agent_aux.insert(
+            aux_key.clone(),
+            persisted_auxiliary_entry(&aux, AgentAuxKind::Terminal, &parent, 10),
+        );
+
+        let meta = AgentMetaSnapshot {
+            pid: 4242,
+            provider: Some(aux.provider.as_str().to_string()),
+            session_id: Some(aux.session_id.clone()),
+            cwd: Some(aux.cwd.clone()),
+            source: Some(aux.source.display().to_string()),
+            updated_at_epoch_s: aux.updated_at_epoch_s,
+            ..Default::default()
+        };
+
+        assert!(app.release_persisted_auxiliary_key_with_meta(
+            &aux_key,
+            "test_possible_release_runtime",
+            |probe_key| {
+                assert_eq!(probe_key, &aux_key);
+                Some((meta.clone(), AgentMetaLivenessKind::Possible))
+            },
+        ));
+
+        assert!(!app.persisted_agent_aux.contains_key(&aux_key));
+        assert!(
+            app.live_shells
+                .iter()
+                .any(|info| AgentKey::new(info) == aux_key),
+            "possible-live runtime evidence must be preserved as standalone live state"
+        );
+        assert_eq!(
+            app.agent_states.get(&aux_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            }),
+            "possible-live runtime evidence must remain switchable instead of being dropped"
+        );
     }
 
     #[cfg(unix)]
@@ -53782,7 +58484,7 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
-    fn active_parent_exit_terminates_owned_auxiliaries() {
+    fn active_parent_exit_releases_owned_auxiliaries() {
         let mut app = app_for_key_tests();
         app.show_sessions_view = false;
         let mut active_info = new_agent_info(Provider::Codex, "/repo");
@@ -53840,6 +58542,26 @@ IF EXIST "%~dp0\node.exe" (
         assert!(app.hidden_agent_aux.is_empty());
         assert!(!app.persisted_agent_aux.contains_key(&visible_key));
         assert!(!app.persisted_agent_aux.contains_key(&hidden_key));
+        assert!(app
+            .live_shells
+            .iter()
+            .any(|info| AgentKey::new(info) == visible_key));
+        assert!(app
+            .live_shells
+            .iter()
+            .any(|info| AgentKey::new(info) == hidden_key));
+        assert_eq!(
+            app.agent_states.get(&visible_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            })
+        );
+        assert_eq!(
+            app.agent_states.get(&hidden_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            })
+        );
     }
 
     #[cfg(unix)]
@@ -53911,7 +58633,6 @@ IF EXIST "%~dp0\node.exe" (
                 status_prepare_err_prefix: "right terminal restore failed: ".into(),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -54198,7 +58919,6 @@ IF EXIST "%~dp0\node.exe" (
                 status_prepare_err_prefix: "right terminal restore failed: ".into(),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -54228,7 +58948,7 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
-    fn stale_live_auxiliary_restore_attach_is_discarded_when_parent_is_gone() {
+    fn stale_live_auxiliary_restore_attach_is_released_when_parent_is_gone() {
         let mut app = app_for_key_tests();
         let mut aux = buffered_output_test_client("stale-orphan-restore-aux", 212);
         aux.info = shell_session_info_for_cwd("/repo".into());
@@ -54266,7 +58986,6 @@ IF EXIST "%~dp0\node.exe" (
                 status_prepare_err_prefix: "right terminal restore failed: ".into(),
                 focus_auxiliary_on_ready: false,
                 main_focus_override_on_ready: None,
-                terminate_auxiliary_on_stale: false,
                 select_visible: false,
                 cokacdir_dialog_on_error: false,
                 remove_dead_on_notfound: true,
@@ -54282,12 +59001,18 @@ IF EXIST "%~dp0\node.exe" (
             elapsed_ms: 0,
         }));
 
-        assert!(!app
+        assert!(app
             .live_shells
             .iter()
             .any(|info| AgentKey::new(info) == aux_key));
         assert!(!app.persisted_agent_aux.contains_key(&aux_key));
-        assert!(!app.agent_states.contains_key(&aux_key));
+        assert_eq!(
+            app.agent_states.get(&aux_key).copied(),
+            Some(AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            }),
+            "a stale right-panel attach with a missing parent must be detached as a live standalone process"
+        );
     }
 
     #[cfg(unix)]
@@ -55560,6 +60285,83 @@ IF EXIST "%~dp0\node.exe" (
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn terminate_agent_daemon_keeps_stale_child_without_start_token() {
+        let mut child = match Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().display().to_string();
+        let info = session_info(
+            Provider::Codex,
+            &format!("stale-child-no-token-{}", uuid::Uuid::now_v7()),
+            &cwd,
+        );
+        let key = AgentKey::new(&info);
+        let meta_path = agent_meta_path(&key).unwrap();
+        let socket_path = agent_socket_path(&key).unwrap();
+        let scrollback = meta_path.parent().unwrap().join("scrollback");
+        let pty_log = scrollback.join(format!("{}.ptylog", agent_file_stem(&key)));
+        let lock_path = coding_agent_cwd_lock_path(&info).unwrap().unwrap();
+        fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&scrollback).unwrap();
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "pid": 0,
+                "child_pid": child_pid,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(&socket_path, "").unwrap();
+        fs::write(&pty_log, b"OLD\n").unwrap();
+        fs::write(
+            &lock_path,
+            serde_json::to_string_pretty(&coding_agent_cwd_lock_for_info(
+                &info,
+                0,
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = terminate_agent_daemon(&key).unwrap();
+
+        assert_eq!(outcome.pid, None);
+        assert_eq!(outcome.child_pid, None);
+        assert!(outcome.skipped_unverified);
+        assert!(meta_path.exists());
+        assert!(socket_path.exists());
+        assert!(pty_log.exists());
+        assert!(lock_path.exists());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "destructive cleanup must not kill or lose a child without a matching start token"
+        );
+        let _ = fs::remove_file(&meta_path);
+        let _ = fs::remove_file(&socket_path);
+        let _ = fs::remove_file(&pty_log);
+        let _ = fs::remove_file(&lock_path);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn terminate_agent_daemon_keeps_mismatched_cwd_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -55635,13 +60437,8 @@ IF EXIST "%~dp0\node.exe" (
         }
         let mut child = command.spawn().unwrap();
         let child_pid = child.id();
-        let info = session_info(Provider::Claude, "kill-child", "/repo");
-        let key = AgentKey::new(&info);
 
-        assert_eq!(
-            terminate_agent_child_process(Some(child_pid), 1, &key),
-            Some(child_pid)
-        );
+        terminate_process_group(child_pid);
 
         assert_process_exits(&mut child, "PTY child process group survived termination");
     }
@@ -55680,6 +60477,41 @@ IF EXIST "%~dp0\node.exe" (
             exited,
             "direct-pid fallback failed to terminate a non-group-leader process"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_termination_skips_start_token_mismatch() {
+        let mut child = match Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let Some(actual_start_ticks) = process_start_ticks(child_pid) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        };
+        let mismatched_start_ticks = actual_start_ticks.wrapping_add(1);
+
+        assert!(!terminate_process_group_if_start_token_matches(
+            child_pid,
+            Some(mismatched_start_ticks),
+            "test_start_token_mismatch"
+        ));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "start-token mismatch must not terminate the process"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -55739,8 +60571,9 @@ IF EXIST "%~dp0\node.exe" (
         let info = session_info(Provider::Codex, "stale-child", "/tmp/stale-child");
         let key = AgentKey::new(&info);
         let stem = agent_file_stem(&key);
+        let meta = dir.path().join(format!("{stem}.json"));
         fs::write(
-            dir.path().join(format!("{stem}.json")),
+            &meta,
             serde_json::json!({
                 "pid": 3000000000u32,
                 "child_pid": child_pid,
@@ -55764,7 +60597,81 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
-    fn killall_terminates_child_from_reused_daemon_pid_meta() {
+    fn killall_keeps_stale_meta_child_without_start_token() {
+        let mut child = match Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(
+            Provider::Codex,
+            "stale-child-no-token-killall",
+            "/tmp/stale-child-no-token-killall",
+        );
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let meta = dir.path().join(format!("{stem}.json"));
+        let socket = dir.path().join(format!("{stem}.sock"));
+        let scrollback = dir.path().join("scrollback");
+        let pty_log = scrollback.join(format!("{stem}.ptylog"));
+        let cwd_lock = dir.path().join("cwd-preserved-unverified.lock");
+        fs::create_dir_all(&scrollback).unwrap();
+        fs::write(
+            &meta,
+            serde_json::json!({
+                "pid": 3000000000u32,
+                "child_pid": child_pid,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(&socket, "").unwrap();
+        fs::write(&pty_log, b"OLD\n").unwrap();
+        fs::write(
+            &cwd_lock,
+            serde_json::to_string_pretty(&coding_agent_cwd_lock_for_info(
+                &info,
+                0,
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = kill_all_agent_daemons_at(dir.path(), std::process::id());
+
+        assert_eq!(report.stale, 1);
+        assert_eq!(report.skipped_unverified, 1);
+        assert_eq!(report.child_processes_terminated, 0);
+        assert_eq!(report.pty_logs_deleted, 0);
+        assert_eq!(report.cwd_locks_removed, 0);
+        assert!(meta.exists());
+        assert!(socket.exists());
+        assert!(pty_log.exists());
+        assert!(cwd_lock.exists());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "killall must not kill or lose a child without a matching start token"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killall_preserves_child_from_reused_daemon_pid_meta() {
         let mut child = match Command::new("sleep")
             .arg("30")
             .stdin(Stdio::null())
@@ -55804,11 +60711,17 @@ IF EXIST "%~dp0\node.exe" (
         let report = kill_all_agent_daemons_at(dir.path(), std::process::id());
 
         assert_eq!(report.scanned, 1);
-        assert_eq!(report.stale, 1);
+        assert_eq!(report.stale, 0);
         assert_eq!(report.skipped_self, 0);
-        assert_eq!(report.child_processes_terminated, 1);
-        assert!(!meta.exists());
-        assert_process_exits(&mut child, "reused daemon pid child survived killall");
+        assert_eq!(report.skipped_unverified, 1);
+        assert_eq!(report.child_processes_terminated, 0);
+        assert!(meta.exists());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "killall must not kill a child from metadata whose daemon pid was reused"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[cfg(unix)]
@@ -55895,6 +60808,90 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
+    fn stale_agent_runtime_sweep_preserves_matching_child() {
+        let mut child = match Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let dir = tempfile::tempdir().unwrap();
+        let scrollback = dir.path().join("scrollback");
+        let info = session_info(
+            Provider::Codex,
+            "sweep-preserve-child",
+            "/tmp/sweep-preserve-child",
+        );
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let socket = dir.path().join(format!("{stem}.sock"));
+        let pty_log = scrollback.join(format!("{stem}.ptylog"));
+        let cwd_lock = dir.path().join("cwd-preserve-child.lock");
+        fs::create_dir_all(&scrollback).unwrap();
+        fs::write(&socket, b"").unwrap();
+        fs::write(&pty_log, b"OLD\n").unwrap();
+        fs::write(
+            dir.path().join(format!("{stem}.json")),
+            serde_json::json!({
+                "pid": 3000000000u32,
+                "child_pid": child_pid,
+                "child_pid_start_ticks": process_start_ticks(child_pid),
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            &cwd_lock,
+            serde_json::to_string_pretty(&coding_agent_cwd_lock_for_info(
+                &info,
+                3_000_000_000,
+                CODING_AGENT_CWD_LOCK_OWNER_AGENT,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = cleanup_stale_agent_runtime_files_at(dir.path(), "test_preserve_child");
+
+        assert_eq!(report.child_processes_terminated, 0);
+        assert_eq!(report.pty_logs_deleted, 0);
+        assert_eq!(report.cwd_locks_removed, 0);
+        assert!(
+            dir.path().join(format!("{stem}.json")).exists(),
+            "startup/runtime sweep must preserve metadata for a matching live child"
+        );
+        assert!(
+            socket.exists(),
+            "startup/runtime sweep must preserve the socket marker for a matching live child"
+        );
+        assert!(
+            pty_log.exists(),
+            "startup/runtime sweep must preserve the PTY log when it preserves a matching child"
+        );
+        assert!(
+            cwd_lock.exists(),
+            "startup/runtime sweep must preserve the cwd lock while the matching child is alive"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "startup/runtime sweep must not terminate a matching child without an explicit kill"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stale_agent_runtime_sweep_keeps_reachable_orphan_socket() {
         let dir = tempfile::tempdir().unwrap();
         let stem = "codex-starting";
@@ -55911,12 +60908,248 @@ IF EXIST "%~dp0\node.exe" (
         assert!(tmp_meta.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stale_agent_runtime_sweep_keeps_unreadable_meta_with_reachable_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let scrollback = dir.path().join("scrollback");
+        fs::create_dir_all(&scrollback).unwrap();
+        let stem = "codex-corrupt-live";
+        let meta = dir.path().join(format!("{stem}.json"));
+        let socket = dir.path().join(format!("{stem}.sock"));
+        let pty_log = scrollback.join(format!("{stem}.ptylog"));
+        let _listener = AgentListener::bind(&socket).unwrap();
+        fs::write(&meta, b"not json").unwrap();
+        fs::write(&pty_log, b"OLD\n").unwrap();
+
+        let report =
+            cleanup_stale_agent_runtime_files_at(dir.path(), "test_reachable_corrupt_meta");
+
+        assert_eq!(report.pty_logs_deleted, 0);
+        assert_eq!(report.runtime_files_removed, 0);
+        assert!(meta.exists());
+        assert!(socket.exists());
+        assert!(pty_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_agent_runtime_sweep_keeps_readable_stale_meta_with_reachable_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let scrollback = dir.path().join("scrollback");
+        fs::create_dir_all(&scrollback).unwrap();
+        let info = session_info(Provider::Codex, "reachable-stale-meta", "/repo/reachable-stale");
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let meta = dir.path().join(format!("{stem}.json"));
+        let socket = dir.path().join(format!("{stem}.sock"));
+        let pty_log = scrollback.join(format!("{stem}.ptylog"));
+        let _listener = AgentListener::bind(&socket).unwrap();
+        fs::write(
+            &meta,
+            serde_json::json!({
+                "pid": 3_000_000_000u32,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(&pty_log, b"OLD\n").unwrap();
+
+        let report =
+            cleanup_stale_agent_runtime_files_at(dir.path(), "test_reachable_stale_meta");
+
+        assert_eq!(report.pty_logs_deleted, 0);
+        assert_eq!(report.runtime_files_removed, 0);
+        assert!(meta.exists());
+        assert!(socket.exists());
+        assert!(pty_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killall_preserves_stale_meta_with_reachable_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let scrollback = dir.path().join("scrollback");
+        fs::create_dir_all(&scrollback).unwrap();
+        let info = session_info(Provider::Claude, "killall-reachable-stale", "/repo/killall");
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let meta = dir.path().join(format!("{stem}.json"));
+        let socket = dir.path().join(format!("{stem}.sock"));
+        let pty_log = scrollback.join(format!("{stem}.ptylog"));
+        let _listener = AgentListener::bind(&socket).unwrap();
+        fs::write(
+            &meta,
+            serde_json::json!({
+                "pid": 3_000_000_000u32,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(&pty_log, b"OLD\n").unwrap();
+
+        let report = kill_all_agent_daemons_at(dir.path(), std::process::id());
+
+        assert_eq!(report.killed, 0);
+        assert_eq!(report.skipped_unverified, 1);
+        assert_eq!(report.pty_logs_deleted, 0);
+        assert!(meta.exists());
+        assert!(socket.exists());
+        assert!(pty_log.exists());
+    }
+
     #[test]
     fn unconnected_current_process_is_not_verified_agent_daemon() {
         let info = session_info(Provider::Codex, "verify-miss", "/repo");
         let key = AgentKey::new(&info);
 
-        assert!(!verify_agent_daemon_identity(&key, std::process::id()));
+        assert_ne!(
+            agent_daemon_process_identity(std::process::id(), &key),
+            AgentDaemonProcessIdentity::CokacmuxDaemon
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_guard_finds_matching_daemon_from_os_process_table() {
+        if Command::new("bash")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let info = session_info(
+            Provider::Codex,
+            &format!("os-scan-{}", uuid::Uuid::now_v7()),
+            "/repo",
+        );
+        let key = AgentKey::new(&info);
+        let fake_argv0 = tempfile::tempdir().unwrap().path().join("cokacmux");
+        let script = format!(
+            "exec -a {} bash -c 'while true; do sleep 30; done' x {} {} {}",
+            shell_single_quote(&fake_argv0.display().to_string()),
+            shell_single_quote(AGENT_DAEMON_ARG),
+            shell_single_quote(key.provider.as_str()),
+            shell_single_quote(&key.session_id),
+        );
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+
+        let started = Instant::now();
+        let mut meta = None;
+        while started.elapsed() < Duration::from_secs(2) {
+            meta = possible_agent_daemon_meta_from_os_process(&key);
+            if meta.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let expected_start_ticks = process_start_ticks(child_pid);
+        terminate_process_group(child_pid);
+        let _ = child.wait();
+
+        let meta = meta.expect("matching daemon process should be found from the OS process table");
+        assert_eq!(meta.pid, child_pid);
+        assert_eq!(agent_key_from_meta(&meta).as_ref(), Some(&key));
+        assert_eq!(meta.pid_start_ticks, expected_start_ticks);
+    }
+
+    #[test]
+    fn daemon_start_lock_replaces_dead_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(Provider::Codex, "dead-start-lock", "/repo");
+        let key = AgentKey::new(&info);
+        let path = agent_daemon_start_lock_path_at(dir.path(), &key);
+        let dead_lock = AgentDaemonStartLock {
+            version: AGENT_DAEMON_START_LOCK_VERSION,
+            pid: u32::MAX,
+            pid_start_ticks: Some(1),
+            provider: key.provider.as_str().to_string(),
+            session_id: key.session_id.clone(),
+            created_at_epoch_s: current_epoch_s(),
+        };
+        fs::write(&path, serde_json::to_string_pretty(&dead_lock).unwrap()).unwrap();
+
+        let guard = acquire_agent_daemon_start_lock_at(dir.path(), &key)
+            .expect("dead start lock should be replaced");
+
+        assert_eq!(guard.lock.pid, std::process::id());
+        assert!(path.exists());
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn daemon_start_lock_waits_for_live_owner_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().to_path_buf();
+        let info = session_info(Provider::Codex, "live-start-lock", "/repo");
+        let key = AgentKey::new(&info);
+        let guard = acquire_agent_daemon_start_lock_at(&runtime_dir, &key)
+            .expect("first start lock should be acquired");
+
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let wait_key = key.clone();
+        let wait_dir = runtime_dir.clone();
+        let waiter = thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            let next_guard = acquire_agent_daemon_start_lock_at(&wait_dir, &wait_key)
+                .expect("second start lock should be acquired after release");
+            acquired_tx.send(next_guard.lock.pid).unwrap();
+            drop(next_guard);
+        });
+
+        attempt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "second owner must not acquire the start lock while the first live owner holds it"
+        );
+
+        drop(guard);
+
+        assert_eq!(
+            acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            std::process::id()
+        );
+        waiter.join().unwrap();
+        assert!(!agent_daemon_start_lock_path_at(&runtime_dir, &key).exists());
     }
 
     #[test]
@@ -55965,6 +61198,28 @@ IF EXIST "%~dp0\node.exe" (
             ],
             &key,
         ));
+        assert!(agent_daemon_args_have_agent_arg(&[
+            "cokacmux".into(),
+            AGENT_DAEMON_ARG.into(),
+            "codex".into(),
+            "verify-match".into(),
+        ]));
+        assert!(!agent_daemon_args_have_agent_arg(&[
+            "cokacmux".into(),
+            AGENT_DAEMON_ARG.into(),
+        ]));
+        assert!(!agent_daemon_args_have_agent_arg(&[
+            "cokacmux".into(),
+            AGENT_DAEMON_ARG.into(),
+            "not-a-provider".into(),
+            "verify-match".into(),
+        ]));
+        assert!(!agent_daemon_args_have_agent_arg(&[
+            "cokacmux".into(),
+            AGENT_DAEMON_ARG.into(),
+            "codex".into(),
+            "".into(),
+        ]));
         assert!(!agent_daemon_args_match(
             &[
                 "sleep".into(),
@@ -56014,8 +61269,9 @@ IF EXIST "%~dp0\node.exe" (
         let info = session_info(Provider::Codex, "pid-reuse", "/repo");
         let key = AgentKey::new(&info);
         let stem = agent_file_stem(&key);
+        let meta = dir.path().join(format!("{}.json", stem));
         fs::write(
-            dir.path().join(format!("{}.json", stem)),
+            &meta,
             format!(
                 r#"{{"pid":{},"provider":"codex","session_id":"pid-reuse"}}"#,
                 child.id()
@@ -56027,7 +61283,9 @@ IF EXIST "%~dp0\node.exe" (
 
         assert_eq!(report.scanned, 1);
         assert_eq!(report.killed, 0);
-        assert_eq!(report.stale, 1);
+        assert_eq!(report.stale, 0);
+        assert_eq!(report.skipped_unverified, 1);
+        assert!(meta.exists());
         assert!(
             child.try_wait().unwrap().is_none(),
             "unverified live pid was terminated"
@@ -56037,7 +61295,7 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn killall_removes_unverified_current_process_meta() {
+    fn killall_preserves_unverified_current_process_meta() {
         let dir = tempfile::tempdir().unwrap();
         let stem = "codex-self";
         let meta = dir.path().join(format!("{}.json", stem));
@@ -56054,9 +61312,10 @@ IF EXIST "%~dp0\node.exe" (
 
         assert_eq!(report.scanned, 1);
         assert_eq!(report.skipped_self, 0);
-        assert_eq!(report.stale, 1);
+        assert_eq!(report.stale, 0);
+        assert_eq!(report.skipped_unverified, 1);
         assert_eq!(report.killed, 0);
-        assert!(!meta.exists());
+        assert!(meta.exists());
     }
 
     #[test]
@@ -56077,7 +61336,7 @@ IF EXIST "%~dp0\node.exe" (
         fs::write(dir.path().join("clone_tree.json"), b"{}").unwrap();
         fs::write(data.join("snapshot.txt"), b"snapshot").unwrap();
 
-        let report = remove_killall_config_dirs_at(dir.path()).unwrap();
+        let report = remove_killall_config_dirs_at_with_policy(dir.path(), false).unwrap();
 
         assert!(report.agents_removed);
         assert!(!report.agents_missing);
@@ -56093,11 +61352,30 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
+    fn killall_config_cleanup_preserves_agents_when_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        let debug = dir.path().join("debug");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&debug).unwrap();
+        fs::write(agents.join("preserved.json"), b"{}").unwrap();
+        fs::write(debug.join("cokacmux.log"), b"debug").unwrap();
+
+        let report = remove_killall_config_dirs_at_with_policy(dir.path(), true).unwrap();
+
+        assert!(!report.agents_removed);
+        assert!(!report.agents_missing);
+        assert!(report.debug_removed);
+        assert!(agents.join("preserved.json").exists());
+        assert!(!debug.exists());
+    }
+
+    #[test]
     fn killall_config_cleanup_reports_missing_agents_and_debug() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("settings.json"), b"{}").unwrap();
 
-        let report = remove_killall_config_dirs_at(dir.path()).unwrap();
+        let report = remove_killall_config_dirs_at_with_policy(dir.path(), false).unwrap();
 
         assert!(!report.agents_removed);
         assert!(report.agents_missing);
