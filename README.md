@@ -164,6 +164,7 @@ cokacmux
 | 7 | 다시 열기 창만 열고 닫기 | `e`, `Esc` |
 | 8 | 복사 창만 열고 닫기 | `c`, `Esc` |
 | 9 | 삭제 창만 열고 닫기 | `Delete`, `Esc` |
+| 10 | 서버 명령을 background terminal로 시작 | `cokacmux start web -- node server.js` |
 
 ### 세션 읽기
 
@@ -206,6 +207,28 @@ AI로 찾으려면 먼저 설정 화면에서 사용할 코딩 도구를 골라�
 | Coding agent | 화면에 보이는 이름입니다. 새 코딩 도구를 엽니다. |
 
 새 코딩 도구를 열 때는 Claude Code, Codex, OpenCode, Pi, GJC 중 하나를 고릅니다.
+
+Folder 항목에서는 `Tab`으로 로컬 디렉터리 자동완성을 쓸 수 있습니다. 후보 목록이 열려 있으면 `↑` / `↓`로 고르고, `Esc`는 목록만 먼저 닫습니다.
+
+명령줄에서 바로 background terminal을 만들 수도 있습니다.
+
+```bash
+cokacmux start web --cwd /path/to/project -- node server.js
+```
+
+`--` 뒤에 실제 실행할 명령과 인자를 둡니다. 이렇게 시작한 명령도 실행 중인 agent 목록에 `terminal`로 나타나며, `Ctrl+]` 또는 `Ctrl+[`로 목록에 돌아가 확인할 수 있습니다.
+
+이 기능은 `npm run dev`, `node server.js`, `cargo watch`처럼 계속 켜 두는 명령에 맞습니다. `cokacmux start`는 명령을 켠 뒤 바로 shell로 돌아오고, 출력 화면은 나중에 cokacmux TUI에서 다시 볼 수 있게 보관합니다.
+
+Windows에서도 같은 방식으로 쓸 수 있습니다.
+
+```powershell
+cokacmux start web --cwd C:\work\app -- npm run dev
+```
+
+`npm.cmd`처럼 `.cmd` 파일로 설치된 명령도 `PATH`와 `PATHEXT` 규칙에 따라 찾습니다. 프로그램 경로에 공백이 있어도 일반 Windows 명령처럼 처리합니다. PowerShell 문법이 필요한 명령은 `powershell.exe -Command "..."`로 감싸면 됩니다.
+
+자세한 CLI 사용법과 제한은 [`docs/CLI.md`](docs/CLI.md)를 보세요.
 
 ### 실행 중인 화면으로 돌아가기
 
@@ -392,6 +415,8 @@ AI로 찾으려면 먼저 설정 화면에서 사용할 코딩 도구를 골라�
 | `←` | 선택 항목의 이전 값을 고르고 싶을 때 | 작업 종류, 코딩 도구, 권한 모드를 이전 값으로 바꿉니다. |
 | 폴더 칸에서 `←`, `→`, `Home`, `End` | 폴더 경로를 고칠 때 | 커서를 움직입니다. |
 | 폴더 칸에서 `Backspace`, `Delete` | 폴더 경로를 지울 때 | 경로 글자를 지웁니다. |
+| 폴더 칸에서 `Tab` | 로컬 폴더 이름을 완성하고 싶을 때 | 경로 자동완성을 적용하거나 후보 목록을 엽니다. |
+| 후보 목록에서 `↑`, `↓` | 다른 폴더 후보를 고르고 싶을 때 | 선택 후보를 움직입니다. |
 | 폴더 칸에서 일반 글자 | 새 작업을 열 폴더를 입력할 때 | 폴더 경로에 글자를 넣습니다. |
 
 ### 실행 방식 선택창
@@ -586,6 +611,8 @@ cokacmux는 내 컴퓨터에 저장된 대화 기록을 읽어서 보여줍니�
 대화를 다시 열 때는 내 컴퓨터에 설치된 `claude`, `codex`, `opencode`, `pi`, `gjc` 명령을 실행합니다.
 
 `q`나 `Ctrl+Q`로 cokacmux를 종료해도 실행 중인 코딩 도구는 자동으로 꺼지지 않습니다. 하나만 끄려면 `Ctrl+K`를 쓰고, 모두 끄려면 `Ctrl+Shift+K` 또는 `cokacmux killall`을 쓰세요.
+
+`cokacmux start`는 `node server.js`처럼 계속 떠 있어야 하는 명령을 background terminal로 관리하기 위한 기능입니다. 금방 끝나는 일회성 명령은 일반 shell에서 직접 실행하는 편이 낫습니다.
 
 대화 삭제, 폴더 복사, 위험한 실행을 하기 전에는 중요한 파일을 따로 보관하세요.
 

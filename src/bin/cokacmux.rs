@@ -55,6 +55,7 @@ unsafe extern "system" {
 }
 
 use anyhow::Result;
+use clap::{Parser, Subcommand};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -192,8 +193,96 @@ const AGENT_OUTPUT_DRAIN_BUDGET_MS: u64 = 8;
 const TERMINAL_RESPONSE_SCAN_TAIL_BYTES: usize = 4;
 const AGENT_DAEMON_ARG: &str = "--agent-daemon";
 const AGENT_DAEMON_READY_ENV: &str = "COKACMUX_DAEMON_READY_STDOUT";
+const AGENT_DAEMON_READY_TCP_ENV: &str = "COKACMUX_DAEMON_READY_TCP";
 const AGENT_DAEMON_READY_KIND: &str = "cokacmux_agent_daemon_ready";
+const CLI_AFTER_LONG_HELP: &str = "\
+CONFIG:
+  ~/.cokacmux/settings.json
+  ~/.cokacmux/keybinding.json
+
+INTERACTIVE KEYS:
+  Esc/q/Ctrl+q quit
+  Up/Down      navigate
+  Alt+Up/Down or Ctrl+Shift+Up/Down select from sidebar/list
+  Alt+Left/Right or Ctrl+Shift+Left/Right resize focused side pane
+  Agent: Shift+Up/Down child transcript line, Shift+Alt+Up/Down page, Shift/Alt+Home/End top/bottom
+  PgUp / PgDn  jump 10
+  g/Home / G/End top / bottom
+  Tab          switch focus between session list and preview
+  Ctrl+F       open search mode chooser
+  v            toggle session list/tree view
+  t            edit selected session title
+  ,            configure AI agent; title edit Ctrl+T generates AI title
+  r            refresh from disk
+  c            clone selected session
+  e / Enter    switch to live selected agent, or choose launch mode to start it
+  Ctrl+] / Ctrl+[ switch between sessions and active agent
+  Ctrl+K       kill selected/current agent
+  Ctrl+PgUp/PgDn switch live agent from agent screen
+  Delete / d   delete selected session (confirm)
+  Space        refresh preview";
 const AGENT_DAEMON_START_LOCK_VERSION: u32 = 1;
+
+#[derive(Debug, Parser, PartialEq, Eq)]
+#[command(
+    name = "cokacmux",
+    version,
+    about = "TUI session browser for local coding agents",
+    long_about = "cokacmux - TUI session browser for local coding agents",
+    after_long_help = CLI_AFTER_LONG_HELP
+)]
+struct CokacmuxCli {
+    /// Enable debug logs.
+    #[arg(long, global = true)]
+    debug: bool,
+
+    /// Enable high-volume trace logs.
+    #[arg(long, global = true)]
+    trace: bool,
+
+    /// Headless sanity check without entering the TUI.
+    #[arg(long)]
+    check: bool,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum CliCommand {
+    /// Start a managed terminal command in the background.
+    Start {
+        /// Stable label shown in the live terminal list.
+        name: String,
+
+        /// Working directory for the command.
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        cwd: PathBuf,
+
+        /// Command and arguments to run. Put these after `--`.
+        #[arg(value_name = "COMMAND", required = true, num_args = 1.., last = true)]
+        command: Vec<String>,
+    },
+
+    /// Terminate cokacmux processes and remove ~/.cokacmux/{agents,debug}.
+    Killall,
+
+    /// Terminate cokacmux processes and remove ~/.cokacmux.
+    Reset,
+
+    /// Manage cokacmux agent processes.
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCliCommand,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum AgentsCliCommand {
+    /// Terminate cokacmux agent processes and remove runtime/debug files.
+    Killall,
+}
+
 /// Poll a concrete start-lock file while another live cokacmux client is
 /// starting the same daemon. This does not infer readiness from elapsed time:
 /// it only waits for the lock owner to release or become provably dead.
@@ -2954,6 +3043,7 @@ enum InputMode {
         kind: NewSessionKind,
         cwd: String,
         cwd_cursor: usize,
+        cwd_completion: NewSessionPathCompletion,
         provider: Provider,
         provider_options: Vec<Provider>,
         launch_mode: AgentLaunchMode,
@@ -3205,6 +3295,35 @@ const NEW_SESSION_FIELD_KIND: usize = 0;
 const NEW_SESSION_FIELD_CWD: usize = 1;
 const NEW_SESSION_FIELD_PROVIDER: usize = 2;
 const NEW_SESSION_FIELD_PERMISSIONS: usize = 3;
+const NEW_SESSION_PATH_COMPLETION_MAX_ITEMS: usize = 4;
+
+#[derive(Debug, Clone, Default)]
+struct NewSessionPathCompletion {
+    suggestions: Vec<String>,
+    selected_index: usize,
+    visible: bool,
+}
+
+#[derive(Debug)]
+struct NewSessionPathSuggestionCandidate {
+    display_name: String,
+    match_rank: u8,
+    hidden_penalty: u8,
+    match_start: usize,
+    name_len: usize,
+    sort_name: String,
+    original_name: String,
+}
+
+#[derive(Debug)]
+struct NewSessionPathCompletionContext {
+    base_dir: PathBuf,
+    prefix: String,
+    replace_start: usize,
+    replace_end: usize,
+    replace_end_with_separator: usize,
+    replacement_prefix: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NewSessionLaunchStage {
@@ -3798,8 +3917,8 @@ fn agent_key_debug_value(key: &AgentKey) -> serde_json::Value {
 }
 
 fn agent_info_kind(info: &SessionInfo) -> &'static str {
-    if is_shell_session_info(info) {
-        "shell"
+    if is_shell_session_info(info) || is_cli_command_session_info(info) {
+        "terminal"
     } else if is_cokacdir_session_info(info) {
         "cokacdir"
     } else if is_new_agent_session_info(info) {
@@ -16991,6 +17110,7 @@ impl App {
             kind: NewSessionKind::Terminal,
             cwd,
             cwd_cursor,
+            cwd_completion: NewSessionPathCompletion::default(),
             provider,
             provider_options,
             launch_mode: AgentLaunchMode::Normal,
@@ -17132,6 +17252,7 @@ impl App {
                         kind: result.kind,
                         cwd: result.raw_cwd,
                         cwd_cursor,
+                        cwd_completion: NewSessionPathCompletion::default(),
                         provider,
                         provider_options,
                         launch_mode: result.launch_mode,
@@ -23060,89 +23181,32 @@ fn main() -> Result<()> {
 
 fn cokacmux_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let debug_enabled = args.iter().any(|a| a == "--debug");
-    let trace_enabled = args.iter().any(|a| a == "--trace");
-    let command_args: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|arg| *arg != "--debug" && *arg != "--trace")
-        .collect();
-    if matches!(command_args.as_slice(), ["reset"]) {
-        let report = reset_cokacmux()?;
-        println!(
-            "reset cokacmux: killed={} stale={} skipped_unverified={} child_processes_terminated={} runtime_files_removed={} pty_logs_deleted={} cwd_locks_removed={} untracked_daemons_scanned={} untracked_daemons_terminated={} untracked_daemons_skipped_self={} untracked_daemons_skipped_unverified={} clients_scanned={} clients_terminated={} clients_skipped_self={} clients_skipped_unverified={} errors={} removed={}{}",
-            report.killall.killed,
-            report.killall.stale,
-            report.killall.skipped_unverified,
-            report.killall.child_processes_terminated,
-            report.killall.runtime_files_removed,
-            report.killall.pty_logs_deleted,
-            report.killall.cwd_locks_removed,
-            report.untracked_daemon_processes_scanned,
-            report.untracked_daemon_processes_terminated,
-            report.untracked_daemon_processes_skipped_self,
-            report.untracked_daemon_processes_skipped_unverified,
-            report.client_processes_scanned,
-            report.client_processes_terminated,
-            report.client_processes_skipped_self,
-            report.client_processes_skipped_unverified,
-            report
-                .killall
-                .errors
-                .saturating_add(report.client_process_errors)
-                .saturating_add(report.untracked_daemon_process_errors),
-            report.config_removed,
-            if report.config_missing {
-                " config_already_missing"
-            } else {
-                ""
-            }
+
+    if args.first().map(String::as_str) == Some(AGENT_DAEMON_ARG) {
+        let debug_enabled = args.iter().any(|a| a == "--debug");
+        let trace_enabled = args.iter().any(|a| a == "--trace");
+        init_debug_from_cli(debug_enabled, trace_enabled);
+        install_vt100_panic_filter();
+        debug_log("main_dispatch_agent_daemon", serde_json::json!({}));
+        let result = run_agent_daemon_args(&args[1..]);
+        debug_log(
+            "main_agent_daemon_exit",
+            serde_json::json!({
+                "ok": result.is_ok(),
+                "error": result.as_ref().err().map(|e| e.to_string()),
+            }),
         );
-        return Ok(());
+        return result;
     }
-    if matches!(command_args.as_slice(), ["killall"] | ["agents", "killall"]) {
-        let report = killall_cokacmux()?;
-        println!(
-            "killall cokacmux: killed={} stale={} skipped_unverified={} child_processes_terminated={} runtime_files_removed={} pty_logs_deleted={} cwd_locks_removed={} untracked_daemons_scanned={} untracked_daemons_terminated={} untracked_daemons_skipped_self={} untracked_daemons_skipped_unverified={} clients_scanned={} clients_terminated={} clients_skipped_self={} clients_skipped_unverified={} errors={} agents_removed={}{} debug_removed={}{}",
-            report.killall.killed,
-            report.killall.stale,
-            report.killall.skipped_unverified,
-            report.killall.child_processes_terminated,
-            report.killall.runtime_files_removed,
-            report.killall.pty_logs_deleted,
-            report.killall.cwd_locks_removed,
-            report.untracked_daemon_processes_scanned,
-            report.untracked_daemon_processes_terminated,
-            report.untracked_daemon_processes_skipped_self,
-            report.untracked_daemon_processes_skipped_unverified,
-            report.client_processes_scanned,
-            report.client_processes_terminated,
-            report.client_processes_skipped_self,
-            report.client_processes_skipped_unverified,
-            report
-                .killall
-                .errors
-                .saturating_add(report.client_process_errors)
-                .saturating_add(report.untracked_daemon_process_errors),
-            report.agents_removed,
-            if report.agents_missing {
-                " agents_already_missing"
-            } else {
-                ""
-            },
-            report.debug_removed,
-            if report.debug_missing {
-                " debug_already_missing"
-            } else {
-                ""
-            }
-        );
-        return Ok(());
-    }
-    init_debug_from_cli(debug_enabled, trace_enabled);
+
+    let cli =
+        CokacmuxCli::parse_from(std::iter::once("cokacmux").chain(args.iter().map(String::as_str)));
+    validate_cli(&cli)?;
+    init_debug_from_cli(cli.debug, cli.trace);
     install_vt100_panic_filter();
-    // Headless smoke-test mode — doesn't enter raw mode / alternate screen.
-    // Useful for CI-style sanity checks of the library + discovery layer.
+    if let Some(command) = cli.command.as_ref() {
+        return run_cli_command(command);
+    }
     debug_log(
         "main_start",
         serde_json::json!({
@@ -23156,29 +23220,8 @@ fn cokacmux_main() -> Result<()> {
             "trace": TRACE_ENABLED.load(Ordering::Relaxed),
         }),
     );
-    if args.first().map(String::as_str) == Some(AGENT_DAEMON_ARG) {
-        debug_log("main_dispatch_agent_daemon", serde_json::json!({}));
-        let result = run_agent_daemon_args(&args[1..]);
-        debug_log(
-            "main_agent_daemon_exit",
-            serde_json::json!({
-                "ok": result.is_ok(),
-                "error": result.as_ref().err().map(|e| e.to_string()),
-            }),
-        );
-        return result;
-    }
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        debug_log("main_dispatch_version", serde_json::json!({}));
-        println!("cokacmux {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        debug_log("main_dispatch_help", serde_json::json!({}));
-        print_help();
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--check") {
+
+    if cli.check {
         debug_log("main_dispatch_check", serde_json::json!({}));
         let app = App::new();
         debug_log(
@@ -23209,38 +23252,167 @@ fn cokacmux_main() -> Result<()> {
     result
 }
 
-fn print_help() {
+fn validate_cli(cli: &CokacmuxCli) -> Result<()> {
+    if cli.check && cli.command.is_some() {
+        anyhow::bail!("--check cannot be combined with subcommands");
+    }
+    Ok(())
+}
+
+fn run_cli_command(command: &CliCommand) -> Result<()> {
+    match command {
+        CliCommand::Start { name, cwd, command } => run_start_cli(name, cwd, command),
+        CliCommand::Killall => run_killall_cli(),
+        CliCommand::Reset => run_reset_cli(),
+        CliCommand::Agents {
+            command: AgentsCliCommand::Killall,
+        } => run_killall_cli(),
+    }
+}
+
+fn run_start_cli(name: &str, cwd: &Path, command: &[String]) -> Result<()> {
+    let name = validate_cli_terminal_name(name)?;
+    let cwd = normalize_cli_start_cwd(cwd)?;
+    let command = validate_cli_terminal_command(command)?;
+    let info = cli_command_session_info(name.clone(), cwd, command)?;
+    let key = AgentKey::new(&info);
+    let command_line = cli_command_launch_spec(&info).command_line();
+    let stream = start_agent_daemon(&info, AgentLaunchMode::Normal)?;
+    let identity = identify_started_cli_terminal(stream, &key)?;
+    if identity.provider != key.provider || identity.session_id != key.session_id {
+        anyhow::bail!("started daemon reported a different terminal session");
+    }
     println!(
-        "cokacmux — TUI session browser for local coding agents\n\n\
-         USAGE:\n  cokacmux              launch interactive TUI\n  \
-         cokacmux --debug      launch with debug logs enabled\n  \
-         cokacmux --trace      launch with high-volume trace logs enabled\n  \
-         cokacmux --check      headless sanity check (no TTY needed)\n  \
-         cokacmux killall      terminate cokacmux processes and remove ~/.cokacmux/{{agents,debug}}\n  \
-         cokacmux reset        terminate cokacmux processes and remove ~/.cokacmux\n  \
-         cokacmux --version    print version\n\n\
-         CONFIG:\n  ~/.cokacmux/settings.json\n  ~/.cokacmux/keybinding.json\n\n\
-         INTERACTIVE KEYS:\n  \
-         Esc/q/Ctrl+q quit\n  \
-         ↑↓            navigate\n  \
-         Alt+↑/↓ or Ctrl+Shift+↑/↓ select from sidebar/list\n  \
-         Alt+←/→ or Ctrl+Shift+←/→ resize focused side pane\n  \
-         Agent: Shift+↑/↓ child transcript line, Shift+Alt+↑/↓ page, Shift/Alt+Home/End top/bottom\n  \
-         PgUp / PgDn   jump 10\n  \
-         g/Home / G/End top / bottom\n  \
-         Tab           switch focus between session list and preview\n  \
-         Ctrl+F        open search mode chooser\n  \
-         v             toggle session list/tree view\n  \
-         t             edit selected session title\n  \
-         ,             configure AI agent; title edit Ctrl+T generates AI title\n  \
-         r             refresh from disk\n  \
-         c             clone selected session\n  \
-         e / Enter     switch to live selected agent, or choose launch mode to start it\n  \
-         Ctrl+] / Ctrl+[ switch between sessions and active agent\n  \
-         Ctrl+K        kill selected/current agent\n  \
-         Ctrl+PgUp/PgDn switch live agent from agent screen\n  \
-         Delete / d    delete selected session (confirm)\n  \
-         Space         refresh preview"
+        "started terminal {}: session={} cwd={} command={}",
+        name,
+        info.session_id,
+        display_cwd_str(&info.cwd),
+        command_line
+    );
+    Ok(())
+}
+
+struct StartedCliTerminalIdentity {
+    provider: Provider,
+    session_id: String,
+}
+
+fn identify_started_cli_terminal(
+    mut stream: AgentStream,
+    key: &AgentKey,
+) -> Result<StartedCliTerminalIdentity> {
+    let timeout = Duration::from_millis(AGENT_IDENTITY_QUERY_TIMEOUT_MS);
+    write_json_line_with_timeout(&mut stream, &AgentDaemonRequest::Identify, timeout)
+        .map_err(|e| anyhow::anyhow!("started terminal identify request failed: {}", e))?;
+    match read_agent_daemon_event_with_timeout(&mut stream, timeout)
+        .map_err(|e| anyhow::anyhow!("started terminal identify response failed: {}", e))?
+    {
+        AgentDaemonEvent::Identity {
+            provider,
+            session_id,
+            ..
+        } => {
+            let identity = StartedCliTerminalIdentity {
+                provider,
+                session_id,
+            };
+            if identity.provider == key.provider && identity.session_id == key.session_id {
+                Ok(identity)
+            } else {
+                Err(anyhow::anyhow!(
+                    "started terminal identity mismatch: expected {}:{}, got {}:{}",
+                    key.provider.as_str(),
+                    key.session_id,
+                    identity.provider.as_str(),
+                    identity.session_id
+                ))
+            }
+        }
+        _ => Err(anyhow::anyhow!(
+            "started terminal daemon returned an unexpected event"
+        )),
+    }
+}
+
+fn run_reset_cli() -> Result<()> {
+    let report = reset_cokacmux()?;
+    print_reset_report(&report);
+    Ok(())
+}
+
+fn run_killall_cli() -> Result<()> {
+    let report = killall_cokacmux()?;
+    print_killall_report(&report);
+    Ok(())
+}
+
+fn print_reset_report(report: &ResetReport) {
+    println!(
+        "reset cokacmux: killed={} stale={} skipped_unverified={} child_processes_terminated={} runtime_files_removed={} pty_logs_deleted={} cwd_locks_removed={} untracked_daemons_scanned={} untracked_daemons_terminated={} untracked_daemons_skipped_self={} untracked_daemons_skipped_unverified={} clients_scanned={} clients_terminated={} clients_skipped_self={} clients_skipped_unverified={} errors={} removed={}{}",
+        report.killall.killed,
+        report.killall.stale,
+        report.killall.skipped_unverified,
+        report.killall.child_processes_terminated,
+        report.killall.runtime_files_removed,
+        report.killall.pty_logs_deleted,
+        report.killall.cwd_locks_removed,
+        report.untracked_daemon_processes_scanned,
+        report.untracked_daemon_processes_terminated,
+        report.untracked_daemon_processes_skipped_self,
+        report.untracked_daemon_processes_skipped_unverified,
+        report.client_processes_scanned,
+        report.client_processes_terminated,
+        report.client_processes_skipped_self,
+        report.client_processes_skipped_unverified,
+        report
+            .killall
+            .errors
+            .saturating_add(report.client_process_errors)
+            .saturating_add(report.untracked_daemon_process_errors),
+        report.config_removed,
+        if report.config_missing {
+            " config_already_missing"
+        } else {
+            ""
+        }
+    );
+}
+
+fn print_killall_report(report: &KillAllCokacmuxReport) {
+    println!(
+        "killall cokacmux: killed={} stale={} skipped_unverified={} child_processes_terminated={} runtime_files_removed={} pty_logs_deleted={} cwd_locks_removed={} untracked_daemons_scanned={} untracked_daemons_terminated={} untracked_daemons_skipped_self={} untracked_daemons_skipped_unverified={} clients_scanned={} clients_terminated={} clients_skipped_self={} clients_skipped_unverified={} errors={} agents_removed={}{} debug_removed={}{}",
+        report.killall.killed,
+        report.killall.stale,
+        report.killall.skipped_unverified,
+        report.killall.child_processes_terminated,
+        report.killall.runtime_files_removed,
+        report.killall.pty_logs_deleted,
+        report.killall.cwd_locks_removed,
+        report.untracked_daemon_processes_scanned,
+        report.untracked_daemon_processes_terminated,
+        report.untracked_daemon_processes_skipped_self,
+        report.untracked_daemon_processes_skipped_unverified,
+        report.client_processes_scanned,
+        report.client_processes_terminated,
+        report.client_processes_skipped_self,
+        report.client_processes_skipped_unverified,
+        report
+            .killall
+            .errors
+            .saturating_add(report.client_process_errors)
+            .saturating_add(report.untracked_daemon_process_errors),
+        report.agents_removed,
+        if report.agents_missing {
+            " agents_already_missing"
+        } else {
+            ""
+        },
+        report.debug_removed,
+        if report.debug_missing {
+            " debug_already_missing"
+        } else {
+            ""
+        }
     );
 }
 
@@ -23762,10 +23934,12 @@ fn paste_text_into_input_mode(app: &mut App, text: &str) -> bool {
             selected,
             cwd,
             cwd_cursor,
+            cwd_completion,
             ..
         } => {
             if *selected == NEW_SESSION_FIELD_CWD {
                 insert_str_at_cursor(cwd, cwd_cursor, &text);
+                update_new_session_path_completion(cwd, *cwd_cursor, cwd_completion, true);
                 debug_log(
                     "input_paste_inserted",
                     serde_json::json!({
@@ -24630,9 +24804,46 @@ fn handle_daemon_client_request(
 }
 
 fn notify_agent_daemon_ready(key: &AgentKey, socket_path: &Path) {
-    if std::env::var_os(AGENT_DAEMON_READY_ENV).is_none() {
+    if let Some(addr) =
+        std::env::var_os(AGENT_DAEMON_READY_TCP_ENV).and_then(|addr| addr.into_string().ok())
+    {
+        let result = std::net::TcpStream::connect(&addr)
+            .and_then(|stream| notify_agent_daemon_ready_to_writer(stream, key, socket_path));
+        debug_log(
+            "daemon_ready_notify",
+            serde_json::json!({
+                "key": agent_key_debug_value(key),
+                "socket": socket_path.display().to_string(),
+                "transport": "tcp",
+                "addr": addr,
+                "ok": result.is_ok(),
+                "error": result.err().map(|e| e.to_string()),
+            }),
+        );
         return;
     }
+
+    if std::env::var_os(AGENT_DAEMON_READY_ENV).is_some() {
+        let stdout = io::stdout().lock();
+        let result = notify_agent_daemon_ready_to_writer(stdout, key, socket_path);
+        debug_log(
+            "daemon_ready_notify",
+            serde_json::json!({
+                "key": agent_key_debug_value(key),
+                "socket": socket_path.display().to_string(),
+                "transport": "stdout",
+                "ok": result.is_ok(),
+                "error": result.err().map(|e| e.to_string()),
+            }),
+        );
+    }
+}
+
+fn notify_agent_daemon_ready_to_writer<W: Write>(
+    mut writer: W,
+    key: &AgentKey,
+    socket_path: &Path,
+) -> io::Result<()> {
     let ready = AgentDaemonReady {
         kind: AGENT_DAEMON_READY_KIND.to_string(),
         provider: key.provider,
@@ -24640,20 +24851,10 @@ fn notify_agent_daemon_ready(key: &AgentKey, socket_path: &Path) {
         pid: std::process::id(),
         socket: socket_path.display().to_string(),
     };
-    let mut stdout = io::stdout().lock();
-    let result = serde_json::to_writer(&mut stdout, &ready)
+    serde_json::to_writer(&mut writer, &ready)
         .map_err(io::Error::other)
-        .and_then(|_| stdout.write_all(b"\n"))
-        .and_then(|_| stdout.flush());
-    debug_log(
-        "daemon_ready_notify",
-        serde_json::json!({
-            "key": agent_key_debug_value(key),
-            "socket": socket_path.display().to_string(),
-            "ok": result.is_ok(),
-            "error": result.err().map(|e| e.to_string()),
-        }),
-    );
+        .and_then(|_| writer.write_all(b"\n"))
+        .and_then(|_| writer.flush())
 }
 
 fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<()> {
@@ -27134,6 +27335,17 @@ fn session_info_from_agent_meta_snapshot(meta: &AgentMetaSnapshot) -> Option<Ses
         SHELL_SESSION_SOURCE_MARKER => shell_pane_title(&cwd),
         COKACDIR_SESSION_SOURCE_MARKER => cokacdir_pane_title(&cwd),
         NEW_AGENT_SESSION_SOURCE_MARKER => new_agent_pane_title(provider, &cwd),
+        _ if source.starts_with(CLI_COMMAND_SESSION_SOURCE_PREFIX) => {
+            let info = SessionInfo {
+                provider,
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
+                source: PathBuf::from(source),
+                updated_at_epoch_s: meta.updated_at_epoch_s,
+                title: None,
+            };
+            cli_command_status_name(&info)
+        }
         _ => String::new(),
     };
     Some(SessionInfo {
@@ -30429,7 +30641,9 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
     }
 
     let current_exe = std::env::current_exe()?;
-    let command = build_agent_daemon_command(&current_exe, info, launch_mode);
+    let ready_listener = bind_agent_daemon_ready_listener()?;
+    let ready_addr = ready_listener.local_addr()?.to_string();
+    let command = build_agent_daemon_command(&current_exe, info, launch_mode, &ready_addr);
     debug_log(
         "daemon_spawn_command_prepared",
         serde_json::json!({
@@ -30438,6 +30652,7 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
             "current_exe": current_exe.display().to_string(),
             "debug_env_forwarded": DEBUG_ENABLED.load(Ordering::Relaxed),
             "socket_path": socket_path.display().to_string(),
+            "ready_addr": ready_addr,
             "source": info.source.display().to_string(),
             "cwd": &info.cwd,
             "windows_breakaway_requested": daemon_uses_windows_breakaway(),
@@ -30476,6 +30691,7 @@ fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Resul
     );
     wait_for_agent_daemon_ready(
         &mut child,
+        &ready_listener,
         &key,
         Duration::from_millis(AGENT_DAEMON_START_TIMEOUT_MS),
     )?;
@@ -30491,84 +30707,111 @@ struct AgentDaemonReady {
     socket: String,
 }
 
+fn bind_agent_daemon_ready_listener() -> io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
 fn wait_for_agent_daemon_ready(
     child: &mut std::process::Child,
+    listener: &std::net::TcpListener,
     key: &AgentKey,
     timeout: Duration,
 ) -> Result<()> {
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("daemon readiness pipe unavailable"))?;
-    let (tx, rx) = mpsc::channel();
-    let expected_key = key.clone();
-    thread::Builder::new()
-        .name("cokacmux-daemon-ready".into())
-        .spawn(move || {
-            let result = read_agent_daemon_ready(stdout, &expected_key);
-            let _ = tx.send(result);
-        })
-        .map_err(|e| anyhow::anyhow!("daemon readiness reader failed: {}", e))?;
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(ready)) => {
-            debug_log(
-                "daemon_ready_received",
-                serde_json::json!({
-                    "key": agent_key_debug_value(key),
-                    "daemon_pid": ready.pid,
-                    "socket": ready.socket,
-                }),
-            );
-            Ok(())
+    let started = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                let remaining = timeout
+                    .checked_sub(started.elapsed())
+                    .unwrap_or_else(|| Duration::from_millis(1));
+                prepare_agent_daemon_ready_stream(&stream, remaining)?;
+                match read_agent_daemon_ready(stream, key) {
+                    Ok(ready) => {
+                        debug_log(
+                            "daemon_ready_received",
+                            serde_json::json!({
+                                "key": agent_key_debug_value(key),
+                                "daemon_pid": ready.pid,
+                                "socket": ready.socket,
+                                "peer_addr": addr.to_string(),
+                            }),
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let exited = child
+                            .try_wait()
+                            .ok()
+                            .flatten()
+                            .map(|status| status.to_string());
+                        debug_log(
+                            "daemon_ready_failed",
+                            serde_json::json!({
+                                "key": agent_key_debug_value(key),
+                                "daemon_pid": child.id(),
+                                "child_status": exited.as_deref(),
+                                "peer_addr": addr.to_string(),
+                                "error": e.to_string(),
+                            }),
+                        );
+                        return Err(e.into());
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
         }
-        Ok(Err(e)) => {
-            let exited = child
-                .try_wait()
-                .ok()
-                .flatten()
-                .map(|status| status.to_string());
+
+        if let Some(status) = child.try_wait()? {
             debug_log(
                 "daemon_ready_failed",
                 serde_json::json!({
                     "key": agent_key_debug_value(key),
                     "daemon_pid": child.id(),
-                    "child_status": exited.as_deref(),
-                    "error": e.to_string(),
+                    "child_status": status.to_string(),
+                    "error": "daemon exited before readiness",
                 }),
             );
-            Err(e.into())
+            anyhow::bail!("daemon exited before readiness: {}", status);
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let exited = child
-                .try_wait()
-                .ok()
-                .flatten()
-                .map(|status| status.to_string());
+
+        if started.elapsed() >= timeout {
             debug_log(
                 "daemon_ready_timeout",
                 serde_json::json!({
                     "key": agent_key_debug_value(key),
                     "daemon_pid": child.id(),
-                    "child_status": exited.as_deref(),
                     "timeout_ms": timeout.as_millis(),
                 }),
             );
-            Err(anyhow::anyhow!(
+            anyhow::bail!(
                 "daemon did not report readiness within {}ms",
                 timeout.as_millis()
-            ))
+            );
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-            "daemon readiness reader ended before reporting readiness"
-        )),
+
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn read_agent_daemon_ready(
-    stdout: std::process::ChildStdout,
+fn prepare_agent_daemon_ready_stream(
+    stream: &std::net::TcpStream,
+    timeout: Duration,
+) -> io::Result<()> {
+    // Accepted streams can keep the listener's nonblocking mode on Windows.
+    // The daemon may connect before it writes the ready line, so switch back
+    // to blocking reads and rely on the timeout instead.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(timeout))
+}
+
+fn read_agent_daemon_ready<R: Read>(
+    reader: R,
     expected_key: &AgentKey,
 ) -> io::Result<AgentDaemonReady> {
-    let mut reader = BufReader::new(stdout);
+    let mut reader = BufReader::new(reader);
     let mut line = String::new();
     let len = reader.read_line(&mut line)?;
     if len == 0 {
@@ -30605,6 +30848,7 @@ fn build_agent_daemon_command(
     current_exe: &Path,
     info: &SessionInfo,
     launch_mode: AgentLaunchMode,
+    ready_addr: &str,
 ) -> Command {
     let mut command = Command::new(current_exe);
     command
@@ -30615,9 +30859,10 @@ fn build_agent_daemon_command(
         .arg(info.source.as_os_str())
         .arg(launch_mode.as_str())
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null());
-    command.env(AGENT_DAEMON_READY_ENV, "1");
+    command.env(AGENT_DAEMON_READY_TCP_ENV, ready_addr);
+    command.env_remove(AGENT_DAEMON_READY_ENV);
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         command.env("COKACMUX_DEBUG", "1");
     } else {
@@ -30654,6 +30899,7 @@ fn spawn_agent_daemon_process(
     key: &AgentKey,
 ) -> io::Result<(std::process::Child, bool)> {
     configure_daemon_command(&mut command, true);
+    disable_windows_standard_handle_inheritance_for_daemon_spawn(key);
     match command.spawn() {
         Ok(child) => Ok((child, true)),
         Err(e) => {
@@ -30669,6 +30915,45 @@ fn spawn_agent_daemon_process(
             );
             Err(e)
         }
+    }
+}
+
+#[cfg(windows)]
+fn disable_windows_standard_handle_inheritance_for_daemon_spawn(key: &AgentKey) {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const INVALID_HANDLE_VALUE: Handle = (-1isize) as Handle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> Handle;
+        fn SetHandleInformation(hObject: Handle, dwMask: u32, dwFlags: u32) -> i32;
+    }
+
+    for (label, id) in [
+        ("stdin", STD_INPUT_HANDLE),
+        ("stdout", STD_OUTPUT_HANDLE),
+        ("stderr", STD_ERROR_HANDLE),
+    ] {
+        let handle = unsafe { GetStdHandle(id) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        let ok = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0;
+        debug_log(
+            "daemon_spawn_standard_handle_inheritance_cleared",
+            serde_json::json!({
+                "key": agent_key_debug_value(key),
+                "handle": label,
+                "ok": ok,
+                "error": (!ok).then(|| io::Error::last_os_error().to_string()),
+            }),
+        );
     }
 }
 
@@ -32228,13 +32513,8 @@ fn windows_process_command_line_direct(pid: u32, event: &'static str) -> Option<
     if pid == 0 {
         return None;
     }
-    let handle = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-            0,
-            pid,
-        )
-    };
+    let handle =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
     if handle.is_null() {
         let error = io::Error::last_os_error();
         trace_log(
@@ -33344,6 +33624,7 @@ where
             continue;
         };
         let is_synthetic = source == SHELL_SESSION_SOURCE_MARKER
+            || source.starts_with(CLI_COMMAND_SESSION_SOURCE_PREFIX)
             || source == NEW_AGENT_SESSION_SOURCE_MARKER
             || source == COKACDIR_SESSION_SOURCE_MARKER;
         if debug_enabled {
@@ -34001,6 +34282,7 @@ fn windows_agent_command_argv(program: PathBuf, args: &[String]) -> Vec<OsString
         argv.push(windows_comspec());
         argv.push(OsString::from("/D"));
         argv.push(OsString::from("/C"));
+        argv.push(OsString::from("call"));
         argv.push(program.into_os_string());
     } else if is_windows_powershell_script(&program) {
         argv.push(OsString::from("powershell.exe"));
@@ -34188,9 +34470,59 @@ fn windows_comspec() -> OsString {
 /// (PTY + vt100 + socket) — `agent_launch_spec` branches on this to spawn
 /// the user's shell/default shell instead of the provider's resume command.
 const SHELL_SESSION_SOURCE_MARKER: &str = "@cokacmux-shell";
+const CLI_COMMAND_SESSION_SOURCE_PREFIX: &str = "@cokacmux-command ";
+const CLI_TERMINAL_NAME_MAX_CHARS: usize = 80;
+const CLI_TERMINAL_COMMAND_MAX_ARGS: usize = 256;
+const CLI_TERMINAL_COMMAND_SOURCE_MAX_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CliCommandSessionSource {
+    argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
 
 fn is_shell_session_info(info: &SessionInfo) -> bool {
     info.source.as_os_str() == SHELL_SESSION_SOURCE_MARKER
+}
+
+fn is_cli_command_session_source(source: &Path) -> bool {
+    source
+        .as_os_str()
+        .to_str()
+        .is_some_and(|source| source.starts_with(CLI_COMMAND_SESSION_SOURCE_PREFIX))
+}
+
+fn is_cli_command_session_info(info: &SessionInfo) -> bool {
+    is_cli_command_session_source(&info.source)
+}
+
+fn cli_command_session_source_for(name: &str, argv: &[String]) -> Result<PathBuf> {
+    let payload = CliCommandSessionSource {
+        argv: argv.to_vec(),
+        name: Some(name.to_string()),
+    };
+    let encoded = serde_json::to_string(&payload)?;
+    let source = format!("{CLI_COMMAND_SESSION_SOURCE_PREFIX}{encoded}");
+    if source.len() > CLI_TERMINAL_COMMAND_SOURCE_MAX_BYTES {
+        anyhow::bail!(
+            "command is too long to store safely in terminal runtime metadata ({} > {} bytes)",
+            source.len(),
+            CLI_TERMINAL_COMMAND_SOURCE_MAX_BYTES
+        );
+    }
+    Ok(PathBuf::from(source))
+}
+
+fn cli_command_session_source(info: &SessionInfo) -> Option<CliCommandSessionSource> {
+    let source = info.source.as_os_str().to_str()?;
+    let raw = source.strip_prefix(CLI_COMMAND_SESSION_SOURCE_PREFIX)?;
+    serde_json::from_str(raw).ok()
+}
+
+fn cli_command_session_argv(info: &SessionInfo) -> Option<Vec<String>> {
+    let source = cli_command_session_source(info)?;
+    validate_cli_terminal_command(&source.argv).ok()
 }
 
 fn shell_line_is_exit_command(line: &str) -> bool {
@@ -34199,11 +34531,13 @@ fn shell_line_is_exit_command(line: &str) -> bool {
 }
 
 fn is_plain_pty_tool_session_info(info: &SessionInfo) -> bool {
-    is_shell_session_info(info) || is_cokacdir_session_info(info)
+    is_shell_session_info(info)
+        || is_cli_command_session_info(info)
+        || is_cokacdir_session_info(info)
 }
 
 fn auxiliary_kind_for_session_info(info: &SessionInfo) -> Option<AgentAuxKind> {
-    if is_shell_session_info(info) {
+    if is_shell_session_info(info) || is_cli_command_session_info(info) {
         Some(AgentAuxKind::Terminal)
     } else if is_cokacdir_session_info(info) {
         Some(AgentAuxKind::Cokacdir)
@@ -34238,6 +34572,21 @@ fn shell_session_info_for_cwd(cwd: String) -> SessionInfo {
         updated_at_epoch_s: chrono::Utc::now().timestamp().max(0) as u64,
         title: Some(title),
     }
+}
+
+fn cli_command_session_info(name: String, cwd: String, argv: Vec<String>) -> Result<SessionInfo> {
+    let title = cli_command_terminal_title(&name, &argv);
+    Ok(SessionInfo {
+        // Provider is arbitrary for synthetic terminal panes; AgentKey uses it
+        // only as part of the socket/meta namespace. Keep this aligned with
+        // shell panes.
+        provider: Provider::Claude,
+        session_id: format!("command-{}", uuid::Uuid::now_v7()),
+        cwd,
+        source: cli_command_session_source_for(&name, &argv)?,
+        updated_at_epoch_s: chrono::Utc::now().timestamp().max(0) as u64,
+        title: Some(title),
+    })
 }
 
 /// Marker for a coding agent launched from scratch through the new session
@@ -34468,6 +34817,93 @@ fn normalize_launch_cwd(raw: &str) -> std::result::Result<String, String> {
         .map_err(|e| format!("resolve folder failed: {}", e))
 }
 
+fn normalize_cli_start_cwd(raw: &Path) -> Result<String> {
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("--cwd must be valid UTF-8"))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--cwd is required");
+    }
+    let path = expand_home_path(trimmed);
+    validate_agent_launch_cwd(&path)?;
+    path.canonicalize()
+        .map(|path| launch_cwd_string(&path))
+        .map_err(|e| anyhow::anyhow!("resolve --cwd failed: {}", e))
+}
+
+fn validate_cli_terminal_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("terminal name is required");
+    }
+    if trimmed.chars().any(char::is_control) {
+        anyhow::bail!("terminal name must not contain control characters");
+    }
+    if trimmed.chars().count() > CLI_TERMINAL_NAME_MAX_CHARS {
+        anyhow::bail!(
+            "terminal name is too long (max {} chars)",
+            CLI_TERMINAL_NAME_MAX_CHARS
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_cli_terminal_command(command: &[String]) -> Result<Vec<String>> {
+    if command.is_empty() {
+        anyhow::bail!("command is required after `--`");
+    }
+    if command.len() > CLI_TERMINAL_COMMAND_MAX_ARGS {
+        anyhow::bail!(
+            "command has too many arguments ({} > {})",
+            command.len(),
+            CLI_TERMINAL_COMMAND_MAX_ARGS
+        );
+    }
+    if command[0].trim().is_empty() {
+        anyhow::bail!("command program is required");
+    }
+    if command.iter().any(|arg| arg.chars().any(|ch| ch == '\0')) {
+        anyhow::bail!("command arguments must not contain NUL bytes");
+    }
+    validate_cli_terminal_program(&command[0])?;
+    Ok(command.to_vec())
+}
+
+#[cfg(unix)]
+fn validate_cli_terminal_program(program: &str) -> Result<()> {
+    if resolve_unix_agent_program(program).is_some() {
+        Ok(())
+    } else {
+        anyhow::bail!("command program is not runnable or not found: {}", program)
+    }
+}
+
+#[cfg(windows)]
+fn validate_cli_terminal_program(program: &str) -> Result<()> {
+    if resolve_windows_agent_program_with_env(
+        program,
+        std::env::var_os("PATH"),
+        std::env::var_os("PATHEXT"),
+    )
+    .is_some()
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("command program is not runnable or not found: {}", program)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_cli_terminal_program(program: &str) -> Result<()> {
+    let path = Path::new(program);
+    if path.is_file() {
+        Ok(())
+    } else {
+        anyhow::bail!("command program is not runnable or not found: {}", program)
+    }
+}
+
 fn validate_session_launch_cwd(info: &SessionInfo) -> Result<()> {
     match missing_session_launch_cwd(info)? {
         Some(path) => Err(anyhow::anyhow!(
@@ -34522,12 +34958,419 @@ fn expand_home_path(raw: &str) -> PathBuf {
         if let Some(home) = configured_home_dir() {
             return home;
         }
-    } else if let Some(rest) = raw.strip_prefix("~/") {
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
         if let Some(home) = configured_home_dir() {
             return home.join(rest);
         }
     }
     PathBuf::from(raw)
+}
+
+fn new_session_path_ends_with_separator(path: &str) -> bool {
+    path.ends_with('/') || path.ends_with('\\')
+}
+
+fn new_session_expand_home_path_for_completion(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return configured_home_dir().unwrap_or_else(|| PathBuf::from(raw));
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        if let Some(home) = configured_home_dir() {
+            return if rest.is_empty() {
+                home
+            } else {
+                home.join(rest)
+            };
+        }
+    }
+    PathBuf::from(raw)
+}
+
+fn new_session_parse_path_for_completion(input: &str) -> (PathBuf, String) {
+    if input.is_empty() {
+        return (PathBuf::from("."), String::new());
+    }
+
+    let expanded = new_session_expand_home_path_for_completion(input)
+        .display()
+        .to_string();
+
+    if input == "~" || new_session_path_ends_with_separator(&expanded) {
+        return (PathBuf::from(expanded), String::new());
+    }
+
+    if (expanded.ends_with("/.") || expanded.ends_with("\\."))
+        && !expanded.ends_with("/..")
+        && !expanded.ends_with("\\..")
+    {
+        let parent = &expanded[..expanded.len().saturating_sub(2)];
+        let parent = if parent.is_empty() {
+            if cfg!(windows) {
+                PathBuf::from("C:\\")
+            } else {
+                PathBuf::from("/")
+            }
+        } else {
+            PathBuf::from(parent)
+        };
+        return (parent, ".".to_string());
+    }
+
+    if expanded == "." {
+        return (PathBuf::from("."), ".".to_string());
+    }
+
+    let path = PathBuf::from(&expanded);
+    if let Some(parent) = path.parent() {
+        let prefix = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        (parent.to_path_buf(), prefix)
+    } else {
+        (PathBuf::from("."), expanded)
+    }
+}
+
+fn new_session_last_separator_end(input: &str) -> Option<usize> {
+    input
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| *ch == '/' || *ch == '\\')
+        .map(|(index, ch)| index + ch.len_utf8())
+}
+
+fn new_session_component_end(input: &str, cursor: usize) -> usize {
+    let mut end = clamp_to_char_boundary(input, cursor);
+    while end < input.len() {
+        let Some(ch) = input[end..].chars().next() else {
+            break;
+        };
+        if ch == '/' || ch == '\\' {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    end
+}
+
+fn new_session_separator_end_at(input: &str, cursor: usize) -> Option<usize> {
+    if cursor >= input.len() {
+        return None;
+    }
+    let ch = input[cursor..].chars().next()?;
+    if ch == '/' || ch == '\\' {
+        Some(cursor + ch.len_utf8())
+    } else {
+        None
+    }
+}
+
+fn new_session_path_completion_context(
+    cwd: &str,
+    cwd_cursor: usize,
+) -> NewSessionPathCompletionContext {
+    let cursor = clamp_to_char_boundary(cwd, cwd_cursor);
+    let before_cursor = &cwd[..cursor];
+    let (base_dir, prefix) = new_session_parse_path_for_completion(before_cursor);
+
+    let replace_start = if before_cursor == "~" {
+        0
+    } else if new_session_path_ends_with_separator(before_cursor) {
+        cursor
+    } else {
+        new_session_last_separator_end(before_cursor).unwrap_or(0)
+    };
+    let replace_end = new_session_component_end(cwd, cursor);
+    let replace_end_with_separator =
+        new_session_separator_end_at(cwd, replace_end).unwrap_or(replace_end);
+    let replacement_prefix = if before_cursor == "~" {
+        format!("~{}", std::path::MAIN_SEPARATOR)
+    } else {
+        String::new()
+    };
+
+    NewSessionPathCompletionContext {
+        base_dir,
+        prefix,
+        replace_start,
+        replace_end,
+        replace_end_with_separator,
+        replacement_prefix,
+    }
+}
+
+fn new_session_subsequence_match_start(text: &str, pattern: &str) -> Option<usize> {
+    if pattern.is_empty() {
+        return Some(0);
+    }
+
+    let mut pattern_chars = pattern.chars().peekable();
+    let mut start = None;
+    for (index, text_char) in text.chars().enumerate() {
+        let Some(&pattern_char) = pattern_chars.peek() else {
+            break;
+        };
+        if text_char == pattern_char {
+            if start.is_none() {
+                start = Some(index);
+            }
+            pattern_chars.next();
+        }
+    }
+
+    pattern_chars.peek().is_none().then_some(start).flatten()
+}
+
+fn new_session_path_match_score(
+    name: &str,
+    prefix: &str,
+    lower_prefix: &str,
+) -> Option<(u8, usize)> {
+    if prefix.is_empty() {
+        return Some((0, 0));
+    }
+
+    let lower_name = name.to_lowercase();
+    if name == prefix {
+        return Some((0, 0));
+    }
+    if lower_name == lower_prefix {
+        return Some((1, 0));
+    }
+    if lower_name.starts_with(lower_prefix) {
+        return Some((2, 0));
+    }
+    if let Some(byte_index) = lower_name.find(lower_prefix) {
+        return Some((3, lower_name[..byte_index].chars().count()));
+    }
+    new_session_subsequence_match_start(&lower_name, lower_prefix).map(|index| (4, index))
+}
+
+fn new_session_ranked_path_suggestions(
+    base_dir: &Path,
+    prefix: &str,
+) -> Vec<NewSessionPathSuggestionCandidate> {
+    let mut suggestions = Vec::new();
+    let lower_prefix = prefix.to_lowercase();
+
+    if let Ok(entries) = fs::read_dir(base_dir) {
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "." || name == ".." {
+                continue;
+            }
+            if !entry.path().is_dir() {
+                continue;
+            }
+            if let Some((match_rank, match_start)) =
+                new_session_path_match_score(&name, prefix, &lower_prefix)
+            {
+                let sort_name = name.to_lowercase();
+                suggestions.push(NewSessionPathSuggestionCandidate {
+                    display_name: format!("{}{}", name, std::path::MAIN_SEPARATOR),
+                    match_rank,
+                    hidden_penalty: if name.starts_with('.') && !prefix.starts_with('.') {
+                        1
+                    } else {
+                        0
+                    },
+                    match_start,
+                    name_len: name.chars().count(),
+                    sort_name,
+                    original_name: name,
+                });
+            }
+        }
+    }
+
+    suggestions.sort_by(|a, b| {
+        a.match_rank
+            .cmp(&b.match_rank)
+            .then_with(|| a.hidden_penalty.cmp(&b.hidden_penalty))
+            .then_with(|| a.match_start.cmp(&b.match_start))
+            .then_with(|| a.name_len.cmp(&b.name_len))
+            .then_with(|| a.sort_name.cmp(&b.sort_name))
+            .then_with(|| a.original_name.cmp(&b.original_name))
+    });
+    suggestions
+}
+
+fn new_session_path_suggestions(base_dir: &Path, prefix: &str) -> Vec<String> {
+    new_session_ranked_path_suggestions(base_dir, prefix)
+        .into_iter()
+        .map(|candidate| candidate.display_name)
+        .collect()
+}
+
+fn update_new_session_path_completion(
+    cwd: &str,
+    cwd_cursor: usize,
+    completion: &mut NewSessionPathCompletion,
+    reset_selection: bool,
+) {
+    let context = new_session_path_completion_context(cwd, cwd_cursor);
+    let suggestions = new_session_path_suggestions(&context.base_dir, &context.prefix);
+    if suggestions.is_empty() {
+        completion.suggestions.clear();
+        completion.selected_index = 0;
+        completion.visible = false;
+    } else {
+        completion.suggestions = suggestions;
+        if reset_selection {
+            completion.selected_index = 0;
+        } else {
+            completion.selected_index = completion
+                .selected_index
+                .min(completion.suggestions.len().saturating_sub(1));
+        }
+        completion.visible = true;
+    }
+}
+
+fn clear_new_session_path_completion(completion: &mut NewSessionPathCompletion) {
+    completion.suggestions.clear();
+    completion.selected_index = 0;
+    completion.visible = false;
+}
+
+fn new_session_completion_is_visible(completion: &NewSessionPathCompletion) -> bool {
+    completion.visible && !completion.suggestions.is_empty()
+}
+
+fn new_session_path_completion_replacement(
+    suggestion: &str,
+    context: &NewSessionPathCompletionContext,
+    append_separator: bool,
+) -> String {
+    let mut replacement = context.replacement_prefix.clone();
+    replacement.push_str(suggestion.trim_end_matches(['/', '\\']));
+    if append_separator && !new_session_path_ends_with_separator(&replacement) {
+        replacement.push(std::path::MAIN_SEPARATOR);
+    }
+    replacement
+}
+
+fn apply_new_session_path_completion(cwd: &mut String, cwd_cursor: &mut usize, suggestion: &str) {
+    let context = new_session_path_completion_context(cwd, *cwd_cursor);
+    let replacement = new_session_path_completion_replacement(suggestion, &context, true);
+    let replace_end = if new_session_path_ends_with_separator(&replacement) {
+        context.replace_end_with_separator
+    } else {
+        context.replace_end
+    };
+    cwd.replace_range(context.replace_start..replace_end, &replacement);
+    *cwd_cursor = context.replace_start + replacement.len();
+}
+
+fn apply_new_session_common_path_completion(
+    cwd: &mut String,
+    cwd_cursor: &mut usize,
+    common: &str,
+) {
+    let context = new_session_path_completion_context(cwd, *cwd_cursor);
+    let replacement = new_session_path_completion_replacement(common, &context, false);
+    cwd.replace_range(context.replace_start..context.replace_end, &replacement);
+    *cwd_cursor = context.replace_start + replacement.len();
+}
+
+fn trigger_new_session_path_completion(
+    cwd: &mut String,
+    cwd_cursor: &mut usize,
+    completion: &mut NewSessionPathCompletion,
+) -> bool {
+    let context = new_session_path_completion_context(cwd, *cwd_cursor);
+    let ranked = new_session_ranked_path_suggestions(&context.base_dir, &context.prefix);
+    let suggestions: Vec<String> = ranked
+        .iter()
+        .map(|candidate| candidate.display_name.clone())
+        .collect();
+
+    if suggestions.is_empty() {
+        clear_new_session_path_completion(completion);
+        return false;
+    }
+
+    if suggestions.len() == 1 {
+        apply_new_session_path_completion(cwd, cwd_cursor, &suggestions[0]);
+        update_new_session_path_completion(cwd, *cwd_cursor, completion, true);
+        return true;
+    }
+
+    let completion_candidates: Vec<String> = if context.prefix.is_empty() {
+        suggestions.clone()
+    } else {
+        let prefix_matches: Vec<String> = ranked
+            .iter()
+            .filter(|candidate| candidate.match_rank <= 2)
+            .map(|candidate| candidate.display_name.clone())
+            .collect();
+        if prefix_matches.is_empty() {
+            suggestions.clone()
+        } else {
+            prefix_matches
+        }
+    };
+
+    if completion_candidates.len() == 1 {
+        apply_new_session_path_completion(cwd, cwd_cursor, &completion_candidates[0]);
+        update_new_session_path_completion(cwd, *cwd_cursor, completion, true);
+        return true;
+    }
+
+    if let Some(common) =
+        new_session_completion_prefix_for_input(&completion_candidates, &context.prefix)
+    {
+        apply_new_session_common_path_completion(cwd, cwd_cursor, &common);
+    }
+    update_new_session_path_completion(cwd, *cwd_cursor, completion, true);
+    true
+}
+
+fn new_session_common_completion_prefix(suggestions: &[String]) -> String {
+    let Some(first) = suggestions.first() else {
+        return String::new();
+    };
+
+    let mut common_chars = first.chars().count();
+    for suggestion in suggestions.iter().skip(1) {
+        let mut len = 0;
+        for (left, right) in first.chars().zip(suggestion.chars()) {
+            if left.to_lowercase().eq(right.to_lowercase()) {
+                len += 1;
+            } else {
+                break;
+            }
+        }
+        common_chars = common_chars.min(len);
+    }
+
+    first
+        .chars()
+        .take(common_chars)
+        .collect::<String>()
+        .trim_end_matches(['/', '\\'])
+        .to_string()
+}
+
+fn new_session_completion_prefix_for_input(
+    suggestions: &[String],
+    typed_prefix: &str,
+) -> Option<String> {
+    let common = new_session_common_completion_prefix(suggestions);
+    let typed_len = typed_prefix.chars().count();
+    if common.chars().count() <= typed_len {
+        return None;
+    }
+
+    let lower_common = common.to_lowercase();
+    let lower_typed = typed_prefix.to_lowercase();
+    if !lower_common.starts_with(&lower_typed) {
+        return None;
+    }
+
+    let suffix: String = common.chars().skip(typed_len).collect();
+    Some(format!("{}{}", typed_prefix, suffix))
 }
 
 /// Label for a shell pane in the agents sidebar — distinguishes multiple
@@ -34545,6 +35388,29 @@ fn shell_pane_title(cwd: &str) -> String {
     format!("shell @ {}", basename)
 }
 
+fn cli_command_terminal_title(name: &str, argv: &[String]) -> String {
+    let trimmed = name.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    cli_command_display_command(argv)
+}
+
+fn cli_command_display_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| shell_display_word(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn cli_command_status_name(info: &SessionInfo) -> String {
+    cli_command_session_source(info)
+        .and_then(|source| source.name)
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| info.title.clone())
+        .unwrap_or_else(|| "command".to_string())
+}
+
 fn live_agent_status_label(info: &SessionInfo) -> String {
     if is_shell_session_info(info) {
         if info.cwd.is_empty() {
@@ -34552,6 +35418,17 @@ fn live_agent_status_label(info: &SessionInfo) -> String {
         } else {
             format!(
                 "shell at {}",
+                truncate_width(&display_cwd_str(&info.cwd), 40)
+            )
+        }
+    } else if is_cli_command_session_info(info) {
+        let name = truncate_width(&cli_command_status_name(info), 24);
+        if info.cwd.is_empty() {
+            format!("terminal {}", name)
+        } else {
+            format!(
+                "terminal {} at {}",
+                name,
                 truncate_width(&display_cwd_str(&info.cwd), 40)
             )
         }
@@ -34629,6 +35506,55 @@ fn shell_launch_spec(info: &SessionInfo) -> AgentLaunchSpec {
         args: Vec::new(),
         env: Vec::new(),
         cwd,
+    }
+}
+
+fn cli_command_launch_spec(info: &SessionInfo) -> AgentLaunchSpec {
+    let cwd = if info.cwd.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(&info.cwd))
+    };
+    let Some(argv) = cli_command_session_argv(info) else {
+        return invalid_cli_command_launch_spec(cwd, "invalid cokacmux command terminal metadata");
+    };
+    let Some((program, args)) = argv.split_first() else {
+        return invalid_cli_command_launch_spec(cwd, "missing cokacmux command terminal argv");
+    };
+    AgentLaunchSpec {
+        program: program.clone(),
+        args: args.to_vec(),
+        env: Vec::new(),
+        cwd,
+    }
+}
+
+fn invalid_cli_command_launch_spec(cwd: Option<PathBuf>, message: &str) -> AgentLaunchSpec {
+    if cfg!(windows) {
+        AgentLaunchSpec {
+            program: "powershell.exe".to_string(),
+            args: vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!("Write-Error {}; exit 127", shell_display_word(message)),
+            ],
+            env: Vec::new(),
+            cwd,
+        }
+    } else {
+        AgentLaunchSpec {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-lc".to_string(),
+                format!(
+                    "printf '%s\\n' {} >&2; exit 127",
+                    shell_display_word(message)
+                ),
+            ],
+            env: Vec::new(),
+            cwd,
+        }
     }
 }
 
@@ -35293,6 +36219,9 @@ fn agent_launch_spec_with_programs(
     if is_shell_session_info(info) {
         return shell_launch_spec(info);
     }
+    if is_cli_command_session_info(info) {
+        return cli_command_launch_spec(info);
+    }
     if is_cokacdir_session_info(info) {
         return cokacdir_launch_spec(info, &CokacmuxSettings::default());
     }
@@ -35393,6 +36322,7 @@ fn handle_new_session_key(
         kind,
         cwd,
         cwd_cursor,
+        cwd_completion,
         provider,
         provider_options,
         launch_mode,
@@ -35406,11 +36336,29 @@ fn handle_new_session_key(
                 *provider = normalized;
             }
         }
-        if keybindings.matches(KeyAction::NewSessionCancel, key) {
+        if *selected == NEW_SESSION_FIELD_CWD
+            && new_session_completion_is_visible(cwd_completion)
+            && keybindings.matches(KeyAction::NewSessionCancel, key)
+        {
+            clear_new_session_path_completion(cwd_completion);
+            debug_log_key_event(key, "new_session_cwd_completion_close");
+        } else if keybindings.matches(KeyAction::NewSessionCancel, key) {
             app.input_mode = InputMode::Normal;
             app.status = "cancelled.".into();
             debug_log_key_event(key, "new_session_cancel");
         } else if keybindings.matches(KeyAction::NewSessionConfirm, key) {
+            if *selected == NEW_SESSION_FIELD_CWD
+                && new_session_completion_is_visible(cwd_completion)
+            {
+                if let Some(suggestion) = cwd_completion
+                    .suggestions
+                    .get(cwd_completion.selected_index)
+                    .cloned()
+                {
+                    apply_new_session_path_completion(cwd, cwd_cursor, &suggestion);
+                    update_new_session_path_completion(cwd, *cwd_cursor, cwd_completion, true);
+                }
+            }
             start_action = Some((*kind, cwd.clone(), *provider, *launch_mode));
             debug_log(
                 "new_session_confirm",
@@ -35421,9 +36369,31 @@ fn handle_new_session_key(
                     "launch_mode": launch_mode.as_str(),
                 }),
             );
+        } else if *selected == NEW_SESSION_FIELD_CWD
+            && handle_new_session_cwd_completion_key(
+                cwd,
+                cwd_cursor,
+                cwd_completion,
+                keybindings,
+                key,
+            )
+        {
+            debug_log(
+                "new_session_cwd_completion",
+                serde_json::json!({
+                    "cwd": cwd,
+                    "cursor": *cwd_cursor,
+                    "visible": cwd_completion.visible,
+                    "selected_index": cwd_completion.selected_index,
+                    "suggestions": cwd_completion.suggestions.len(),
+                }),
+            );
         } else if keybindings.matches(KeyAction::NewSessionNext, key)
             && !new_session_cwd_text_key(*selected, key)
         {
+            if *selected == NEW_SESSION_FIELD_CWD {
+                clear_new_session_path_completion(cwd_completion);
+            }
             *selected = move_new_session_field(*selected, *kind, 1);
             debug_log(
                 "new_session_move_field",
@@ -35435,6 +36405,9 @@ fn handle_new_session_key(
         } else if keybindings.matches(KeyAction::NewSessionPrev, key)
             && !new_session_cwd_text_key(*selected, key)
         {
+            if *selected == NEW_SESSION_FIELD_CWD {
+                clear_new_session_path_completion(cwd_completion);
+            }
             *selected = move_new_session_field(*selected, *kind, -1);
             debug_log(
                 "new_session_move_field",
@@ -35446,27 +36419,34 @@ fn handle_new_session_key(
         } else if *selected == NEW_SESSION_FIELD_CWD {
             if keybindings.matches(KeyAction::NewSessionBackspace, key) {
                 delete_before_cursor(cwd, cwd_cursor);
+                update_new_session_path_completion(cwd, *cwd_cursor, cwd_completion, true);
                 debug_log_key_event(key, "new_session_cwd_backspace");
             } else if keybindings.matches(KeyAction::NewSessionDelete, key) {
                 delete_at_cursor(cwd, cwd_cursor);
+                update_new_session_path_completion(cwd, *cwd_cursor, cwd_completion, true);
                 debug_log_key_event(key, "new_session_cwd_delete");
             } else if keybindings.matches(KeyAction::NewSessionHome, key) {
                 *cwd_cursor = 0;
+                clear_new_session_path_completion(cwd_completion);
                 debug_log_key_event(key, "new_session_cwd_home");
             } else if keybindings.matches(KeyAction::NewSessionEnd, key) {
                 *cwd_cursor = cwd.len();
+                clear_new_session_path_completion(cwd_completion);
                 debug_log_key_event(key, "new_session_cwd_end");
             } else if keybindings.matches(KeyAction::NewSessionMoveLeft, key) {
                 *cwd_cursor = prev_char_boundary(cwd, *cwd_cursor);
+                clear_new_session_path_completion(cwd_completion);
                 debug_log_key_event(key, "new_session_cwd_left");
             } else if keybindings.matches(KeyAction::NewSessionMoveRight, key) {
                 *cwd_cursor = next_char_boundary(cwd, *cwd_cursor);
+                clear_new_session_path_completion(cwd_completion);
                 debug_log_key_event(key, "new_session_cwd_right");
             } else if let KeyCode::Char(c) = key.code {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
                 {
                     insert_at_cursor(cwd, cwd_cursor, c);
+                    update_new_session_path_completion(cwd, *cwd_cursor, cwd_completion, true);
                     debug_log_key_event(key, "new_session_cwd_insert");
                 } else {
                     debug_log_key_event(key, "new_session_ignored");
@@ -35477,6 +36457,7 @@ fn handle_new_session_key(
         } else if keybindings.matches(KeyAction::NewSessionChoiceNext, key) {
             match *selected {
                 NEW_SESSION_FIELD_KIND => {
+                    clear_new_session_path_completion(cwd_completion);
                     *kind = move_new_session_kind(*kind, 1);
                     *selected = clamp_new_session_field(*selected, *kind);
                     if *kind == NewSessionKind::CodingAgent {
@@ -35488,9 +36469,13 @@ fn handle_new_session_key(
                     }
                 }
                 NEW_SESSION_FIELD_PROVIDER => {
+                    clear_new_session_path_completion(cwd_completion);
                     *provider = move_provider_in_options(*provider, 1, provider_options)
                 }
-                NEW_SESSION_FIELD_PERMISSIONS => *launch_mode = move_launch_mode(*launch_mode, 1),
+                NEW_SESSION_FIELD_PERMISSIONS => {
+                    clear_new_session_path_completion(cwd_completion);
+                    *launch_mode = move_launch_mode(*launch_mode, 1);
+                }
                 _ => {}
             }
             debug_log(
@@ -35505,6 +36490,7 @@ fn handle_new_session_key(
         } else if keybindings.matches(KeyAction::NewSessionChoicePrev, key) {
             match *selected {
                 NEW_SESSION_FIELD_KIND => {
+                    clear_new_session_path_completion(cwd_completion);
                     *kind = move_new_session_kind(*kind, -1);
                     *selected = clamp_new_session_field(*selected, *kind);
                     if *kind == NewSessionKind::CodingAgent {
@@ -35516,9 +36502,13 @@ fn handle_new_session_key(
                     }
                 }
                 NEW_SESSION_FIELD_PROVIDER => {
+                    clear_new_session_path_completion(cwd_completion);
                     *provider = move_provider_in_options(*provider, -1, provider_options)
                 }
-                NEW_SESSION_FIELD_PERMISSIONS => *launch_mode = move_launch_mode(*launch_mode, -1),
+                NEW_SESSION_FIELD_PERMISSIONS => {
+                    clear_new_session_path_completion(cwd_completion);
+                    *launch_mode = move_launch_mode(*launch_mode, -1);
+                }
                 _ => {}
             }
             debug_log(
@@ -35554,6 +36544,50 @@ fn new_session_cwd_text_key(selected: usize, key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char(_))
         && !key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn handle_new_session_cwd_completion_key(
+    cwd: &mut String,
+    cwd_cursor: &mut usize,
+    completion: &mut NewSessionPathCompletion,
+    keybindings: &KeyBindings,
+    key: KeyEvent,
+) -> bool {
+    let visible = new_session_completion_is_visible(completion);
+
+    if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+        if visible {
+            if let Some(suggestion) = completion
+                .suggestions
+                .get(completion.selected_index)
+                .cloned()
+            {
+                apply_new_session_path_completion(cwd, cwd_cursor, &suggestion);
+                update_new_session_path_completion(cwd, *cwd_cursor, completion, true);
+            }
+            return true;
+        } else {
+            return trigger_new_session_path_completion(cwd, cwd_cursor, completion);
+        }
+    }
+
+    if !visible {
+        return false;
+    }
+
+    if keybindings.matches(KeyAction::NewSessionPrev, key) {
+        if completion.selected_index == 0 {
+            completion.selected_index = completion.suggestions.len().saturating_sub(1);
+        } else {
+            completion.selected_index -= 1;
+        }
+        true
+    } else if keybindings.matches(KeyAction::NewSessionNext, key) {
+        completion.selected_index = (completion.selected_index + 1) % completion.suggestions.len();
+        true
+    } else {
+        false
+    }
 }
 
 fn plain_escape_key(key: KeyEvent) -> bool {
@@ -37481,6 +38515,7 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
         kind,
         cwd,
         cwd_cursor,
+        cwd_completion,
         provider,
         provider_options,
         launch_mode,
@@ -37493,6 +38528,7 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
             *kind,
             cwd,
             *cwd_cursor,
+            cwd_completion,
             *provider,
             provider_options,
             *launch_mode,
@@ -38605,7 +39641,9 @@ fn draw_agent_sidebar(
             // Direct PTY tools use an arbitrary provider only for daemon
             // namespacing; render their actual tool kind instead.
             let (badge_span, label) = if is_plain_pty_tool_session_info(info) {
-                let cwd_label = if info.cwd.is_empty() {
+                let label = if is_cli_command_session_info(info) {
+                    truncate_width(&cli_command_status_name(info), id_width)
+                } else if info.cwd.is_empty() {
                     "(no cwd)".to_string()
                 } else {
                     truncate_width(&display_cwd_str(&info.cwd), id_width)
@@ -38615,7 +39653,7 @@ fn draw_agent_sidebar(
                 } else {
                     shell_badge_span()
                 };
-                (badge, cwd_label)
+                (badge, label)
             } else {
                 let title = info.title.as_deref().unwrap_or("");
                 let label = if title.is_empty() {
@@ -41901,6 +42939,7 @@ fn draw_new_session_modal(
     kind: NewSessionKind,
     cwd: &str,
     cwd_cursor: usize,
+    cwd_completion: &NewSessionPathCompletion,
     provider: Provider,
     provider_options: &[Provider],
     launch_mode: AgentLaunchMode,
@@ -41908,21 +42947,44 @@ fn draw_new_session_modal(
     keybindings: &KeyBindings,
 ) {
     let selected = clamp_new_session_field(selected, kind);
-    let help_items = new_session_help_items(keybindings);
+    let completion_visible =
+        selected == NEW_SESSION_FIELD_CWD && new_session_completion_is_visible(cwd_completion);
+    let completion_rows = if completion_visible {
+        cwd_completion
+            .suggestions
+            .len()
+            .min(NEW_SESSION_PATH_COMPLETION_MAX_ITEMS)
+    } else {
+        0
+    };
+    let help_items = new_session_help_items(selected, completion_visible, keybindings);
     let help = help_text_from_items(&help_items);
     let preview_command =
         new_session_preview_command(kind, cwd, provider, provider_options, launch_mode, settings);
+    let completion_width = if completion_visible {
+        cwd_completion
+            .suggestions
+            .iter()
+            .map(|suggestion| UnicodeWidthStr::width(suggestion.as_str()))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(20)
+    } else {
+        0
+    };
     let desired_width = UnicodeWidthStr::width("Choose what to start")
         .max(UnicodeWidthStr::width(cwd).saturating_add(20))
+        .max(completion_width)
         .max(UnicodeWidthStr::width(kind.label()).saturating_add(20))
         .max(UnicodeWidthStr::width(launch_mode.label()).saturating_add(20))
         .max(UnicodeWidthStr::width(help.as_str()))
         .max(UnicodeWidthStr::width(preview_command.as_str()).min(76));
-    let content_rows: usize = if kind == NewSessionKind::CodingAgent {
+    let base_content_rows: usize = if kind == NewSessionKind::CodingAgent {
         8
     } else {
         6
     };
+    let content_rows = base_content_rows.saturating_add(completion_rows);
     let min_height = content_rows.saturating_add(2) as u16;
     let provisional_area = modal_area_from_content_rows(
         area,
@@ -41966,6 +43028,13 @@ fn draw_new_session_modal(
         label_width,
         value_width,
     ));
+    if completion_visible {
+        lines.extend(new_session_path_completion_lines(
+            cwd_completion,
+            label_width,
+            value_width,
+        ));
+    }
 
     if kind == NewSessionKind::CodingAgent {
         let provider_label = if provider_options.is_empty() {
@@ -42040,6 +43109,49 @@ fn new_session_field_line(
         ),
         style,
     ))
+}
+
+fn new_session_path_completion_lines(
+    completion: &NewSessionPathCompletion,
+    label_width: usize,
+    value_width: usize,
+) -> Vec<Line<'static>> {
+    let total = completion.suggestions.len();
+    if !completion.visible || total == 0 {
+        return Vec::new();
+    }
+
+    let max_visible = total.min(NEW_SESSION_PATH_COMPLETION_MAX_ITEMS);
+    let selected = completion.selected_index.min(total.saturating_sub(1));
+    let scroll_offset = if total <= max_visible || selected < max_visible / 2 {
+        0
+    } else if selected >= total.saturating_sub(max_visible / 2) {
+        total.saturating_sub(max_visible)
+    } else {
+        selected.saturating_sub(max_visible / 2)
+    };
+
+    completion
+        .suggestions
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(max_visible)
+        .map(|(index, suggestion)| {
+            let selected = index == completion.selected_index;
+            let mut value = suggestion.clone();
+            if index == scroll_offset && total > max_visible {
+                value.push_str(&format!(" [{}/{}]", completion.selected_index + 1, total));
+            }
+            new_session_field_line(
+                selected,
+                "",
+                fit_width(&value, value_width, Align::Left),
+                label_width,
+                value_width,
+            )
+        })
+        .collect()
 }
 
 fn new_session_preview_command(
@@ -42386,7 +43498,49 @@ fn clone_options_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
     ]
 }
 
-fn new_session_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
+fn new_session_help_items(
+    selected: usize,
+    completion_visible: bool,
+    keybindings: &KeyBindings,
+) -> Vec<HelpItem> {
+    if selected == NEW_SESSION_FIELD_CWD {
+        let mut items = vec![
+            help_item(keybindings, KeyAction::NewSessionConfirm, "Enter", "start"),
+            direct_help_item("Tab", "complete"),
+        ];
+        if completion_visible {
+            items.push(direct_help_item("↑/↓", "select"));
+        } else {
+            items.push(help_pair_item(
+                keybindings,
+                KeyAction::NewSessionPrev,
+                KeyAction::NewSessionNext,
+                "↑",
+                "↓",
+                "field",
+            ));
+        }
+        items.push(help_pair_item(
+            keybindings,
+            KeyAction::NewSessionMoveLeft,
+            KeyAction::NewSessionMoveRight,
+            "←",
+            "→",
+            "cursor",
+        ));
+        items.push(help_item(
+            keybindings,
+            KeyAction::NewSessionCancel,
+            "Esc",
+            if completion_visible {
+                "close/cancel"
+            } else {
+                "cancel"
+            },
+        ));
+        return items;
+    }
+
     vec![
         help_item(keybindings, KeyAction::NewSessionConfirm, "Enter", "start"),
         help_pair_item(
@@ -42404,14 +43558,6 @@ fn new_session_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
             "←",
             "→",
             "change",
-        ),
-        help_pair_item(
-            keybindings,
-            KeyAction::NewSessionMoveLeft,
-            KeyAction::NewSessionMoveRight,
-            "←",
-            "→",
-            "cursor",
         ),
         help_item(keybindings, KeyAction::NewSessionCancel, "Esc", "cancel"),
     ]
@@ -44230,6 +45376,237 @@ fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_parses_existing_commands_with_clap() {
+        let cli = CokacmuxCli::try_parse_from(["cokacmux", "--debug", "--trace", "--check"])
+            .expect("check flags should parse");
+        assert!(cli.debug);
+        assert!(cli.trace);
+        assert!(cli.check);
+        assert_eq!(cli.command, None);
+
+        let cli = CokacmuxCli::try_parse_from([
+            "cokacmux",
+            "start",
+            "web",
+            "--cwd",
+            "/repo",
+            "--",
+            "node",
+            "server.js",
+            "--port",
+            "3000",
+        ])
+        .expect("start command should parse");
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Start {
+                name: "web".into(),
+                cwd: PathBuf::from("/repo"),
+                command: vec![
+                    "node".into(),
+                    "server.js".into(),
+                    "--port".into(),
+                    "3000".into()
+                ],
+            })
+        );
+
+        let cli = CokacmuxCli::try_parse_from(["cokacmux", "killall"])
+            .expect("top-level killall should parse");
+        assert_eq!(cli.command, Some(CliCommand::Killall));
+
+        let cli = CokacmuxCli::try_parse_from(["cokacmux", "agents", "killall"])
+            .expect("agents killall should parse");
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Agents {
+                command: AgentsCliCommand::Killall,
+            })
+        );
+
+        let cli = CokacmuxCli::try_parse_from(["cokacmux", "reset"]).expect("reset should parse");
+        assert_eq!(cli.command, Some(CliCommand::Reset));
+    }
+
+    #[test]
+    fn cli_start_requires_command_separator() {
+        assert!(CokacmuxCli::try_parse_from(["cokacmux", "start", "web", "node"]).is_err());
+    }
+
+    #[test]
+    fn cli_start_validation_rejects_unsafe_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = normalize_cli_start_cwd(dir.path()).expect("existing cwd should normalize");
+        assert_eq!(cwd, launch_cwd_string(&dir.path().canonicalize().unwrap()));
+
+        let missing = dir.path().join("missing");
+        assert!(normalize_cli_start_cwd(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("launch folder does not exist"));
+
+        let file = dir.path().join("file.txt");
+        fs::write(&file, "").unwrap();
+        assert!(normalize_cli_start_cwd(&file)
+            .unwrap_err()
+            .to_string()
+            .contains("launch folder is not a directory"));
+
+        assert!(validate_cli_terminal_name("").is_err());
+        assert!(validate_cli_terminal_name("bad\nname").is_err());
+        assert!(validate_cli_terminal_name(&"x".repeat(CLI_TERMINAL_NAME_MAX_CHARS + 1)).is_err());
+
+        let program = std::env::current_exe().unwrap().display().to_string();
+        assert!(validate_cli_terminal_command(&[program.clone()]).is_ok());
+        assert!(validate_cli_terminal_command(&[]).is_err());
+        assert!(validate_cli_terminal_command(&["".to_string()]).is_err());
+        assert!(validate_cli_terminal_command(&[program.clone(), "bad\0arg".to_string()]).is_err());
+        assert!(
+            validate_cli_terminal_command(&vec![program; CLI_TERMINAL_COMMAND_MAX_ARGS + 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_command_terminal_source_round_trips() {
+        let program = std::env::current_exe().unwrap().display().to_string();
+        let argv = vec![program.clone(), "--version".to_string()];
+        let info = cli_command_session_info("web".into(), "/repo".into(), argv.clone())
+            .expect("command session info should encode source");
+
+        assert!(is_cli_command_session_info(&info));
+        assert!(is_plain_pty_tool_session_info(&info));
+        assert_eq!(
+            auxiliary_kind_for_session_info(&info),
+            Some(AgentAuxKind::Terminal)
+        );
+        assert_eq!(agent_info_kind(&info), "terminal");
+        assert_eq!(info.title.as_deref(), Some("web"));
+
+        let source = cli_command_session_source(&info).expect("source should decode");
+        assert_eq!(source.name.as_deref(), Some("web"));
+        assert_eq!(source.argv, argv);
+
+        let spec = cli_command_launch_spec(&info);
+        assert_eq!(spec.program, program);
+        assert_eq!(spec.args, vec!["--version".to_string()]);
+        assert_eq!(spec.cwd, Some(PathBuf::from("/repo")));
+    }
+
+    #[test]
+    fn cli_command_terminal_invalid_metadata_stays_terminal() {
+        let info = SessionInfo {
+            provider: Provider::Claude,
+            session_id: "command-invalid".into(),
+            cwd: "/repo".into(),
+            source: PathBuf::from(format!("{CLI_COMMAND_SESSION_SOURCE_PREFIX}not-json")),
+            updated_at_epoch_s: 0,
+            title: None,
+        };
+
+        assert!(is_cli_command_session_info(&info));
+        assert!(is_plain_pty_tool_session_info(&info));
+        assert_eq!(
+            auxiliary_kind_for_session_info(&info),
+            Some(AgentAuxKind::Terminal)
+        );
+
+        let spec = cli_command_launch_spec(&info);
+        if cfg!(windows) {
+            assert_eq!(spec.program, "powershell.exe");
+        } else {
+            assert_eq!(spec.program, "/bin/sh");
+        }
+        assert!(spec
+            .command_line()
+            .contains("invalid cokacmux command terminal metadata"));
+    }
+
+    #[test]
+    fn cli_command_terminal_meta_restores_terminal_kind() {
+        let program = std::env::current_exe().unwrap().display().to_string();
+        let info = cli_command_session_info("web".into(), "/repo".into(), vec![program])
+            .expect("command session info should encode source");
+        let meta = AgentMetaSnapshot {
+            provider: Some(info.provider.as_str().to_string()),
+            session_id: Some(info.session_id.clone()),
+            cwd: Some(info.cwd.clone()),
+            source: Some(info.source.display().to_string()),
+            updated_at_epoch_s: 42,
+            ..AgentMetaSnapshot::default()
+        };
+
+        let restored =
+            session_info_from_agent_meta_snapshot(&meta).expect("meta should restore session info");
+        assert!(is_cli_command_session_info(&restored));
+        assert!(is_plain_pty_tool_session_info(&restored));
+        assert_eq!(
+            auxiliary_kind_for_session_info(&restored),
+            Some(AgentAuxKind::Terminal)
+        );
+        assert_eq!(restored.title.as_deref(), Some("web"));
+        assert_eq!(live_agent_status_label(&restored), "terminal web at /repo");
+    }
+
+    #[test]
+    fn cli_command_terminal_appears_in_agent_sidebar_candidates() {
+        let mut app = app_for_key_tests();
+        let active_info = new_agent_info(Provider::Codex, "/repo");
+        let active_key = AgentKey::new(&active_info);
+        let mut active = buffered_output_test_client("active-cli-command-sidebar", 12);
+        active.info = active_info;
+        app.set_active_agent(active);
+        app.mark_agent_attached_locally(active_key.clone());
+
+        let program = std::env::current_exe().unwrap().display().to_string();
+        let terminal = cli_command_session_info("web".into(), "/repo".into(), vec![program])
+            .expect("command session info should encode source");
+        let terminal_key = AgentKey::new(&terminal);
+        app.live_shells.push(terminal);
+        app.agent_states.insert(
+            terminal_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+
+        let candidates = app.live_agent_switch_candidates();
+        let candidate = candidates
+            .iter()
+            .find(|info| AgentKey::new(info) == terminal_key)
+            .expect("cli command terminal should be switchable from the agents sidebar");
+        assert_eq!(
+            auxiliary_kind_for_session_info(candidate),
+            Some(AgentAuxKind::Terminal)
+        );
+        assert_eq!(candidate.title.as_deref(), Some("web"));
+        assert_eq!(live_agent_status_label(candidate), "terminal web at /repo");
+    }
+
+    #[test]
+    fn cli_rejects_check_with_subcommand() {
+        let cli = CokacmuxCli::try_parse_from(["cokacmux", "--check", "killall"])
+            .expect("clap accepts top-level --check before validation");
+
+        assert!(validate_cli(&cli)
+            .unwrap_err()
+            .to_string()
+            .contains("--check cannot be combined"));
+    }
+
+    #[test]
+    fn cli_help_keeps_interactive_key_reference() {
+        let error =
+            CokacmuxCli::try_parse_from(["cokacmux", "--help"]).expect_err("help exits early");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("Usage:"));
+        assert!(rendered.contains("Commands:"));
+        assert!(rendered.contains("INTERACTIVE KEYS"));
+        assert!(rendered.contains("Ctrl+K"));
+    }
 
     // Regression tests for the vt100 wide-char-at-edge panic. The bytes
     // below trigger Screen::text() / Row::clear_wide() OOB indexing in
@@ -47138,6 +48515,7 @@ mod tests {
                         NewSessionKind::CodingAgent,
                         &source.cwd,
                         source.cwd.len(),
+                        &NewSessionPathCompletion::default(),
                         Provider::Codex,
                         &[Provider::Codex],
                         AgentLaunchMode::SkipPermissions,
@@ -47568,6 +48946,7 @@ mod tests {
             kind: NewSessionKind::CokacDir,
             cwd: cwd.clone(),
             cwd_cursor: cwd.len(),
+            cwd_completion: NewSessionPathCompletion::default(),
             provider: Provider::Codex,
             provider_options: vec![Provider::Codex],
             launch_mode: AgentLaunchMode::Normal,
@@ -51415,6 +52794,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 kind,
                 cwd,
                 cwd_cursor,
+                cwd_completion,
                 provider,
                 provider_options,
                 launch_mode,
@@ -51423,6 +52803,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 assert_eq!(*kind, NewSessionKind::Terminal);
                 assert_eq!(cwd, "/repo");
                 assert_eq!(*cwd_cursor, "/repo".len());
+                assert!(!cwd_completion.visible);
                 let expected_provider = if provider_options.is_empty()
                     || provider_options.contains(&Provider::OpenCode)
                 {
@@ -51449,6 +52830,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             kind: NewSessionKind::Terminal,
             cwd: cwd.clone(),
             cwd_cursor: cwd.len(),
+            cwd_completion: NewSessionPathCompletion::default(),
             provider: Provider::Codex,
             provider_options: Vec::new(),
             launch_mode: AgentLaunchMode::Normal,
@@ -51500,6 +52882,38 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(rendered.contains("Starting new session"));
         assert!(rendered.contains("Preparing terminal"));
         assert!(rendered.contains("Folder: /repo"));
+    }
+
+    #[test]
+    fn new_session_cwd_completion_modal_renders_at_80x24() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::NewSession {
+            selected: NEW_SESSION_FIELD_CWD,
+            kind: NewSessionKind::Terminal,
+            cwd: "/repo/".into(),
+            cwd_cursor: "/repo/".len(),
+            cwd_completion: NewSessionPathCompletion {
+                suggestions: vec!["alpha/".into(), "beta/".into()],
+                selected_index: 0,
+                visible: true,
+            },
+            provider: Provider::Codex,
+            provider_options: Vec::new(),
+            launch_mode: AgentLaunchMode::Normal,
+        };
+
+        terminal
+            .draw(|f| {
+                assert!(draw_input_modal(f, f.area(), &app));
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("alpha/"));
+        assert!(rendered.contains("beta/"));
+        assert!(rendered.contains("Tab complete"));
     }
 
     #[test]
@@ -51635,6 +53049,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             kind: NewSessionKind::Terminal,
             cwd: "/repo".into(),
             cwd_cursor: "/repo".len(),
+            cwd_completion: NewSessionPathCompletion::default(),
             provider: Provider::Codex,
             provider_options: Vec::new(),
             launch_mode: AgentLaunchMode::Normal,
@@ -51666,6 +53081,290 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn new_session_path_suggestions_prioritize_prefix_and_hide_dot_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        fs::create_dir(dir.path().join(".claude")).unwrap();
+        fs::create_dir(dir.path().join("Desktop")).unwrap();
+        fs::create_dir(dir.path().join("develop")).unwrap();
+        fs::create_dir(dir.path().join("devnoda")).unwrap();
+        fs::write(dir.path().join("delta.txt"), "").unwrap();
+
+        let suggestions = new_session_path_suggestions(dir.path(), "de");
+
+        assert_eq!(suggestions[0], format!("Desktop{}", sep));
+        assert_eq!(suggestions[1], format!("develop{}", sep));
+        assert_eq!(suggestions[2], format!("devnoda{}", sep));
+        assert!(!suggestions.iter().any(|entry| entry == "delta.txt"));
+        assert!(
+            suggestions
+                .iter()
+                .position(|entry| entry == &format!(".claude{}", sep))
+                .unwrap()
+                > 2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_session_path_suggestions_include_symlinked_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("target-dir")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("target-dir"),
+            dir.path().join("target-link"),
+        )
+        .unwrap();
+
+        let suggestions = new_session_path_suggestions(dir.path(), "target-l");
+
+        assert_eq!(
+            suggestions,
+            vec![format!("target-link{}", std::path::MAIN_SEPARATOR)]
+        );
+    }
+
+    #[test]
+    fn new_session_cwd_tab_completion_prefers_prefix_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".vol")).unwrap();
+        fs::create_dir(dir.path().join("private")).unwrap();
+        fs::create_dir(dir.path().join("Volumes")).unwrap();
+
+        let mut input = dir.path().join("V").display().to_string();
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::NewSession {
+            selected: NEW_SESSION_FIELD_CWD,
+            kind: NewSessionKind::Terminal,
+            cwd_cursor: input.len(),
+            cwd: input.clone(),
+            cwd_completion: NewSessionPathCompletion::default(),
+            provider: Provider::Codex,
+            provider_options: Vec::new(),
+            launch_mode: AgentLaunchMode::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        if !new_session_path_ends_with_separator(&input) {
+            input = dir.path().join("Volumes").display().to_string();
+            input.push(std::path::MAIN_SEPARATOR);
+        }
+        match &app.input_mode {
+            InputMode::NewSession {
+                cwd,
+                cwd_cursor,
+                cwd_completion,
+                ..
+            } => {
+                assert_eq!(cwd, &input);
+                assert_eq!(*cwd_cursor, input.len());
+                assert!(!cwd_completion.visible);
+            }
+            other => panic!("expected new session mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn new_session_cwd_completion_uses_cursor_and_preserves_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("alpha")).unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        let base = format!("{}{}", dir.path().display(), sep);
+        let cwd = format!("{}a{}child", base, sep);
+        let cursor = base.len() + "a".len();
+
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::NewSession {
+            selected: NEW_SESSION_FIELD_CWD,
+            kind: NewSessionKind::Terminal,
+            cwd_cursor: cursor,
+            cwd,
+            cwd_completion: NewSessionPathCompletion::default(),
+            provider: Provider::Codex,
+            provider_options: Vec::new(),
+            launch_mode: AgentLaunchMode::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        let expected = format!("{}alpha{}child", base, sep);
+        match &app.input_mode {
+            InputMode::NewSession {
+                cwd,
+                cwd_cursor,
+                cwd_completion,
+                ..
+            } => {
+                assert_eq!(cwd, &expected);
+                assert_eq!(*cwd_cursor, format!("{}alpha{}", base, sep).len());
+                assert!(!cwd_completion.visible);
+            }
+            other => panic!("expected new session mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn new_session_cwd_common_completion_preserves_suffix_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("alpha")).unwrap();
+        fs::create_dir(dir.path().join("alpine")).unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        let base = format!("{}{}", dir.path().display(), sep);
+        let cwd = format!("{}a{}child", base, sep);
+        let cursor = base.len() + "a".len();
+
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::NewSession {
+            selected: NEW_SESSION_FIELD_CWD,
+            kind: NewSessionKind::Terminal,
+            cwd_cursor: cursor,
+            cwd,
+            cwd_completion: NewSessionPathCompletion::default(),
+            provider: Provider::Codex,
+            provider_options: Vec::new(),
+            launch_mode: AgentLaunchMode::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        let expected = format!("{}alp{}child", base, sep);
+        match &app.input_mode {
+            InputMode::NewSession {
+                cwd,
+                cwd_cursor,
+                cwd_completion,
+                ..
+            } => {
+                assert_eq!(cwd, &expected);
+                assert_eq!(*cwd_cursor, format!("{}alp", base).len());
+                assert!(cwd_completion.visible);
+                assert_eq!(cwd_completion.suggestions.len(), 2);
+            }
+            other => panic!("expected new session mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn new_session_cwd_tab_without_suggestions_falls_back_to_field_movement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cwd = dir.path().display().to_string();
+        cwd.push(std::path::MAIN_SEPARATOR);
+
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::NewSession {
+            selected: NEW_SESSION_FIELD_CWD,
+            kind: NewSessionKind::CodingAgent,
+            cwd_cursor: cwd.len(),
+            cwd,
+            cwd_completion: NewSessionPathCompletion::default(),
+            provider: Provider::Codex,
+            provider_options: vec![Provider::Codex],
+            launch_mode: AgentLaunchMode::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::NewSession {
+                selected,
+                cwd_completion,
+                ..
+            } => {
+                assert_eq!(*selected, NEW_SESSION_FIELD_PROVIDER);
+                assert!(!cwd_completion.visible);
+            }
+            other => panic!("expected new session mode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn new_session_cwd_completion_selects_and_esc_closes_before_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("alpha")).unwrap();
+        fs::create_dir(dir.path().join("beta")).unwrap();
+        let mut cwd = dir.path().display().to_string();
+        cwd.push(std::path::MAIN_SEPARATOR);
+
+        let mut app = app_for_key_tests();
+        app.input_mode = InputMode::NewSession {
+            selected: NEW_SESSION_FIELD_CWD,
+            kind: NewSessionKind::Terminal,
+            cwd_cursor: cwd.len(),
+            cwd,
+            cwd_completion: NewSessionPathCompletion::default(),
+            provider: Provider::Codex,
+            provider_options: Vec::new(),
+            launch_mode: AgentLaunchMode::Normal,
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::NewSession { cwd_completion, .. } => {
+                assert!(cwd_completion.visible);
+                assert_eq!(cwd_completion.selected_index, 1);
+            }
+            other => panic!("expected new session mode, got {:?}", other),
+        }
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            100,
+            80,
+            20,
+        );
+
+        match &app.input_mode {
+            InputMode::NewSession { cwd_completion, .. } => {
+                assert!(!cwd_completion.visible);
+            }
+            other => panic!(
+                "expected new session mode after closing completion, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
     fn custom_new_session_cwd_cursor_keys_are_used_by_handler() {
         let mut app = app_for_key_tests();
         app.keybindings.apply_json(&serde_json::json!({
@@ -51679,6 +53378,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             kind: NewSessionKind::Terminal,
             cwd: "/repo".into(),
             cwd_cursor: "/repo".len(),
+            cwd_completion: NewSessionPathCompletion::default(),
             provider: Provider::Codex,
             provider_options: Vec::new(),
             launch_mode: AgentLaunchMode::Normal,
@@ -51729,6 +53429,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             kind: NewSessionKind::Terminal,
             cwd: "".into(),
             cwd_cursor: 0,
+            cwd_completion: NewSessionPathCompletion::default(),
             provider: Provider::Codex,
             provider_options: Vec::new(),
             launch_mode: AgentLaunchMode::Normal,
@@ -51841,6 +53542,15 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(normalize_launch_cwd("")
             .unwrap_err()
             .starts_with("folder path is required."));
+    }
+
+    #[test]
+    fn expand_home_path_accepts_backslash_separator() {
+        let Some(home) = configured_home_dir() else {
+            return;
+        };
+
+        assert_eq!(expand_home_path("~\\child"), home.join("child"));
     }
 
     #[test]
@@ -54370,6 +56080,46 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn daemon_ready_tcp_listener_reads_delayed_ready_line() {
+        let key = AgentKey {
+            provider: Provider::Codex,
+            session_id: "ready-session".into(),
+        };
+        let listener = bind_agent_daemon_ready_listener().unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer_key = key.clone();
+        let writer = thread::spawn(move || {
+            let stream = std::net::TcpStream::connect(addr).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            notify_agent_daemon_ready_to_writer(stream, &writer_key, Path::new("/tmp/ready.sock"))
+                .unwrap();
+        });
+
+        let started = Instant::now();
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _addr)) => break stream,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(1),
+                        "listener did not accept readiness connection"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("listener accept failed: {e}"),
+            }
+        };
+        prepare_agent_daemon_ready_stream(&stream, Duration::from_secs(1)).unwrap();
+
+        let ready = read_agent_daemon_ready(stream, &key).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(ready.provider, Provider::Codex);
+        assert_eq!(ready.session_id, "ready-session");
+        assert_eq!(ready.socket, "/tmp/ready.sock");
+    }
+
+    #[test]
     fn runtime_refresh_without_discovery_preserves_cached_live_shell() {
         let live = new_agent_info(Provider::Codex, "/repo");
         let key = AgentKey::new(&live);
@@ -55426,8 +57176,30 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert_eq!(argv[0], windows_comspec());
         assert_eq!(argv[1], OsString::from("/D"));
         assert_eq!(argv[2], OsString::from("/C"));
-        assert_eq!(argv[3], shim.into_os_string());
-        assert_eq!(argv[4], OsString::from("resume"));
+        assert_eq!(argv[3], OsString::from("call"));
+        assert_eq!(argv[4], shim.into_os_string());
+        assert_eq!(argv[5], OsString::from("resume"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_agent_command_runs_script_path_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_dir = dir.path().join("tools with spaces");
+        fs::create_dir(&script_dir).unwrap();
+        let shim = script_dir.join("codex.cmd");
+        fs::write(&shim, "@echo off\r\necho OK %~1 %~2\r\n").unwrap();
+
+        let argv = windows_agent_command_argv(shim, &["ARG ONE".into(), "ARG_TWO".into()]);
+        let output = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
+
+        assert!(
+            output.status.success(),
+            "batch command failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("OK ARG ONE ARG_TWO"));
     }
 
     #[cfg(windows)]
@@ -60938,7 +62710,11 @@ IF EXIST "%~dp0\node.exe" (
         let dir = tempfile::tempdir().unwrap();
         let scrollback = dir.path().join("scrollback");
         fs::create_dir_all(&scrollback).unwrap();
-        let info = session_info(Provider::Codex, "reachable-stale-meta", "/repo/reachable-stale");
+        let info = session_info(
+            Provider::Codex,
+            "reachable-stale-meta",
+            "/repo/reachable-stale",
+        );
         let key = AgentKey::new(&info);
         let stem = agent_file_stem(&key);
         let meta = dir.path().join(format!("{stem}.json"));
@@ -60960,8 +62736,7 @@ IF EXIST "%~dp0\node.exe" (
         .unwrap();
         fs::write(&pty_log, b"OLD\n").unwrap();
 
-        let report =
-            cleanup_stale_agent_runtime_files_at(dir.path(), "test_reachable_stale_meta");
+        let report = cleanup_stale_agent_runtime_files_at(dir.path(), "test_reachable_stale_meta");
 
         assert_eq!(report.pty_logs_deleted, 0);
         assert_eq!(report.runtime_files_removed, 0);

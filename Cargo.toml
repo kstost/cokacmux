@@ -1,6 +1,6 @@
 [package]
 name = "cokacmux"
-version = "0.2.37"
+version = "0.2.38"
 edition = "2021"
 authors = ["cokac <monogatree@gmail.com>"]
 description = "TUI multiplexer for local coding agent sessions."
@@ -34,6 +34,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 uuid = { version = "1", features = ["v7", "serde"] }
 sha2 = "0.10"
 thiserror = "1"
+clap = { version = "4", features = ["derive"] }
 
 anyhow = { version = "1", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }

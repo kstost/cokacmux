@@ -333,8 +333,8 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 |---|---|---|
 | `new_session.cancel` | `esc` | 취소 |
 | `new_session.confirm` | `enter` | 선택한 설정으로 시작 |
-| `new_session.next` | `down`, `tab` | 다음 입력 항목 |
-| `new_session.prev` | `up`, `backtab` | 이전 입력 항목 |
+| `new_session.next` | `down`, `tab` | 다음 입력 항목. Folder 항목에서는 `tab`이 경로 자동완성으로 우선 동작 |
+| `new_session.prev` | `up`, `backtab` | 이전 입력 항목. Folder 자동완성 목록이 열려 있으면 `up`/`backtab`은 후보 선택 |
 | `new_session.choice_next` | `right`, `space` | Type / Agent / Permissions 다음 값 |
 | `new_session.choice_prev` | `left` | Type / Agent / Permissions 이전 값 |
 | `new_session.move_left` | `left` | 폴더 경로 커서 왼쪽 이동 |
@@ -343,6 +343,8 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 | `new_session.delete` | `delete` | 폴더 경로에서 커서 위치 글자 삭제 |
 | `new_session.home` | `home` | 폴더 경로 커서 처음으로 |
 | `new_session.end` | `end` | 폴더 경로 커서 끝으로 |
+
+Folder 항목의 자동완성은 로컬 디렉터리만 제안합니다. 후보는 exact, 대소문자 무시 exact, prefix, substring, subsequence 순서로 정렬되며, 숨김 디렉터리는 `.`를 직접 입력하기 전까지 뒤로 밀립니다.
 
 폴더 경로 입력 항목에서는 일반 문자 키가 경로 입력으로 우선 처리됩니다. 입력 항목을 이동하려면 `up`, `down`, `tab`, `backtab`을 쓰면 됩니다.
 
