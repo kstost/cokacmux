@@ -3296,6 +3296,9 @@ const NEW_SESSION_FIELD_CWD: usize = 1;
 const NEW_SESSION_FIELD_PROVIDER: usize = 2;
 const NEW_SESSION_FIELD_PERMISSIONS: usize = 3;
 const NEW_SESSION_PATH_COMPLETION_MAX_ITEMS: usize = 4;
+const NEW_SESSION_PATH_COMPLETION_OVERLAY_ROW: u16 = 3;
+const NEW_SESSION_MODAL_STABLE_CONTENT_WIDTH: usize = 76;
+const NEW_SESSION_MODAL_MAX_HEIGHT: u16 = 16;
 
 #[derive(Debug, Clone, Default)]
 struct NewSessionPathCompletion {
@@ -42949,42 +42952,18 @@ fn draw_new_session_modal(
     let selected = clamp_new_session_field(selected, kind);
     let completion_visible =
         selected == NEW_SESSION_FIELD_CWD && new_session_completion_is_visible(cwd_completion);
-    let completion_rows = if completion_visible {
-        cwd_completion
-            .suggestions
-            .len()
-            .min(NEW_SESSION_PATH_COMPLETION_MAX_ITEMS)
-    } else {
-        0
-    };
     let help_items = new_session_help_items(selected, completion_visible, keybindings);
-    let help = help_text_from_items(&help_items);
     let preview_command =
         new_session_preview_command(kind, cwd, provider, provider_options, launch_mode, settings);
-    let completion_width = if completion_visible {
-        cwd_completion
-            .suggestions
-            .iter()
-            .map(|suggestion| UnicodeWidthStr::width(suggestion.as_str()))
-            .max()
-            .unwrap_or(0)
-            .saturating_add(20)
-    } else {
-        0
-    };
-    let desired_width = UnicodeWidthStr::width("Choose what to start")
-        .max(UnicodeWidthStr::width(cwd).saturating_add(20))
-        .max(completion_width)
-        .max(UnicodeWidthStr::width(kind.label()).saturating_add(20))
-        .max(UnicodeWidthStr::width(launch_mode.label()).saturating_add(20))
-        .max(UnicodeWidthStr::width(help.as_str()))
-        .max(UnicodeWidthStr::width(preview_command.as_str()).min(76));
+    let desired_width = NEW_SESSION_MODAL_STABLE_CONTENT_WIDTH;
     let base_content_rows: usize = if kind == NewSessionKind::CodingAgent {
         8
     } else {
         6
     };
-    let content_rows = base_content_rows.saturating_add(completion_rows);
+    // Path suggestions are drawn as an overlay, so they do not reserve rows in
+    // the modal's content flow.
+    let content_rows = base_content_rows;
     let min_height = content_rows.saturating_add(2) as u16;
     let provisional_area = modal_area_from_content_rows(
         area,
@@ -42994,7 +42973,7 @@ fn draw_new_session_modal(
         56,
         98,
         min_height,
-        14,
+        NEW_SESSION_MODAL_MAX_HEIGHT,
     );
     let inner_width = provisional_area.width.saturating_sub(2) as usize;
     let label_width = 12usize.min(inner_width.saturating_sub(8));
@@ -43021,21 +43000,13 @@ fn draw_new_session_modal(
     } else {
         fit_width(cwd, value_width, Align::Left)
     };
-    lines.push(new_session_field_line(
+    lines.push(new_session_text_input_field_line(
         selected == NEW_SESSION_FIELD_CWD,
         "Folder",
         cwd_value,
         label_width,
         value_width,
     ));
-    if completion_visible {
-        lines.extend(new_session_path_completion_lines(
-            cwd_completion,
-            label_width,
-            value_width,
-        ));
-    }
-
     if kind == NewSessionKind::CodingAgent {
         let provider_label = if provider_options.is_empty() {
             "none installed".to_string()
@@ -43063,10 +43034,47 @@ fn draw_new_session_modal(
         Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
     )));
     lines.push(Line::from(""));
-    lines.push(modal_help_line(&help_items));
+    lines.push(help_line_from_items_with_bg(
+        &help_items,
+        inner_width,
+        THEME_BG_ALT,
+    ));
 
-    let modal_area =
-        modal_area_for_wrapped_lines(area, "New session", &lines, 56, 98, min_height, 14);
+    let modal_area = modal_area_for_wrapped_lines_with_content_width(
+        area,
+        "New session",
+        &lines,
+        desired_width,
+        56,
+        98,
+        min_height,
+        NEW_SESSION_MODAL_MAX_HEIGHT,
+    );
+    let completion_overlay = if completion_visible {
+        let line_budget = cwd_completion
+            .suggestions
+            .len()
+            .min(NEW_SESSION_PATH_COMPLETION_MAX_ITEMS);
+        let overlay_area = new_session_path_completion_overlay_area(modal_area, line_budget);
+        let root_anchor = new_session_completion_anchors_at_root(cwd, cwd_cursor);
+        let value_indent = cwd_input
+            .as_ref()
+            .map(|input| new_session_completion_value_indent(cwd, cwd_cursor, input))
+            .unwrap_or(0)
+            .saturating_sub(usize::from(root_anchor))
+            .min(value_width);
+        let lines = new_session_path_completion_lines(
+            cwd_completion,
+            label_width,
+            value_width,
+            value_indent,
+            root_anchor,
+            overlay_area.height as usize,
+        );
+        Some((overlay_area, lines))
+    } else {
+        None
+    };
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -43079,6 +43087,19 @@ fn draw_new_session_modal(
         .wrap(Wrap { trim: false });
     f.render_widget(ratatui::widgets::Clear, modal_area);
     f.render_widget(p, modal_area);
+    if let Some((overlay_area, completion_overlay_lines)) = completion_overlay {
+        if overlay_area.height > 0 && overlay_area.width > 0 && !completion_overlay_lines.is_empty()
+        {
+            f.render_widget(ratatui::widgets::Clear, overlay_area);
+            fill_area(f.buffer_mut(), overlay_area, theme_alt_style());
+            f.render_widget(
+                Paragraph::new(completion_overlay_lines)
+                    .style(theme_alt_style())
+                    .wrap(Wrap { trim: false }),
+                overlay_area,
+            );
+        }
+    }
     if let Some(input) = cwd_input {
         let cursor_col = UnicodeWidthStr::width(selection_marker(true))
             .saturating_add(label_width)
@@ -43088,6 +43109,21 @@ fn draw_new_session_modal(
     }
 }
 
+fn new_session_path_completion_overlay_area(modal_area: Rect, line_count: usize) -> Rect {
+    let inner_height = modal_area.height.saturating_sub(2);
+    let available_height = inner_height.saturating_sub(NEW_SESSION_PATH_COMPLETION_OVERLAY_ROW);
+    let height = usize_to_u16_saturating(line_count).min(available_height);
+    Rect::new(
+        modal_area.x.saturating_add(1),
+        modal_area
+            .y
+            .saturating_add(1)
+            .saturating_add(NEW_SESSION_PATH_COMPLETION_OVERLAY_ROW),
+        modal_area.width.saturating_sub(2),
+        height,
+    )
+}
+
 fn new_session_field_line(
     selected: bool,
     label: &str,
@@ -43095,33 +43131,104 @@ fn new_session_field_line(
     label_width: usize,
     value_width: usize,
 ) -> Line<'static> {
-    let style = if selected {
-        theme_selected_style()
+    new_session_field_line_with_value_focus(selected, label, value, label_width, value_width, true)
+}
+
+fn new_session_text_input_field_line(
+    selected: bool,
+    label: &str,
+    value: String,
+    label_width: usize,
+    value_width: usize,
+) -> Line<'static> {
+    new_session_field_line_with_value_focus(selected, label, value, label_width, value_width, false)
+}
+
+fn new_session_field_line_with_value_focus(
+    selected: bool,
+    label: &str,
+    value: String,
+    label_width: usize,
+    value_width: usize,
+    focus_value: bool,
+) -> Line<'static> {
+    let marker_style = if selected {
+        Style::default()
+            .fg(THEME_ACCENT)
+            .bg(THEME_BG_ALT)
+            .add_modifier(Modifier::BOLD)
     } else {
         theme_alt_style()
     };
-    Line::from(Span::styled(
-        format!(
-            "{}{} {}",
-            selection_marker(selected),
-            fit_width(label, label_width, Align::Left),
-            fit_width(&value, value_width, Align::Left)
-        ),
-        style,
-    ))
+    let label_style = Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT);
+    let separator_style = theme_alt_style();
+    let mut spans = vec![
+        Span::styled(selection_marker(selected), marker_style),
+        Span::styled(fit_width(label, label_width, Align::Left), label_style),
+        Span::styled(" ", separator_style),
+    ];
+    spans.extend(new_session_field_value_spans(
+        &value,
+        selected && focus_value,
+        value_width,
+    ));
+    Line::from(spans)
+}
+
+fn new_session_field_value_spans(
+    value: &str,
+    selected: bool,
+    value_width: usize,
+) -> Vec<Span<'static>> {
+    let display_value = fit_width(value, value_width, Align::Left);
+    if !selected {
+        return vec![Span::styled(display_value, theme_alt_style())];
+    }
+
+    let leading_end = display_value
+        .char_indices()
+        .find_map(|(index, ch)| (ch != ' ').then_some(index))
+        .unwrap_or(display_value.len());
+    let content_end = display_value.trim_end_matches(' ').len();
+    let mut spans = Vec::new();
+    if leading_end > 0 {
+        spans.push(Span::styled(
+            display_value[..leading_end].to_string(),
+            theme_alt_style(),
+        ));
+    }
+    if content_end > leading_end {
+        spans.push(Span::styled(
+            display_value[leading_end..content_end].to_string(),
+            theme_selected_style(),
+        ));
+    }
+    if content_end < display_value.len() {
+        spans.push(Span::styled(
+            display_value[content_end..].to_string(),
+            theme_alt_style(),
+        ));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(display_value, theme_alt_style()));
+    }
+    spans
 }
 
 fn new_session_path_completion_lines(
     completion: &NewSessionPathCompletion,
     label_width: usize,
     value_width: usize,
+    value_indent: usize,
+    root_anchor: bool,
+    max_items: usize,
 ) -> Vec<Line<'static>> {
     let total = completion.suggestions.len();
-    if !completion.visible || total == 0 {
+    if !completion.visible || total == 0 || max_items == 0 {
         return Vec::new();
     }
 
-    let max_visible = total.min(NEW_SESSION_PATH_COMPLETION_MAX_ITEMS);
+    let max_visible = total.min(max_items);
     let selected = completion.selected_index.min(total.saturating_sub(1));
     let scroll_offset = if total <= max_visible || selected < max_visible / 2 {
         0
@@ -43140,18 +43247,41 @@ fn new_session_path_completion_lines(
         .map(|(index, suggestion)| {
             let selected = index == completion.selected_index;
             let mut value = suggestion.clone();
-            if index == scroll_offset && total > max_visible {
-                value.push_str(&format!(" [{}/{}]", completion.selected_index + 1, total));
+            if root_anchor {
+                value = format!("{}{}", std::path::MAIN_SEPARATOR, value);
             }
-            new_session_field_line(
-                selected,
-                "",
-                fit_width(&value, value_width, Align::Left),
-                label_width,
-                value_width,
-            )
+            let visible_width = value_width.saturating_sub(value_indent);
+            let value = format!(
+                "{}{}",
+                " ".repeat(value_indent),
+                fit_width(&value, visible_width, Align::Left)
+            );
+            new_session_field_line(selected, "", value, label_width, value_width)
         })
         .collect()
+}
+
+fn new_session_completion_value_indent(
+    cwd: &str,
+    cwd_cursor: usize,
+    input: &InputViewport,
+) -> usize {
+    let context = new_session_path_completion_context(cwd, cwd_cursor);
+    let display = sanitize_for_single_line(cwd);
+    let visible_start = clamp_to_char_boundary(&display, input.visible_start.min(display.len()));
+    let replace_start = clamp_to_char_boundary(&display, context.replace_start.min(display.len()));
+    if replace_start <= visible_start {
+        return 0;
+    }
+
+    UnicodeWidthStr::width(&display[visible_start..replace_start])
+}
+
+fn new_session_completion_anchors_at_root(cwd: &str, cwd_cursor: usize) -> bool {
+    let context = new_session_path_completion_context(cwd, cwd_cursor);
+    context.replace_start > 0
+        && context.base_dir.has_root()
+        && context.base_dir.components().count() <= 1
 }
 
 fn new_session_preview_command(
@@ -44817,6 +44947,7 @@ fn session_id_display_part(session_id: &str) -> &str {
 struct InputViewport {
     text: String,
     cursor_col: usize,
+    visible_start: usize,
 }
 
 fn input_viewport(value: &str, cursor: usize, width: usize) -> InputViewport {
@@ -44824,6 +44955,7 @@ fn input_viewport(value: &str, cursor: usize, width: usize) -> InputViewport {
         return InputViewport {
             text: String::new(),
             cursor_col: 0,
+            visible_start: 0,
         };
     }
 
@@ -44838,10 +44970,11 @@ fn input_viewport(value: &str, cursor: usize, width: usize) -> InputViewport {
         return InputViewport {
             text: fit_width(&format!("{}{}", before, after_visible), width, Align::Left),
             cursor_col: before_width,
+            visible_start: 0,
         };
     }
 
-    let before_visible = suffix_width(before, width.saturating_sub(1));
+    let (before_visible, visible_start) = suffix_width_with_start(before, width.saturating_sub(1));
     let cursor_col = UnicodeWidthStr::width(before_visible.as_str());
     let after_visible = prefix_width(after, width.saturating_sub(cursor_col));
     InputViewport {
@@ -44851,6 +44984,7 @@ fn input_viewport(value: &str, cursor: usize, width: usize) -> InputViewport {
             Align::Left,
         ),
         cursor_col,
+        visible_start,
     }
 }
 
@@ -44958,18 +45092,20 @@ fn prefix_width(s: &str, width: usize) -> String {
     out
 }
 
-fn suffix_width(s: &str, width: usize) -> String {
+fn suffix_width_with_start(s: &str, width: usize) -> (String, usize) {
     let mut chars = Vec::new();
     let mut used = 0usize;
-    for ch in s.chars().rev() {
+    let mut start = s.len();
+    for (index, ch) in s.char_indices().rev() {
         let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
         if used + ch_width > width {
             break;
         }
         chars.push(ch);
         used += ch_width;
+        start = index;
     }
-    chars.into_iter().rev().collect()
+    (chars.into_iter().rev().collect(), start)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45292,6 +45428,27 @@ fn modal_area_for_wrapped_lines(
         .max()
         .unwrap_or(0)
         .max(modal_title_content_width(title));
+    let width = modal_width(area, desired_content_width, min_width, max_width);
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    let content_rows = lines
+        .iter()
+        .map(|line| wrapped_modal_rows(line.width(), content_width))
+        .sum();
+    let height = modal_height(area, content_rows, min_height, max_height);
+    centered_rect_fixed(width, height, area)
+}
+
+fn modal_area_for_wrapped_lines_with_content_width(
+    area: Rect,
+    title: &str,
+    lines: &[Line<'_>],
+    desired_content_width: usize,
+    min_width: u16,
+    max_width: u16,
+    min_height: u16,
+    max_height: u16,
+) -> Rect {
+    let desired_content_width = desired_content_width.max(modal_title_content_width(title));
     let width = modal_width(area, desired_content_width, min_width, max_width);
     let content_width = width.saturating_sub(2).max(1) as usize;
     let content_rows = lines
@@ -48602,10 +48759,169 @@ mod tests {
         buffer_text(terminal.backend().buffer())
     }
 
+    fn rendered_new_session_modal(cols: u16, rows: u16, selected: usize) -> String {
+        let keybindings = KeyBindings::default();
+        rendered_new_session_modal_for(
+            cols,
+            rows,
+            selected,
+            NewSessionKind::Terminal,
+            "/repo",
+            NewSessionPathCompletion::default(),
+            &keybindings,
+        )
+    }
+
+    fn rendered_new_session_modal_for(
+        cols: u16,
+        rows: u16,
+        selected: usize,
+        kind: NewSessionKind,
+        cwd: &str,
+        completion: NewSessionPathCompletion,
+        keybindings: &KeyBindings,
+    ) -> String {
+        let backend = ratatui::backend::TestBackend::new(cols, rows);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let provider_options = [Provider::Codex, Provider::Claude, Provider::OpenCode];
+        terminal
+            .draw(|f| {
+                draw_new_session_modal(
+                    f,
+                    f.area(),
+                    selected,
+                    kind,
+                    cwd,
+                    cwd.len(),
+                    &completion,
+                    Provider::Codex,
+                    &provider_options,
+                    AgentLaunchMode::Normal,
+                    &CokacmuxSettings::default(),
+                    keybindings,
+                );
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn rendered_new_session_completion_modal(
+        cols: u16,
+        rows: u16,
+        cwd: &str,
+        suggestions: Vec<String>,
+    ) -> String {
+        let keybindings = KeyBindings::default();
+        let completion = NewSessionPathCompletion {
+            suggestions,
+            selected_index: 0,
+            visible: true,
+        };
+        rendered_new_session_modal_for(
+            cols,
+            rows,
+            NEW_SESSION_FIELD_CWD,
+            NewSessionKind::Terminal,
+            cwd,
+            completion,
+            &keybindings,
+        )
+    }
+
     fn rendered_line_index(text: &str, pattern: &str) -> usize {
         text.lines()
             .position(|line| line.contains(pattern))
             .unwrap_or_else(|| panic!("rendered output should contain {pattern:?}\n{text}"))
+    }
+
+    fn rendered_modal_frame_metrics(text: &str, title: &str) -> (usize, usize, usize, usize) {
+        let line = text
+            .lines()
+            .find(|line| line.contains(title) && line.contains('┌') && line.contains('┐'))
+            .unwrap_or_else(|| {
+                panic!("rendered modal should contain border title {title:?}\n{text}")
+            });
+        let top = text
+            .lines()
+            .position(|line| line.contains(title) && line.contains('┌') && line.contains('┐'))
+            .unwrap_or_else(|| {
+                panic!("rendered modal should contain border title {title:?}\n{text}")
+            });
+        let chars = line.chars().collect::<Vec<_>>();
+        let start = chars
+            .iter()
+            .position(|ch| *ch == '┌')
+            .unwrap_or_else(|| panic!("rendered modal should contain left border\n{text}"));
+        let end = chars
+            .iter()
+            .rposition(|ch| *ch == '┐')
+            .unwrap_or_else(|| panic!("rendered modal should contain right border\n{text}"));
+        let bottom = text
+            .lines()
+            .enumerate()
+            .skip(top)
+            .filter_map(|(index, line)| (line.contains('└') && line.contains('┘')).then_some(index))
+            .next()
+            .unwrap_or_else(|| panic!("rendered modal should contain bottom border\n{text}"));
+        (
+            start,
+            end.saturating_sub(start).saturating_add(1),
+            top,
+            bottom.saturating_sub(top).saturating_add(1),
+        )
+    }
+
+    fn rendered_modal_frame_bounds(text: &str, title: &str) -> (usize, usize) {
+        let (x, width, _, _) = rendered_modal_frame_metrics(text, title);
+        (x, width)
+    }
+
+    fn verbose_new_session_keybindings() -> KeyBindings {
+        let mut keybindings = KeyBindings::default();
+        let verbose = [
+            "ctrl+shift+alt+right",
+            "ctrl+shift+alt+left",
+            "ctrl+shift+alt+down",
+            "ctrl+shift+alt+up",
+        ]
+        .into_iter()
+        .map(|binding| KeyBinding::parse(binding).unwrap())
+        .collect::<Vec<_>>();
+        keybindings
+            .bindings
+            .insert(KeyAction::NewSessionChoiceNext, verbose.clone());
+        keybindings
+            .bindings
+            .insert(KeyAction::NewSessionChoicePrev, verbose.clone());
+        keybindings
+            .bindings
+            .insert(KeyAction::NewSessionNext, verbose.clone());
+        keybindings
+            .bindings
+            .insert(KeyAction::NewSessionPrev, verbose);
+        keybindings
+    }
+
+    fn rendered_new_session_help_line_index(text: &str) -> usize {
+        text.lines()
+            .position(|line| line.contains("start") && line.contains("Esc"))
+            .unwrap_or_else(|| panic!("rendered output should contain new session help\n{text}"))
+    }
+
+    fn rendered_modal_body_text(line: &str) -> String {
+        let trimmed = line.trim();
+        let without_left_border = trimmed.strip_prefix('│').unwrap_or(trimmed);
+        let without_borders = without_left_border
+            .strip_suffix('│')
+            .unwrap_or(without_left_border);
+        without_borders.trim().to_string()
+    }
+
+    fn rendered_pattern_cell_column(line: &str, pattern: &str) -> usize {
+        let index = line
+            .find(pattern)
+            .unwrap_or_else(|| panic!("rendered line should contain {pattern:?}\n{line}"));
+        line[..index].chars().count()
     }
 
     fn settings_modal_border_rows(text: &str) -> (usize, usize) {
@@ -52914,6 +53230,363 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(rendered.contains("alpha/"));
         assert!(rendered.contains("beta/"));
         assert!(rendered.contains("Tab complete"));
+    }
+
+    #[test]
+    fn new_session_choice_focus_styles_only_value_text() {
+        let line = new_session_field_line(true, "Type", "Terminal".into(), 12, 16);
+        let selected_spans = line
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(THEME_SELECTED_BG))
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected_spans, vec!["Terminal"]);
+        assert!(line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref().contains("Type"))
+            .is_some_and(|span| span.style.bg == Some(THEME_BG_ALT)));
+    }
+
+    #[test]
+    fn new_session_text_input_focus_does_not_fill_value() {
+        let line = new_session_text_input_field_line(true, "Folder", "/repo".into(), 12, 16);
+        let selected_spans = line
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(THEME_SELECTED_BG))
+            .collect::<Vec<_>>();
+
+        assert!(selected_spans.is_empty());
+        assert!(line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref().contains("/repo"))
+            .is_some_and(|span| span.style.bg == Some(THEME_BG_ALT)));
+    }
+
+    #[test]
+    fn new_session_completion_focus_does_not_fill_indent_or_padding() {
+        let line = new_session_field_line(true, "", "   Desktop/".into(), 12, 16);
+        let selected_spans = line
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(THEME_SELECTED_BG))
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected_spans, vec!["Desktop/"]);
+        assert!(line
+            .spans
+            .iter()
+            .any(|span| span.content.as_ref() == "   " && span.style.bg == Some(THEME_BG_ALT)));
+    }
+
+    #[test]
+    fn new_session_completion_does_not_append_scroll_count_to_candidate() {
+        let rendered = rendered_new_session_completion_modal(
+            100,
+            24,
+            "/repo/de",
+            vec![
+                "Desktop/".into(),
+                "develop/".into(),
+                "deployments/".into(),
+                "delta/".into(),
+                "docs/".into(),
+            ],
+        );
+
+        assert!(rendered.contains("Desktop/"));
+        assert!(!rendered.contains("[1/5]"), "\n{rendered}");
+        assert!(!rendered.contains("Desktop/ ["), "\n{rendered}");
+    }
+
+    #[test]
+    fn new_session_cwd_completion_aligns_to_current_path_segment() {
+        let rendered = rendered_new_session_completion_modal(
+            100,
+            24,
+            "/repo/de",
+            vec!["Desktop/".into(), "develop/".into()],
+        );
+        let folder_line = rendered
+            .lines()
+            .find(|line| line.contains("Folder") && line.contains("/repo/de"))
+            .unwrap_or_else(|| panic!("rendered output should contain folder input\n{rendered}"));
+        let completion_line = rendered
+            .lines()
+            .find(|line| line.contains("Desktop/"))
+            .unwrap_or_else(|| panic!("rendered output should contain completion\n{rendered}"));
+
+        let expected = rendered_pattern_cell_column(folder_line, "/repo/de") + "/repo/".len();
+        let actual = rendered_pattern_cell_column(completion_line, "Desktop/");
+        assert_eq!(actual, expected, "\n{rendered}");
+    }
+
+    #[test]
+    fn new_session_root_cwd_completion_aligns_to_root_separator() {
+        let rendered =
+            rendered_new_session_completion_modal(100, 24, "/D", vec!["Desktop/".into()]);
+        let folder_line = rendered
+            .lines()
+            .find(|line| line.contains("Folder") && line.contains("/D"))
+            .unwrap_or_else(|| panic!("rendered output should contain folder input\n{rendered}"));
+        let completion_line = rendered
+            .lines()
+            .find(|line| line.contains("/Desktop/"))
+            .unwrap_or_else(|| {
+                panic!("rendered output should contain rooted completion\n{rendered}")
+            });
+
+        let expected = rendered_pattern_cell_column(folder_line, "/D");
+        let actual = rendered_pattern_cell_column(completion_line, "/Desktop/");
+        assert_eq!(actual, expected, "\n{rendered}");
+    }
+
+    #[test]
+    fn new_session_cwd_completion_aligns_after_wide_path_text() {
+        let rendered = rendered_new_session_completion_modal(
+            100,
+            24,
+            "/repo/가/de",
+            vec!["Desktop/".into(), "develop/".into()],
+        );
+        let folder_line = rendered
+            .lines()
+            .find(|line| line.contains("Folder") && line.contains('가') && line.contains("/de"))
+            .unwrap_or_else(|| {
+                panic!("rendered output should contain wide folder input\n{rendered}")
+            });
+        let completion_line = rendered
+            .lines()
+            .find(|line| line.contains("Desktop/"))
+            .unwrap_or_else(|| panic!("rendered output should contain completion\n{rendered}"));
+
+        let expected = rendered_pattern_cell_column(folder_line, "/de") + 1;
+        let actual = rendered_pattern_cell_column(completion_line, "Desktop/");
+        assert_eq!(actual, expected, "\n{rendered}");
+    }
+
+    #[test]
+    fn new_session_cwd_completion_aligns_when_input_is_horizontally_scrolled() {
+        let rendered = rendered_new_session_completion_modal(
+            80,
+            24,
+            "/very/long/path/that/forces/the/folder/input/to/scroll/de",
+            vec!["Desktop/".into(), "develop/".into()],
+        );
+        let folder_line = rendered
+            .lines()
+            .find(|line| line.contains("Folder") && line.contains("/scroll/de"))
+            .unwrap_or_else(|| {
+                panic!("rendered output should contain scrolled folder suffix\n{rendered}")
+            });
+        let completion_line = rendered
+            .lines()
+            .find(|line| line.contains("De"))
+            .unwrap_or_else(|| panic!("rendered output should contain completion\n{rendered}"));
+
+        let expected = rendered_pattern_cell_column(folder_line, "/de") + 1;
+        let actual = rendered_pattern_cell_column(completion_line, "De");
+        assert_eq!(actual, expected, "\n{rendered}");
+    }
+
+    #[test]
+    fn new_session_modal_frame_is_stable_between_type_and_folder_focus() {
+        let type_focus = rendered_new_session_modal(100, 24, NEW_SESSION_FIELD_KIND);
+        let folder_focus = rendered_new_session_modal(100, 24, NEW_SESSION_FIELD_CWD);
+
+        assert_eq!(
+            rendered_modal_frame_metrics(&type_focus, "New session"),
+            rendered_modal_frame_metrics(&folder_focus, "New session")
+        );
+        assert_eq!(
+            rendered_new_session_help_line_index(&type_focus),
+            rendered_new_session_help_line_index(&folder_focus)
+        );
+    }
+
+    #[test]
+    fn new_session_modal_does_not_reserve_completion_rows_between_folder_and_preview() {
+        let rendered = rendered_new_session_modal(100, 24, NEW_SESSION_FIELD_CWD);
+        let lines = rendered.lines().collect::<Vec<_>>();
+        let folder_row = rendered_line_index(&rendered, "Folder");
+        let next_row = lines.get(folder_row.saturating_add(1)).unwrap_or_else(|| {
+            panic!("rendered output should have a row after Folder\n{rendered}")
+        });
+
+        assert!(
+            !rendered_modal_body_text(next_row).is_empty(),
+            "Folder should be followed by the next content row, not reserved completion space\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn new_session_modal_width_is_fixed_across_kind_fields_completion_and_help() {
+        let default_keybindings = KeyBindings::default();
+        let verbose_keybindings = verbose_new_session_keybindings();
+        let completion = NewSessionPathCompletion {
+            suggestions: vec![
+                "Desktop/".into(),
+                "development-with-a-very-long-project-name-that-must-not-resize-the-modal/".into(),
+                "downloads/".into(),
+            ],
+            selected_index: 0,
+            visible: true,
+        };
+
+        let rendered_cases = vec![
+            rendered_new_session_modal_for(
+                100,
+                24,
+                NEW_SESSION_FIELD_KIND,
+                NewSessionKind::Terminal,
+                "/repo",
+                NewSessionPathCompletion::default(),
+                &default_keybindings,
+            ),
+            rendered_new_session_modal_for(
+                100,
+                24,
+                NEW_SESSION_FIELD_KIND,
+                NewSessionKind::CokacDir,
+                "/repo",
+                NewSessionPathCompletion::default(),
+                &default_keybindings,
+            ),
+            rendered_new_session_modal_for(
+                100,
+                24,
+                NEW_SESSION_FIELD_KIND,
+                NewSessionKind::CodingAgent,
+                "/repo",
+                NewSessionPathCompletion::default(),
+                &default_keybindings,
+            ),
+            rendered_new_session_modal_for(
+                100,
+                24,
+                NEW_SESSION_FIELD_CWD,
+                NewSessionKind::CodingAgent,
+                "/repo/de",
+                completion.clone(),
+                &default_keybindings,
+            ),
+            rendered_new_session_modal_for(
+                100,
+                24,
+                NEW_SESSION_FIELD_PROVIDER,
+                NewSessionKind::CodingAgent,
+                "/repo",
+                NewSessionPathCompletion::default(),
+                &default_keybindings,
+            ),
+            rendered_new_session_modal_for(
+                100,
+                24,
+                NEW_SESSION_FIELD_PERMISSIONS,
+                NewSessionKind::CodingAgent,
+                "/repo",
+                NewSessionPathCompletion::default(),
+                &default_keybindings,
+            ),
+            rendered_new_session_modal_for(
+                100,
+                24,
+                NEW_SESSION_FIELD_KIND,
+                NewSessionKind::Terminal,
+                "/repo",
+                NewSessionPathCompletion::default(),
+                &verbose_keybindings,
+            ),
+            rendered_new_session_modal_for(
+                100,
+                24,
+                NEW_SESSION_FIELD_CWD,
+                NewSessionKind::Terminal,
+                "/repo/de",
+                completion,
+                &verbose_keybindings,
+            ),
+        ];
+
+        let expected_bounds = rendered_modal_frame_bounds(&rendered_cases[0], "New session");
+        for rendered in rendered_cases.iter().skip(1) {
+            assert_eq!(
+                rendered_modal_frame_bounds(rendered, "New session"),
+                expected_bounds,
+                "\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_session_modal_frame_is_stable_across_folder_completion_lists() {
+        let empty = rendered_new_session_completion_modal(100, 24, "/repo/de", Vec::new());
+        let short =
+            rendered_new_session_completion_modal(100, 24, "/repo/de", vec!["Desktop/".into()]);
+        let long = rendered_new_session_completion_modal(
+            100,
+            24,
+            "/repo/de",
+            vec![
+                "Desktop/".into(),
+                "development-with-a-very-long-project-name-that-must-fit-inside-the-slot/".into(),
+                "deployments/".into(),
+                "delta/".into(),
+                "docs/".into(),
+                "downloads/".into(),
+            ],
+        );
+
+        let expected_frame = rendered_modal_frame_metrics(&empty, "New session");
+        for rendered in [&short, &long] {
+            assert_eq!(
+                rendered_modal_frame_metrics(rendered, "New session"),
+                expected_frame,
+                "\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_session_completion_overlay_starts_below_folder_without_resizing_frame() {
+        let hidden = rendered_new_session_completion_modal(100, 24, "/repo/de", Vec::new());
+        let visible = rendered_new_session_completion_modal(
+            100,
+            24,
+            "/repo/de",
+            vec![
+                "Desktop/".into(),
+                "develop/".into(),
+                "deployments/".into(),
+                "delta/".into(),
+            ],
+        );
+
+        assert_eq!(
+            rendered_modal_frame_metrics(&hidden, "New session"),
+            rendered_modal_frame_metrics(&visible, "New session"),
+            "\n{visible}"
+        );
+        let folder_row = rendered_line_index(&visible, "Folder");
+        let completion_row = rendered_line_index(&visible, "Desktop/");
+        assert_eq!(completion_row, folder_row.saturating_add(1), "\n{visible}");
+    }
+
+    #[test]
+    fn new_session_modal_frame_ignores_folder_input_width() {
+        let short = rendered_new_session_completion_modal(100, 24, "/repo", Vec::new());
+        let long_cwd = format!("/repo/{}de", "very-long-folder-name-segment/".repeat(8));
+        let long = rendered_new_session_completion_modal(100, 24, &long_cwd, Vec::new());
+
+        assert_eq!(
+            rendered_modal_frame_metrics(&short, "New session"),
+            rendered_modal_frame_metrics(&long, "New session")
+        );
     }
 
     #[test]
