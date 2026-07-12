@@ -2,18 +2,20 @@
 Tool installation and management for cross-compilation.
 Installs Rust, zig, cargo-zigbuild, and macOS SDK into the builder/tools directory.
 """
+import hashlib
 import os
 import shutil
 import subprocess
 import struct
 import tarfile
+import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional
 import urllib.request
 import ssl
 
-from .config import BuildConfig
+from .config import BuildConfig, RUSTUP_DIST_SERVER, RUSTUP_UPDATE_ROOT
 from .logger import Logger
 
 
@@ -39,7 +41,6 @@ WINDOWS_STUB_IMPORT_DLLS: Dict[str, str] = {
     # archive is enough because this project does not reference those symbols.
     "synchronization": "api-ms-win-core-synch-l1-2-0.dll",
 }
-
 
 class ToolInstaller:
     """Manages installation of build tools."""
@@ -89,14 +90,42 @@ class ToolInstaller:
 
     # ==================== Rust Installation ====================
 
+    def _is_runnable_file(self, path: Path) -> bool:
+        return path.is_file() and (os.name == "nt" or os.access(path, os.X_OK))
+
+    def _local_cargo_path(self) -> Path:
+        return self.cargo_home / "bin" / self._exe_name("cargo")
+
+    def _local_rustup_path(self) -> Path:
+        return self.cargo_home / "bin" / self._exe_name("rustup")
+
+    def _has_local_rust_install(self) -> bool:
+        """Return whether the local cargo/rustup pair is complete."""
+        return self._is_runnable_file(
+            self._local_cargo_path()
+        ) and self._is_runnable_file(self._local_rustup_path())
+
     def get_cargo_path(self) -> Optional[Path]:
         """Get path to cargo executable."""
-        # Check local installation first
-        local_cargo = self.cargo_home / "bin" / self._exe_name("cargo")
-        if local_cargo.exists():
-            return local_cargo
+        # A partial local install must not be mixed with a system rustup.
+        if self._has_local_rust_install():
+            return self._local_cargo_path()
 
-        # Check system installation
+        # `+toolchain` is implemented by the rustup cargo proxy, not Cargo
+        # itself. Prefer the cargo executable beside the selected rustup so a
+        # distro Cargo earlier on PATH cannot be paired with a different
+        # rustup installation.
+        system_rustup = shutil.which("rustup")
+        if system_rustup:
+            rustup_cargo = Path(system_rustup).with_name(self._exe_name("cargo"))
+            if self._is_runnable_file(rustup_cargo):
+                return rustup_cargo
+            # Never pair this rustup with an unrelated Cargo elsewhere on
+            # PATH.  Exact Cargo execution uses the selected rustup boundary.
+            return None
+
+        # Fall back for status/error reporting. `is_rust_installed` still
+        # requires rustup, so a standalone Cargo cannot enter a build path.
         system_cargo = shutil.which("cargo")
         if system_cargo:
             return Path(system_cargo)
@@ -105,10 +134,9 @@ class ToolInstaller:
 
     def get_rustup_path(self) -> Optional[Path]:
         """Get path to rustup executable."""
-        # Check local installation first
-        local_rustup = self.cargo_home / "bin" / self._exe_name("rustup")
-        if local_rustup.exists():
-            return local_rustup
+        # A partial local install must not be mixed with a system cargo.
+        if self._has_local_rust_install():
+            return self._local_rustup_path()
 
         # Check system installation
         system_rustup = shutil.which("rustup")
@@ -116,6 +144,34 @@ class ToolInstaller:
             return Path(system_rustup)
 
         return None
+
+    def get_pinned_rustup_path(self) -> Optional[Path]:
+        """Return the project-local rustup only when its bootstrap hash matches.
+
+        Non-interactive builds must not execute an arbitrary rustup discovered
+        on PATH.  rustup installs its command proxies from the downloaded
+        rustup-init executable, so the version-controlled bootstrap digest is
+        also the receipt for the local rustup proxy.
+        """
+        if not self._has_local_rust_install():
+            return None
+        try:
+            expected_sha256 = self.config.rustup_init_sha256
+        except ValueError as error:
+            self.logger.error(str(error))
+            return None
+        rustup_path = self._local_rustup_path()
+        if not self._verify_sha256(
+            rustup_path,
+            expected_sha256,
+            "project-local rustup",
+        ):
+            return None
+        return rustup_path
+
+    def is_pinned_rust_installed(self) -> bool:
+        """Return whether the receipted project-local rustup pair is ready."""
+        return self.get_pinned_rustup_path() is not None
 
     def is_rust_installed(self) -> bool:
         """Check if Rust is installed."""
@@ -126,6 +182,12 @@ class ToolInstaller:
         env = os.environ.copy()
         env["CARGO_HOME"] = str(self.cargo_home)
         env["RUSTUP_HOME"] = str(self.rustup_home)
+        env["RUSTUP_AUTO_INSTALL"] = "0"
+        env["RUSTUP_DIST_SERVER"] = RUSTUP_DIST_SERVER
+        env["RUSTUP_UPDATE_ROOT"] = RUSTUP_UPDATE_ROOT
+        env.pop("RUSTUP_TOOLCHAIN", None)
+        env.pop("RUSTUP_OVERRIDE_HOST_TRIPLE", None)
+        env.pop("SDKROOT", None)
 
         # Add cargo bin to PATH
         cargo_bin = self.cargo_home / "bin"
@@ -137,29 +199,34 @@ class ToolInstaller:
 
     def install_rust(self) -> bool:
         """Install Rust toolchain into builder/tools directory."""
-        if self.is_rust_installed():
+        if self.is_pinned_rust_installed():
             cargo_path = self.get_cargo_path()
             self.logger.success(f"Rust is already installed at {cargo_path}")
-            return True
+            return self._ensure_default_toolchain() and self.verify_release_toolchain()
 
         self.ensure_tools_dir()
         self.logger.info("Installing Rust toolchain...")
 
-        # Download rustup-init
-        if self.config.host_os == "windows":
-            rust_target = f"{self.config.host_arch}-pc-windows-msvc"
-            rustup_init_url = (
-                "https://static.rust-lang.org/rustup/dist/"
-                f"{rust_target}/rustup-init.exe"
-            )
-            rustup_init_path = self.tools_dir / "rustup-init.exe"
-        else:
-            rustup_init_url = "https://sh.rustup.rs"
-            rustup_init_path = self.tools_dir / "rustup-init.sh"
+        try:
+            rustup_init_url = self.config.rustup_init_url
+            rustup_init_sha256 = self.config.rustup_init_sha256
+        except ValueError as error:
+            self.logger.error(str(error))
+            return False
+
+        rustup_init_name = (
+            "rustup-init.exe"
+            if self.config.host_os == "windows"
+            else "rustup-init"
+        )
+        rustup_init_path = self.tools_dir / rustup_init_name
 
         try:
             if not self.download_file(
-                rustup_init_url, rustup_init_path, "rustup installer"
+                rustup_init_url,
+                rustup_init_path,
+                "rustup installer",
+                expected_sha256=rustup_init_sha256,
             ):
                 return False
 
@@ -172,7 +239,7 @@ class ToolInstaller:
             # Run rustup-init with options:
             # -y: don't prompt
             # --no-modify-path: don't modify shell profiles
-            # --default-toolchain stable: install stable toolchain
+            # --default-toolchain: install the exact release toolchain locally
             self.logger.info("Running rustup installer (this may take a while)...")
 
             result = subprocess.run(
@@ -180,7 +247,8 @@ class ToolInstaller:
                     str(rustup_init_path),
                     "-y",
                     "--no-modify-path",
-                    "--default-toolchain", "stable",
+                    "--default-toolchain",
+                    self.config.rust_version,
                 ],
                 env=env,
                 capture_output=True,
@@ -188,11 +256,22 @@ class ToolInstaller:
             )
 
             if result.returncode == 0:
+                if not self.is_pinned_rust_installed():
+                    self.logger.error(
+                        "Rust installer exited successfully, but the pinned "
+                        "project-local cargo/rustup pair is incomplete or invalid"
+                    )
+                    return False
+                if not self.verify_release_toolchain():
+                    self.logger.error(
+                        "Rust installer did not produce the exact release toolchain"
+                    )
+                    return False
                 self.logger.success(f"Rust installed at {self.cargo_home}")
 
                 # Verify installation
-                cargo_path = self.cargo_home / "bin" / self._exe_name("cargo")
-                if cargo_path.exists():
+                cargo_path = self._local_cargo_path()
+                if self._is_runnable_file(cargo_path):
                     # Get version
                     version_result = subprocess.run(
                         [str(cargo_path), "--version"],
@@ -214,23 +293,40 @@ class ToolInstaller:
 
         finally:
             # Cleanup installer
-            if rustup_init_path.exists():
-                rustup_init_path.unlink()
+            try:
+                rustup_init_path.unlink(missing_ok=True)
+            except OSError as e:
+                self.logger.warning(f"Could not remove rustup installer: {e}")
 
     # ==================== Zig Installation ====================
 
     def get_zig_path(self) -> Optional[Path]:
-        """Get path to zig executable."""
+        """Get a Zig executable matching the configured release version."""
         zig_exe = self.zig_dir / self._exe_name("zig")
-        if zig_exe.exists():
+        if self._is_runnable_file(zig_exe) and self._zig_version_matches(zig_exe):
             return zig_exe
 
         # Check if zig is in system PATH
         system_zig = shutil.which("zig")
-        if system_zig:
+        if system_zig and self._zig_version_matches(Path(system_zig)):
             return Path(system_zig)
 
         return None
+
+    def _zig_version_matches(self, zig_path: Path) -> bool:
+        """Return whether a Zig executable reports the pinned version."""
+        try:
+            result = subprocess.run(
+                [str(zig_path), "version"],
+                capture_output=True,
+                text=True,
+            )
+            return (
+                result.returncode == 0
+                and result.stdout.strip() == self.config.zig_version
+            )
+        except (FileNotFoundError, OSError):
+            return False
 
     def is_zig_installed(self) -> bool:
         """Check if zig is installed."""
@@ -238,6 +334,13 @@ class ToolInstaller:
 
     def install_zig(self) -> bool:
         """Install zig compiler."""
+        try:
+            zig_url = self.config.zig_url
+            zig_sha256 = self.config.zig_sha256
+        except ValueError as error:
+            self.logger.error(str(error))
+            return False
+
         if self.is_zig_installed():
             zig_path = self.get_zig_path()
             self.logger.success(f"Zig is already installed at {zig_path}")
@@ -257,28 +360,61 @@ class ToolInstaller:
             local_cache = Path.home() / ".rustbuilder" / archive_name
             if local_cache.exists():
                 self.logger.info(f"Using cached {archive_name} from {local_cache.parent}")
-                shutil.copy2(local_cache, archive_path)
-            elif not self.download_file(self.config.zig_url, archive_path, "Zig compiler"):
-                return False
-
-        # Extract to tools directory
-        if archive_ext == "zip":
-            if not self.extract_zip(archive_path, self.tools_dir):
-                return False
-        else:
-            if not self.extract_tar_xz(archive_path, self.tools_dir):
-                return False
-
-        # Rename to standard directory name
-        extracted_dir = self.tools_dir / f"zig-{self.config.host_os}-{self.config.host_arch}-{self.config.zig_version}"
-        if extracted_dir.exists() and extracted_dir != self.zig_dir:
-            if self.zig_dir.exists():
-                # Security: Verify the path is within tools_dir before deletion
-                if not self._is_safe_path_for_deletion(self.zig_dir):
-                    self.logger.error(f"Refusing to delete unsafe path: {self.zig_dir}")
+                if not self._copy_file_atomically(
+                    local_cache,
+                    archive_path,
+                    expected_sha256=zig_sha256,
+                ):
                     return False
-                shutil.rmtree(self.zig_dir)
-            extracted_dir.rename(self.zig_dir)
+            elif not self.download_file(
+                zig_url,
+                archive_path,
+                "Zig compiler",
+                expected_sha256=zig_sha256,
+            ):
+                return False
+
+        if not self._verify_sha256(archive_path, zig_sha256, "Zig compiler"):
+            return False
+
+        # Extract into a staging directory.  A killed or failed extraction must
+        # not leave a partial directory that a later run mistakes for Zig.
+        staging_dir = Path(tempfile.mkdtemp(prefix=".zig-extract-", dir=self.tools_dir))
+        try:
+            if archive_ext == "zip":
+                if not self.extract_zip(archive_path, staging_dir):
+                    return False
+            elif not self.extract_tar_xz(archive_path, staging_dir):
+                return False
+
+            extracted_dir = staging_dir / (
+                f"zig-{self.config.host_os}-{self.config.host_arch}-"
+                f"{self.config.zig_version}"
+            )
+            extracted_exe = extracted_dir / self._exe_name("zig")
+            if not extracted_exe.is_file():
+                self.logger.error("Zig archive did not contain the expected executable")
+                return False
+            if os.name != "nt":
+                extracted_exe.chmod(0o755)
+            if not self._zig_version_matches(extracted_exe):
+                self.logger.error(
+                    "Zig archive executable did not report version "
+                    f"{self.config.zig_version}"
+                )
+                return False
+
+            if not self._replace_staged_directory(
+                extracted_dir,
+                self.zig_dir,
+                "Zig",
+            ):
+                return False
+        except Exception as e:
+            self.logger.error(f"Failed to install Zig from archive: {e}")
+            return False
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
         # Verify installation
         zig_exe = self.zig_dir / self._exe_name("zig")
@@ -321,11 +457,11 @@ class ToolInstaller:
         """Return the Zig ar wrapper path for Windows GNU/LLVM targets."""
         return self.project_root / "builder" / "zig-ar.cmd"
 
-    def is_rust_toolchain_installed(self, toolchain: str) -> bool:
-        """Check whether a rustup toolchain is installed."""
+    def _rust_toolchain_status(self, toolchain: str) -> Optional[bool]:
+        """Return installed/missing, or ``None`` when rustup cannot answer."""
         rustup_path = self.get_rustup_path()
         if not rustup_path:
-            return False
+            return None
         try:
             result = subprocess.run(
                 [str(rustup_path), "toolchain", "list"],
@@ -334,16 +470,37 @@ class ToolInstaller:
                 env=self.get_env(),
             )
             if result.returncode != 0:
-                return False
-            return any(line.split()[0] == toolchain for line in result.stdout.splitlines())
-        except FileNotFoundError:
+                return None
+            installed = {
+                line.split()[0]
+                for line in result.stdout.splitlines()
+                if line.strip()
+            }
+            if toolchain in installed:
+                return True
+            if toolchain == self.config.rust_version:
+                return any(
+                    name.startswith(f"{toolchain}-") for name in installed
+                )
             return False
+        except (FileNotFoundError, OSError):
+            return None
+
+    def is_rust_toolchain_installed(self, toolchain: str) -> bool:
+        """Check whether a rustup toolchain is installed."""
+        return self._rust_toolchain_status(toolchain) is True
 
     def install_rust_toolchain(self, toolchain: str) -> bool:
         """Install a rustup toolchain if it is missing."""
-        if self.is_rust_toolchain_installed(toolchain):
+        status = self._rust_toolchain_status(toolchain)
+        if status is True:
             self.logger.debug(f"Toolchain {toolchain} is already installed")
             return True
+        if status is None:
+            self.logger.error(
+                f"Failed to inspect Rust toolchain {toolchain}; refusing to install"
+            )
+            return False
 
         rustup_path = self.get_rustup_path()
         if not rustup_path:
@@ -352,12 +509,6 @@ class ToolInstaller:
 
         self.logger.info(f"Installing Rust toolchain: {toolchain}")
         cmd = [str(rustup_path), "toolchain", "install", toolchain]
-        if (
-            self.config.host_os == "windows" and
-            toolchain.endswith("pc-windows-gnullvm") and
-            self.config.host_arch not in toolchain
-        ):
-            cmd.append("--force-non-host")
         try:
             result = subprocess.run(
                 cmd,
@@ -370,15 +521,127 @@ class ToolInstaller:
                 return True
             self.logger.error(f"Failed to install toolchain {toolchain}: {result.stderr}")
             return False
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
+            self.logger.error("rustup not found. Please run --setup first.")
+            return False
+
+    def _rust_target_status(
+        self,
+        rust_target: str,
+        toolchain: Optional[str] = None,
+    ) -> Optional[bool]:
+        """Return target installed/missing, or ``None`` on inspection failure."""
+        rustup_path = self.get_rustup_path()
+        if not rustup_path:
+            return None
+        selected_toolchain = toolchain or self.config.rust_version
+        try:
+            result = subprocess.run(
+                [
+                    str(rustup_path),
+                    "target",
+                    "list",
+                    "--installed",
+                    "--toolchain",
+                    selected_toolchain,
+                ],
+                capture_output=True,
+                text=True,
+                env=self.get_env(),
+            )
+            if result.returncode != 0:
+                return None
+            return rust_target in {
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            }
+        except (FileNotFoundError, OSError):
+            return None
+
+    def is_rust_target_installed(
+        self,
+        rust_target: str,
+        toolchain: Optional[str] = None,
+    ) -> bool:
+        """Check whether a target is installed for the selected toolchain."""
+        return self._rust_target_status(rust_target, toolchain) is True
+
+    def install_rust_target(
+        self,
+        rust_target: str,
+        toolchain: Optional[str] = None,
+    ) -> bool:
+        """Install a target only after a definitive missing result."""
+        selected_toolchain = toolchain or self.config.rust_version
+        status = self._rust_target_status(rust_target, selected_toolchain)
+        if status is True:
+            self.logger.debug(
+                f"Target {rust_target} is already installed for {selected_toolchain}"
+            )
+            return True
+        if status is None:
+            self.logger.error(
+                f"Failed to inspect Rust target {rust_target} for "
+                f"{selected_toolchain}; refusing to install"
+            )
+            return False
+
+        rustup_path = self.get_rustup_path()
+        if not rustup_path:
+            self.logger.error("rustup not found. Please run --setup first.")
+            return False
+
+        self.logger.info(
+            f"Installing Rust target {rust_target} for {selected_toolchain}"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    str(rustup_path),
+                    "target",
+                    "add",
+                    rust_target,
+                    "--toolchain",
+                    selected_toolchain,
+                ],
+                capture_output=True,
+                text=True,
+                env=self.get_env(),
+            )
+            if result.returncode == 0:
+                self.logger.success(
+                    f"Target {rust_target} installed for {selected_toolchain}"
+                )
+                return True
+            self.logger.error(
+                f"Failed to install target {rust_target}: {result.stderr}"
+            )
+            return False
+        except (FileNotFoundError, OSError):
             self.logger.error("rustup not found. Please run --setup first.")
             return False
 
     def is_windows_import_libs_installed(self, rust_target: Optional[str] = None) -> bool:
         """Check whether generated Windows import libraries are available."""
         lib_dir = self.windows_import_lib_dir(rust_target)
-        expected = list(WINDOWS_IMPORT_DLLS) + list(WINDOWS_STUB_IMPORT_DLLS)
-        return all((lib_dir / f"lib{name}.a").exists() for name in expected)
+        normal_ready = all(
+            self._is_valid_archive(lib_dir / f"lib{name}.a", allow_empty=False)
+            for name in WINDOWS_IMPORT_DLLS
+        )
+        stubs_ready = all(
+            self._is_valid_archive(lib_dir / f"lib{name}.a", allow_empty=True)
+            for name in WINDOWS_STUB_IMPORT_DLLS
+        )
+        return normal_ready and stubs_ready
+
+    def _is_valid_archive(self, path: Path, allow_empty: bool) -> bool:
+        """Validate the GNU archive header and required member content."""
+        try:
+            with path.open("rb") as archive:
+                header = archive.read(8)
+            size = path.stat().st_size
+            return header == b"!<arch>\n" and (allow_empty or size > 8)
+        except OSError:
+            return False
 
     def install_windows_import_libs(self, rust_target: Optional[str] = None) -> bool:
         """
@@ -416,8 +679,9 @@ class ToolInstaller:
         success = True
         for lib_name, dll_name in WINDOWS_IMPORT_DLLS.items():
             lib_path = lib_dir / f"lib{lib_name}.a"
-            if lib_path.exists():
+            if self._is_valid_archive(lib_path, allow_empty=False):
                 continue
+            lib_path.unlink(missing_ok=True)
 
             dll_path = self._system_dll_path(dll_name)
             if not dll_path:
@@ -436,8 +700,9 @@ class ToolInstaller:
 
         for lib_name, dll_name in WINDOWS_STUB_IMPORT_DLLS.items():
             lib_path = lib_dir / f"lib{lib_name}.a"
-            if lib_path.exists():
+            if self._is_valid_archive(lib_path, allow_empty=True):
                 continue
+            lib_path.unlink(missing_ok=True)
             if not self._write_import_lib(zig_path, machine, lib_dir, lib_name, dll_name, []):
                 # Empty .def files are rejected by some dlltool builds. An empty
                 # archive still satisfies -l<name> when no symbols are used.
@@ -499,7 +764,9 @@ class ToolInstaller:
             capture_output=True,
             text=True,
         )
-        if result.returncode == 0 and lib_path.exists():
+        if result.returncode == 0 and self._is_valid_archive(
+            lib_path, allow_empty=False
+        ):
             return True
 
         self.logger.debug(result.stderr.strip())
@@ -514,7 +781,9 @@ class ToolInstaller:
             capture_output=True,
             text=True,
         )
-        if result.returncode == 0 and lib_path.exists():
+        if result.returncode == 0 and self._is_valid_archive(
+            lib_path, allow_empty=True
+        ):
             return True
         self.logger.error(f"Failed to create {lib_path.name}: {result.stderr}")
         return False
@@ -604,54 +873,108 @@ class ToolInstaller:
 
     # ==================== cargo-zigbuild Installation ====================
 
+    def _cargo_tool_version_matches(
+        self,
+        executable: Path,
+        package: str,
+        expected_version: str,
+    ) -> bool:
+        """Check a Cargo-installed tool's reported package/version pair."""
+        try:
+            result = subprocess.run(
+                [str(executable), "--version"],
+                capture_output=True,
+                text=True,
+                env=self.get_env(),
+            )
+        except (FileNotFoundError, OSError):
+            return False
+        if result.returncode != 0:
+            return False
+        output = f"{result.stdout}\n{result.stderr}"
+        return any(
+            len(parts) >= 2
+            and parts[0] == package
+            and parts[1] == expected_version
+            for parts in (line.split() for line in output.splitlines())
+        )
+
     def is_cargo_zigbuild_installed(self) -> bool:
-        """Check if cargo-zigbuild is installed."""
-        # Check if cargo-zigbuild binary exists in cargo bin
+        """Check if the pinned cargo-zigbuild version is installed."""
         cargo_zigbuild = self.cargo_home / "bin" / self._exe_name("cargo-zigbuild")
-        if cargo_zigbuild.exists():
-            return True
+        if self._is_runnable_file(cargo_zigbuild):
+            return self._cargo_tool_version_matches(
+                cargo_zigbuild,
+                "cargo-zigbuild",
+                self.config.cargo_zigbuild_version,
+            )
 
         # Fallback: check if it's in PATH
         env = self.get_env()
-        try:
-            result = subprocess.run(
-                [self._resolve_command("cargo-zigbuild", env), "--version"],
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-            return result.returncode == 0
-        except FileNotFoundError:
+        return self._cargo_tool_version_matches(
+            Path(self._resolve_command("cargo-zigbuild", env)),
+            "cargo-zigbuild",
+            self.config.cargo_zigbuild_version,
+        )
+
+    def _ensure_default_toolchain(self, install_if_missing: bool = True) -> bool:
+        """Ensure rustup has the exact release toolchain installed.
+
+        This deliberately does not change the user's global rustup default.
+        """
+        toolchain = self.config.rust_version
+        status = self._rust_toolchain_status(toolchain)
+        if status is True:
+            return True
+        if status is None:
+            self.logger.error("Failed to inspect installed Rust toolchains")
             return False
 
-    def _ensure_default_toolchain(self) -> bool:
-        """Ensure rustup has a default toolchain configured."""
-        env = self.get_env()
-        rustup_path = self.get_rustup_path()
+        if not install_if_missing:
+            self.logger.error(
+                f"Rust toolchain {toolchain} is not installed. "
+                "Run with --setup-rust first."
+            )
+            return False
+
+        return self.install_rust_toolchain(toolchain)
+
+    def verify_release_toolchain(self) -> bool:
+        """Verify that the receipted rustup runs the exact rustc and Cargo."""
+        rustup_path = self.get_pinned_rustup_path()
         if not rustup_path:
             return False
-        try:
-            result = subprocess.run(
-                [str(rustup_path), "default"],
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-            if result.returncode != 0 or "no default" in result.stderr.lower() or "no default" in result.stdout.lower():
-                self.logger.info("No default Rust toolchain configured. Setting up stable...")
-                setup_result = subprocess.run(
-                    [str(rustup_path), "default", "stable"],
+        env = self.get_env()
+        for command in ("rustc", "cargo"):
+            try:
+                result = subprocess.run(
+                    [
+                        str(rustup_path),
+                        "run",
+                        self.config.rust_version,
+                        command,
+                        "--version",
+                    ],
                     capture_output=True,
                     text=True,
                     env=env,
                 )
-                if setup_result.returncode != 0:
-                    self.logger.error(f"Failed to set default toolchain: {setup_result.stderr}")
-                    return False
-                self.logger.success("Default Rust toolchain set to stable")
-            return True
-        except FileNotFoundError:
-            return False
+            except (FileNotFoundError, OSError) as error:
+                self.logger.error(f"Failed to verify release {command}: {error}")
+                return False
+            fields = result.stdout.strip().split()
+            if (
+                result.returncode != 0
+                or len(fields) < 2
+                or fields[0] != command
+                or fields[1] != self.config.rust_version
+            ):
+                self.logger.error(
+                    f"Release {command} did not report exact version "
+                    f"{self.config.rust_version}: {result.stdout.strip()}"
+                )
+                return False
+        return True
 
     def install_cargo_zigbuild(self) -> bool:
         """Install cargo-zigbuild."""
@@ -666,54 +989,69 @@ class ToolInstaller:
         if not self._ensure_default_toolchain():
             return False
 
-        self.logger.info("Installing cargo-zigbuild...")
+        version = self.config.cargo_zigbuild_version
+        self.logger.info(f"Installing cargo-zigbuild {version}...")
 
         env = self.get_env()
-        cargo_path = self.get_cargo_path()
-        if not cargo_path:
-            self.logger.error("cargo not found. Please install Rust first.")
+        env["CARGO_INSTALL_ROOT"] = str(self.cargo_home)
+        rustup_path = self.get_rustup_path()
+        if not rustup_path:
+            self.logger.error("rustup not found. Please install Rust first.")
             return False
 
         try:
             result = subprocess.run(
-                [str(cargo_path), "install", "cargo-zigbuild"],
+                [
+                    str(rustup_path),
+                    "run",
+                    self.config.rust_version,
+                    "cargo",
+                    "install",
+                    "cargo-zigbuild",
+                    "--version",
+                    f"={version}",
+                    "--locked",
+                ],
                 capture_output=True,
                 text=True,
                 env=env,
             )
 
             if result.returncode == 0:
-                self.logger.success("cargo-zigbuild installed successfully")
-                return True
+                if self.is_cargo_zigbuild_installed():
+                    self.logger.success("cargo-zigbuild installed successfully")
+                    return True
+                self.logger.error(
+                    f"cargo-zigbuild did not report expected version {version}"
+                )
+                return False
             else:
                 self.logger.error(f"Failed to install cargo-zigbuild: {result.stderr}")
                 return False
 
-        except FileNotFoundError:
-            self.logger.error("cargo not found. Please install Rust first.")
+        except (FileNotFoundError, OSError):
+            self.logger.error("rustup not found. Please install Rust first.")
             return False
 
     # ==================== cargo-xwin Installation ====================
 
     def is_cargo_xwin_installed(self) -> bool:
-        """Check if cargo-xwin is installed."""
-        # Check if cargo-xwin binary exists in cargo bin
+        """Check if the pinned cargo-xwin version is installed."""
         cargo_xwin = self.cargo_home / "bin" / self._exe_name("cargo-xwin")
-        if cargo_xwin.exists():
-            return True
+        if self._is_runnable_file(cargo_xwin):
+            return self._cargo_tool_version_matches(
+                cargo_xwin,
+                "cargo-xwin",
+                self.config.cargo_xwin_version,
+            )
 
         # Fallback: check if it's in PATH
         env = self.get_env()
-        try:
-            result = subprocess.run(
-                [self._resolve_command("cargo-xwin", env), "--version"],
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-            return result.returncode == 0
-        except FileNotFoundError:
-            return False
+        return self._cargo_tool_version_matches(
+            Path(self._resolve_command("cargo-xwin", env)),
+            "cargo-xwin",
+            self.config.cargo_xwin_version,
+        )
 
     def install_cargo_xwin(self) -> bool:
         """Install cargo-xwin for Windows MSVC cross-compilation."""
@@ -728,31 +1066,48 @@ class ToolInstaller:
         if not self._ensure_default_toolchain():
             return False
 
-        self.logger.info("Installing cargo-xwin...")
+        version = self.config.cargo_xwin_version
+        self.logger.info(f"Installing cargo-xwin {version}...")
 
         env = self.get_env()
-        cargo_path = self.get_cargo_path()
-        if not cargo_path:
-            self.logger.error("cargo not found. Please install Rust first.")
+        env["CARGO_INSTALL_ROOT"] = str(self.cargo_home)
+        rustup_path = self.get_rustup_path()
+        if not rustup_path:
+            self.logger.error("rustup not found. Please install Rust first.")
             return False
 
         try:
             result = subprocess.run(
-                [str(cargo_path), "install", "cargo-xwin"],
+                [
+                    str(rustup_path),
+                    "run",
+                    self.config.rust_version,
+                    "cargo",
+                    "install",
+                    "cargo-xwin",
+                    "--version",
+                    f"={version}",
+                    "--locked",
+                ],
                 capture_output=True,
                 text=True,
                 env=env,
             )
 
             if result.returncode == 0:
-                self.logger.success("cargo-xwin installed successfully")
-                return True
+                if self.is_cargo_xwin_installed():
+                    self.logger.success("cargo-xwin installed successfully")
+                    return True
+                self.logger.error(
+                    f"cargo-xwin did not report expected version {version}"
+                )
+                return False
             else:
                 self.logger.error(f"Failed to install cargo-xwin: {result.stderr}")
                 return False
 
-        except FileNotFoundError:
-            self.logger.error("cargo not found. Please install Rust first.")
+        except (FileNotFoundError, OSError):
+            self.logger.error("rustup not found. Please install Rust first.")
             return False
 
     # ==================== clang/lld Detection ====================
@@ -813,7 +1168,11 @@ class ToolInstaller:
 
     def is_macos_sdk_installed(self) -> bool:
         """Check if macOS SDK is installed."""
-        return self.sdk_dir.exists() and self.sdk_dir.is_dir()
+        return (
+            self.sdk_dir.is_dir()
+            and (self.sdk_dir / "SDKSettings.json").is_file()
+            and (self.sdk_dir / "usr" / "lib").is_dir()
+        )
 
     def install_macos_sdk(self) -> bool:
         """Install macOS SDK for cross-compilation."""
@@ -821,8 +1180,9 @@ class ToolInstaller:
             self.logger.success(f"macOS SDK is already installed at {self.sdk_dir}")
             return True
 
-        # Only needed on Linux
-        if self.config.host_os != "linux":
+        # Native macOS builds use the SDK provided by Xcode.  Other hosts,
+        # including Windows, need the downloaded SDK for cargo-zigbuild.
+        if self.config.host_os == "macos":
             self.logger.info("macOS SDK not needed on this platform")
             return True
 
@@ -831,72 +1191,269 @@ class ToolInstaller:
         # Download SDK
         archive_name = f"MacOSX{self.config.macos_sdk_version}.sdk.tar.xz"
         archive_path = self.tools_dir / archive_name
+        expected_sha256 = self.config.macos_sdk_sha256
 
         if not archive_path.exists():
             local_cache = Path.home() / ".rustbuilder" / archive_name
             if local_cache.exists():
                 self.logger.info(f"Using cached {archive_name} from {local_cache.parent}")
-                shutil.copy2(local_cache, archive_path)
+                if not self._copy_file_atomically(
+                    local_cache,
+                    archive_path,
+                    expected_sha256=expected_sha256,
+                ):
+                    return False
             elif not self.download_file(
-                self.config.macos_sdk_url, archive_path, "macOS SDK"
+                self.config.macos_sdk_url,
+                archive_path,
+                "macOS SDK",
+                expected_sha256=expected_sha256,
             ):
                 return False
 
-        # Extract SDK
-        if not self.extract_tar_xz(archive_path, self.tools_dir):
+        if not self._verify_sha256(archive_path, expected_sha256, "macOS SDK"):
             return False
 
-        if self.sdk_dir.exists():
-            self.logger.success(f"macOS SDK installed at {self.sdk_dir}")
-            return True
-        else:
-            self.logger.error("macOS SDK installation failed")
+        # Stage the SDK so an interrupted extraction cannot be observed as a
+        # completed installation on the next run.
+        staging_dir = Path(tempfile.mkdtemp(prefix=".sdk-extract-", dir=self.tools_dir))
+        try:
+            if not self.extract_tar_xz(archive_path, staging_dir):
+                return False
+
+            extracted_sdk = staging_dir / self.sdk_dir.name
+            if not (
+                (extracted_sdk / "SDKSettings.json").is_file()
+                and (extracted_sdk / "usr" / "lib").is_dir()
+            ):
+                self.logger.error("macOS SDK archive is incomplete")
+                return False
+
+            if not self._replace_staged_directory(
+                extracted_sdk,
+                self.sdk_dir,
+                "macOS SDK",
+            ):
+                return False
+        except Exception as e:
+            self.logger.error(f"Failed to install macOS SDK from archive: {e}")
             return False
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+        self.logger.success(f"macOS SDK installed at {self.sdk_dir}")
+        return True
 
     # ==================== Utility Methods ====================
 
-    def download_file(self, url: str, dest: Path, desc: str = "file") -> bool:
-        """Download a file with progress indication."""
+    def _replace_staged_directory(
+        self,
+        staged: Path,
+        destination: Path,
+        desc: str,
+    ) -> bool:
+        """Commit a staged tool directory while preserving the prior install."""
+        backup: Optional[Path] = None
+        destination_exists = destination.exists() or destination.is_symlink()
+
+        if destination_exists:
+            if not self._is_safe_path_for_deletion(destination):
+                self.logger.error(f"Refusing to replace unsafe path: {destination}")
+                return False
+            try:
+                backup = Path(
+                    tempfile.mkdtemp(
+                        prefix=f".{destination.name}.",
+                        suffix=".backup",
+                        dir=destination.parent,
+                    )
+                )
+                backup.rmdir()
+                destination.rename(backup)
+            except Exception as error:
+                self.logger.error(f"Failed to stage prior {desc} install: {error}")
+                if (
+                    backup
+                    and (backup.exists() or backup.is_symlink())
+                    and not (destination.exists() or destination.is_symlink())
+                ):
+                    try:
+                        backup.rename(destination)
+                    except OSError as restore_error:
+                        self.logger.error(
+                            f"Failed to restore prior {desc} install from {backup}: "
+                            f"{restore_error}"
+                        )
+                return False
+
+        try:
+            staged.rename(destination)
+        except Exception as error:
+            self.logger.error(f"Failed to commit staged {desc} install: {error}")
+            if destination.exists() or destination.is_symlink():
+                if not self._remove_safe_tool_path(destination):
+                    self.logger.error(
+                        f"Could not clear failed {desc} install before rollback; "
+                        f"prior install remains at {backup}"
+                    )
+                    return False
+            if backup:
+                try:
+                    backup.rename(destination)
+                except OSError as restore_error:
+                    self.logger.error(
+                        f"Failed to restore prior {desc} install from {backup}: "
+                        f"{restore_error}"
+                    )
+            return False
+
+        if backup and not self._remove_safe_tool_path(backup):
+            self.logger.warning(
+                f"Installed {desc}, but could not remove prior-install backup {backup}"
+            )
+        return True
+
+    def _verify_sha256(self, path: Path, expected: str, desc: str) -> bool:
+        """Verify a file checksum without modifying the file on failure."""
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+            actual = digest.hexdigest()
+        except OSError as error:
+            self.logger.error(f"Failed to hash {desc}: {error}")
+            return False
+
+        if actual.lower() != expected.lower():
+            self.logger.error(
+                f"SHA-256 mismatch for {desc}: expected {expected}, got {actual}"
+            )
+            return False
+        return True
+
+    def _copy_file_atomically(
+        self,
+        source: Path,
+        destination: Path,
+        expected_sha256: Optional[str] = None,
+    ) -> bool:
+        """Copy a cached tool archive without exposing a partial destination."""
+        temp_path: Optional[Path] = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.",
+                suffix=".copy",
+                dir=destination.parent,
+            )
+            os.close(fd)
+            temp_path = Path(temp_name)
+            shutil.copy2(source, temp_path)
+            if expected_sha256 and not self._verify_sha256(
+                temp_path,
+                expected_sha256,
+                source.name,
+            ):
+                return False
+            os.replace(temp_path, destination)
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to copy cached archive {source}: {e}")
+            return False
+        finally:
+            if temp_path:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError as e:
+                    self.logger.warning(f"Could not remove temporary archive copy: {e}")
+
+    def download_file(
+        self,
+        url: str,
+        dest: Path,
+        desc: str = "file",
+        expected_sha256: Optional[str] = None,
+    ) -> bool:
+        """Download a file with progress indication and atomic replacement."""
         self.logger.info(f"Downloading {desc}...")
         self.logger.info(f"  URL: {url}")
 
+        temp_path: Optional[Path] = None
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{dest.name}.",
+                suffix=".download",
+                dir=dest.parent,
+            )
+            os.close(fd)
+            temp_path = Path(temp_name)
+        except Exception as e:
+            self.logger.error(f"Failed to prepare download for {desc}: {e}")
+            return False
+
         try:
             ctx = ssl.create_default_context()
+            try:
+                with urllib.request.urlopen(url, context=ctx) as response:
+                    total_size = int(response.headers.get("content-length", 0))
+                    downloaded = 0
+                    chunk_size = 8192
 
-            with urllib.request.urlopen(url, context=ctx) as response:
-                total_size = int(response.headers.get("content-length", 0))
-                downloaded = 0
-                chunk_size = 8192
+                    with open(temp_path, "wb") as f:
+                        while True:
+                            chunk = response.read(chunk_size)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            downloaded += len(chunk)
 
-                with open(dest, "wb") as f:
-                    while True:
-                        chunk = response.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
+                            if total_size > 0:
+                                percent = (downloaded / total_size) * 100
+                                mb_downloaded = downloaded / (1024 * 1024)
+                                mb_total = total_size / (1024 * 1024)
+                                print(
+                                    f"\r  Progress: {mb_downloaded:.1f}/{mb_total:.1f} MB ({percent:.1f}%)",
+                                    end="",
+                                    flush=True,
+                                )
 
-                        if total_size > 0:
-                            percent = (downloaded / total_size) * 100
-                            mb_downloaded = downloaded / (1024 * 1024)
-                            mb_total = total_size / (1024 * 1024)
-                            print(
-                                f"\r  Progress: {mb_downloaded:.1f}/{mb_total:.1f} MB ({percent:.1f}%)",
-                                end="",
-                                flush=True,
-                            )
+                    if downloaded <= 0:
+                        raise OSError("download produced an empty file")
+                    if total_size > 0 and downloaded != total_size:
+                        raise OSError(
+                            f"incomplete download: expected {total_size} bytes, got {downloaded}"
+                        )
+            except Exception as download_error:
+                if os.name != "nt":
+                    raise
+                temp_path.unlink(missing_ok=True)
+                if not self._download_file_with_powershell(
+                    url, temp_path, desc, download_error
+                ):
+                    raise
 
-                print()  # New line after progress
-                self.logger.success(f"Downloaded {desc}")
-                return True
+            if expected_sha256 and not self._verify_sha256(
+                temp_path,
+                expected_sha256,
+                desc,
+            ):
+                return False
+            os.replace(temp_path, dest)
+            print()  # New line after progress
+            self.logger.success(f"Downloaded {desc}")
+            return True
 
         except Exception as e:
-            if os.name == "nt" and self._download_file_with_powershell(url, dest, desc, e):
-                return True
             self.logger.error(f"Failed to download {desc}: {e}")
-            if dest.exists():
-                dest.unlink()
             return False
+        finally:
+            if temp_path:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError as e:
+                    self.logger.warning(f"Could not remove temporary download: {e}")
 
     def _download_file_with_powershell(
         self, url: str, dest: Path, desc: str, original_error: Exception
@@ -981,14 +1538,24 @@ class ToolInstaller:
         except (ValueError, OSError):
             return False
 
-    def _is_safe_tar_member(self, member: tarfile.TarInfo, dest_dir: Path) -> bool:
-        """Check if a tar member is safe to extract (no path traversal)."""
-        # Reject absolute paths
-        if member.name.startswith('/'):
+    def _remove_safe_tool_path(self, path: Path) -> bool:
+        """Remove a tool path only when it resolves inside ``tools_dir``."""
+        if not self._is_safe_path_for_deletion(path):
+            self.logger.error(f"Refusing to delete unsafe path: {path}")
+            return False
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+            return True
+        except OSError as e:
+            self.logger.error(f"Failed to remove incomplete tool path {path}: {e}")
             return False
 
-        # Reject paths with parent directory references
-        if '..' in member.name.split('/'):
+    def _is_safe_tar_member(self, member: tarfile.TarInfo, dest_dir: Path) -> bool:
+        """Check if a tar member is safe to extract (no path traversal)."""
+        if self._is_unsafe_archive_name(member.name):
             return False
 
         # Resolve the final path and ensure it's within dest_dir
@@ -1000,6 +1567,20 @@ class ToolInstaller:
         except (ValueError, OSError):
             return False
 
+    def _is_unsafe_archive_name(self, name: str) -> bool:
+        """Recognize POSIX and Windows absolute/traversal archive names."""
+        if not name or "\0" in name:
+            return True
+        normalized = name.replace("\\", "/")
+        posix_path = PurePosixPath(normalized)
+        windows_path = PureWindowsPath(name)
+        return (
+            posix_path.is_absolute()
+            or bool(windows_path.drive)
+            or bool(windows_path.root)
+            or ".." in posix_path.parts
+        )
+
     def extract_tar_xz(self, archive: Path, dest_dir: Path) -> bool:
         """Extract a .tar.xz archive with path traversal protection."""
         self.logger.info(f"Extracting {archive.name}...")
@@ -1010,10 +1591,13 @@ class ToolInstaller:
                     if not self._is_safe_tar_member(member, dest_dir):
                         self.logger.error(f"Unsafe path in archive: {member.name}")
                         return False
+                    if member.isdev() or member.isfifo():
+                        self.logger.error(f"Unsafe special file in archive: {member.name}")
+                        return False
                     # Also reject symbolic links pointing outside
                     if member.issym() or member.islnk():
                         link_target = member.linkname
-                        if link_target.startswith('/') or '..' in link_target.split('/'):
+                        if self._is_unsafe_archive_name(link_target):
                             self.logger.error(f"Unsafe symlink in archive: {member.name} -> {link_target}")
                             return False
 
@@ -1027,10 +1611,7 @@ class ToolInstaller:
 
     def _is_safe_zip_member(self, name: str, dest_dir: Path) -> bool:
         """Check if a zip member is safe to extract (no path traversal)."""
-        if name.startswith(("/", "\\")):
-            return False
-        parts = Path(name).parts
-        if ".." in parts:
+        if self._is_unsafe_archive_name(name):
             return False
         try:
             dest_dir_resolved = dest_dir.resolve()
@@ -1095,7 +1676,10 @@ class ToolInstaller:
                 success = False
 
             for rust_target in self._windows_gnullvm_triples():
-                if not self.install_rust_toolchain(f"stable-{rust_target}"):
+                if not self.install_rust_target(
+                    rust_target,
+                    self.config.rust_version,
+                ):
                     success = False
                 if not self.install_windows_import_libs(rust_target):
                     success = False
@@ -1165,26 +1749,44 @@ class ToolInstaller:
         elif addition not in existing:
             env[key] = f"{existing} {addition}"
 
-    def get_env(self) -> dict:
-        """Get environment variables for build process."""
+    def get_env(
+        self,
+        include_zig: bool = False,
+        include_macos_sdk: bool = False,
+    ) -> dict:
+        """Get a target-aware environment for Rust/cross-tool operations."""
         env = os.environ.copy()
+        env["RUSTUP_AUTO_INSTALL"] = "0"
+        env["RUSTUP_DIST_SERVER"] = RUSTUP_DIST_SERVER
+        env["RUSTUP_UPDATE_ROOT"] = RUSTUP_UPDATE_ROOT
+        env.pop("RUSTUP_TOOLCHAIN", None)
+        env.pop("RUSTUP_OVERRIDE_HOST_TRIPLE", None)
+        env.pop("SDKROOT", None)
 
-        # Set Rust environment
-        env["CARGO_HOME"] = str(self.cargo_home)
-        env["RUSTUP_HOME"] = str(self.rustup_home)
+        # Only redirect Rust homes when the matching local cargo/rustup pair
+        # exists.  Redirecting a detected system installation to an empty
+        # builder/tools home makes its installed toolchains disappear.
+        if self._has_local_rust_install():
+            env["CARGO_HOME"] = str(self.cargo_home)
+            env["RUSTUP_HOME"] = str(self.rustup_home)
 
         # Build PATH with all tools
         path_parts = []
 
         # Add cargo bin
         cargo_bin = self.cargo_home / "bin"
-        if cargo_bin.exists():
-            path_parts.append(str(cargo_bin))
+        local_core_present = self._local_cargo_path().exists() or self._local_rustup_path().exists()
+        if self._has_local_rust_install() or not local_core_present:
+            if cargo_bin.exists():
+                path_parts.append(str(cargo_bin))
 
-        # Add zig
-        zig_path = self.get_zig_path()
-        if zig_path:
-            path_parts.append(str(zig_path.parent))
+        # Resolving Zig executes ``zig version``.  Keep that probe out of
+        # native/read-only Rust operations and add it only after a caller has
+        # established that a Zig-backed debug build is allowed.
+        if include_zig:
+            zig_path = self.get_zig_path()
+            if zig_path:
+                path_parts.append(str(zig_path.parent))
 
         # Add original PATH
         path_key = self._path_env_key(env)
@@ -1192,8 +1794,9 @@ class ToolInstaller:
 
         env[path_key] = os.pathsep.join(path_parts)
 
-        # Set SDKROOT for macOS cross-compilation
-        if self.sdk_dir.exists():
+        # Never leak a stale downloaded SDK into native Rust operations.
+        # Cross callers opt in only after their setup/receipt policy passes.
+        if include_macos_sdk and self.is_macos_sdk_installed():
             env["SDKROOT"] = str(self.sdk_dir)
 
         if self.config.host_os == "windows":
@@ -1253,7 +1856,7 @@ class ToolInstaller:
         if self.is_macos_sdk_installed():
             self.logger.success(f"macOS SDK: {self.sdk_dir}")
         else:
-            if self.config.host_os == "linux":
+            if self.config.host_os != "macos":
                 self.logger.warning("macOS SDK: Not installed")
             else:
                 self.logger.info("macOS SDK: Not needed on this platform")
@@ -1261,11 +1864,17 @@ class ToolInstaller:
         if self.config.host_os == "windows":
             self.logger.info("cargo-xwin/clang-cl: Not needed for Windows GNU/LLVM builds")
             for rust_target in self._windows_gnullvm_triples():
-                toolchain = f"stable-{rust_target}"
-                if self.is_rust_toolchain_installed(toolchain):
-                    self.logger.success(f"{toolchain}: Installed")
+                if self.is_rust_target_installed(
+                    rust_target,
+                    self.config.rust_version,
+                ):
+                    self.logger.success(
+                        f"{rust_target} target for {self.config.rust_version}: Installed"
+                    )
                 else:
-                    self.logger.warning(f"{toolchain}: Not installed")
+                    self.logger.warning(
+                        f"{rust_target} target for {self.config.rust_version}: Not installed"
+                    )
 
                 if self.is_windows_import_libs_installed(rust_target):
                     self.logger.success(f"winlibs {rust_target}: Installed")

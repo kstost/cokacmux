@@ -130,9 +130,20 @@ pub fn validate_clone_artifact_with_opts(
             Provider::OpenCode,
             ArtifactPath::OpenCodeDb {
                 db_path,
-                session_id,
+                session_id: artifact_session_id,
             },
-        ) => validate_opencode_db(db_path, session_id),
+        ) => {
+            // The caller's expected identity is authoritative. Validating the
+            // id embedded in ArtifactPath would allow an artifact for some
+            // other session to be reported as a successful clone/install.
+            let mut report = validate_opencode_db(db_path, session_id)?;
+            report.check(
+                "artifact_session_id_matches",
+                artifact_session_id == session_id,
+                format!("artifact={artifact_session_id} expected={session_id}"),
+            );
+            Ok(report)
+        }
         (provider, artifact) => {
             let mut report =
                 NativeValidationReport::new(provider, session_id, format!("{:?}", artifact));
@@ -880,4 +891,33 @@ fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(exists > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "opencode")]
+    #[test]
+    fn opencode_artifact_identity_must_match_expected_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = "ses_0123456789abABCDEFGHIJKLMN";
+        let other = "ses_abcdef012345NOPQRSTUVWXYZ0";
+        let artifact = ArtifactPath::OpenCodeDb {
+            db_path: dir.path().join("missing.db"),
+            session_id: other.into(),
+        };
+
+        let report = validate_clone_artifact(Provider::OpenCode, expected, &artifact).unwrap();
+        let identity = report
+            .checks
+            .iter()
+            .find(|check| check.name == "artifact_session_id_matches")
+            .expect("artifact identity check");
+
+        assert!(!identity.ok);
+        assert!(!report.ok);
+        assert_eq!(report.session_id, expected);
+        assert!(!dir.path().join("missing.db").exists());
+    }
 }

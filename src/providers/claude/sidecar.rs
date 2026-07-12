@@ -13,9 +13,7 @@ pub fn extract_sidecar_ref(text: &str) -> Option<PathBuf> {
     let needle = "Full output saved to: ";
     let i = text.find(needle)?;
     let after = &text[i + needle.len()..];
-    let end = after
-        .find(|c: char| c == '\n' || c == '\r')
-        .unwrap_or(after.len());
+    let end = after.find(['\n', '\r']).unwrap_or(after.len());
     let path = after[..end].trim();
     if path.is_empty() {
         None

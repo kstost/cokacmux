@@ -4,6 +4,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::debug;
 use crate::error::Result;
@@ -58,7 +59,13 @@ pub fn to_jsonl_string(session: &UniversalSession, opts: &PiWriteOpts) -> Result
             let line = serde_json::to_string(&message.provenance.raw)?;
             out.push_str(&line);
             out.push('\n');
-            previous_entry_id = Some(message.id.clone());
+            previous_entry_id = message
+                .provenance
+                .raw
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some(message.id.clone()));
             continue;
         }
         let entry = synth_entry(session, message, previous_entry_id.as_deref());
@@ -151,8 +158,10 @@ fn synth_tool_entry(
     parent_id: Option<String>,
     timestamp: DateTime<Utc>,
 ) -> Value {
-    if let Some((call_id, output, is_error, tool_name)) = first_tool_result(&message.content) {
-        return json!({
+    if let Some((call_id, output, is_error, tool_name, details)) =
+        first_tool_result(&message.content)
+    {
+        let mut entry = json!({
             "type": "message",
             "id": entry_id,
             "parentId": parent_id,
@@ -166,6 +175,10 @@ fn synth_tool_entry(
                 "timestamp": timestamp.timestamp_millis(),
             },
         });
+        if let Some(details) = details {
+            entry["message"]["details"] = details;
+        }
+        return entry;
     }
     json!({
         "type": "custom_message",
@@ -178,7 +191,9 @@ fn synth_tool_entry(
     })
 }
 
-fn first_tool_result(content: &[ContentBlock]) -> Option<(String, Value, bool, String)> {
+fn first_tool_result(
+    content: &[ContentBlock],
+) -> Option<(String, Value, bool, String, Option<Value>)> {
     for block in content {
         if let ContentBlock::ToolResult {
             call_id,
@@ -193,7 +208,14 @@ fn first_tool_result(content: &[ContentBlock]) -> Option<(String, Value, bool, S
                 .and_then(Value::as_str)
                 .unwrap_or("tool")
                 .to_string();
-            return Some((call_id.clone(), output.clone(), *is_error, tool_name));
+            let details = extras.get("details").cloned();
+            return Some((
+                call_id.clone(),
+                output.clone(),
+                *is_error,
+                tool_name,
+                details,
+            ));
         }
     }
     None
@@ -333,17 +355,24 @@ fn pi_usage(message: &UMessage) -> Value {
 }
 
 fn pi_entry_id(id: &str) -> String {
-    let trimmed = id.trim();
-    if !trimmed.is_empty()
-        && trimmed
+    if id.len() == 8
+        && id
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, 'a'..='f'))
     {
-        return trimmed.to_string();
+        return id.to_string();
     }
-    crate::ids::new_uuid_v7()
-        .chars()
-        .filter(|ch| ch.is_ascii_hexdigit())
-        .take(8)
+
+    // Pi entry ids are 8 hexadecimal characters. Hash the complete source id
+    // instead of truncating UUID text: UUIDv7 values created in the same time
+    // window share their leading timestamp digits, and parent references must
+    // normalize to exactly the same id as the referenced entry.
+    let mut hasher = Sha256::new();
+    hasher.update(id.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
         .collect()
 }

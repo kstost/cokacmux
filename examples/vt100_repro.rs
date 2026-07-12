@@ -11,6 +11,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static HOOK_FIRED: AtomicUsize = AtomicUsize::new(0);
 static HOOK_VT100: AtomicUsize = AtomicUsize::new(0);
 
+type ResizeCase = (
+    &'static str,
+    u16,
+    u16,
+    &'static [u8],
+    u16,
+    u16,
+    &'static [u8],
+);
+
 fn install_filter() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -178,7 +188,7 @@ fn main() {
     //   ECH ("\x1b[NX") erases N characters starting at cursor without
     //   moving the cursor. It calls row.erase under the hood, which calls
     //   clear_wide which indexes cells[col+1] -> panic.
-    let cases: &[(&str, u16, u16, &[u8], u16, u16, &[u8])] = &[
+    let cases: &[ResizeCase] = &[
         // (label, start_cols, rows, init bytes, new_cols, new_rows, post bytes)
         (
             "ECH_after_shrink_w20to19",

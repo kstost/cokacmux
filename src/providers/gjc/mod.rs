@@ -15,19 +15,10 @@ use serde_json::{json, Value};
 use crate::error::Result;
 use crate::universal::{Provider, UniversalSession};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GjcReadCtx {
     pub session_id: Option<String>,
     pub cwd: Option<String>,
-}
-
-impl Default for GjcReadCtx {
-    fn default() -> Self {
-        Self {
-            session_id: None,
-            cwd: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

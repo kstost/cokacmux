@@ -92,7 +92,7 @@ fn create_codex_threads_table(path: &Path) {
     .unwrap();
 }
 
-fn text_messages_for_role<'a>(session: &'a cokacmux::UniversalSession, role: Role) -> Vec<&'a str> {
+fn text_messages_for_role(session: &cokacmux::UniversalSession, role: Role) -> Vec<&str> {
     session
         .messages
         .iter()
@@ -317,6 +317,31 @@ fn pi_install_into_tempdir() {
 
 #[cfg(feature = "pi")]
 #[test]
+fn pi_install_rejects_session_ids_that_can_escape_the_session_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join(".pi").join("agent");
+    let mut session = pi::from_jsonl_str(pi_fixture(), &Default::default()).unwrap();
+    session.session_id = "../../../outside".into();
+
+    let error = pi::install::install_to_user_dir(
+        &session,
+        &pi::install::InstallOpts {
+            pi_agent_dir: Some(agent_dir.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("safe filename component"));
+    assert!(
+        !agent_dir.exists(),
+        "validation must happen before creating directories"
+    );
+    assert!(!tmp.path().join("outside.jsonl").exists());
+}
+
+#[cfg(feature = "pi")]
+#[test]
 fn context_wrapper_install_into_pi_tempdir_validates_native_layout() {
     let tmp = tempfile::tempdir().unwrap();
     let agent_dir = tmp.path().join(".pi").join("agent");
@@ -408,6 +433,31 @@ fn gjc_install_into_tempdir() {
         },
     )
     .unwrap();
+}
+
+#[cfg(feature = "gjc")]
+#[test]
+fn gjc_install_rejects_session_ids_that_can_escape_the_session_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join(".gjc").join("agent");
+    let mut session = gjc::from_jsonl_str(gjc_fixture(), &Default::default()).unwrap();
+    session.session_id = "../../../outside".into();
+
+    let error = gjc::install::install_to_user_dir(
+        &session,
+        &gjc::install::InstallOpts {
+            gjc_agent_dir: Some(agent_dir.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("safe filename component"));
+    assert!(
+        !agent_dir.exists(),
+        "validation must happen before creating directories"
+    );
+    assert!(!tmp.path().join("outside.jsonl").exists());
 }
 
 #[cfg(feature = "gjc")]
@@ -768,6 +818,7 @@ fn codex_install_updates_threads_table() {
 /// real-schema compatibility. We never write to the user's actual file.
 #[cfg(feature = "opencode")]
 #[test]
+#[ignore = "reads the user's live Codex state; run only in the explicit live-read gate"]
 fn codex_install_against_live_state_5_clone() {
     let live = match dirs::home_dir() {
         Some(h) => h.join(".codex").join("state_5.sqlite"),

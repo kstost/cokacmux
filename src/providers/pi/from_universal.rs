@@ -190,22 +190,31 @@ fn message_entry_to_umessage(value: &Value, index: u32, ts: Option<DateTime<Utc>
             Role::Assistant,
             pi_content_to_blocks(message.get("content")),
         ),
-        "toolResult" => (
-            Role::Tool,
-            vec![ContentBlock::ToolResult {
-                call_id: message
-                    .get("toolCallId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                output: pi_tool_result_output(message),
-                is_error: message
-                    .get("isError")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                extras: BTreeMap::new(),
-            }],
-        ),
+        "toolResult" => {
+            let mut block_extras = BTreeMap::new();
+            if let Some(tool_name) = message.get("toolName") {
+                block_extras.insert("toolName".into(), tool_name.clone());
+            }
+            if let Some(details) = message.get("details") {
+                block_extras.insert("details".into(), details.clone());
+            }
+            (
+                Role::Tool,
+                vec![ContentBlock::ToolResult {
+                    call_id: message
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    output: pi_tool_result_output(message),
+                    is_error: message
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    extras: block_extras,
+                }],
+            )
+        }
         "bashExecution" => {
             let mut block_extras = BTreeMap::new();
             if let Some(command) = message.get("command").and_then(Value::as_str) {
@@ -307,8 +316,10 @@ fn summary_entry_to_umessage(
     source_event_type: &str,
     is_compaction: bool,
 ) -> UMessage {
-    let mut flags = MessageFlags::default();
-    flags.is_compaction = is_compaction;
+    let flags = MessageFlags {
+        is_compaction,
+        ..Default::default()
+    };
     UMessage {
         id: entry_id(value),
         parent_id: parent_id(value),
@@ -340,8 +351,10 @@ fn meta_entry_to_umessage(
     ts: Option<DateTime<Utc>>,
     source_event_type: &str,
 ) -> UMessage {
-    let mut flags = MessageFlags::default();
-    flags.is_meta = true;
+    let flags = MessageFlags {
+        is_meta: true,
+        ..Default::default()
+    };
     UMessage {
         id: entry_id(value),
         parent_id: parent_id(value),

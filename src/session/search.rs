@@ -35,7 +35,7 @@ pub fn search_all_with_cancel(
     case_insensitive: bool,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<SearchHit>> {
-    search_all_impl(query, case_insensitive, cancel, None)
+    search_impl(None, query, case_insensitive, cancel, None)
 }
 
 pub fn search_all_with_cancel_and_progress(
@@ -44,20 +44,50 @@ pub fn search_all_with_cancel_and_progress(
     cancel: Option<&AtomicBool>,
     mut progress: impl FnMut(SearchProgress),
 ) -> Result<Vec<SearchHit>> {
-    search_all_impl(query, case_insensitive, cancel, Some(&mut progress))
+    search_impl(None, query, case_insensitive, cancel, Some(&mut progress))
 }
 
-fn search_all_impl(
+/// Search only the supplied sessions, without running provider discovery.
+pub fn search_infos_with_cancel(
+    infos: Vec<SessionInfo>,
+    query: &str,
+    case_insensitive: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<SearchHit>> {
+    search_impl(Some(infos), query, case_insensitive, cancel, None)
+}
+
+/// Search only the supplied sessions and report progress to the caller.
+pub fn search_infos_with_cancel_and_progress(
+    infos: Vec<SessionInfo>,
+    query: &str,
+    case_insensitive: bool,
+    cancel: Option<&AtomicBool>,
+    mut progress: impl FnMut(SearchProgress),
+) -> Result<Vec<SearchHit>> {
+    search_impl(
+        Some(infos),
+        query,
+        case_insensitive,
+        cancel,
+        Some(&mut progress),
+    )
+}
+
+fn search_impl(
+    infos: Option<Vec<SessionInfo>>,
     query: &str,
     case_insensitive: bool,
     cancel: Option<&AtomicBool>,
     mut progress: Option<&mut dyn FnMut(SearchProgress)>,
 ) -> Result<Vec<SearchHit>> {
+    let scope = if infos.is_some() { "provided" } else { "all" };
     crate::debug::log(
         "search_library_start",
         serde_json::json!({
             "query_len": query.chars().count(),
             "case_insensitive": case_insensitive,
+            "scope": scope,
         }),
     );
     if query.is_empty() {
@@ -69,11 +99,15 @@ fn search_all_impl(
     } else {
         query.to_string()
     };
-    let infos = super::list_all()?;
+    let infos = match infos {
+        Some(infos) => infos,
+        None => super::list_all()?,
+    };
     crate::debug::log(
         "search_library_sessions_loaded",
         serde_json::json!({
             "sessions": infos.len(),
+            "scope": scope,
         }),
     );
     let mut hits: Vec<SearchHit> = Vec::new();
@@ -168,7 +202,7 @@ fn search_all_impl(
         }
     }
     // Newest sessions first.
-    hits.sort_by(|a, b| b.info.updated_at_epoch_s.cmp(&a.info.updated_at_epoch_s));
+    hits.sort_by_key(|hit| std::cmp::Reverse(hit.info.updated_at_epoch_s));
     crate::debug::log(
         "search_library_ok",
         serde_json::json!({
@@ -252,6 +286,7 @@ fn lowercase_with_original_ranges(text: &str) -> (String, Vec<(usize, usize)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::universal::Provider;
 
     #[test]
     fn count_matches_counts_non_overlapping_hits() {
@@ -264,5 +299,45 @@ mod tests {
     fn snippet_uses_original_text_case() {
         let snippet = snippet_for("Hello Tool Result", "tool", true);
         assert!(snippet.contains("Tool"));
+    }
+
+    #[test]
+    fn supplied_infos_do_not_trigger_global_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = SessionInfo {
+            provider: Provider::Codex,
+            session_id: "missing-session".into(),
+            cwd: "/missing".into(),
+            source: dir.path().join("missing.jsonl"),
+            updated_at_epoch_s: 0,
+            title: None,
+            relation: None,
+        };
+        let mut updates = Vec::new();
+
+        let hits =
+            search_infos_with_cancel_and_progress(vec![info], "needle", true, None, |progress| {
+                updates.push(progress)
+            })
+            .unwrap();
+
+        assert!(hits.is_empty());
+        assert_eq!(
+            updates,
+            vec![
+                SearchProgress {
+                    processed: 0,
+                    total: 1,
+                    hits: 0,
+                    load_errors: 0,
+                },
+                SearchProgress {
+                    processed: 1,
+                    total: 1,
+                    hits: 0,
+                    load_errors: 1,
+                },
+            ]
+        );
     }
 }

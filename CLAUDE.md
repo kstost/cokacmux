@@ -69,6 +69,22 @@ responsiveness (5); never risk a live agent (1) to clean up the display (3).
 - Do not use `cargo build`, `python3 build.py`, or any build commands unless user asks
 - Focus only on code modifications; user handles all builds manually
 
+## Test Storage Safety
+
+- Rust tests require the same explicit user approval as build commands.
+- Never run Rust tests against the real home or app storage. Set an isolated
+  `COKACMUX_TEST_ROOT`, `COKACMUX_HOME`, `COKACMUX_CONFIG_DIR`, HOME,
+  USERPROFILE, temp, XDG, LOCALAPPDATA, and APPDATA tree first.
+- Preserve the original `CARGO_HOME` and `RUSTUP_HOME` before replacing HOME,
+  or a rustup proxy can silently resolve a different toolchain.
+- Set `RUSTUP_AUTO_INSTALL=0` for read-only verification after the required
+  toolchain is prepared. Even `rustup --version` can provision a repository
+  override when auto-install remains enabled.
+- Keep `COKACMUX_DEBUG=0`, `COKACMUX_TRACE=0`, and provider directory
+  overrides empty in the normal test gate.
+- Never add `--ignored` to the normal test command. Tests marked as live-read
+  or live-acceptance require a separate, explicit user-approved gate.
+
 ## Version Management
 
 - Version is defined in `Cargo.toml` (line 3: `version = "x.x.x"`)

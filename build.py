@@ -65,11 +65,6 @@ Targets:
   linux-x86_64      Linux x86_64
   windows-x86_64    Windows x86_64
   windows-arm64     Windows ARM64
-  windows-x86_64-msvc / windows-arm64-msvc
-                    Force MSVC targets
-  windows-x86_64-gnullvm / windows-arm64-gnullvm
-                    Force GNU/LLVM targets
-
 Note: All tools are installed locally in builder/tools/ directory.
 """,
     )
@@ -170,7 +165,7 @@ Note: All tools are installed locally in builder/tools/ directory.
     setup_group.add_argument(
         "--setup-windows",
         action="store_true",
-        help="Install Windows build tools (gnullvm on Windows, cargo-xwin off Windows)",
+        help="Install Windows cross-compilation tools only (cargo-xwin)",
     )
     setup_group.add_argument(
         "--status",
@@ -214,13 +209,6 @@ def collect_targets(args: argparse.Namespace) -> list:
     # Flag-based targets
     if args.all:
         targets.append("all")
-        if args.windows:
-            targets.append("windows")
-        else:
-            if args.windows_x86_64:
-                targets.append("windows-x86_64")
-            if args.windows_arm64:
-                targets.append("windows-arm64")
     else:
         if args.macos:
             targets.append("macos")
@@ -289,7 +277,10 @@ def needs_cross_compilation(targets: list) -> bool:
             return True
         if target in ("linux", "linux-arm64", "linux-x86_64"):
             return True
-        if target in RUST_TARGETS and ("apple-darwin" in RUST_TARGETS[target] or "linux" in RUST_TARGETS[target]):
+        if target in RUST_TARGETS and (
+            "apple-darwin" in RUST_TARGETS[target]
+            or "linux" in RUST_TARGETS[target]
+        ):
             return True
     return False
 
@@ -307,18 +298,11 @@ def needs_macos_cross(targets: list) -> bool:
 
 def needs_windows_cross(targets: list) -> bool:
     """Check if any target requires Windows cross-compilation tools (cargo-xwin)."""
-    if platform.system().lower() == "windows":
-        return False
-
     for target in targets:
         target = target.lower()
-        if target.endswith("-gnullvm"):
-            continue
         if target in ("windows", "windows-x86_64", "windows-arm64"):
             return True
         if target in RUST_TARGETS and "windows" in RUST_TARGETS[target]:
-            if RUST_TARGETS[target].endswith("pc-windows-gnullvm"):
-                continue
             return True
     return False
 
@@ -343,6 +327,7 @@ def main() -> int:
     config = BuildConfig(
         release=not args.debug,
         clean=args.clean,
+        allow_release_auto_setup=True,
     )
 
     # Create tool installer
@@ -400,7 +385,10 @@ def main() -> int:
         missing_zig = not tool_installer.is_zig_installed()
         missing_zigbuild = not tool_installer.is_cargo_zigbuild_installed()
         # macOS SDK — only needed for macOS targets
-        missing_sdk = needs_macos_cross(targets) and not tool_installer.is_macos_sdk_installed()
+        missing_sdk = (
+            needs_macos_cross(targets)
+            and not tool_installer.is_macos_sdk_installed()
+        )
 
         if missing_zig or missing_zigbuild or missing_sdk:
             if auto_setup:
@@ -427,9 +415,17 @@ def main() -> int:
 
     # Check if Windows cross-compilation is needed
     if needs_windows_cross(targets):
-        if not tool_installer.is_cargo_xwin_installed() or not tool_installer.is_clang_installed() or not tool_installer.is_lld_installed() or not tool_installer.is_llvm_lib_installed() or not tool_installer.is_clang_cl_installed():
+        if (
+            not tool_installer.is_cargo_xwin_installed()
+            or not tool_installer.is_clang_installed()
+            or not tool_installer.is_lld_installed()
+            or not tool_installer.is_llvm_lib_installed()
+            or not tool_installer.is_clang_cl_installed()
+        ):
             if auto_setup:
-                logger.warning("Windows cross-compilation tools not installed. Installing...")
+                logger.warning(
+                    "Windows cross-compilation tools not installed. Installing..."
+                )
                 logger.newline()
                 if not tool_installer.setup_windows_cross():
                     logger.error("Failed to install Windows cross-compilation tools")
@@ -440,7 +436,13 @@ def main() -> int:
                 return 1
 
     # Run build
-    success = run_build(config, project_root, targets, logger)
+    success = run_build(
+        config,
+        project_root,
+        targets,
+        logger,
+        auto_setup=auto_setup,
+    )
 
     return 0 if success else 1
 

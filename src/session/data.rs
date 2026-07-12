@@ -1283,7 +1283,10 @@ fn current_epoch_s() -> u64 {
 }
 
 fn temp_suffix() -> String {
-    format!("{}-{}", current_epoch_s(), std::process::id())
+    // Snapshot workers can run concurrently in the same process. A
+    // second-resolution timestamp plus PID makes them choose the same staging
+    // paths and lets one worker delete another's in-progress copy.
+    crate::ids::new_uuid_v7()
 }
 
 #[cfg(test)]
@@ -1299,6 +1302,7 @@ mod tests {
             source: PathBuf::from("/tmp/source"),
             updated_at_epoch_s: 0,
             title: None,
+            relation: None,
         }
     }
 
@@ -2087,6 +2091,11 @@ mod tests {
             snapshot_stem(Provider::Codex, "same/id"),
             snapshot_stem(Provider::Codex, "same_id")
         );
+    }
+
+    #[test]
+    fn snapshot_temp_suffixes_are_unique_within_one_process() {
+        assert_ne!(temp_suffix(), temp_suffix());
     }
 
     fn set_readonly(path: &Path, readonly: bool) {

@@ -19,8 +19,8 @@ use crate::providers::discovery::{self, SessionInfo};
 use crate::universal::{Provider, UniversalSession};
 
 pub use search::{
-    search_all, search_all_with_cancel, search_all_with_cancel_and_progress, SearchHit,
-    SearchProgress,
+    search_all, search_all_with_cancel, search_all_with_cancel_and_progress,
+    search_infos_with_cancel, search_infos_with_cancel_and_progress, SearchHit, SearchProgress,
 };
 
 /// List every session known to every enabled provider, most-recent first.
@@ -60,7 +60,7 @@ pub fn list_all() -> Result<Vec<SessionInfo>> {
         }
     }
     title::apply_overrides(&mut out);
-    out.sort_by(|a, b| b.updated_at_epoch_s.cmp(&a.updated_at_epoch_s));
+    out.sort_by_key(|info| std::cmp::Reverse(info.updated_at_epoch_s));
     crate::debug::log(
         "session_list_all_ok",
         serde_json::json!({
@@ -81,6 +81,11 @@ pub fn resolve(id_or_prefix: &str) -> Result<SessionInfo> {
             "id_or_prefix": id_or_prefix,
         }),
     );
+    if id_or_prefix.is_empty() {
+        return Err(ConvertError::Other(
+            "session id or prefix must not be empty".into(),
+        ));
+    }
     let all = list_all()?;
     let matches: Vec<_> = all
         .into_iter()
@@ -137,6 +142,15 @@ pub fn resolve(id_or_prefix: &str) -> Result<SessionInfo> {
                 ids.join(", ")
             )))
         }
+    }
+}
+
+#[cfg(all(test, feature = "discovery"))]
+mod tests {
+    #[test]
+    fn resolve_rejects_empty_prefix_before_session_discovery() {
+        let error = super::resolve("").expect_err("an empty prefix must never select a session");
+        assert!(error.to_string().contains("must not be empty"));
     }
 }
 

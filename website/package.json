@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vite build && node scripts/copy-build.mjs",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "node --test scripts/copy-build.test.mjs src/copy-command.test.js"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.2",

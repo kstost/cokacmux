@@ -269,6 +269,7 @@ mod tests {
             source: PathBuf::from("/tmp/source"),
             updated_at_epoch_s: 0,
             title: title.map(str::to_string),
+            relation: None,
         }
     }
 

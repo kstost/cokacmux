@@ -1,13 +1,20 @@
 """
 Rust target management for cross-compilation.
 """
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import List, Set, Optional, Dict
 from pathlib import Path
 
-from .config import BuildConfig, RUST_TARGETS, TARGET_NAMES
+from .config import (
+    BuildConfig,
+    RUST_TARGETS,
+    RUSTUP_DIST_SERVER,
+    RUSTUP_UPDATE_ROOT,
+    TARGET_NAMES,
+)
 from .logger import Logger
 
 
@@ -46,13 +53,14 @@ class Target:
         else:
             arch = "unknown"
 
-        # Determine if zigbuild is needed (not for Windows targets)
-        # 1. macOS targets when building on Linux
-        # 2. All Linux targets (to pin GLIBC version for broad compatibility)
+        # Determine if zigbuild is needed (not for Windows targets).
+        # 1. macOS targets when building on a non-macOS host.
+        # 2. All Linux targets, on every host, both for cross-linking and to
+        #    pin GLIBC for broad compatibility.
         needs_zigbuild = (
             platform != "windows" and (
-                (platform == "macos" and config.host_os == "linux") or
-                (platform == "linux" and config.host_os == "linux")
+                (platform == "macos" and config.host_os != "macos") or
+                platform == "linux"
             )
         )
 
@@ -89,10 +97,24 @@ class Target:
 class TargetManager:
     """Manages Rust targets and rustup operations."""
 
-    def __init__(self, config: BuildConfig, logger: Logger, env: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        config: BuildConfig,
+        logger: Logger,
+        env: Optional[Dict[str, str]] = None,
+        rustup_path: Optional[Path] = None,
+    ):
         self.config = config
         self.logger = logger
-        self.env = env  # Environment for running rustup commands
+        self.env = dict(env) if env is not None else os.environ.copy()
+        # Read-only rustup queries must never provision a repository override,
+        # including when TargetManager is used directly outside build.py.
+        self.env["RUSTUP_AUTO_INSTALL"] = "0"
+        self.env["RUSTUP_DIST_SERVER"] = RUSTUP_DIST_SERVER
+        self.env["RUSTUP_UPDATE_ROOT"] = RUSTUP_UPDATE_ROOT
+        self.env.pop("RUSTUP_TOOLCHAIN", None)
+        self.env.pop("RUSTUP_OVERRIDE_HOST_TRIPLE", None)
+        self.rustup_path = rustup_path
         self._installed_targets: Optional[Set[str]] = None
         self._installed_toolchains: Optional[Set[str]] = None
 
@@ -107,6 +129,8 @@ class TargetManager:
 
     def _rustup_command(self) -> str:
         """Resolve rustup to an absolute path when possible."""
+        if self.rustup_path is not None:
+            return str(self.rustup_path)
         path_value = self._path_value()
         for name in ("rustup.exe", "rustup"):
             resolved = shutil.which(name, path=path_value)
@@ -114,14 +138,21 @@ class TargetManager:
                 return resolved
         return "rustup"
 
-    def get_installed_targets(self) -> Set[str]:
-        """Get list of installed Rust targets."""
+    def get_installed_targets(self) -> Optional[Set[str]]:
+        """Return installed targets, or ``None`` when rustup cannot answer."""
         if self._installed_targets is not None:
             return self._installed_targets
 
         try:
             result = subprocess.run(
-                [self._rustup_command(), "target", "list", "--installed"],
+                [
+                    self._rustup_command(),
+                    "target",
+                    "list",
+                    "--installed",
+                    "--toolchain",
+                    self.config.rust_version,
+                ],
                 capture_output=True,
                 text=True,
                 env=self.env,
@@ -131,29 +162,48 @@ class TargetManager:
                 targets = result.stdout.strip().split("\n")
                 self._installed_targets = set(t for t in targets if t)
             else:
-                self._installed_targets = set()
+                self.logger.error(
+                    f"Failed to inspect installed Rust targets: {result.stderr}"
+                )
+                return None
 
-        except FileNotFoundError:
-            self.logger.error("rustup not found. Please run --setup first.")
-            self._installed_targets = set()
+        except OSError as error:
+            self.logger.error(f"Failed to inspect installed Rust targets: {error}")
+            return None
 
         return self._installed_targets
 
-    def is_target_installed(self, rust_target: str) -> bool:
-        """Check if a Rust target is installed."""
-        return rust_target in self.get_installed_targets()
+    def is_target_installed(self, rust_target: str) -> Optional[bool]:
+        """Return installed/missing, or ``None`` when inspection failed."""
+        installed = self.get_installed_targets()
+        if installed is None:
+            return None
+        return rust_target in installed
 
     def add_target(self, rust_target: str) -> bool:
         """Add a Rust target using rustup."""
-        if self.is_target_installed(rust_target):
+        installed = self.is_target_installed(rust_target)
+        if installed is True:
             self.logger.debug(f"Target {rust_target} is already installed")
             return True
+        if installed is None:
+            self.logger.error(
+                f"Cannot add Rust target {rust_target}: installed targets are unknown"
+            )
+            return False
 
         self.logger.info(f"Adding Rust target: {rust_target}")
 
         try:
             result = subprocess.run(
-                [self._rustup_command(), "target", "add", rust_target],
+                [
+                    self._rustup_command(),
+                    "target",
+                    "add",
+                    rust_target,
+                    "--toolchain",
+                    self.config.rust_version,
+                ],
                 capture_output=True,
                 text=True,
                 env=self.env,
@@ -168,12 +218,12 @@ class TargetManager:
                 self.logger.error(f"Failed to add target: {result.stderr}")
                 return False
 
-        except FileNotFoundError:
-            self.logger.error("rustup not found. Please run --setup first.")
+        except OSError as error:
+            self.logger.error(f"Failed to add Rust target {rust_target}: {error}")
             return False
 
-    def get_installed_toolchains(self) -> Set[str]:
-        """Get installed rustup toolchains."""
+    def get_installed_toolchains(self) -> Optional[Set[str]]:
+        """Return installed toolchains, or ``None`` when rustup cannot answer."""
         if self._installed_toolchains is not None:
             return self._installed_toolchains
 
@@ -191,31 +241,37 @@ class TargetManager:
                     if line.strip()
                 }
             else:
-                self._installed_toolchains = set()
-        except FileNotFoundError:
-            self.logger.error("rustup not found. Please run --setup first.")
-            self._installed_toolchains = set()
+                self.logger.error(
+                    f"Failed to inspect installed Rust toolchains: {result.stderr}"
+                )
+                return None
+        except OSError as error:
+            self.logger.error(f"Failed to inspect installed Rust toolchains: {error}")
+            return None
 
         return self._installed_toolchains
 
-    def is_toolchain_installed(self, toolchain: str) -> bool:
-        """Check if a rustup toolchain is installed."""
-        return toolchain in self.get_installed_toolchains()
+    def is_toolchain_installed(self, toolchain: str) -> Optional[bool]:
+        """Return installed/missing, or ``None`` when inspection failed."""
+        installed = self.get_installed_toolchains()
+        if installed is None:
+            return None
+        return toolchain in installed
 
     def add_toolchain(self, toolchain: str) -> bool:
         """Install a rustup toolchain."""
-        if self.is_toolchain_installed(toolchain):
+        installed = self.is_toolchain_installed(toolchain)
+        if installed is True:
             self.logger.debug(f"Toolchain {toolchain} is already installed")
             return True
+        if installed is None:
+            self.logger.error(
+                f"Cannot install Rust toolchain {toolchain}: installed toolchains are unknown"
+            )
+            return False
 
         self.logger.info(f"Installing Rust toolchain: {toolchain}")
         cmd = [self._rustup_command(), "toolchain", "install", toolchain]
-        if (
-            self.config.host_os == "windows" and
-            toolchain.endswith("pc-windows-gnullvm") and
-            self.config.host_arch not in toolchain
-        ):
-            cmd.append("--force-non-host")
         try:
             result = subprocess.run(
                 cmd,
@@ -229,15 +285,38 @@ class TargetManager:
                 return True
             self.logger.error(f"Failed to install toolchain: {result.stderr}")
             return False
-        except FileNotFoundError:
-            self.logger.error("rustup not found. Please run --setup first.")
+        except OSError as error:
+            self.logger.error(f"Failed to install Rust toolchain {toolchain}: {error}")
             return False
 
     def _msvc_linker_available(self) -> bool:
-        """Check whether the MSVC linker is available in the current shell."""
-        return shutil.which("link.exe") is not None or shutil.which("link") is not None
+        """Check whether the linker on PATH is Microsoft's linker.
 
-    def _default_windows_spec(self, spec: str) -> str:
+        Git/MSYS environments can put the unrelated GNU ``link`` utility on
+        PATH.  Treating that program as MSVC makes generic Windows targets
+        select a toolchain which is guaranteed to fail at link time.
+        """
+        linker = shutil.which("link.exe")
+        if not linker:
+            return False
+
+        try:
+            result = subprocess.run(
+                [linker, "/?"],
+                capture_output=True,
+                text=True,
+            )
+        except (FileNotFoundError, OSError):
+            return False
+
+        banner = f"{result.stdout}\n{result.stderr}".lower()
+        return "microsoft" in banner and "linker" in banner
+
+    def _default_windows_spec(
+        self,
+        spec: str,
+        allow_system_probe: bool = True,
+    ) -> str:
         """
         Resolve generic Windows aliases to the best local toolchain.
 
@@ -247,18 +326,48 @@ class TargetManager:
         """
         if self.config.host_os != "windows":
             return spec
+        if spec not in ("windows-arm64", "windows-x86_64"):
+            return spec
+        # Non-interactive builds choose the deterministic native MSVC triple.
+        # Local debug builds retain the convenience GNU/LLVM fallback.
+        if not allow_system_probe:
+            return spec
         if self._msvc_linker_available():
             return spec
-        if spec in ("windows-arm64", "windows-x86_64"):
-            return f"{spec}-gnullvm"
-        return spec
+        return f"{spec}-gnullvm"
 
-    def _windows_group_specs(self) -> List[str]:
-        """Return the two Windows targets implied by the 'windows' group."""
-        specs = ["windows-x86_64", "windows-arm64"]
-        return [self._default_windows_spec(spec) for spec in specs]
+    def _target_from_friendly_spec(
+        self,
+        spec: str,
+        allow_system_probe: bool = True,
+    ) -> Target:
+        """Resolve a friendly target while preserving its release filename.
 
-    def resolve_targets(self, target_specs: List[str]) -> List[Target]:
+        A generic Windows alias may select GNU/LLVM internally on Windows,
+        but it still has to produce the canonical artifact name consumed by
+        ``manage.ps1``.  Explicit ``-msvc`` and ``-gnullvm`` aliases retain a
+        suffix so callers can request both variants without a name collision.
+        """
+        resolved_spec = self._default_windows_spec(spec, allow_system_probe)
+        target = Target.from_rust_target(RUST_TARGETS[resolved_spec], self.config)
+        if spec.endswith("-msvc"):
+            target.friendly_name = f"{TARGET_NAMES[RUST_TARGETS[spec]]}-msvc"
+        elif resolved_spec != spec:
+            target.friendly_name = TARGET_NAMES[RUST_TARGETS[spec]]
+        return target
+
+    def _replace_resolved_name(self, resolved: List[Target], target: Target) -> None:
+        """Prefer a canonical alias name for an already-resolved triple."""
+        for existing in resolved:
+            if existing.rust_target == target.rust_target:
+                existing.friendly_name = target.friendly_name
+                return
+
+    def resolve_targets(
+        self,
+        target_specs: List[str],
+        allow_system_probe: bool = True,
+    ) -> List[Target]:
         """
         Resolve target specifications to Target objects.
 
@@ -277,10 +386,12 @@ class TargetManager:
 
             if spec == "native":
                 # Add native target
-                native_target = self._get_native_target()
+                native_target = self._get_native_target(allow_system_probe)
                 if native_target and native_target.rust_target not in seen:
                     resolved.append(native_target)
                     seen.add(native_target.rust_target)
+                elif native_target:
+                    self._replace_resolved_name(resolved, native_target)
 
             elif spec == "all":
                 # Add all targets (excluding Windows — use --windows explicitly)
@@ -308,21 +419,30 @@ class TargetManager:
 
             elif spec == "windows":
                 # Add both Windows targets
-                for name in self._windows_group_specs():
-                    rust_target = RUST_TARGETS[name]
+                for name in ("windows-x86_64", "windows-arm64"):
+                    target = self._target_from_friendly_spec(
+                        name,
+                        allow_system_probe,
+                    )
+                    rust_target = target.rust_target
                     if rust_target not in seen:
-                        target = Target.from_rust_target(rust_target, self.config)
                         resolved.append(target)
                         seen.add(rust_target)
+                    else:
+                        self._replace_resolved_name(resolved, target)
 
             elif spec in RUST_TARGETS:
                 # Direct friendly name (e.g., "macos-arm64")
-                spec = self._default_windows_spec(spec)
-                rust_target = RUST_TARGETS[spec]
+                target = self._target_from_friendly_spec(
+                    spec,
+                    allow_system_probe,
+                )
+                rust_target = target.rust_target
                 if rust_target not in seen:
-                    target = Target.from_rust_target(rust_target, self.config)
                     resolved.append(target)
                     seen.add(rust_target)
+                elif spec in ("windows-x86_64", "windows-arm64"):
+                    self._replace_resolved_name(resolved, target)
 
             elif spec in RUST_TARGETS.values():
                 # Direct Rust target (e.g., "aarch64-apple-darwin")
@@ -336,7 +456,10 @@ class TargetManager:
 
         return resolved
 
-    def _get_native_target(self) -> Optional[Target]:
+    def _get_native_target(
+        self,
+        allow_system_probe: bool = True,
+    ) -> Optional[Target]:
         """Get the native target for the current platform."""
         host_os = self.config.host_os
         host_arch = self.config.host_arch
@@ -351,18 +474,18 @@ class TargetManager:
         # Try direct match first
         native_key = f"{host_os}-{host_arch}"
         if native_key in RUST_TARGETS:
-            native_key = self._default_windows_spec(native_key)
-            return Target.from_rust_target(
-                RUST_TARGETS[native_key], self.config
+            return self._target_from_friendly_spec(
+                native_key,
+                allow_system_probe,
             )
 
         # Try with arch aliases
         for arch_name in arch_aliases.get(host_arch, [host_arch]):
             alias_key = f"{host_os}-{arch_name}"
             if alias_key in RUST_TARGETS:
-                alias_key = self._default_windows_spec(alias_key)
-                return Target.from_rust_target(
-                    RUST_TARGETS[alias_key], self.config
+                return self._target_from_friendly_spec(
+                    alias_key,
+                    allow_system_probe,
                 )
 
         # Try searching by components
@@ -370,21 +493,41 @@ class TargetManager:
             if host_os in name:
                 for arch_name in arch_aliases.get(host_arch, [host_arch]):
                     if arch_name in name:
-                        resolved_name = self._default_windows_spec(name)
-                        return Target.from_rust_target(
-                            RUST_TARGETS[resolved_name], self.config
+                        return self._target_from_friendly_spec(
+                            name,
+                            allow_system_probe,
                         )
 
         return None
 
-    def ensure_targets(self, targets: List[Target]) -> bool:
-        """Ensure all specified targets are installed."""
+    def ensure_targets(
+        self,
+        targets: List[Target],
+        install_missing: bool = True,
+    ) -> bool:
+        """Ensure all specified targets are installed.
+
+        ``install_missing=False`` is used by ``--no-auto-setup`` and performs
+        a read-only availability check instead of silently invoking rustup.
+        """
         success = True
 
         for target in targets:
-            if target.needs_gnullvm and self.config.host_os == "windows":
-                if not self.add_toolchain(f"stable-{target.rust_target}"):
-                    success = False
+            installed = self.is_target_installed(target.rust_target)
+            if installed is True:
+                continue
+            if installed is None:
+                self.logger.error(
+                    f"Cannot prepare Rust target {target.rust_target}: "
+                    "installed targets are unknown"
+                )
+                success = False
+            elif not install_missing:
+                self.logger.error(
+                    f"Rust target {target.rust_target} is not installed. "
+                    "Run with --setup-rust first."
+                )
+                success = False
             elif not self.add_target(target.rust_target):
                 success = False
 

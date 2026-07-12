@@ -54,8 +54,8 @@ New-Item -ItemType Directory -Path $cokacdirDir -Force | Out-Null
 
 $url = "$base/$app-windows-$arch.exe"
 $cokacdirUrl = "$cokacdirBase/$cokacdirApp-windows-$arch.exe"
-$tmp = Join-Path ([IO.Path]::GetTempPath()) "$app-$PID.exe"
-$cokacdirTmp = Join-Path ([IO.Path]::GetTempPath()) "$cokacdirApp-$PID.exe"
+$tmp = Join-Path ([IO.Path]::GetTempPath()) "$app-$PID-$([IO.Path]::GetRandomFileName()).exe"
+$cokacdirTmp = Join-Path ([IO.Path]::GetTempPath()) "$cokacdirApp-$PID-$([IO.Path]::GetRandomFileName()).exe"
 $dest = Join-Path $dir "$app.exe"
 $cokacdirDest = Join-Path $cokacdirDir "$cokacdirApp.exe"
 
@@ -73,6 +73,39 @@ function Download-Binary {
     }
 }
 
+function Install-BinaryAtomically {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $targetDir = Split-Path -Parent $Destination
+    $targetName = Split-Path -Leaf $Destination
+    $staged = Join-Path $targetDir ".$targetName-$PID-$([IO.Path]::GetRandomFileName()).tmp"
+    try {
+        Copy-Item -LiteralPath $Source -Destination $staged
+        Move-Item -LiteralPath $staged -Destination $Destination -Force
+    } finally {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Assert-BinaryVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $versionOutput = (& $Path --version 2>&1 | Out-String).Trim()
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$Name file did not run"
+    }
+    if ($versionOutput -notmatch "^$([Regex]::Escape($Name))(?:\s|$)") {
+        throw "$Name file returned an unexpected version: $versionOutput"
+    }
+}
+
 try {
     try {
         [Net.ServicePointManager]::SecurityProtocol =
@@ -82,20 +115,14 @@ try {
     Download-Binary -Name "$app (windows-$arch)" -Uri $url -OutFile $tmp
     Download-Binary -Name "$cokacdirApp (windows-$arch)" -Uri $cokacdirUrl -OutFile $cokacdirTmp
 
-    & $tmp --version *> $null
-    if ($LASTEXITCODE -ne 0) { throw "Downloaded file did not run" }
+    Assert-BinaryVersion -Name $app -Path $tmp
+    Assert-BinaryVersion -Name $cokacdirApp -Path $cokacdirTmp
 
-    Move-Item -LiteralPath $tmp -Destination $dest -Force
-    Move-Item -LiteralPath $cokacdirTmp -Destination $cokacdirDest -Force
+    Install-BinaryAtomically -Source $cokacdirTmp -Destination $cokacdirDest
+    Install-BinaryAtomically -Source $tmp -Destination $dest
 
-    & $dest --version *> $null
-    if ($LASTEXITCODE -ne 0) { throw "Installed file did not run" }
-    if (-not (Test-Path -LiteralPath $cokacdirDest -PathType Leaf)) {
-        throw "Installed cokacdir file was not found"
-    }
-    if ((Get-Item -LiteralPath $cokacdirDest).Length -le 0) {
-        throw "Installed cokacdir file is empty"
-    }
+    Assert-BinaryVersion -Name $app -Path $dest
+    Assert-BinaryVersion -Name $cokacdirApp -Path $cokacdirDest
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if (($userPath -split ";") -notcontains $dir) {

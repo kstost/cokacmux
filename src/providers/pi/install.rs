@@ -29,6 +29,12 @@ pub fn install_to_user_dir(
             "overwrite": opts.overwrite,
         }),
     );
+    if !super::session_id_is_safe_path_component(&session.session_id) {
+        return Err(ConvertError::Other(format!(
+            "pi session id is not a safe filename component: {}",
+            session.session_id
+        )));
+    }
     let dir = target_session_dir(session, opts)?;
     std::fs::create_dir_all(&dir)?;
     let existing = super::find_session_file_by_id(&dir, &session.session_id);

@@ -12,6 +12,23 @@ use crate::universal::{ContentBlock, ImageSource, Role, UMessage, UniversalSessi
 use super::CodexWriteOpts;
 
 pub fn to_jsonl_path(session: &UniversalSession, path: &Path, opts: &CodexWriteOpts) -> Result<()> {
+    to_jsonl_path_with_mode(session, path, opts, false)
+}
+
+pub(crate) fn to_install_jsonl_path(
+    session: &UniversalSession,
+    path: &Path,
+    opts: &CodexWriteOpts,
+) -> Result<()> {
+    to_jsonl_path_with_mode(session, path, opts, true)
+}
+
+fn to_jsonl_path_with_mode(
+    session: &UniversalSession,
+    path: &Path,
+    opts: &CodexWriteOpts,
+    install_mode: bool,
+) -> Result<()> {
     debug::log(
         "provider_codex_write_file_start",
         serde_json::json!({
@@ -21,7 +38,12 @@ pub fn to_jsonl_path(session: &UniversalSession, path: &Path, opts: &CodexWriteO
             "replay_raw": opts.replay_raw,
         }),
     );
-    let s = to_jsonl_string(session, opts)?;
+    let serialized = to_jsonl_string(session, opts)?;
+    let s = if install_mode {
+        patch_install_identity(&serialized, session)?
+    } else {
+        serialized
+    };
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -38,6 +60,43 @@ pub fn to_jsonl_path(session: &UniversalSession, path: &Path, opts: &CodexWriteO
         }),
     );
     Ok(())
+}
+
+fn patch_install_identity(jsonl: &str, session: &UniversalSession) -> Result<String> {
+    let mut out = String::new();
+    for line in jsonl.lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let mut value: Value = serde_json::from_str(line)?;
+        let line_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+            match line_type.as_str() {
+                "session_meta" => {
+                    payload.insert("id".into(), Value::String(session.session_id.clone()));
+                    if payload.contains_key("session_id") {
+                        payload.insert(
+                            "session_id".into(),
+                            Value::String(session.session_id.clone()),
+                        );
+                    }
+                    payload.insert("cwd".into(), Value::String(session.cwd.clone()));
+                }
+                "turn_context" => {
+                    payload.insert("cwd".into(), Value::String(session.cwd.clone()));
+                }
+                _ => {}
+            }
+        }
+        out.push_str(&serde_json::to_string(&value)?);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 pub fn to_jsonl_string(session: &UniversalSession, opts: &CodexWriteOpts) -> Result<String> {
@@ -272,7 +331,9 @@ fn synth_token_count(ts: &str, session: &UniversalSession) -> Value {
     let reasoning = usage.and_then(|u| u.reasoning_output_tokens).unwrap_or(0);
     let total = usage
         .and_then(|u| u.total_tokens)
-        .unwrap_or(input + output + reasoning);
+        // Codex reports reasoning tokens as a subset of output_tokens. Adding
+        // them again inflates total_tokens (native rollouts use input+output).
+        .unwrap_or_else(|| input.saturating_add(output));
     let token_usage = json!({
         "input_tokens": input,
         "cached_input_tokens": cached,
@@ -330,12 +391,6 @@ fn synthesize_lines(session: &UniversalSession, m: &UMessage) -> Vec<Value> {
     //   event_msg payload types.
 
     if matches!(m.role, Role::User | Role::Assistant | Role::Developer) {
-        let role_str = match m.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::Developer => "developer",
-            _ => "user",
-        };
         let block_type = if matches!(m.role, Role::Assistant) {
             "output_text"
         } else {
@@ -359,7 +414,6 @@ fn synthesize_lines(session: &UniversalSession, m: &UMessage) -> Vec<Value> {
                         &mut lines,
                         &ts,
                         m.role,
-                        role_str,
                         &mut content,
                         &mut text_parts,
                         &mut images,
@@ -390,7 +444,6 @@ fn synthesize_lines(session: &UniversalSession, m: &UMessage) -> Vec<Value> {
                         &mut lines,
                         &ts,
                         m.role,
-                        role_str,
                         &mut content,
                         &mut text_parts,
                         &mut images,
@@ -414,7 +467,6 @@ fn synthesize_lines(session: &UniversalSession, m: &UMessage) -> Vec<Value> {
                         &mut lines,
                         &ts,
                         m.role,
-                        role_str,
                         &mut content,
                         &mut text_parts,
                         &mut images,
@@ -454,7 +506,6 @@ fn synthesize_lines(session: &UniversalSession, m: &UMessage) -> Vec<Value> {
                             &mut lines,
                             &ts,
                             m.role,
-                            role_str,
                             &mut content,
                             &mut text_parts,
                             &mut images,
@@ -474,7 +525,6 @@ fn synthesize_lines(session: &UniversalSession, m: &UMessage) -> Vec<Value> {
             &mut lines,
             &ts,
             m.role,
-            role_str,
             &mut content,
             &mut text_parts,
             &mut images,
@@ -803,12 +853,18 @@ fn push_codex_text_lines(
     lines: &mut Vec<Value>,
     ts: &str,
     role: Role,
-    role_str: &str,
     content: &mut Vec<Value>,
     text_parts: &mut Vec<String>,
     images: &mut Vec<String>,
     local_images: &mut Vec<String>,
 ) {
+    let role_str = match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Developer => "developer",
+        _ => "user",
+    };
+
     if content.is_empty() && images.is_empty() && local_images.is_empty() {
         text_parts.clear();
         return;
@@ -886,4 +942,29 @@ fn synthesized_timestamp(session: &UniversalSession, m: &UMessage) -> String {
         .or(session.created_at)
         .map(to_rfc3339_ms)
         .unwrap_or_else(|| to_rfc3339_ms(chrono::Utc::now()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::universal::{Provider, Usage};
+
+    #[test]
+    fn synthesized_token_total_does_not_double_count_reasoning() {
+        let mut session = UniversalSession::new("s1", Provider::Codex, "/tmp");
+        session.usage_total = Some(Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(25),
+            reasoning_output_tokens: Some(10),
+            total_tokens: None,
+            ..Default::default()
+        });
+
+        let value = synth_token_count("2026-05-20T01:00:00.000Z", &session);
+
+        assert_eq!(
+            value["payload"]["info"]["total_token_usage"]["total_tokens"],
+            125
+        );
+    }
 }

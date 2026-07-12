@@ -19,6 +19,15 @@ pub fn open_readwrite(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open an existing database for mutation without ever creating a new file.
+/// Destructive/read-modify-write operations such as native row cloning must
+/// use this instead of `open_readwrite` so a bad source path has no side
+/// effects.
+pub fn open_existing_readwrite(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    Ok(conn)
+}
+
 pub fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_sql_ident(table)))?;
     let mut rows = stmt.query([])?;
@@ -29,6 +38,15 @@ pub fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<
         }
     }
     Ok(false)
+}
+
+pub fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        rusqlite::params![table],
+        |row| row.get(0),
+    )?;
+    Ok(exists > 0)
 }
 
 fn quote_sql_ident(ident: &str) -> String {

@@ -24,6 +24,25 @@ pub fn to_jsonl_path(
     path: &Path,
     opts: &ClaudeWriteOpts,
 ) -> Result<()> {
+    to_jsonl_path_with_mode(session, path, opts, false)
+}
+
+/// Install writing keeps native raw records, but makes their identity and
+/// hydrated tool results self-contained for the target location.
+pub(crate) fn to_install_jsonl_path(
+    session: &UniversalSession,
+    path: &Path,
+    opts: &ClaudeWriteOpts,
+) -> Result<()> {
+    to_jsonl_path_with_mode(session, path, opts, true)
+}
+
+fn to_jsonl_path_with_mode(
+    session: &UniversalSession,
+    path: &Path,
+    opts: &ClaudeWriteOpts,
+    install_mode: bool,
+) -> Result<()> {
     debug::log(
         "provider_claude_write_file_start",
         serde_json::json!({
@@ -33,7 +52,11 @@ pub fn to_jsonl_path(
             "sidecar_threshold_bytes": opts.sidecar_threshold_bytes,
         }),
     );
-    let s = to_jsonl_file_string(session, path, opts)?;
+    let s = if install_mode && should_replay_claude_raw(session) {
+        replay_claude_raw_for_install(session)?
+    } else {
+        to_jsonl_file_string(session, path, opts)?
+    };
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -119,6 +142,65 @@ fn replay_claude_raw(session: &UniversalSession) -> Result<String> {
         out.push('\n');
     }
     Ok(out)
+}
+
+fn replay_claude_raw_for_install(session: &UniversalSession) -> Result<String> {
+    let mut out = String::new();
+    for message in &session.messages {
+        let mut raw = message.provenance.raw.clone();
+        patch_install_raw_line(&mut raw, session, message);
+        out.push_str(&serde_json::to_string(&raw)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn patch_install_raw_line(value: &mut Value, session: &UniversalSession, message: &UMessage) {
+    let Some(top) = value.as_object_mut() else {
+        return;
+    };
+    let is_conversation = matches!(
+        top.get("type").and_then(Value::as_str),
+        Some("user" | "assistant" | "message")
+    );
+    if is_conversation || top.contains_key("sessionId") {
+        top.insert(
+            "sessionId".into(),
+            Value::String(session.session_id.clone()),
+        );
+    }
+    if is_conversation || top.contains_key("cwd") {
+        top.insert("cwd".into(), Value::String(session.cwd.clone()));
+    }
+
+    let Some(content) = top
+        .get_mut("message")
+        .and_then(Value::as_object_mut)
+        .and_then(|inner| inner.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for raw_block in content {
+        if raw_block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let call_id = raw_block
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Some(output) = message.content.iter().find_map(|block| match block {
+            ContentBlock::ToolResult {
+                call_id: semantic_id,
+                output,
+                ..
+            } if semantic_id == call_id => Some(output),
+            _ => None,
+        }) else {
+            continue;
+        };
+        raw_block["content"] = output.clone();
+    }
 }
 
 fn synthesize_session(session: &UniversalSession) -> Result<String> {
@@ -582,12 +664,12 @@ fn synthetic_claude_request_id() -> String {
 
 fn user_content_value(blocks: &[ContentBlock]) -> Option<Value> {
     let values = content_blocks_to_claude(blocks, Role::User);
-    if values.len() == 1 {
-        if values[0].get("type").and_then(|v| v.as_str()) == Some("text") {
-            if let Some(text) = values[0].get("text").and_then(|v| v.as_str()) {
-                return Some(Value::String(text.to_string()));
-            }
-        }
+    let single_text = (values.len() == 1)
+        .then(|| &values[0])
+        .filter(|value| value.get("type").and_then(|v| v.as_str()) == Some("text"))
+        .and_then(|value| value.get("text").and_then(|v| v.as_str()));
+    if let Some(text) = single_text {
+        return Some(Value::String(text.to_string()));
     }
     if values.is_empty() {
         None

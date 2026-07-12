@@ -1,0 +1,424 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+  RUST_MSRV_VERSION: 1.93.0
+  NODE_VERSION: 24.18.0
+  NPM_VERSION: 11.17.0
+  PYTHON_VERSION: 3.14.4
+
+jobs:
+  fast:
+    name: Fast checks (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Set up Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+          rustc --version --verbose
+          cargo --version
+          rustfmt --version
+          cargo clippy --version
+          test "$(rustc --version | awk '{print $2}')" = "$RUST_TOOLCHAIN_VERSION"
+          test "$(sed -n 's/^channel = \"\(.*\)\"/\1/p' rust-toolchain.toml)" = "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Prepare isolated test storage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+          npm_cache="$(npm config get cache)"
+          root="$RUNNER_TEMP/cokacmux-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RUNNER_OS-$RUNNER_ARCH-$GITHUB_JOB"
+          home="$root/home"
+          config="$root/config"
+          tmp="$root/tmp"
+          target="$root/target"
+          xdg_data="$root/xdg/data"
+          xdg_config="$root/xdg/config"
+          xdg_cache="$root/xdg/cache"
+          xdg_state="$root/xdg/state"
+          local_app_data="$root/localappdata"
+          app_data="$root/appdata"
+
+          mkdir -p \
+            "$home" "$config" "$tmp" "$target" \
+            "$xdg_data" "$xdg_config" "$xdg_cache" "$xdg_state" \
+            "$local_app_data" "$app_data"
+          chmod -R 700 "$root"
+
+          {
+            printf '%s\n' \
+              "CARGO_HOME=$cargo_home" \
+              "RUSTUP_HOME=$rustup_home" \
+              "RUSTUP_AUTO_INSTALL=0" \
+              "NPM_CONFIG_CACHE=$npm_cache"
+            printf '%s\n' \
+              "CARGO_TARGET_DIR=$target" \
+              "COKACMUX_TEST_ROOT=$root" \
+              "COKACMUX_HOME=$home" \
+              "COKACMUX_CONFIG_DIR=$config"
+            printf '%s\n' \
+              "HOME=$home" "USERPROFILE=$home" \
+              "TMPDIR=$tmp" "TMP=$tmp" "TEMP=$tmp"
+            printf '%s\n' \
+              "XDG_DATA_HOME=$xdg_data" \
+              "XDG_CONFIG_HOME=$xdg_config" \
+              "XDG_CACHE_HOME=$xdg_cache" \
+              "XDG_STATE_HOME=$xdg_state"
+            printf '%s\n' \
+              "LOCALAPPDATA=$local_app_data" \
+              "APPDATA=$app_data"
+            printf '%s\n' \
+              'COKACMUX_DEBUG=0' \
+              'COKACMUX_TRACE=0' \
+              'PI_CODING_AGENT_DIR=' \
+              'PI_CODING_AGENT_SESSION_DIR=' \
+              'GJC_CODING_AGENT_DIR='
+          } >> "$GITHUB_ENV"
+
+      - name: Check Bash syntax
+        shell: bash
+        run: bash -n manage.sh install_windows_build_deps.sh tools/normalize_eol.sh
+
+      - name: Check PowerShell syntax
+        shell: pwsh
+        run: ./.github/scripts/check-powershell.ps1
+
+      - name: Test Python builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(tr -d '\r\n' < .python-version)" = "$PYTHON_VERSION"
+          test "$(python -c 'import platform; print(platform.python_version())')" = "$PYTHON_VERSION"
+          python -m unittest discover -s builder/tests -p 'test_*.py' -v
+
+      - name: Install website dependencies
+        working-directory: website
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(tr -d '\r\n' < ../.node-version)" = "$NODE_VERSION"
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+          npm ci
+
+      - name: Test website
+        working-directory: website
+        run: npm test
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all Rust targets and features
+        run: cargo check --locked --all-targets --all-features
+
+      - name: Check minimal provider feature set
+        run: cargo check --locked --no-default-features --features claude,codex
+
+      - name: Test Rust
+        run: cargo test --locked --all-features
+
+      - name: Lint Rust
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Verify published website assets
+        working-directory: website
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build
+          cd ..
+          git diff --exit-code -- index.html assets
+          test -z "$(git status --porcelain=v1 --untracked-files=all -- index.html assets)"
+
+  msrv:
+    name: Rust MSRV (1.93.0)
+    needs: fast
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust MSRV
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_MSRV_VERSION" --profile minimal
+          rustc +"$RUST_MSRV_VERSION" --version --verbose
+          cargo +"$RUST_MSRV_VERSION" --version
+          test "$(rustc +"$RUST_MSRV_VERSION" --version | awk '{print $2}')" = "$RUST_MSRV_VERSION"
+          cargo_msrv="$(sed -n 's/^rust-version = \"\(.*\)\"/\1/p' Cargo.toml)"
+          case "$RUST_MSRV_VERSION" in
+            "$cargo_msrv"|"$cargo_msrv".*) ;;
+            *) exit 1 ;;
+          esac
+
+      - name: Prepare isolated test storage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+          root="$RUNNER_TEMP/cokacmux-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RUNNER_OS-$RUNNER_ARCH-$GITHUB_JOB"
+          home="$root/home"
+          config="$root/config"
+          tmp="$root/tmp"
+          target="$root/target"
+          xdg_data="$root/xdg/data"
+          xdg_config="$root/xdg/config"
+          xdg_cache="$root/xdg/cache"
+          xdg_state="$root/xdg/state"
+          local_app_data="$root/localappdata"
+          app_data="$root/appdata"
+
+          mkdir -p \
+            "$home" "$config" "$tmp" "$target" \
+            "$xdg_data" "$xdg_config" "$xdg_cache" "$xdg_state" \
+            "$local_app_data" "$app_data"
+          chmod -R 700 "$root"
+
+          {
+            printf '%s\n' \
+              "CARGO_HOME=$cargo_home" \
+              "RUSTUP_HOME=$rustup_home" \
+              "RUSTUP_AUTO_INSTALL=0"
+            printf '%s\n' \
+              "CARGO_TARGET_DIR=$target" \
+              "COKACMUX_TEST_ROOT=$root" \
+              "COKACMUX_HOME=$home" \
+              "COKACMUX_CONFIG_DIR=$config"
+            printf '%s\n' \
+              "HOME=$home" "USERPROFILE=$home" \
+              "TMPDIR=$tmp" "TMP=$tmp" "TEMP=$tmp"
+            printf '%s\n' \
+              "XDG_DATA_HOME=$xdg_data" \
+              "XDG_CONFIG_HOME=$xdg_config" \
+              "XDG_CACHE_HOME=$xdg_cache" \
+              "XDG_STATE_HOME=$xdg_state"
+            printf '%s\n' \
+              "LOCALAPPDATA=$local_app_data" \
+              "APPDATA=$app_data"
+            printf '%s\n' \
+              'COKACMUX_DEBUG=0' \
+              'COKACMUX_TRACE=0' \
+              'PI_CODING_AGENT_DIR=' \
+              'PI_CODING_AGENT_SESSION_DIR=' \
+              'GJC_CODING_AGENT_DIR='
+          } >> "$GITHUB_ENV"
+
+      - name: Check Rust MSRV
+        run: cargo +"$RUST_MSRV_VERSION" check --locked --all-targets --all-features
+
+      - name: Check minimal provider feature set at MSRV
+        run: cargo +"$RUST_MSRV_VERSION" check --locked --no-default-features --features claude,codex
+
+      - name: Test Rust at MSRV
+        run: cargo +"$RUST_MSRV_VERSION" test --locked --all-features
+
+  native:
+    name: Native Rust (${{ matrix.os }})
+    needs: fast
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+          - windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+          rustc --version --verbose
+          cargo --version
+          test "$(rustc --version | awk '{print $2}')" = "$RUST_TOOLCHAIN_VERSION"
+          test "$(sed -n 's/^channel = \"\(.*\)\"/\1/p' rust-toolchain.toml)" = "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Prepare isolated test storage (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+          root="$RUNNER_TEMP/cokacmux-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RUNNER_OS-$RUNNER_ARCH-$GITHUB_JOB"
+          home="$root/home"
+          config="$root/config"
+          tmp="$root/tmp"
+          target="$root/target"
+          xdg_data="$root/xdg/data"
+          xdg_config="$root/xdg/config"
+          xdg_cache="$root/xdg/cache"
+          xdg_state="$root/xdg/state"
+          local_app_data="$root/localappdata"
+          app_data="$root/appdata"
+
+          mkdir -p \
+            "$home" "$config" "$tmp" "$target" \
+            "$xdg_data" "$xdg_config" "$xdg_cache" "$xdg_state" \
+            "$local_app_data" "$app_data"
+          chmod -R 700 "$root"
+
+          {
+            printf '%s\n' \
+              "CARGO_HOME=$cargo_home" \
+              "RUSTUP_HOME=$rustup_home" \
+              "RUSTUP_AUTO_INSTALL=0"
+            printf '%s\n' \
+              "CARGO_TARGET_DIR=$target" \
+              "COKACMUX_TEST_ROOT=$root" \
+              "COKACMUX_HOME=$home" \
+              "COKACMUX_CONFIG_DIR=$config"
+            printf '%s\n' \
+              "HOME=$home" "USERPROFILE=$home" \
+              "TMPDIR=$tmp" "TMP=$tmp" "TEMP=$tmp"
+            printf '%s\n' \
+              "XDG_DATA_HOME=$xdg_data" \
+              "XDG_CONFIG_HOME=$xdg_config" \
+              "XDG_CACHE_HOME=$xdg_cache" \
+              "XDG_STATE_HOME=$xdg_state"
+            printf '%s\n' \
+              "LOCALAPPDATA=$local_app_data" \
+              "APPDATA=$app_data"
+            printf '%s\n' \
+              'COKACMUX_DEBUG=0' \
+              'COKACMUX_TRACE=0' \
+              'PI_CODING_AGENT_DIR=' \
+              'PI_CODING_AGENT_SESSION_DIR=' \
+              'GJC_CODING_AGENT_DIR='
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare isolated test storage (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $cargoHome = if ($env:CARGO_HOME) {
+            $env:CARGO_HOME
+          } else {
+            Join-Path $env:USERPROFILE '.cargo'
+          }
+          $rustupHome = if ($env:RUSTUP_HOME) {
+            $env:RUSTUP_HOME
+          } else {
+            Join-Path $env:USERPROFILE '.rustup'
+          }
+
+          $root = Join-Path $env:RUNNER_TEMP "cokacmux-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:RUNNER_OS-$env:RUNNER_ARCH-$env:GITHUB_JOB"
+          $home = Join-Path $root 'home'
+          $config = Join-Path $root 'config'
+          $tmp = Join-Path $root 'tmp'
+          $target = Join-Path $root 'target'
+          $xdgData = Join-Path $root 'xdg\data'
+          $xdgConfig = Join-Path $root 'xdg\config'
+          $xdgCache = Join-Path $root 'xdg\cache'
+          $xdgState = Join-Path $root 'xdg\state'
+          $localAppData = Join-Path $root 'localappdata'
+          $appData = Join-Path $root 'appdata'
+
+          New-Item -ItemType Directory -Force -Path @(
+            $home, $config, $tmp, $target,
+            $xdgData, $xdgConfig, $xdgCache, $xdgState,
+            $localAppData, $appData
+          ) | Out-Null
+
+          @(
+            "CARGO_HOME=$cargoHome",
+            "RUSTUP_HOME=$rustupHome",
+            'RUSTUP_AUTO_INSTALL=0',
+            "CARGO_TARGET_DIR=$target",
+            "COKACMUX_TEST_ROOT=$root",
+            "COKACMUX_HOME=$home",
+            "COKACMUX_CONFIG_DIR=$config",
+            "HOME=$home",
+            "USERPROFILE=$home",
+            "TMPDIR=$tmp",
+            "TMP=$tmp",
+            "TEMP=$tmp",
+            "XDG_DATA_HOME=$xdgData",
+            "XDG_CONFIG_HOME=$xdgConfig",
+            "XDG_CACHE_HOME=$xdgCache",
+            "XDG_STATE_HOME=$xdgState",
+            "LOCALAPPDATA=$localAppData",
+            "APPDATA=$appData",
+            'COKACMUX_DEBUG=0',
+            'COKACMUX_TRACE=0',
+            'PI_CODING_AGENT_DIR=',
+            'PI_CODING_AGENT_SESSION_DIR=',
+            'GJC_CODING_AGENT_DIR='
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Check PowerShell syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/check-powershell.ps1
+
+      - name: Check Rust
+        run: cargo check --locked --all-targets --all-features
+
+      - name: Test Rust
+        run: cargo test --locked --all-features

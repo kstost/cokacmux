@@ -153,6 +153,8 @@ G
 
 세션 목록/미리보기 화면에서 쓰는 액션입니다. `Esc`는 `sessions.toggle_focus` 기본값이 아닙니다. normal 세션 화면에서는 적용된 검색 결과를 먼저 해제하고, 검색 결과가 없으면 종료합니다.
 
+Codex가 만든 non-root 세션은 기본 `top-level` 범위에서 숨겨집니다. 앱을 시작할 때마다 이 범위로 초기화되며, `sessions.toggle_subagents`의 변경은 현재 실행에만 적용됩니다. 전체 목록에서는 spawned subagent가 `SUB`, review가 `REV`, compact·memory 등 기타 보조 작업이 `AUX`, Codex 내부 작업이 `INT`로 표시됩니다. 표식 공간이 5칸 이상이면 `[SUB]`처럼, 3–4칸이면 `SUB`처럼, 1–2칸이면 `S`, `R`, `A`, `I`로 줄어듭니다. 현재 범위는 일반 검색과 AI 검색에도 적용되며 범위를 바꾸면 기존 검색 결과가 해제됩니다. 판별할 수 없는 세션은 목록에 남고 숨긴 세션 데이터는 삭제되지 않습니다.
+
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
 | `sessions.quit` | `q` | 종료 |
@@ -171,6 +173,7 @@ G
 | `sessions.filter` | `ctrl+f` | 검색 방식 선택창 열기 |
 | `sessions.ai_search` | 없음 | AI 검색 프롬프트 직접 열기. 기본값에서는 검색 선택창을 사용 |
 | `sessions.toggle_view` | `v` | tree/list 보기 전환 |
+| `sessions.toggle_subagents` | `u` | 현재 실행에서 top-level 범위와 spawned/review/auxiliary/internal 포함 전체 범위 전환; 기존 검색 결과 해제 |
 | `sessions.refresh` | `r` | 세션 다시 읽기 |
 | `sessions.delete` | `delete`, `d` | 선택 세션 삭제 확인 열기 |
 | `sessions.clone` | `c` | 선택 세션 복제 |

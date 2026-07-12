@@ -21,8 +21,8 @@ use crate::error::Result;
 use crate::ids;
 use crate::time;
 use crate::universal::{
-    ContentBlock, ImageSource, MessageFlags, ModelInfo, Provenance, Provider, Role, UMessage,
-    UniversalSession, Usage, SCHEMA_VERSION,
+    ContentBlock, GitInfo, ImageSource, MessageFlags, ModelInfo, Provenance, Provider, Role,
+    UMessage, UniversalSession, Usage, SCHEMA_VERSION,
 };
 
 use super::sidecar;
@@ -128,6 +128,28 @@ pub(crate) fn parse_lines_with_sidecar_root(
         if session.created_at.is_none() {
             session.created_at = ts;
         }
+        if let Some(timestamp) = ts {
+            session.updated_at = Some(
+                session
+                    .updated_at
+                    .map(|updated| updated.max(timestamp))
+                    .unwrap_or(timestamp),
+            );
+        }
+
+        if session.git.is_none() {
+            if let Some(branch) = val
+                .get("gitBranch")
+                .and_then(|v| v.as_str())
+                .filter(|branch| !branch.is_empty())
+            {
+                session.git = Some(GitInfo {
+                    branch: Some(branch.to_string()),
+                    commit: None,
+                    origin_url: None,
+                });
+            }
+        }
 
         // Sidechain marker — preserved, not dropped.
         let is_sidechain = val
@@ -150,16 +172,10 @@ pub(crate) fn parse_lines_with_sidecar_root(
         }
 
         // Compose the UMessage.
-        let umessage = build_umessage(
-            &val,
-            &line_type,
-            idx,
-            ts,
-            is_sidechain,
-            ctx,
-            sidecar_root,
-            lineno,
-        );
+        let umessage = build_umessage(&val, idx, ts, is_sidechain, ctx, sidecar_root, lineno);
+        if session.model.is_none() {
+            session.model = umessage.model.clone();
+        }
         if umessage.flags.is_meta {
             meta_messages = meta_messages.saturating_add(1);
         } else {
@@ -196,7 +212,6 @@ fn claude_title(val: &Value) -> Option<&str> {
 
 fn build_umessage(
     val: &Value,
-    line_type: &str,
     idx: u32,
     ts: Option<chrono::DateTime<chrono::Utc>>,
     is_sidechain: bool,
@@ -204,6 +219,8 @@ fn build_umessage(
     sidecar_root: Option<&Path>,
     lineno: usize,
 ) -> UMessage {
+    let line_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+
     // Derive a stable id. Claude JSONL lines have:
     //  - `uuid`        — unique per JSONL line
     //  - `message.id`  — Anthropic message id, may be shared across multiple
@@ -605,5 +622,34 @@ mod tests {
         let session = parse_lines(jsonl, &ClaudeReadCtx::default()).unwrap();
 
         assert_eq!(session.title.as_deref(), Some("Named Agent"));
+    }
+
+    #[test]
+    fn extracts_session_model_git_branch_and_latest_timestamp() {
+        let jsonl = r#"{"type":"user","sessionId":"s1","cwd":"/tmp","gitBranch":"feature/a","timestamp":"2026-05-20T01:00:02.000Z","uuid":"019e0000-0000-7000-8000-000000000001","message":{"role":"user","content":"hello"}}
+{"type":"assistant","sessionId":"s1","cwd":"/tmp","gitBranch":"feature/a","timestamp":"2026-05-20T01:00:05.000Z","uuid":"019e0000-0000-7000-8000-000000000002","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"hi"}]}}
+{"type":"system","sessionId":"s1","timestamp":"2026-05-20T01:00:03.000Z"}"#;
+
+        let session = parse_lines(jsonl, &ClaudeReadCtx::default()).unwrap();
+
+        assert_eq!(
+            session.model.as_ref().map(|model| model.model_id.as_str()),
+            Some("claude-opus-4-7")
+        );
+        assert_eq!(
+            session
+                .model
+                .as_ref()
+                .and_then(|model| model.provider_id.as_deref()),
+            Some("anthropic")
+        );
+        assert_eq!(
+            session.git.as_ref().and_then(|git| git.branch.as_deref()),
+            Some("feature/a")
+        );
+        assert_eq!(
+            session.updated_at.map(|timestamp| timestamp.to_rfc3339()),
+            Some("2026-05-20T01:00:05+00:00".to_string())
+        );
     }
 }

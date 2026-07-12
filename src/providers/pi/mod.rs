@@ -15,19 +15,10 @@ use serde_json::Value;
 use crate::error::Result;
 use crate::universal::UniversalSession;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PiReadCtx {
     pub session_id: Option<String>,
     pub cwd: Option<String>,
-}
-
-impl Default for PiReadCtx {
-    fn default() -> Self {
-        Self {
-            session_id: None,
-            cwd: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +109,19 @@ pub fn session_file_name(session_id: &str, created_at: Option<DateTime<Utc>>) ->
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let file_timestamp = timestamp.replace([':', '.'], "-");
     format!("{file_timestamp}_{session_id}.jsonl")
+}
+
+pub(crate) fn session_id_is_safe_path_component(session_id: &str) -> bool {
+    let mut chars = session_id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let last = session_id.chars().next_back().unwrap_or(first);
+    first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
+        && session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
 }
 
 pub fn find_session_file_by_id(root_or_project_dir: &Path, session_id: &str) -> Option<PathBuf> {

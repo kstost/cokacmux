@@ -394,6 +394,7 @@ mod tests {
             source: PathBuf::from("/tmp/source"),
             updated_at_epoch_s,
             title: None,
+            relation: None,
         }
     }
 

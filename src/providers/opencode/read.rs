@@ -176,7 +176,7 @@ pub fn from_db_connection(conn: &Connection, session_id: &str) -> Result<Univers
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let session_message_rows = if table_exists(conn, "session_message")? {
+    let session_message_rows = if db::table_exists(conn, "session_message")? {
         let has_seq = db::table_has_column(conn, "session_message", "seq")?;
         let sql = if has_seq {
             "SELECT id, session_id, type, time_created, time_updated, data, seq
@@ -241,15 +241,6 @@ pub fn from_db_connection(conn: &Connection, session_id: &str) -> Result<Univers
         ),
     }
     result
-}
-
-fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
-    let exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        rusqlite::params![table],
-        |row| row.get(0),
-    )?;
-    Ok(exists > 0)
 }
 
 pub struct SessionRow {

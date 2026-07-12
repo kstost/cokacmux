@@ -5,6 +5,28 @@ use std::path::{Path, PathBuf};
 use crate::error::{ConvertError, Result};
 use crate::universal::{Provider, UniversalSession};
 
+/// Provider metadata that identifies a session as non-root agent work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRelation {
+    SpawnedAgent {
+        parent_session_id: String,
+        depth: Option<u32>,
+    },
+    AuxiliaryAgent {
+        kind: AuxiliaryAgentKind,
+    },
+    Internal,
+}
+
+/// Codex-managed auxiliary session kinds that are not collaboration spawns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuxiliaryAgentKind {
+    Review,
+    Compact,
+    MemoryConsolidation,
+    Other,
+}
+
 /// Information about a discovered session.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -14,6 +36,8 @@ pub struct SessionInfo {
     pub source: PathBuf, // file path; opencode uses the db file
     pub updated_at_epoch_s: u64,
     pub title: Option<String>,
+    /// `None` means top-level or unclassified; callers must keep it visible.
+    pub relation: Option<SessionRelation>,
 }
 
 /// Pick the most-recently-updated session for `provider` matching `cwd`.
@@ -158,10 +182,11 @@ fn list_claude() -> Result<Vec<SessionInfo>> {
                 source: p,
                 updated_at_epoch_s: mtime,
                 title: meta.title,
+                relation: None,
             });
         }
     }
-    out.sort_by(|a, b| b.updated_at_epoch_s.cmp(&a.updated_at_epoch_s));
+    out.sort_by_key(|info| std::cmp::Reverse(info.updated_at_epoch_s));
     crate::debug::log(
         "discovery_claude_scan_ok",
         serde_json::json!({
@@ -195,7 +220,7 @@ fn extract_claude_meta_from_jsonl(path: &Path) -> ClaudeJsonlMeta {
     };
     for line in BufReader::new(f)
         .lines()
-        .flatten()
+        .map_while(std::result::Result::ok)
         .take(CLAUDE_DISCOVERY_SCAN_LINES)
     {
         if meta.cwd.is_some() && meta.title.is_some() {
@@ -252,7 +277,7 @@ fn list_codex() -> Result<Vec<SessionInfo>> {
     let titles = codex_thread_titles().unwrap_or_default();
     let mut out: Vec<SessionInfo> = Vec::new();
     walk_codex(&sessions, &titles, &mut out);
-    out.sort_by(|a, b| b.updated_at_epoch_s.cmp(&a.updated_at_epoch_s));
+    out.sort_by_key(|info| std::cmp::Reverse(info.updated_at_epoch_s));
     crate::debug::log(
         "discovery_codex_scan_ok",
         serde_json::json!({
@@ -311,14 +336,15 @@ fn walk_codex(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let cwd = extract_cwd_from_codex(&p).unwrap_or_default();
+            let meta = extract_codex_meta_from_jsonl(&p, &session_id);
             out.push(SessionInfo {
                 provider: Provider::Codex,
                 session_id,
-                cwd,
+                cwd: meta.cwd.unwrap_or_default(),
                 source: p,
                 updated_at_epoch_s: mtime,
                 title,
+                relation: meta.relation,
             });
         }
     }
@@ -356,23 +382,104 @@ fn codex_thread_titles_from_db(path: &Path) -> Result<std::collections::HashMap<
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-fn extract_cwd_from_codex(path: &Path) -> Option<String> {
+const CODEX_DISCOVERY_SCAN_LINES: usize = 8;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CodexJsonlMeta {
+    cwd: Option<String>,
+    relation: Option<SessionRelation>,
+}
+
+fn extract_codex_meta_from_jsonl(path: &Path, expected_session_id: &str) -> CodexJsonlMeta {
     use std::io::{BufRead, BufReader};
-    let f = std::fs::File::open(path).ok()?;
-    for line in BufReader::new(f).lines().flatten().take(8) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            if v.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
-                if let Some(c) = v
-                    .get("payload")
-                    .and_then(|p| p.get("cwd"))
-                    .and_then(|v| v.as_str())
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return CodexJsonlMeta::default();
+    };
+    for line in BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+        .take(CODEX_DISCOVERY_SCAN_LINES)
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let Some(payload) = value.get("payload").and_then(serde_json::Value::as_object) else {
+            return CodexJsonlMeta::default();
+        };
+        let cwd = payload
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let id_matches =
+            payload.get("id").and_then(serde_json::Value::as_str) == Some(expected_session_id);
+        return CodexJsonlMeta {
+            cwd,
+            relation: if id_matches {
+                codex_session_relation(payload.get("source"))
+            } else {
+                None
+            },
+        };
+    }
+    CodexJsonlMeta::default()
+}
+
+fn codex_session_relation(source: Option<&serde_json::Value>) -> Option<SessionRelation> {
+    let source = source?.as_object()?;
+    if source.len() != 1 {
+        return None;
+    }
+    if let Some(subagent) = source.get("subagent") {
+        return codex_subagent_relation(subagent);
+    }
+    source
+        .get("internal")
+        .and_then(serde_json::Value::as_str)
+        .map(|_| SessionRelation::Internal)
+}
+
+fn codex_subagent_relation(subagent: &serde_json::Value) -> Option<SessionRelation> {
+    match subagent {
+        serde_json::Value::String(kind) => Some(SessionRelation::AuxiliaryAgent {
+            kind: match kind.as_str() {
+                "review" => AuxiliaryAgentKind::Review,
+                "compact" => AuxiliaryAgentKind::Compact,
+                "memory" | "memory_consolidation" => AuxiliaryAgentKind::MemoryConsolidation,
+                _ => AuxiliaryAgentKind::Other,
+            },
+        }),
+        serde_json::Value::Object(tagged) => {
+            if tagged.len() == 1 {
+                if let Some(spawn) = tagged
+                    .get("thread_spawn")
+                    .and_then(serde_json::Value::as_object)
                 {
-                    return Some(c.to_string());
+                    let parent_session_id = spawn
+                        .get("parent_thread_id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty());
+                    let depth = spawn
+                        .get("depth")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|depth| u32::try_from(depth).ok());
+                    if let Some(parent_session_id) = parent_session_id {
+                        return Some(SessionRelation::SpawnedAgent {
+                            parent_session_id: parent_session_id.to_string(),
+                            depth,
+                        });
+                    }
                 }
             }
+            Some(SessionRelation::AuxiliaryAgent {
+                kind: AuxiliaryAgentKind::Other,
+            })
         }
+        _ => None,
     }
-    None
 }
 
 fn latest_codex_by_cwd(cwd: &str) -> Result<SessionInfo> {
@@ -413,7 +520,7 @@ fn list_pi() -> Result<Vec<SessionInfo>> {
             }
         }
     }
-    out.sort_by(|a, b| b.updated_at_epoch_s.cmp(&a.updated_at_epoch_s));
+    out.sort_by_key(|info| std::cmp::Reverse(info.updated_at_epoch_s));
     crate::debug::log(
         "discovery_pi_scan_ok",
         serde_json::json!({
@@ -458,6 +565,7 @@ fn scan_pi_session_dir(dir: &Path, out: &mut Vec<SessionInfo>) {
             source: path,
             updated_at_epoch_s: meta.updated_at_epoch_s.unwrap_or(mtime),
             title: meta.title,
+            relation: None,
         });
     }
 }
@@ -478,7 +586,10 @@ fn extract_pi_meta_from_jsonl(path: &Path) -> Option<PiJsonlMeta> {
     let file = std::fs::File::open(path).ok()?;
     let mut meta = PiJsonlMeta::default();
     let mut header_seen = false;
-    for line in BufReader::new(file).lines().flatten() {
+    for line in BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+    {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -580,7 +691,7 @@ fn list_gjc() -> Result<Vec<SessionInfo>> {
             scan_gjc_session_dir(&entry.path(), &mut out);
         }
     }
-    out.sort_by(|a, b| b.updated_at_epoch_s.cmp(&a.updated_at_epoch_s));
+    out.sort_by_key(|info| std::cmp::Reverse(info.updated_at_epoch_s));
     crate::debug::log(
         "discovery_gjc_scan_ok",
         serde_json::json!({
@@ -625,6 +736,7 @@ fn scan_gjc_session_dir(dir: &Path, out: &mut Vec<SessionInfo>) {
             source: path,
             updated_at_epoch_s: meta.updated_at_epoch_s.unwrap_or(mtime),
             title: meta.title,
+            relation: None,
         });
     }
 }
@@ -645,7 +757,10 @@ fn extract_gjc_meta_from_jsonl(path: &Path) -> Option<GjcJsonlMeta> {
     let file = std::fs::File::open(path).ok()?;
     let mut meta = GjcJsonlMeta::default();
     let mut header_seen = false;
-    for line in BufReader::new(file).lines().flatten() {
+    for line in BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+    {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -782,6 +897,7 @@ fn list_opencode() -> Result<Vec<SessionInfo>> {
                     Some(t)
                 }
             },
+            relation: None,
         })
     })?;
     let out: Vec<SessionInfo> = rows.filter_map(|r| r.ok()).collect();
@@ -977,6 +1093,275 @@ mod tests {
         let meta = extract_claude_meta_from_jsonl(file.path());
 
         assert_eq!(meta.title.as_deref(), Some("Named Agent"));
+    }
+
+    fn codex_meta_file(lines: &[serde_json::Value]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn codex_root_session_has_no_relation_even_with_legacy_subagent_hints() {
+        let session_id = "019f5150-9e93-70f2-b01b-9099a3126b32";
+        let file = codex_meta_file(&[serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": "/repo/root",
+                "source": "cli",
+                "thread_source": "subagent",
+                "forked_from_id": "019f5150-bf9f-7d53-a832-69bf0d220320"
+            }
+        })]);
+
+        let meta = extract_codex_meta_from_jsonl(file.path(), session_id);
+
+        assert_eq!(meta.cwd.as_deref(), Some("/repo/root"));
+        assert_eq!(meta.relation, None);
+    }
+
+    #[test]
+    fn codex_thread_spawn_relation_keeps_parent_and_optional_depth() {
+        let session_id = "019f5150-9e93-70f2-b01b-9099a3126b32";
+        let parent_id = "019f5150-bf9f-7d53-a832-69bf0d220320";
+        let file = codex_meta_file(&[serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": "/repo/child",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": parent_id,
+                            "depth": 2,
+                            "agent_nickname": "redacted"
+                        }
+                    }
+                }
+            }
+        })]);
+
+        let meta = extract_codex_meta_from_jsonl(file.path(), session_id);
+
+        assert_eq!(meta.cwd.as_deref(), Some("/repo/child"));
+        assert_eq!(
+            meta.relation,
+            Some(SessionRelation::SpawnedAgent {
+                parent_session_id: parent_id.to_string(),
+                depth: Some(2),
+            })
+        );
+
+        let file_without_depth = codex_meta_file(&[serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": "/repo/child",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {"parent_thread_id": parent_id}
+                    }
+                }
+            }
+        })]);
+        let meta_without_depth =
+            extract_codex_meta_from_jsonl(file_without_depth.path(), session_id);
+        assert_eq!(
+            meta_without_depth.relation,
+            Some(SessionRelation::SpawnedAgent {
+                parent_session_id: parent_id.to_string(),
+                depth: None,
+            })
+        );
+
+        let file_with_invalid_depth = codex_meta_file(&[serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": "/repo/child",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": parent_id,
+                            "depth": -1
+                        }
+                    }
+                }
+            }
+        })]);
+        let meta_with_invalid_depth =
+            extract_codex_meta_from_jsonl(file_with_invalid_depth.path(), session_id);
+        assert_eq!(
+            meta_with_invalid_depth.relation,
+            Some(SessionRelation::SpawnedAgent {
+                parent_session_id: parent_id.to_string(),
+                depth: None,
+            })
+        );
+    }
+
+    #[test]
+    fn codex_review_session_is_an_auxiliary_agent() {
+        let session_id = "019f5150-9e93-70f2-b01b-9099a3126b32";
+        let file = codex_meta_file(&[serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": "/repo/review",
+                "source": {"subagent": "review"}
+            }
+        })]);
+
+        let meta = extract_codex_meta_from_jsonl(file.path(), session_id);
+
+        assert_eq!(
+            meta.relation,
+            Some(SessionRelation::AuxiliaryAgent {
+                kind: AuxiliaryAgentKind::Review,
+            })
+        );
+    }
+
+    #[test]
+    fn codex_classifies_other_auxiliary_and_internal_sources() {
+        let session_id = "019f5150-9e93-70f2-b01b-9099a3126b32";
+        let cases = [
+            (
+                serde_json::json!({"subagent": "compact"}),
+                SessionRelation::AuxiliaryAgent {
+                    kind: AuxiliaryAgentKind::Compact,
+                },
+            ),
+            (
+                serde_json::json!({"subagent": "memory_consolidation"}),
+                SessionRelation::AuxiliaryAgent {
+                    kind: AuxiliaryAgentKind::MemoryConsolidation,
+                },
+            ),
+            (
+                serde_json::json!({"subagent": {"other": "guardian"}}),
+                SessionRelation::AuxiliaryAgent {
+                    kind: AuxiliaryAgentKind::Other,
+                },
+            ),
+            (
+                serde_json::json!({"internal": "memory_consolidation"}),
+                SessionRelation::Internal,
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let file = codex_meta_file(&[serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": "/repo/auxiliary",
+                    "source": source
+                }
+            })]);
+
+            let meta = extract_codex_meta_from_jsonl(file.path(), session_id);
+
+            assert_eq!(meta.relation, Some(expected));
+        }
+    }
+
+    #[test]
+    fn codex_discovery_uses_only_the_first_canonical_session_meta() {
+        let session_id = "019f5150-9e93-70f2-b01b-9099a3126b32";
+        let parent_id = "019f5150-bf9f-7d53-a832-69bf0d220320";
+        let file = codex_meta_file(&[
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": "/repo/child",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": parent_id,
+                                "depth": 1
+                            }
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": parent_id,
+                    "cwd": "/repo/copied-parent",
+                    "source": "cli"
+                }
+            }),
+        ]);
+
+        let meta = extract_codex_meta_from_jsonl(file.path(), session_id);
+
+        assert_eq!(meta.cwd.as_deref(), Some("/repo/child"));
+        assert_eq!(
+            meta.relation,
+            Some(SessionRelation::SpawnedAgent {
+                parent_session_id: parent_id.to_string(),
+                depth: Some(1),
+            })
+        );
+    }
+
+    #[test]
+    fn codex_malformed_source_has_no_relation() {
+        let session_id = "019f5150-9e93-70f2-b01b-9099a3126b32";
+        let file = codex_meta_file(&[serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": "/repo/root",
+                "source": {"subagent": 42}
+            }
+        })]);
+
+        let meta = extract_codex_meta_from_jsonl(file.path(), session_id);
+
+        assert_eq!(meta.cwd.as_deref(), Some("/repo/root"));
+        assert_eq!(meta.relation, None);
+    }
+
+    #[test]
+    fn codex_mismatched_payload_id_keeps_session_and_cwd_but_not_relation() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019f5150-9e93-70f2-b01b-9099a3126b32";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-07-11T00-00-00-{session_id}.jsonl"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "019f5150-bf9f-7d53-a832-69bf0d220320",
+                    "cwd": "/repo/untrusted",
+                    "source": {"subagent": "review"}
+                }
+            })
+        )
+        .unwrap();
+
+        let mut discovered = Vec::new();
+        walk_codex(
+            dir.path(),
+            &std::collections::HashMap::new(),
+            &mut discovered,
+        );
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].session_id, session_id);
+        assert_eq!(discovered[0].cwd, "/repo/untrusted");
+        assert_eq!(discovered[0].relation, None);
     }
 
     #[cfg(feature = "pi")]

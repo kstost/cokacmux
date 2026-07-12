@@ -2,6 +2,8 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use serde_json::Value;
@@ -47,17 +49,26 @@ pub fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("jsonl");
     let tmp = path.with_file_name(format!(".{}.tmp-{}", file_name, uuid::Uuid::now_v7()));
     let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        // Session transcripts contain prompts, tool output, and often secrets.
+        // Create the temporary file private from its first observable moment;
+        // chmod-after-create alone would briefly expose it under a permissive
+        // process umask.  Also set the exact mode so an unusually restrictive
+        // umask does not leave an installed session unreadable by its owner.
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
-        match fs::rename(&tmp, path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                fs::remove_file(path)?;
-                fs::rename(&tmp, path)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
+        // std::fs::rename replaces an existing non-directory destination on
+        // supported platforms.  Never emulate replacement by deleting `path`
+        // first: if the following rename failed, the last complete copy would
+        // already be gone and this function would violate its atomic-write
+        // contract.
+        fs::rename(&tmp, path)?;
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             let _ = File::open(parent).and_then(|dir| dir.sync_all());
         }
@@ -73,4 +84,52 @@ pub fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
 /// process crashes mid-write leaving a half-written file at `path`.
 pub fn write_lines_atomic(path: &Path, values: &[Value]) -> Result<()> {
     write_lines(path, values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_replaces_complete_file_without_temp_remnants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        fs::write(&path, "old\n").unwrap();
+
+        write_text_atomic(&path, "new\ncomplete\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\ncomplete\n");
+        let names = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![path.file_name().unwrap().to_os_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_private_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+
+        write_text_atomic(&path, "secret\n").unwrap();
+
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn failed_replacement_keeps_destination_and_cleans_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("session.jsonl");
+        fs::create_dir(&destination).unwrap();
+
+        assert!(write_text_atomic(&destination, "new\n").is_err());
+        assert!(destination.is_dir());
+        let names = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![destination.file_name().unwrap().to_os_string()]);
+    }
 }

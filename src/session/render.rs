@@ -19,7 +19,11 @@ pub enum Mode {
 
 pub fn render(session: &UniversalSession, mode: Mode) -> String {
     if mode == Mode::Summary {
-        return render_summary(session);
+        // Individual content blocks are sanitized before truncation so the
+        // preview limit describes what is actually displayed. Sanitize the
+        // completed transcript as well: metadata and provider-defined labels
+        // are also untrusted session data and may contain terminal controls.
+        return sanitize_for_terminal(&render_summary(session));
     }
 
     let mut out = String::new();
@@ -97,7 +101,7 @@ pub fn render(session: &UniversalSession, mode: Mode) -> String {
         }
         out.push('\n');
     }
-    out
+    sanitize_for_terminal(&out)
 }
 
 fn render_summary(session: &UniversalSession) -> String {
@@ -122,11 +126,8 @@ fn render_summary(session: &UniversalSession) -> String {
     if let Some(git) = &session.git {
         let branch = git.branch.as_deref().unwrap_or("?");
         let commit = git.commit.as_deref().unwrap_or("");
-        summary_field(
-            &mut out,
-            "git",
-            &format!("{} {}", branch, commit).trim().to_string(),
-        );
+        let label = format!("{} {}", branch, commit);
+        summary_field(&mut out, "git", label.trim());
     }
     if let Some(usage) = &session.usage_total {
         summary_field(&mut out, "tokens", &usage_label(usage));
@@ -421,9 +422,6 @@ fn push_indented_text(out: &mut String, indent: &str, text: &str) {
             let _ = writeln!(out, "{}{}", indent, line);
         }
     }
-    if text.ends_with('\n') {
-        return;
-    }
 }
 
 fn inline_value(value: &Value, max_len: usize) -> Option<String> {
@@ -681,15 +679,12 @@ fn truncate_for_mode(s: &str, mode: Mode) -> String {
     // matches — frequently embeds CSI sequences that would otherwise be
     // re-interpreted by the user's terminal and leak across cell boundaries).
     let s = sanitize_for_terminal(s);
-    if mode == Mode::Full || s.len() <= PREVIEW_BLOCK_CAP {
+    let char_count = s.chars().count();
+    if mode == Mode::Full || char_count <= PREVIEW_BLOCK_CAP {
         return s;
     }
-    let mut end = PREVIEW_BLOCK_CAP;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let kept = s[..end].to_string();
-    format!("{}… [+{} chars]", kept, s.len() - end)
+    let kept: String = s.chars().take(PREVIEW_BLOCK_CAP).collect();
+    format!("{}… [+{} chars]", kept, char_count - PREVIEW_BLOCK_CAP)
 }
 
 /// Remove ANSI escape sequences and other terminal-control bytes from text
@@ -721,18 +716,27 @@ pub fn sanitize_for_terminal(s: &str) -> String {
                             if c2 == '\x07' {
                                 break;
                             }
+                            // Session fields are rendered line by line. Treat
+                            // a newline as a safe boundary for a malformed,
+                            // unterminated OSC so one hostile field cannot
+                            // hide the remainder of the transcript.
+                            if c2 == '\n' {
+                                out.push('\n');
+                                break;
+                            }
                             if c2 == '\x1b' {
                                 let _ = chars.next(); // consume the '\'
                                 break;
                             }
                         }
                     }
+                    Some('\n') => out.push('\n'),
                     Some(_) => { /* single-char escape; already consumed */ }
                     None => break,
                 }
             }
             '\n' | '\t' => out.push(c),
-            c if (c as u32) < 0x20 || c == '\x7f' => {
+            c if c.is_control() => {
                 out.push('·');
             }
             other => out.push(other),
@@ -771,6 +775,15 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_unterminated_escape_does_not_hide_following_lines() {
+        assert_eq!(
+            sanitize_for_terminal("before\x1b]unterminated\nafter"),
+            "before\nafter"
+        );
+        assert_eq!(sanitize_for_terminal("before\x1b\nafter"), "before\nafter");
+    }
+
+    #[test]
     fn sanitize_drops_other_control_chars_to_dot() {
         let input = "a\x01b\x07c\x7fd";
         assert_eq!(sanitize_for_terminal(input), "a·b·c·d");
@@ -780,6 +793,41 @@ mod tests {
     fn sanitize_keeps_tabs_and_newlines() {
         let input = "line1\nline2\twith tab";
         assert_eq!(sanitize_for_terminal(input), "line1\nline2\twith tab");
+    }
+
+    #[test]
+    fn sanitize_replaces_unicode_c1_terminal_controls() {
+        // U+009B is the single-code-point CSI control. It must not bypass the
+        // ESC-prefixed sequence handling merely because the input is UTF-8.
+        assert_eq!(
+            sanitize_for_terminal("before\u{009b}31mafter"),
+            "before·31mafter"
+        );
+    }
+
+    #[test]
+    fn summary_cap_counts_characters_not_utf8_bytes() {
+        let text = "한".repeat(PREVIEW_BLOCK_CAP + 2);
+        let truncated = truncate_for_mode(&text, Mode::Summary);
+        assert_eq!(truncated.matches('한').count(), PREVIEW_BLOCK_CAP);
+        assert!(truncated.ends_with("… [+2 chars]"));
+    }
+
+    #[test]
+    fn full_render_sanitizes_session_metadata() {
+        let mut session = UniversalSession::new(
+            "sid\x1b]0;owned\x07",
+            crate::universal::Provider::Claude,
+            "/tmp\x1b[31mred\x1b[0m",
+        );
+        session.title = Some("title\u{009b}31m".into());
+
+        let rendered = render(&session, Mode::Full);
+
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\u{009b}'));
+        assert!(rendered.contains("sid"));
+        assert!(rendered.contains("/tmpred"));
     }
 
     #[test]

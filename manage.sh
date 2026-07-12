@@ -32,8 +32,12 @@ if [ -z "${HOME:-}" ]; then
 fi
 
 tmp="$(mktemp)"
+cokacdir_tmp=""
+cleanup() {
+    rm -f "$tmp" "$cokacdir_tmp"
+}
+trap cleanup EXIT
 cokacdir_tmp="$(mktemp)"
-trap "rm -f '$tmp' '$cokacdir_tmp'" EXIT
 
 download_binary() {
     name="$1"
@@ -57,6 +61,25 @@ url="$base/$app-$os-$arch"
 cokacdir_url="$cokacdir_base/$cokacdir_app-$os-$arch"
 download_binary "$app ($os-$arch)" "$url" "$tmp"
 download_binary "$cokacdir_app ($os-$arch)" "$cokacdir_url" "$cokacdir_tmp"
+
+validate_binary() {
+    name="$1"
+    path="$2"
+    if ! version_output="$("$path" --version 2>&1)"; then
+        echo "$name download is not a runnable binary for this platform" >&2
+        exit 1
+    fi
+    case "$version_output" in
+        "$name "*) ;;
+        *) echo "$name download returned an unexpected version: $version_output" >&2; exit 1 ;;
+    esac
+}
+
+# Validate both downloads before replacing either installed program.  A 200
+# response containing an HTML error page must never destroy a working install.
+chmod 0700 "$tmp" "$cokacdir_tmp"
+validate_binary "$app" "$tmp"
+validate_binary "$cokacdir_app" "$cokacdir_tmp"
 
 if [ -n "${COKACMUX_INSTALL_DIR:-}" ]; then
     dir="$COKACMUX_INSTALL_DIR"
@@ -96,21 +119,34 @@ install_binary() {
     target="$2"
     target_dir="$(dirname "$target")"
 
+    template="$target_dir/.$(basename "$target").XXXXXX"
+    staged=""
+
     if [ -w "$target_dir" ]; then
-        install -m 0755 "$src" "$target"
+        staged="$(mktemp "$template")"
+        if ! install -m 0755 "$src" "$staged" || ! mv -f "$staged" "$target"; then
+            rm -f "$staged"
+            echo "Failed to install $target" >&2
+            exit 1
+        fi
     elif command -v sudo >/dev/null 2>&1; then
-        sudo install -m 0755 "$src" "$target"
+        staged="$(sudo mktemp "$template")"
+        if ! sudo install -m 0755 "$src" "$staged" || ! sudo mv -f "$staged" "$target"; then
+            sudo rm -f "$staged" 2>/dev/null || true
+            echo "Failed to install $target" >&2
+            exit 1
+        fi
     else
         echo "Cannot write to $target_dir" >&2
         exit 1
     fi
 }
 
-install_binary "$tmp" "$dest"
 install_binary "$cokacdir_tmp" "$cokacdir_dest"
+install_binary "$tmp" "$dest"
 
-"$dest" --version >/dev/null 2>&1 || { echo "Installed file did not run" >&2; exit 1; }
-[ -x "$cokacdir_dest" ] || { echo "Installed cokacdir is not executable" >&2; exit 1; }
+validate_binary "$app" "$dest"
+validate_binary "$cokacdir_app" "$cokacdir_dest"
 
 if [ "$dir" = "$HOME/.local/bin" ]; then
     rc=""

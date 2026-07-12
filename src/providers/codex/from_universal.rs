@@ -52,6 +52,7 @@ pub fn parse_lines(content: &str, ctx: &CodexReadCtx) -> Result<UniversalSession
     session.origin.provider = Some(Provider::Codex);
 
     let mut current_model: Option<ModelInfo> = None;
+    let mut current_model_provider: Option<String> = None;
     let mut idx: u32 = 0;
     let mut tool_error_hints: BTreeMap<String, bool> = BTreeMap::new();
     let mut empty_lines = 0usize;
@@ -88,6 +89,14 @@ pub fn parse_lines(content: &str, ctx: &CodexReadCtx) -> Result<UniversalSession
         if session.created_at.is_none() {
             session.created_at = ts;
         }
+        if let Some(timestamp) = ts {
+            session.updated_at = Some(
+                session
+                    .updated_at
+                    .map(|updated| updated.max(timestamp))
+                    .unwrap_or(timestamp),
+            );
+        }
 
         let payload = val.get("payload").cloned().unwrap_or(Value::Null);
 
@@ -115,6 +124,13 @@ pub fn parse_lines(content: &str, ctx: &CodexReadCtx) -> Result<UniversalSession
                 if let Some(v) = payload.get("cli_version").and_then(|v| v.as_str()) {
                     session.origin.cli_version = Some(v.to_string());
                 }
+                if let Some(provider) = payload
+                    .get("model_provider")
+                    .and_then(|v| v.as_str())
+                    .filter(|provider| !provider.is_empty())
+                {
+                    current_model_provider = Some(provider.to_string());
+                }
                 if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
                     if session.session_id.is_empty() {
                         session.session_id = id.to_string();
@@ -133,18 +149,36 @@ pub fn parse_lines(content: &str, ctx: &CodexReadCtx) -> Result<UniversalSession
             }
             "turn_context" => {
                 turn_context_lines = turn_context_lines.saturating_add(1);
-                if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
-                    let variant = payload
+                if let Some(m) = payload.get("model").and_then(|v| v.as_str()).or_else(|| {
+                    payload
+                        .get("collaboration_mode")
+                        .and_then(|v| v.get("settings"))
+                        .and_then(|v| v.get("model"))
+                        .and_then(|v| v.as_str())
+                }) {
+                    let provider_id = payload
                         .get("model_provider")
                         .and_then(|v| v.as_str())
+                        .filter(|provider| !provider.is_empty())
+                        .map(String::from)
+                        .or_else(|| current_model_provider.clone());
+                    let variant = payload
+                        .get("model_reasoning_effort")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| payload.get("effort").and_then(|v| v.as_str()))
+                        .or_else(|| {
+                            payload
+                                .get("collaboration_mode")
+                                .and_then(|v| v.get("settings"))
+                                .and_then(|v| v.get("reasoning_effort"))
+                                .and_then(|v| v.as_str())
+                        })
+                        .filter(|effort| !effort.is_empty())
                         .map(String::from);
                     current_model = Some(ModelInfo {
-                        provider_id: variant,
+                        provider_id,
                         model_id: m.to_string(),
-                        variant: payload
-                            .get("model_reasoning_effort")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
+                        variant,
                     });
                     if session.model.is_none() {
                         session.model = current_model.clone();
@@ -1117,4 +1151,29 @@ fn extract_usage_from_token_count_key(payload: &Value, key: &str) -> Option<Usag
         total_tokens: last.get("total_tokens").and_then(|v| v.as_u64()),
         cost_usd: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_current_turn_context_model_and_latest_timestamp() {
+        let jsonl = r#"{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{"id":"s1","cwd":"/tmp","model_provider":"openai"}}
+{"timestamp":"2026-05-20T01:00:05.000Z","type":"turn_context","payload":{"model":"gpt-5.5","effort":"xhigh","collaboration_mode":{"mode":"default","settings":{"model":"gpt-5.5","reasoning_effort":"xhigh"}}}}
+{"timestamp":"2026-05-20T01:00:03.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#;
+
+        let session = parse_lines(jsonl, &CodexReadCtx::default()).unwrap();
+        let model = session
+            .model
+            .expect("current turn_context should set model");
+
+        assert_eq!(model.provider_id.as_deref(), Some("openai"));
+        assert_eq!(model.model_id, "gpt-5.5");
+        assert_eq!(model.variant.as_deref(), Some("xhigh"));
+        assert_eq!(
+            session.updated_at.map(|timestamp| timestamp.to_rfc3339()),
+            Some("2026-05-20T01:00:05+00:00".to_string())
+        );
+    }
 }

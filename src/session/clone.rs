@@ -166,6 +166,11 @@ fn clone_cross_provider_context_wrapper_with_install_opts(
     opts: &CloneOpts,
     install_opts: &InstallSessionOpts,
 ) -> Result<CloneReport> {
+    if let Some(new_id) = opts.new_id.as_deref() {
+        // Validate before file-reference mode creates a persistent context
+        // file. An invalid id must be a side-effect-free error.
+        ensure_native_session_id_for(target_provider, new_id)?;
+    }
     let source_session = super::load(src)?;
     let context_file_path = match opts.context_mode {
         CloneContextMode::Inline => None,
@@ -186,7 +191,6 @@ fn clone_cross_provider_context_wrapper_with_install_opts(
         wrapped.cwd = new_cwd.clone();
     }
     if let Some(new_id) = opts.new_id.clone() {
-        ensure_native_session_id_for(target_provider, &new_id)?;
         wrapped.session_id = new_id.clone();
         if let Some(context) = wrapped
             .extras
@@ -241,6 +245,9 @@ fn write_context_reference_file(
         None => default_context_dir()?,
     };
     fs::create_dir_all(&dir)?;
+    if context_dir.is_none() {
+        set_private_context_dir_permissions(&dir)?;
+    }
     let filename = format!(
         "{}-{}-to-{}-{}.md",
         src.provider.as_str(),
@@ -249,11 +256,16 @@ fn write_context_reference_file(
         safe_path_component(&crate::ids::new_uuid_v7()),
     );
     let path = dir.join(filename);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
     file.write_all(context_file_contents(source_session).as_bytes())?;
+    file.sync_all()?;
     crate::debug::log(
         "clone_context_file_written",
         serde_json::json!({
@@ -270,6 +282,19 @@ fn default_context_dir() -> Result<PathBuf> {
     Ok(crate::providers::discovery::home_dir()?
         .join(".cokacmux")
         .join("context"))
+}
+
+#[cfg(unix)]
+fn set_private_context_dir_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_context_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn clone_claude_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport> {
@@ -294,6 +319,7 @@ fn clone_claude_same_provider_at_home(
         .new_id
         .clone()
         .unwrap_or_else(|| mint_id_for(Provider::Claude));
+    ensure_distinct_native_clone_id(Provider::Claude, &src.session_id, &new_id)?;
     let new_cwd = opts.cwd.clone().unwrap_or_else(|| src.cwd.clone());
     if new_cwd.is_empty() {
         return Err(ConvertError::MissingField("session.cwd"));
@@ -310,6 +336,8 @@ fn clone_claude_same_provider_at_home(
         &new_cwd,
         &id_map,
     );
+    let rewritten_sidecar_refs =
+        rewrite_claude_sidecar_references(&mut lines, &src.source, &target);
     let repaired = repair_claude_parent_chain(&mut lines);
     let sanitized = sanitize_claude_content_blocks(&mut lines);
     let bytes_written = write_jsonl_lines_atomic(&target, opts.overwrite, &lines)?;
@@ -338,6 +366,7 @@ fn clone_claude_same_provider_at_home(
             "uuid_refs": id_map.len(),
             "parent_chain_rows": repaired,
             "sanitized_content_rows": sanitized,
+            "rewritten_sidecar_refs": rewritten_sidecar_refs,
             "native_validation_checks": validation.checks.len(),
         }),
     );
@@ -373,6 +402,7 @@ fn clone_codex_same_provider_at_home(
         .new_id
         .clone()
         .unwrap_or_else(|| mint_id_for(Provider::Codex));
+    ensure_distinct_native_clone_id(Provider::Codex, &src.session_id, &new_id)?;
     let new_cwd = opts.cwd.clone().unwrap_or_else(|| src.cwd.clone());
     if new_cwd.is_empty() {
         return Err(ConvertError::MissingField("session.cwd"));
@@ -431,6 +461,9 @@ fn clone_codex_same_provider_at_home(
 /// that must become unique are remapped.
 #[cfg(feature = "opencode")]
 fn clone_opencode_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport> {
+    if let Some(new_id) = opts.new_id.as_deref() {
+        ensure_distinct_native_clone_id(Provider::OpenCode, &src.session_id, new_id)?;
+    }
     let report = providers::opencode::clone::clone_session_rows(
         &src.source,
         &src.session_id,
@@ -490,7 +523,7 @@ fn clone_pi_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneRe
         .new_id
         .clone()
         .unwrap_or_else(|| mint_id_for(Provider::Pi));
-    ensure_native_session_id_for(Provider::Pi, &new_id)?;
+    ensure_distinct_native_clone_id(Provider::Pi, &src.session_id, &new_id)?;
     let new_cwd = opts.cwd.clone().unwrap_or_else(|| src.cwd.clone());
     if new_cwd.is_empty() {
         return Err(ConvertError::MissingField("session.cwd"));
@@ -556,7 +589,7 @@ fn clone_gjc_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneR
         .new_id
         .clone()
         .unwrap_or_else(|| mint_id_for(Provider::Gjc));
-    ensure_native_session_id_for(Provider::Gjc, &new_id)?;
+    ensure_distinct_native_clone_id(Provider::Gjc, &src.session_id, &new_id)?;
     let new_cwd = opts.cwd.clone().unwrap_or_else(|| src.cwd.clone());
     if new_cwd.is_empty() {
         return Err(ConvertError::MissingField("session.cwd"));
@@ -778,6 +811,102 @@ fn patch_claude_jsonl_lines(
             rewrite_mapped_string(snapshot, "messageId", id_map);
         }
     }
+}
+
+fn rewrite_claude_sidecar_references(
+    lines: &mut [JsonLine],
+    source_jsonl: &Path,
+    target_jsonl: &Path,
+) -> usize {
+    let source_root = source_jsonl.with_extension("").join("tool-results");
+    let target_root = target_jsonl.with_extension("").join("tool-results");
+    let mut rewritten = 0usize;
+    for line in lines {
+        if let JsonLine::Json(value) = line {
+            rewrite_claude_sidecar_references_in_value(
+                value,
+                &source_root,
+                &target_root,
+                &mut rewritten,
+            );
+        }
+    }
+    rewritten
+}
+
+fn rewrite_claude_sidecar_references_in_value(
+    value: &mut Value,
+    source_root: &Path,
+    target_root: &Path,
+    rewritten: &mut usize,
+) {
+    match value {
+        Value::String(text) => {
+            let (replacement, count) =
+                rewrite_claude_sidecar_reference_text(text, source_root, target_root);
+            if count > 0 {
+                *text = replacement;
+                *rewritten = rewritten.saturating_add(count);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                rewrite_claude_sidecar_references_in_value(
+                    value,
+                    source_root,
+                    target_root,
+                    rewritten,
+                );
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                rewrite_claude_sidecar_references_in_value(
+                    value,
+                    source_root,
+                    target_root,
+                    rewritten,
+                );
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn rewrite_claude_sidecar_reference_text(
+    text: &str,
+    source_root: &Path,
+    target_root: &Path,
+) -> (String, usize) {
+    const NEEDLE: &str = "Full output saved to: ";
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut rewritten = 0usize;
+    while let Some(offset) = rest.find(NEEDLE) {
+        let path_start = offset + NEEDLE.len();
+        out.push_str(&rest[..path_start]);
+        let after = &rest[path_start..];
+        let path_end = after.find(['\r', '\n']).unwrap_or(after.len());
+        let candidate_text = after[..path_end].trim_end();
+        let candidate = Path::new(candidate_text);
+        let relative = candidate.strip_prefix(source_root).ok().filter(|relative| {
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+        });
+        if let Some(relative) = relative {
+            out.push_str(&target_root.join(relative).display().to_string());
+            out.push_str(&after[candidate_text.len()..path_end]);
+            rewritten = rewritten.saturating_add(1);
+        } else {
+            out.push_str(&after[..path_end]);
+        }
+        rest = &after[path_end..];
+    }
+    out.push_str(rest);
+    (out, rewritten)
 }
 
 fn repair_claude_parent_chain(lines: &mut [JsonLine]) -> usize {
@@ -1353,6 +1482,7 @@ fn remove_installed_clone_artifact(
         source,
         updated_at_epoch_s: 0,
         title: None,
+        relation: None,
     };
     super::remove::remove(&info)
 }
@@ -1381,6 +1511,21 @@ fn ensure_native_session_id_for(target: Provider, session_id: &str) -> Result<()
             target.as_str()
         )))
     }
+}
+
+fn ensure_distinct_native_clone_id(
+    target: Provider,
+    source_session_id: &str,
+    new_session_id: &str,
+) -> Result<()> {
+    ensure_native_session_id_for(target, new_session_id)?;
+    if new_session_id == source_session_id {
+        return Err(ConvertError::Other(format!(
+            "new {} session id must differ from the source session id",
+            target.as_str()
+        )));
+    }
+    Ok(())
 }
 
 fn is_opencode_session_id(session_id: &str) -> bool {
@@ -1414,6 +1559,7 @@ mod tests {
             source,
             updated_at_epoch_s: 0,
             title: None,
+            relation: None,
         }
     }
 
@@ -1507,6 +1653,15 @@ mod tests {
         let context_text = fs::read_to_string(context_path).unwrap();
         assert!(context_text.contains("=== source-codex (codex) ==="));
         assert!(context_text.contains("continue this work"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(context_path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "persisted transcript context must not be readable by other users"
+            );
+        }
 
         let ArtifactPath::File(path) = &report.artifact else {
             panic!("expected Claude file artifact, got {:?}", report.artifact);
@@ -1536,12 +1691,15 @@ mod tests {
         )
         .unwrap();
         let db_path = dir.path().join("opencode.db");
+        let context_dir = dir.path().join("context");
         let src = session_info(Provider::Codex, "source-codex", "/repo", source_path);
         let err = clone_cross_provider_context_wrapper_with_install_opts(
             &src,
             Provider::OpenCode,
             &CloneOpts {
                 new_id: Some("not-native".into()),
+                context_mode: CloneContextMode::FileReference,
+                context_dir: Some(context_dir.clone()),
                 ..Default::default()
             },
             &InstallSessionOpts {
@@ -1555,6 +1713,10 @@ mod tests {
         assert!(
             !db_path.exists(),
             "invalid id should fail before creating the OpenCode DB"
+        );
+        assert!(
+            !context_dir.exists(),
+            "invalid id should fail before persisting a context transcript"
         );
     }
 
@@ -1583,6 +1745,8 @@ mod tests {
             .join(providers::claude::path::encode_cwd("/old/cwd"));
         fs::create_dir_all(&source_dir).unwrap();
         let source_path = source_dir.join("old-session.jsonl");
+        let source_sidecar = source_path.with_extension("");
+        let source_overflow = source_sidecar.join("tool-results").join("a.txt");
         fs::write(
             &source_path,
             [
@@ -1606,7 +1770,15 @@ mod tests {
                         "role": "assistant",
                         "content": [
                             {"type": "step-start"},
-                            {"type": "text", "text": "valid"}
+                            {"type": "text", "text": "valid"},
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call-1",
+                                "content": format!(
+                                    "Output too large. Full output saved to: {}\n\nPreview",
+                                    source_overflow.display()
+                                )
+                            }
                         ]
                     },
                     "extraNativeField": "preserved"
@@ -1623,9 +1795,8 @@ mod tests {
                 + "\n",
         )
         .unwrap();
-        let source_sidecar = source_path.with_extension("");
         fs::create_dir_all(source_sidecar.join("tool-results")).unwrap();
-        fs::write(source_sidecar.join("tool-results").join("a.txt"), "sidecar").unwrap();
+        fs::write(&source_overflow, "sidecar").unwrap();
         let src = session_info(Provider::Claude, "old-session", "/old/cwd", source_path);
 
         let report = clone_claude_same_provider_at_home(
@@ -1657,14 +1828,55 @@ mod tests {
         assert_eq!(values[1]["parentUuid"].as_str(), values[0]["uuid"].as_str());
         assert_eq!(values[1]["extraNativeField"], "preserved");
         let content = values[1]["message"]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 1);
+        assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "text");
+        let cloned_sidecar = path.with_extension("").join("tool-results").join("a.txt");
+        let cloned_ref = content[1]["content"].as_str().unwrap();
+        assert!(cloned_ref.contains(&cloned_sidecar.display().to_string()));
+        assert!(!cloned_ref.contains(&source_overflow.display().to_string()));
         assert_eq!(values[2]["leafUuid"].as_str(), values[1]["uuid"].as_str());
         assert!(path
             .with_extension("")
             .join("tool-results")
             .join("a.txt")
             .is_file());
+    }
+
+    #[test]
+    fn same_provider_clone_rejects_source_session_id_without_touching_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_home = dir.path().join(".claude");
+        let source_id = "11111111-1111-7111-8111-111111111111";
+        let source_dir = claude_home
+            .join("projects")
+            .join(providers::claude::path::encode_cwd("/repo"));
+        fs::create_dir_all(&source_dir).unwrap();
+        let source_path = source_dir.join(format!("{source_id}.jsonl"));
+        let source_text = json!({
+            "type": "user",
+            "sessionId": source_id,
+            "cwd": "/repo",
+            "uuid": "22222222-2222-7222-8222-222222222222",
+            "message": {"role": "user", "content": "keep me"}
+        })
+        .to_string()
+            + "\n";
+        fs::write(&source_path, &source_text).unwrap();
+        let src = session_info(Provider::Claude, source_id, "/repo", source_path.clone());
+
+        let error = clone_claude_same_provider_at_home(
+            &src,
+            &CloneOpts {
+                overwrite: true,
+                new_id: Some(source_id.into()),
+                ..Default::default()
+            },
+            &claude_home,
+        )
+        .expect_err("a clone must never overwrite its own source identity");
+
+        assert!(error.to_string().contains("must differ"));
+        assert_eq!(fs::read_to_string(source_path).unwrap(), source_text);
     }
 
     #[test]

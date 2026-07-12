@@ -16,6 +16,7 @@ import {
   TerminalSquare,
   Wand2
 } from 'lucide-react';
+import { copyText } from './copy-command.js';
 import './styles.css';
 
 const quickKeys = [
@@ -915,19 +916,7 @@ function CopyCommandButton({ command }) {
 
   const copyCommand = async () => {
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(command);
-      } else {
-        const textArea = document.createElement('textarea');
-        textArea.value = command;
-        textArea.setAttribute('readonly', '');
-        textArea.style.position = 'fixed';
-        textArea.style.opacity = '0';
-        document.body.appendChild(textArea);
-        textArea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textArea);
-      }
+      await copyText(command);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1400);
     } catch {

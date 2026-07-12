@@ -15,6 +15,23 @@ use cokacmux::{
 };
 use serde_json::Value;
 
+#[cfg(feature = "opencode")]
+type CodexThreadMetadataRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 fn claude_fixture() -> &'static str {
     r#"{"type":"user","sessionId":"sess-claude-1","cwd":"/tmp","timestamp":"2026-05-20T01:00:00.000Z","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"hello there"}}
 {"type":"assistant","sessionId":"sess-claude-1","cwd":"/tmp","timestamp":"2026-05-20T01:00:01.000Z","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","id":"msg_xxx","model":"claude-opus-4-7","content":[{"type":"text","text":"hi back"}]}}
@@ -966,21 +983,7 @@ fn assert_codex_native_wrapper_shape(
             memory_mode,
             model,
             reasoning_effort,
-        ): (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            i64,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-        ) = conn
+        ): CodexThreadMetadataRow = conn
             .query_row(
                 "SELECT rollout_path, source, model_provider, cwd, title,
                         sandbox_policy, approval_mode, has_user_event,

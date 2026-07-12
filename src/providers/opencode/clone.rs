@@ -63,12 +63,22 @@ pub fn clone_session_rows(
         }),
     );
 
-    let mut conn = super::db::open_readwrite(db_path)?;
+    let new_session_id = opts
+        .new_session_id
+        .clone()
+        .unwrap_or_else(ids::opencode_session_id);
+    if new_session_id == src_session_id {
+        return Err(ConvertError::Other(format!(
+            "refusing to clone OpenCode session {src_session_id} onto itself"
+        )));
+    }
+
+    let mut conn = super::db::open_existing_readwrite(db_path)?;
     // Lock probe — bail with a clear message if opencode holds an
     // exclusive lock. Use a separate scope so the probe txn is dropped
     // before we open our real one.
     {
-        let probe = super::db::open_readwrite(db_path)?;
+        let probe = super::db::open_existing_readwrite(db_path)?;
         if let Err(e) = probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
             return Err(ConvertError::Other(format!(
                 "could not acquire write lock on {} (is opencode running?): {}",
@@ -77,13 +87,9 @@ pub fn clone_session_rows(
             )));
         }
     }
-    super::db::ensure_schema(&conn)?;
-    let session_message_has_seq = super::db::table_has_column(&conn, "session_message", "seq")?;
-
-    let new_session_id = opts
-        .new_session_id
-        .clone()
-        .unwrap_or_else(ids::opencode_session_id);
+    let session_message_exists = super::db::table_exists(&conn, "session_message")?;
+    let session_message_has_seq =
+        session_message_exists && super::db::table_has_column(&conn, "session_message", "seq")?;
 
     let tx = conn.transaction()?;
 
@@ -107,14 +113,30 @@ pub fn clone_session_rows(
     // 4. Read session_message rows + build id_map(evt_old → evt_new). CRITICAL:
     // `session_message.id` is globally primary-keyed; reusing origin's id would
     // overwrite the origin row on INSERT OR REPLACE. Always re-mint.
-    let session_message_rows =
-        read_session_message_rows(&tx, src_session_id, session_message_has_seq)?;
+    let session_message_rows = if session_message_exists {
+        read_session_message_rows(&tx, src_session_id, session_message_has_seq)?
+    } else {
+        Vec::new()
+    };
     let evt_id_map: HashMap<String, String> = session_message_rows
         .iter()
         .map(|r| (r.id.clone(), ids::opencode_event_id()))
         .collect();
 
+    let todo_columns = todo_copy_columns(&tx)?;
+
     if opts.overwrite {
+        // `todo` is an official OpenCode child table, but is absent from old
+        // schemas and from our minimal compatibility schema. SQLite foreign
+        // keys are connection-local and are not guaranteed to be enabled, so
+        // deleting the session row alone can leave the overwritten target's
+        // todo rows attached to the new clone.
+        if todo_columns.is_some() {
+            tx.execute(
+                "DELETE FROM todo WHERE session_id = ?1",
+                rusqlite::params![new_session_id],
+            )?;
+        }
         tx.execute(
             "DELETE FROM part WHERE session_id = ?1",
             rusqlite::params![new_session_id],
@@ -123,10 +145,12 @@ pub fn clone_session_rows(
             "DELETE FROM message WHERE session_id = ?1",
             rusqlite::params![new_session_id],
         )?;
-        tx.execute(
-            "DELETE FROM session_message WHERE session_id = ?1",
-            rusqlite::params![new_session_id],
-        )?;
+        if session_message_exists {
+            tx.execute(
+                "DELETE FROM session_message WHERE session_id = ?1",
+                rusqlite::params![new_session_id],
+            )?;
+        }
         tx.execute(
             "DELETE FROM session WHERE id = ?1",
             rusqlite::params![new_session_id],
@@ -141,6 +165,8 @@ pub fn clone_session_rows(
         .unwrap_or_else(|| session_row.directory.clone());
     let new_path = opts.cwd.as_deref().map(opencode_session_path_for_cwd);
     let final_path = new_path.or(session_row.path.clone());
+    let rewritten_revert =
+        rewrite_session_revert_json(session_row.revert.as_deref(), &msg_id_map, &prt_id_map);
     tx.execute(
         "INSERT INTO session
             (id, project_id, parent_id, slug, directory, title, version, share_url,
@@ -165,7 +191,7 @@ pub fn clone_session_rows(
             session_row.summary_deletions,
             session_row.summary_files,
             session_row.summary_diffs,
-            session_row.revert,
+            rewritten_revert,
             session_row.permission,
             session_row.time_created,
             session_row.time_updated,
@@ -274,6 +300,14 @@ pub fn clone_session_rows(
         session_messages_copied = session_messages_copied.saturating_add(1);
     }
 
+    // `todo` belongs to the native session state. Copy every ordinary column
+    // directly in SQLite so stored values, value types, and any
+    // provider/extension columns survive; only the owning session_id changes.
+    let todos_copied = match todo_columns.as_deref() {
+        Some(columns) => copy_todo_rows(&tx, columns, src_session_id, &new_session_id)?,
+        None => 0,
+    };
+
     tx.commit()?;
 
     debug::log(
@@ -285,6 +319,7 @@ pub fn clone_session_rows(
             "messages": messages_copied,
             "parts": parts_copied,
             "session_messages": session_messages_copied,
+            "todos": todos_copied,
         }),
     );
 
@@ -470,6 +505,67 @@ fn read_session_message_rows(
     Ok(rows)
 }
 
+/// Return every ordinary (non-generated/hidden) column in the native todo
+/// table. `PRAGMA table_info` intentionally omits generated columns, which
+/// SQLite computes itself and does not allow in an INSERT column list.
+fn todo_copy_columns(conn: &Connection) -> Result<Option<Vec<String>>> {
+    if !super::db::table_exists(conn, "todo")? {
+        return Ok(None);
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(\"todo\")")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns
+        .iter()
+        .any(|column| column.eq_ignore_ascii_case("session_id"))
+    {
+        return Err(ConvertError::Other(
+            "OpenCode todo table has no session_id column".into(),
+        ));
+    }
+    Ok(Some(columns))
+}
+
+fn copy_todo_rows(
+    conn: &Connection,
+    columns: &[String],
+    src_session_id: &str,
+    new_session_id: &str,
+) -> Result<usize> {
+    let session_id_column = columns
+        .iter()
+        .find(|column| column.eq_ignore_ascii_case("session_id"))
+        .expect("todo_copy_columns checked session_id");
+    let insert_columns = columns
+        .iter()
+        .map(|column| quote_sql_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let select_columns = columns
+        .iter()
+        .map(|column| {
+            if column.eq_ignore_ascii_case("session_id") {
+                "?1".to_string()
+            } else {
+                quote_sql_ident(column)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT INTO \"todo\" ({insert_columns}) \
+         SELECT {select_columns} FROM \"todo\" WHERE {} = ?2",
+        quote_sql_ident(session_id_column)
+    );
+    Ok(conn.execute(&sql, rusqlite::params![new_session_id, src_session_id])?)
+}
+
+fn quote_sql_ident(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
 /// Rewrite `parentID` (message id reference) and optionally `path.cwd`
 /// inside a `message.data` JSON. Everything else is preserved verbatim.
 fn rewrite_message_data_json(
@@ -498,6 +594,43 @@ fn rewrite_message_data_json(
         }
     }
     serde_json::to_string(&value).unwrap_or_else(|_| data_json.to_string())
+}
+
+/// `session.revert` contains database references (`messageID` and optional
+/// `partID`). A row clone must point those fields at the cloned rows rather
+/// than back into the source session.
+fn rewrite_session_revert_json(
+    revert_json: Option<&str>,
+    msg_id_map: &HashMap<String, String>,
+    prt_id_map: &HashMap<String, String>,
+) -> Option<String> {
+    let revert_json = revert_json?;
+    let Ok(mut value) = serde_json::from_str::<Value>(revert_json) else {
+        return Some(revert_json.to_string());
+    };
+    let Some(map) = value.as_object_mut() else {
+        return Some(revert_json.to_string());
+    };
+
+    let mut changed = false;
+    if let Some(Value::String(message_id)) = map.get_mut("messageID") {
+        if let Some(new_id) = msg_id_map.get(message_id) {
+            *message_id = new_id.clone();
+            changed = true;
+        }
+    }
+    if let Some(Value::String(part_id)) = map.get_mut("partID") {
+        if let Some(new_id) = prt_id_map.get(part_id) {
+            *part_id = new_id.clone();
+            changed = true;
+        }
+    }
+
+    if changed {
+        Some(serde_json::to_string(&value).unwrap_or_else(|_| revert_json.to_string()))
+    } else {
+        Some(revert_json.to_string())
+    }
 }
 
 fn opencode_session_path_for_cwd(cwd: &str) -> String {
@@ -567,7 +700,10 @@ mod tests {
         .unwrap();
     }
 
+    // Keep this assertion independent of the production SessionRow mapping;
+    // the tuple intentionally mirrors the SELECT column order.
     #[test]
+    #[allow(clippy::type_complexity)]
     fn row_clone_preserves_all_columns_and_remaps_ids() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oc.db");
@@ -757,5 +893,231 @@ mod tests {
             asst_json.pointer("/path/cwd").and_then(|v| v.as_str()),
             Some("/new/cwd")
         );
+    }
+
+    #[test]
+    fn row_clone_remaps_revert_message_and_part_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oc.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_origin(&conn);
+            conn.execute(
+                "UPDATE session SET revert = ?1 WHERE id = 'ses_origin'",
+                rusqlite::params![serde_json::json!({
+                    "messageID": "msg_asst",
+                    "partID": "prt_text",
+                    "snapshot": "snap-1",
+                    "diff": "kept"
+                })
+                .to_string()],
+            )
+            .unwrap();
+        }
+
+        let report =
+            clone_session_rows(&path, "ses_origin", &OpenCodeRowCloneOpts::default()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let revert: String = conn
+            .query_row(
+                "SELECT revert FROM session WHERE id = ?1",
+                rusqlite::params![report.new_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let revert: Value = serde_json::from_str(&revert).unwrap();
+        let cloned_message_id = revert["messageID"].as_str().unwrap();
+        let cloned_part_id = revert["partID"].as_str().unwrap();
+
+        assert_ne!(cloned_message_id, "msg_asst");
+        assert_ne!(cloned_part_id, "prt_text");
+        assert_eq!(revert["snapshot"], "snap-1");
+        assert_eq!(revert["diff"], "kept");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM message WHERE id = ?1 AND session_id = ?2",
+                rusqlite::params![cloned_message_id, report.new_session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM part
+                 WHERE id = ?1 AND message_id = ?2 AND session_id = ?3",
+                rusqlite::params![cloned_part_id, cloned_message_id, report.new_session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn row_clone_refuses_to_overwrite_its_source_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oc.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_origin(&conn);
+        }
+
+        let error = clone_session_rows(
+            &path,
+            "ses_origin",
+            &OpenCodeRowCloneOpts {
+                new_session_id: Some("ses_origin".into()),
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("onto itself"), "{error}");
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM message WHERE session_id = 'ses_origin'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM part WHERE session_id = 'ses_origin'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn row_clone_missing_source_db_fails_without_creating_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-opencode.db");
+        assert!(!path.exists());
+
+        clone_session_rows(
+            &path,
+            "ses_missing",
+            &OpenCodeRowCloneOpts {
+                new_session_id: Some("ses_target".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            !path.exists(),
+            "a failed source lookup must not create an empty database"
+        );
+    }
+
+    #[test]
+    fn row_clone_copies_all_todo_columns_and_replaces_stale_target_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oc.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_origin(&conn);
+            conn.execute_batch(
+                "CREATE TABLE todo (
+                    session_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    extension_data BLOB,
+                    PRIMARY KEY (session_id, position)
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO todo
+                    (session_id, content, status, priority, position,
+                     time_created, time_updated, extension_data)
+                 VALUES ('ses_origin', 'source todo', 'in_progress', 'medium', 7,
+                         1234, 5678, ?1)",
+                rusqlite::params![vec![0u8, 1, 254, 255]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session
+                    (id, project_id, directory, title, slug, version,
+                     time_created, time_updated)
+                 VALUES ('ses_target', 'global', '/old-target', 'old', 'old', 'old', 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO todo
+                    (session_id, content, status, priority, position,
+                     time_created, time_updated, extension_data)
+                 VALUES ('ses_target', 'stale target todo', 'pending', 'high', 7,
+                         1, 1, X'AA')",
+                [],
+            )
+            .unwrap();
+        }
+
+        clone_session_rows(
+            &path,
+            "ses_origin",
+            &OpenCodeRowCloneOpts {
+                new_session_id: Some("ses_target".into()),
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let cloned: (String, String, String, i64, i64, i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT content, status, priority, position,
+                        time_created, time_updated, extension_data
+                 FROM todo WHERE session_id = 'ses_target'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            cloned,
+            (
+                "source todo".to_string(),
+                "in_progress".to_string(),
+                "medium".to_string(),
+                7,
+                1234,
+                5678,
+                vec![0u8, 1, 254, 255],
+            )
+        );
+        let source_blob: Vec<u8> = conn
+            .query_row(
+                "SELECT extension_data FROM todo
+                 WHERE session_id = 'ses_origin' AND position = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_blob, vec![0u8, 1, 254, 255]);
     }
 }

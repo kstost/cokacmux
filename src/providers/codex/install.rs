@@ -83,6 +83,7 @@ pub fn install_to_user_dir(
     if session.session_id.is_empty() {
         return Err(ConvertError::MissingField("session.session_id"));
     }
+    validate_session_id(&session.session_id)?;
 
     let ts = session.created_at.unwrap_or_else(Utc::now);
     let dir = home
@@ -100,7 +101,7 @@ pub fn install_to_user_dir(
             path.display()
         )));
     }
-    super::write::to_jsonl_path(session, &path, &CodexWriteOpts::default())?;
+    super::write::to_install_jsonl_path(session, &path, &CodexWriteOpts::default())?;
     let bytes_written = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
     // Try to update the index.
@@ -162,6 +163,18 @@ fn rollout_filename(ts: DateTime<Utc>, sid: &str) -> String {
     format!("rollout-{}-{}.jsonl", ts.format("%Y-%m-%dT%H-%M-%S"), sid)
 }
 
+fn validate_session_id(session_id: &str) -> Result<()> {
+    if session_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Ok(());
+    }
+    Err(ConvertError::Validation(
+        "session.session_id must contain only ASCII letters, digits, '-' or '_'".into(),
+    ))
+}
+
 #[cfg(feature = "discovery")]
 fn default_codex_home() -> Option<PathBuf> {
     crate::providers::discovery::configured_home_dir().map(|h| h.join(".codex"))
@@ -206,11 +219,11 @@ fn index_threads_row(
         "sandbox_policy",
         "approval_mode",
     ];
-    for c in &must_have {
-        if !cols.contains(&c.to_string()) {
+    for column in must_have {
+        if !cols.contains(column) {
             return Err(ConvertError::Other(format!(
                 "threads table missing expected column `{}` (state_5.sqlite schema drift?)",
-                c
+                column
             )));
         }
     }
@@ -273,12 +286,13 @@ fn index_threads_row(
             u.total_tokens.or_else(|| {
                 // fall back to input+output if total is missing
                 match (u.input_tokens, u.output_tokens) {
-                    (Some(i), Some(o)) => Some(i + o),
+                    (Some(i), Some(o)) => Some(i.saturating_add(o)),
                     _ => None,
                 }
             })
         })
-        .unwrap_or(0) as i64;
+        .unwrap_or(0)
+        .min(i64::MAX as u64) as i64;
     let has_user_event = if session
         .messages
         .iter()
@@ -543,4 +557,71 @@ fn truncate(mut s: String, max: usize) -> String {
     }
     s.truncate(end);
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::universal::{Provider, UniversalSession};
+
+    #[test]
+    fn rejects_session_id_that_can_escape_sessions_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = UniversalSession::new("../../escape", Provider::Codex, "/tmp");
+
+        let error = install_to_user_dir(
+            &session,
+            &InstallOpts {
+                codex_home: Some(temp.path().join("codex")),
+                overwrite: false,
+                update_index: false,
+                state_5_path: None,
+            },
+        )
+        .expect_err("path separators in a session id must be rejected");
+
+        assert!(error.to_string().contains("session.session_id"));
+        assert!(!temp.path().join("escape.jsonl").exists());
+    }
+
+    #[test]
+    fn install_rewrites_replayed_session_identity() {
+        let source = r#"{"timestamp":"2026-05-20T01:00:00.000Z","type":"session_meta","payload":{"id":"old-session","session_id":"old-session","cwd":"/old","model_provider":"openai"}}
+{"timestamp":"2026-05-20T01:00:00.100Z","type":"turn_context","payload":{"cwd":"/old","model":"gpt-5.5","effort":"high"}}
+{"timestamp":"2026-05-20T01:00:00.500Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#;
+        let mut session =
+            crate::providers::codex::from_jsonl_str(source, &Default::default()).unwrap();
+        session.session_id = "new-session".into();
+        session.cwd = "/new".into();
+        let temp = tempfile::tempdir().unwrap();
+
+        let report = install_to_user_dir(
+            &session,
+            &InstallOpts {
+                codex_home: Some(temp.path().to_path_buf()),
+                overwrite: false,
+                update_index: false,
+                state_5_path: None,
+            },
+        )
+        .unwrap();
+
+        let values = std::fs::read_to_string(report.rollout_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let meta = values
+            .iter()
+            .find(|value| value["type"] == "session_meta")
+            .unwrap();
+        assert_eq!(meta["payload"]["id"], "new-session");
+        assert_eq!(meta["payload"]["session_id"], "new-session");
+        assert_eq!(meta["payload"]["cwd"], "/new");
+        let turn = values
+            .iter()
+            .find(|value| value["type"] == "turn_context")
+            .unwrap();
+        assert_eq!(turn["payload"]["cwd"], "/new");
+    }
 }

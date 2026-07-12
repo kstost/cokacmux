@@ -9,17 +9,18 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # LLVM 버전 탐지: clang-XX 바이너리에서 버전 추출
-LLVM_VERSION=""
-for f in /usr/bin/clang-[0-9]*; do
-    [ -e "$f" ] && LLVM_VERSION=$(basename "$f" | sed 's/clang-//') && break
-done
+detect_llvm_version() {
+    for f in /usr/bin/clang-[0-9]*; do
+        [ -e "$f" ] && basename "$f" | sed 's/clang-//'
+    done | sort -V | tail -n 1
+}
+
+LLVM_VERSION="$(detect_llvm_version)"
 # clang이 아직 없으면 설치 후 탐지
 if [ -z "$LLVM_VERSION" ]; then
     apt update
     apt install -y clang
-    for f in /usr/bin/clang-[0-9]*; do
-        [ -e "$f" ] && LLVM_VERSION=$(basename "$f" | sed 's/clang-//') && break
-    done
+    LLVM_VERSION="$(detect_llvm_version)"
 fi
 if [ -z "$LLVM_VERSION" ]; then
     echo "LLVM 버전을 탐지할 수 없습니다."
@@ -47,9 +48,21 @@ for tool in llvm-lib llvm-dlltool llvm-rc clang-cl; do
     fi
 done
 
+missing=0
+for tool in clang ld.lld llvm-lib llvm-dlltool llvm-rc clang-cl; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "오류: 필수 도구를 찾을 수 없습니다: $tool" >&2
+        missing=1
+    fi
+done
+if [ "$missing" -ne 0 ]; then
+    echo "Windows 크로스 컴파일 의존성 설치가 완료되지 않았습니다." >&2
+    exit 1
+fi
+
 echo ""
 echo "설치 완료:"
 clang --version | head -1
 ld.lld --version | head -1
-llvm-lib --version 2>/dev/null | head -1 || echo "llvm-lib: 미설치"
-clang-cl --version 2>/dev/null | head -1 || echo "clang-cl: 미설치"
+llvm-lib --version | head -1
+clang-cl --version | head -1

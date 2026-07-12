@@ -235,6 +235,7 @@ fn cleanup_failed_install(
         source,
         updated_at_epoch_s: 0,
         title: session.title.clone(),
+        relation: None,
     };
 
     let override_cleanup = cleanup_codex_state_override(provider, session, opts);
@@ -311,7 +312,7 @@ fn cleanup_codex_state_override(
             "DELETE FROM threads WHERE id = ?1",
             rusqlite::params![session.session_id],
         )? as u64;
-        return Ok(deleted);
+        Ok(deleted)
     }
 
     #[cfg(not(feature = "opencode"))]

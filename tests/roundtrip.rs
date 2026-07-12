@@ -6,6 +6,24 @@ use cokacmux::Provider;
 use cokacmux::{providers, universal::Role};
 use serde_json::Value;
 
+#[cfg(feature = "opencode")]
+type OpenCodeExtendedSessionRow = (
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
 // -------- fixtures --------
 
 fn jsonl_values(jsonl: &str) -> Vec<Value> {
@@ -182,6 +200,31 @@ fn pi_text_content_extracted() {
     assert_eq!(texts, vec!["hello there", "hi back"]);
 }
 
+#[cfg(feature = "pi")]
+#[test]
+fn pi_synthetic_write_uses_native_entry_ids_and_preserves_tool_metadata() {
+    let src = r#"{"type":"session","version":3,"id":"11111111-1111-7111-8111-111111111111","timestamp":"2026-05-20T01:00:00.000Z","cwd":"/tmp"}
+{"type":"message","id":"22222222-2222-7222-8222-222222222222","parentId":null,"timestamp":"2026-05-20T01:00:00.500Z","message":{"role":"user","content":"run it","timestamp":1779240000500}}
+{"type":"message","id":"33333333-3333-7333-8333-333333333333","parentId":"22222222-2222-7222-8222-222222222222","timestamp":"2026-05-20T01:00:01.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"shell","content":[{"type":"text","text":"done"}],"details":{"exitCode":0},"isError":false,"timestamp":1779240001000}}
+"#;
+    let session = providers::pi::from_jsonl_str(src, &Default::default()).unwrap();
+    let out =
+        providers::pi::to_jsonl_string(&session, &providers::pi::PiWriteOpts { replay_raw: false })
+            .unwrap();
+    let values = jsonl_values(&out);
+    let user_id = values[1]["id"].as_str().unwrap();
+    let tool_id = values[2]["id"].as_str().unwrap();
+
+    for id in [user_id, tool_id] {
+        assert_eq!(id.len(), 8, "Pi entry id must be 8 hex characters: {id}");
+        assert!(id.chars().all(|ch| ch.is_ascii_hexdigit()), "{id}");
+    }
+    assert_ne!(user_id, tool_id);
+    assert_eq!(values[2]["parentId"], user_id);
+    assert_eq!(values[2]["message"]["toolName"], "shell");
+    assert_eq!(values[2]["message"]["details"]["exitCode"], 0);
+}
+
 // -------- GJC roundtrip --------
 
 #[cfg(feature = "gjc")]
@@ -239,6 +282,27 @@ fn gjc_text_content_extracted() {
         })
         .collect();
     assert_eq!(texts, vec!["hello there", "hi back"]);
+}
+
+#[cfg(feature = "gjc")]
+#[test]
+fn gjc_synthetic_write_uses_native_pi_tree_entry_ids() {
+    let session = providers::gjc::from_jsonl_str(gjc_fixture(), &Default::default()).unwrap();
+    let out = providers::gjc::to_jsonl_string(
+        &session,
+        &providers::gjc::GjcWriteOpts { replay_raw: false },
+    )
+    .unwrap();
+    let values = jsonl_values(&out);
+    let user_id = values[1]["id"].as_str().unwrap();
+    let assistant_id = values[2]["id"].as_str().unwrap();
+
+    for id in [user_id, assistant_id] {
+        assert_eq!(id.len(), 8, "GJC entry id must be 8 hex characters: {id}");
+        assert!(id.chars().all(|ch| ch.is_ascii_hexdigit()), "{id}");
+    }
+    assert_ne!(user_id, assistant_id);
+    assert_eq!(values[2]["parentId"], user_id);
 }
 
 // -------- OpenCode roundtrip (via tempfile) --------
@@ -693,22 +757,7 @@ fn opencode_session_row_extended_fields_survive_roundtrip() {
     providers::opencode::to_db_path(&session, &dst_path).unwrap();
 
     let conn = rusqlite::Connection::open(&dst_path).unwrap();
-    let row: (
-        Option<String>,
-        String,
-        String,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-    ) = conn
+    let row: OpenCodeExtendedSessionRow = conn
         .query_row(
             "SELECT parent_id, slug, version, share_url,
                     summary_additions, summary_deletions, summary_files, summary_diffs,
