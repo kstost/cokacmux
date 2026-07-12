@@ -47,6 +47,13 @@ jobs:
           cache: npm
           cache-dependency-path: website/package-lock.json
 
+      - name: Set up npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global "npm@$NPM_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+
       - name: Set up Rust
         shell: bash
         run: |

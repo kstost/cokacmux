@@ -4099,6 +4099,7 @@ fn text_with_session_relation_badge_for_width(
     }
 }
 
+#[cfg(test)]
 fn title_with_session_relation_badge(info: &SessionInfo, title: &str) -> String {
     text_with_session_relation_badge_for_width(info, title, usize::MAX)
 }
@@ -24271,6 +24272,8 @@ fn generate_ai_title_for_session(
         .ok_or_else(|| "AI title agent returned an empty title".to_string())
 }
 
+// Keep the worker boundary explicit so owned inputs can move into its thread.
+#[allow(clippy::too_many_arguments)]
 fn generate_ai_search_worker(
     seq: u64,
     query: String,
@@ -24302,6 +24305,8 @@ fn generate_ai_search_worker(
     }
 }
 
+// Keep the search inputs explicit for the worker and the opt-in live smoke test.
+#[allow(clippy::too_many_arguments)]
 fn generate_ai_search_for_sessions(
     query: &str,
     sessions: &[SessionInfo],
@@ -32388,15 +32393,11 @@ fn agent_meta_child_pid_liveness(meta: &AgentMetaSnapshot) -> Option<AgentMetaLi
 }
 
 fn agent_meta_verified_child_pid(meta: &AgentMetaSnapshot) -> Option<u32> {
-    let Some(child_pid) = meta.child_pid else {
-        return None;
-    };
+    let child_pid = meta.child_pid?;
     if child_pid == 0 || !process_is_alive(child_pid) {
         return None;
     }
-    let Some(expected) = meta.child_pid_start_ticks else {
-        return None;
-    };
+    let expected = meta.child_pid_start_ticks?;
     (process_start_token_matches(expected, process_start_ticks(child_pid)) == Some(true))
         .then_some(child_pid)
 }
@@ -42525,9 +42526,9 @@ where
             } else {
                 let exact_orphan = agent_key_from_meta(&meta)
                     .filter(|key| agent_file_stem(key) == stem)
-                    .and_then(|_| agent_meta_verified_child_pid(&meta))
-                    .and_then(|child_pid| {
-                        session_info_from_agent_meta_snapshot(&meta).map(|info| (child_pid, info))
+                    .and_then(|_| {
+                        agent_meta_verified_child_pid(&meta)
+                            .zip(session_info_from_agent_meta_snapshot(&meta))
                     });
                 if let Some((child_pid, info)) = exact_orphan {
                     debug_log(
