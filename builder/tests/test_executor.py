@@ -43,7 +43,17 @@ def _executor(root, config=None):
     )
 
 
-class ExecutorSafetyTests(unittest.TestCase):
+class _IsolatedEnvironmentTestCase(unittest.TestCase):
+    """Keep executor tests independent from the invoking build environment."""
+
+    def setUp(self):
+        super().setUp()
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+
+class ExecutorSafetyTests(_IsolatedEnvironmentTestCase):
     def test_every_build_variant_runs_cargo_through_verified_pinned_rustup(self):
         cases = [
             (
@@ -786,7 +796,7 @@ class ExecutorSafetyTests(unittest.TestCase):
         executor.target_manager.ensure_targets.assert_called_once()
 
 
-class RunBuildSetupTests(unittest.TestCase):
+class RunBuildSetupTests(_IsolatedEnvironmentTestCase):
     def test_release_receipt_preflight_precedes_clean_and_all_tool_probes(self):
         config = _Config(clean=True)
         logger = MagicMock()
