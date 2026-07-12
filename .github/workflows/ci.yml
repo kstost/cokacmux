@@ -379,7 +379,7 @@ jobs:
           }
 
           $root = Join-Path $env:RUNNER_TEMP "cokacmux-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:RUNNER_OS-$env:RUNNER_ARCH-$env:GITHUB_JOB"
-          $home = Join-Path $root 'home'
+          $isolatedHome = Join-Path $root 'home'
           $config = Join-Path $root 'config'
           $tmp = Join-Path $root 'tmp'
           $target = Join-Path $root 'target'
@@ -391,7 +391,7 @@ jobs:
           $appData = Join-Path $root 'appdata'
 
           New-Item -ItemType Directory -Force -Path @(
-            $home, $config, $tmp, $target,
+            $isolatedHome, $config, $tmp, $target,
             $xdgData, $xdgConfig, $xdgCache, $xdgState,
             $localAppData, $appData
           ) | Out-Null
@@ -402,10 +402,10 @@ jobs:
             'RUSTUP_AUTO_INSTALL=0',
             "CARGO_TARGET_DIR=$target",
             "COKACMUX_TEST_ROOT=$root",
-            "COKACMUX_HOME=$home",
+            "COKACMUX_HOME=$isolatedHome",
             "COKACMUX_CONFIG_DIR=$config",
-            "HOME=$home",
-            "USERPROFILE=$home",
+            "HOME=$isolatedHome",
+            "USERPROFILE=$isolatedHome",
             "TMPDIR=$tmp",
             "TMP=$tmp",
             "TEMP=$tmp",
