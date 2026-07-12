@@ -78,7 +78,8 @@ jobs:
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
           npm_cache="$(npm config get cache)"
-          root="$RUNNER_TEMP/cokacmux-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RUNNER_OS-$RUNNER_ARCH-$GITHUB_JOB"
+          # Keep Unix socket fixtures below sockaddr_un.sun_path limits.
+          root="$(mktemp -d /tmp/cmx.XXXXXX)"
           home="$root/home"
           config="$root/config"
           tmp="$root/tmp"
@@ -214,7 +215,8 @@ jobs:
 
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
-          root="$RUNNER_TEMP/cokacmux-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RUNNER_OS-$RUNNER_ARCH-$GITHUB_JOB"
+          # Keep Unix socket fixtures below sockaddr_un.sun_path limits.
+          root="$(mktemp -d /tmp/cmx.XXXXXX)"
           home="$root/home"
           config="$root/config"
           tmp="$root/tmp"
@@ -311,7 +313,8 @@ jobs:
 
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
-          root="$RUNNER_TEMP/cokacmux-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RUNNER_OS-$RUNNER_ARCH-$GITHUB_JOB"
+          # Keep Unix socket fixtures below sockaddr_un.sun_path limits.
+          root="$(mktemp -d /tmp/cmx.XXXXXX)"
           home="$root/home"
           config="$root/config"
           tmp="$root/tmp"
