@@ -334,6 +334,9 @@ class ToolInstaller:
 
     def install_zig(self) -> bool:
         """Install zig compiler."""
+        self.ensure_tools_dir()
+        if not self._recover_staged_directory_backup(self.zig_dir, "Zig"):
+            return False
         try:
             zig_url = self.config.zig_url
             zig_sha256 = self.config.zig_sha256
@@ -345,8 +348,6 @@ class ToolInstaller:
             zig_path = self.get_zig_path()
             self.logger.success(f"Zig is already installed at {zig_path}")
             return True
-
-        self.ensure_tools_dir()
 
         # Download zig
         archive_ext = "zip" if self.config.host_os == "windows" else "tar.xz"
@@ -1176,6 +1177,9 @@ class ToolInstaller:
 
     def install_macos_sdk(self) -> bool:
         """Install macOS SDK for cross-compilation."""
+        self.ensure_tools_dir()
+        if not self._recover_staged_directory_backup(self.sdk_dir, "macOS SDK"):
+            return False
         if self.is_macos_sdk_installed():
             self.logger.success(f"macOS SDK is already installed at {self.sdk_dir}")
             return True
@@ -1185,8 +1189,6 @@ class ToolInstaller:
         if self.config.host_os == "macos":
             self.logger.info("macOS SDK not needed on this platform")
             return True
-
-        self.ensure_tools_dir()
 
         # Download SDK
         archive_name = f"MacOSX{self.config.macos_sdk_version}.sdk.tar.xz"
@@ -1253,6 +1255,8 @@ class ToolInstaller:
         desc: str,
     ) -> bool:
         """Commit a staged tool directory while preserving the prior install."""
+        if not self._recover_staged_directory_backup(destination, desc):
+            return False
         backup: Optional[Path] = None
         destination_exists = destination.exists() or destination.is_symlink()
 
@@ -1261,14 +1265,7 @@ class ToolInstaller:
                 self.logger.error(f"Refusing to replace unsafe path: {destination}")
                 return False
             try:
-                backup = Path(
-                    tempfile.mkdtemp(
-                        prefix=f".{destination.name}.",
-                        suffix=".backup",
-                        dir=destination.parent,
-                    )
-                )
-                backup.rmdir()
+                backup = self._staged_directory_backup_path(destination)
                 destination.rename(backup)
             except Exception as error:
                 self.logger.error(f"Failed to stage prior {desc} install: {error}")
@@ -1311,6 +1308,46 @@ class ToolInstaller:
             self.logger.warning(
                 f"Installed {desc}, but could not remove prior-install backup {backup}"
             )
+        return True
+
+    def _staged_directory_backup_path(self, destination: Path) -> Path:
+        """Return the deterministic crash-recovery path for a tool directory."""
+        return destination.parent / f".{destination.name}.backup"
+
+    def _recover_staged_directory_backup(self, destination: Path, desc: str) -> bool:
+        """Finish or roll back an interrupted staged-directory replacement.
+
+        A same-directory deterministic backup acts as a tiny crash journal:
+        backup-only means the old install was moved but the new one was not
+        published, while destination+backup means publication completed and
+        only old-install cleanup was interrupted.
+        """
+        backup = self._staged_directory_backup_path(destination)
+        backup_exists = backup.exists() or backup.is_symlink()
+        if not backup_exists:
+            return True
+        if not self._is_safe_path_for_deletion(backup):
+            self.logger.error(f"Refusing to recover unsafe {desc} backup: {backup}")
+            return False
+
+        destination_exists = destination.exists() or destination.is_symlink()
+        if destination_exists:
+            if not self._remove_safe_tool_path(backup):
+                self.logger.error(
+                    f"Could not finish interrupted {desc} backup cleanup: {backup}"
+                )
+                return False
+            self.logger.info(f"Recovered completed {desc} install after interruption")
+            return True
+
+        try:
+            backup.rename(destination)
+        except OSError as error:
+            self.logger.error(
+                f"Failed to restore interrupted {desc} install from {backup}: {error}"
+            )
+            return False
+        self.logger.info(f"Restored prior {desc} install after interruption")
         return True
 
     def _verify_sha256(self, path: Path, expected: str, desc: str) -> bool:

@@ -106,7 +106,26 @@ pub fn to_db_connection_with_opts(
         }),
     );
     let tx = conn.transaction()?;
-    let session_message_has_seq = db::table_has_column(&tx, "session_message", "seq")?;
+    to_db_transaction_with_opts(&tx, session, opts)?;
+    tx.commit()?;
+    debug::log(
+        "provider_opencode_write_connection_ok",
+        serde_json::json!({
+            "session_id": &session.session_id,
+        }),
+    );
+    Ok(())
+}
+
+/// Write into an existing caller-owned transaction. Live-store installation
+/// uses this to validate the uncommitted native rows before deciding whether
+/// the complete overwrite may be committed.
+pub(crate) fn to_db_transaction_with_opts(
+    tx: &rusqlite::Transaction<'_>,
+    session: &UniversalSession,
+    opts: &WriteOpts,
+) -> Result<()> {
+    let session_message_has_seq = db::table_has_column(tx, "session_message", "seq")?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     if !opts.overwrite {
         let existing: i64 = tx.query_row(
@@ -122,7 +141,7 @@ pub fn to_db_connection_with_opts(
         }
     }
 
-    let project_id = select_project_id(&tx, session, now_ms)?;
+    let project_id = select_project_id(tx, session, now_ms)?;
 
     let time_created = session
         .created_at
@@ -219,7 +238,16 @@ pub fn to_db_connection_with_opts(
         ],
     )?;
 
-    // Drop existing message+part rows for this session, then INSERT.
+    // Drop every native child row owned by the replaced session, then INSERT.
+    // `todo` is absent from older/minimal schemas, so guard it dynamically.
+    // Leaving its prior rows behind would mix stale task state into the new
+    // transcript even though the caller requested a complete overwrite.
+    if opts.overwrite && db::table_exists(tx, "todo")? {
+        tx.execute(
+            "DELETE FROM todo WHERE session_id = ?1",
+            rusqlite::params![session.session_id],
+        )?;
+    }
     tx.execute(
         "DELETE FROM part WHERE session_id = ?1",
         rusqlite::params![session.session_id],
@@ -238,7 +266,7 @@ pub fn to_db_connection_with_opts(
         if let Some(row) = opencode_session_message_write_row(m, &session.session_id, time_created)
         {
             insert_session_message_row(
-                &tx,
+                tx,
                 &session.session_id,
                 &row,
                 session_message_has_seq,
@@ -261,7 +289,7 @@ pub fn to_db_connection_with_opts(
             .to_string(),
         };
         insert_session_message_row(
-            &tx,
+            tx,
             &session.session_id,
             &agent_row,
             session_message_has_seq,
@@ -282,7 +310,7 @@ pub fn to_db_connection_with_opts(
             .to_string(),
         };
         insert_session_message_row(
-            &tx,
+            tx,
             &session.session_id,
             &model_row,
             session_message_has_seq,
@@ -340,14 +368,7 @@ pub fn to_db_connection_with_opts(
         let mut part_seq = 0usize;
         if matches!(m.role, Role::Assistant) && !has_opencode_control_part(m, "step-start") {
             let payload = serde_json::json!({"type": "step-start"});
-            insert_part_row(
-                &tx,
-                &session.session_id,
-                &m.id,
-                part_seq,
-                t_created,
-                payload,
-            )?;
+            insert_part_row(tx, &session.session_id, &m.id, part_seq, t_created, payload)?;
             part_seq = part_seq.saturating_add(1);
             part_rows_inserted = part_rows_inserted.saturating_add(1);
 
@@ -361,14 +382,7 @@ pub fn to_db_connection_with_opts(
                     "text": "",
                     "time": {"start": t_created, "end": t_created},
                 });
-                insert_part_row(
-                    &tx,
-                    &session.session_id,
-                    &m.id,
-                    part_seq,
-                    t_created,
-                    payload,
-                )?;
+                insert_part_row(tx, &session.session_id, &m.id, part_seq, t_created, payload)?;
                 part_seq = part_seq.saturating_add(1);
                 part_rows_inserted = part_rows_inserted.saturating_add(1);
             }
@@ -385,36 +399,21 @@ pub fn to_db_connection_with_opts(
             if matches!(m.role, Role::Assistant) {
                 decorate_assistant_part(&mut payload, part_time);
             }
-            insert_part_row(
-                &tx,
-                &session.session_id,
-                &m.id,
-                part_seq,
-                part_time,
-                payload,
-            )?;
+            insert_part_row(tx, &session.session_id, &m.id, part_seq, part_time, payload)?;
             part_seq = part_seq.saturating_add(1);
             part_rows_inserted = part_rows_inserted.saturating_add(1);
         }
         if matches!(m.role, Role::Assistant) && !has_opencode_control_part(m, "step-finish") {
             let payload = step_finish_part_data(m);
             let part_time = t_created + part_seq as i64;
-            insert_part_row(
-                &tx,
-                &session.session_id,
-                &m.id,
-                part_seq,
-                part_time,
-                payload,
-            )?;
+            insert_part_row(tx, &session.session_id, &m.id, part_seq, part_time, payload)?;
             part_rows_inserted = part_rows_inserted.saturating_add(1);
         }
         last_message_id = Some(m.id.clone());
     }
 
-    tx.commit()?;
     debug::log(
-        "provider_opencode_write_connection_ok",
+        "provider_opencode_write_transaction_prepared",
         serde_json::json!({
             "session_id": &session.session_id,
             "session_message_rows": session_message_rows_inserted,

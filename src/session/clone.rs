@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde_json::Value;
 
 use crate::context_convert::{
@@ -19,7 +19,7 @@ use crate::error::{ConvertError, Result};
 use crate::providers;
 use crate::providers::discovery::SessionInfo;
 use crate::session::install::{install_universal_session, InstallSessionOpts};
-use crate::universal::Provider;
+use crate::universal::{Provider, UniversalSession};
 
 #[derive(Debug)]
 pub struct CloneOpts {
@@ -340,19 +340,27 @@ fn clone_claude_same_provider_at_home(
         rewrite_claude_sidecar_references(&mut lines, &src.source, &target);
     let repaired = repair_claude_parent_chain(&mut lines);
     let sanitized = sanitize_claude_content_blocks(&mut lines);
-    let bytes_written = write_jsonl_lines_atomic(&target, opts.overwrite, &lines)?;
+    let rollback =
+        ClonePathRollback::capture(&[target.clone(), target.with_extension("")], opts.overwrite)?;
+    let bytes_written = match write_jsonl_lines_atomic(&target, opts.overwrite, &lines) {
+        Ok(bytes_written) => bytes_written,
+        Err(error) => return Err(error_after_clone_rollback(error, rollback)),
+    };
     let artifact = ArtifactPath::File(target.clone());
     if let Err(error) = clone_claude_sidecar(&src.source, &target, opts.overwrite) {
-        let _ = fs::remove_file(&target);
-        return Err(error);
+        return Err(error_after_clone_rollback(error, rollback));
     }
-    let validation = ensure_clone_artifact_native_or_cleanup(
+    let validation = match ensure_clone_artifact_native_or_cleanup(
         Provider::Claude,
         &new_id,
         &new_cwd,
         &artifact,
         opts,
-    )?;
+    ) {
+        Ok(validation) => validation,
+        Err(error) => return Err(error_after_clone_rollback(error, rollback)),
+    };
+    rollback.commit();
     crate::debug::log(
         "clone_to_live_ok",
         serde_json::json!({
@@ -407,13 +415,28 @@ fn clone_codex_same_provider_at_home(
     if new_cwd.is_empty() {
         return Err(ConvertError::MissingField("session.cwd"));
     }
-    let target = codex_rollout_path(codex_home, Utc::now(), &new_id);
+    let mut target_identity = UniversalSession::new(&new_id, Provider::Codex, &new_cwd);
+    target_identity.created_at = Some(Utc::now());
+    let target = providers::codex::install::planned_install(
+        &target_identity,
+        &providers::codex::install::InstallOpts {
+            codex_home: Some(codex_home.to_path_buf()),
+            overwrite: opts.overwrite,
+            update_index: false,
+            state_5_path: None,
+        },
+    )?
+    .rollout_path;
     let mut lines = read_jsonl_lines(&src.source)?;
     patch_codex_jsonl_lines(&mut lines, &src.session_id, &new_id, &src.cwd, &new_cwd);
-    let bytes_written = write_jsonl_lines_atomic(&target, opts.overwrite, &lines)?;
+    let rollback = ClonePathRollback::capture(std::slice::from_ref(&target), opts.overwrite)?;
+    let bytes_written = match write_jsonl_lines_atomic(&target, opts.overwrite, &lines) {
+        Ok(bytes_written) => bytes_written,
+        Err(error) => return Err(error_after_clone_rollback(error, rollback)),
+    };
     let artifact = ArtifactPath::File(target.clone());
 
-    if let Err(error) = copy_codex_state_thread_row(
+    let state_rollback = match copy_codex_state_thread_row(
         codex_home,
         &src.session_id,
         &new_id,
@@ -421,17 +444,29 @@ fn clone_codex_same_provider_at_home(
         &new_cwd,
         opts.overwrite,
     ) {
-        let _ = fs::remove_file(&target);
-        return Err(error);
-    }
+        Ok(state_rollback) => state_rollback,
+        Err(error) => return Err(error_after_clone_rollback(error, rollback)),
+    };
 
-    let validation = ensure_clone_artifact_native_or_cleanup(
+    let validation = match ensure_clone_artifact_native_or_cleanup(
         Provider::Codex,
         &new_id,
         &new_cwd,
         &artifact,
         opts,
-    )?;
+    ) {
+        Ok(validation) => validation,
+        Err(error) => {
+            let state_error = state_rollback.rollback().err();
+            let file_error = rollback.rollback().err();
+            return Err(error_with_rollback_failures(
+                error,
+                state_error.into_iter().chain(file_error),
+            ));
+        }
+    };
+    state_rollback.commit();
+    rollback.commit();
     crate::debug::log(
         "clone_to_live_ok",
         serde_json::json!({
@@ -464,13 +499,29 @@ fn clone_opencode_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<C
     if let Some(new_id) = opts.new_id.as_deref() {
         ensure_distinct_native_clone_id(Provider::OpenCode, &src.session_id, new_id)?;
     }
-    let report = providers::opencode::clone::clone_session_rows(
+    let (report, validation) = providers::opencode::clone::clone_session_rows_with_validation(
         &src.source,
         &src.session_id,
         &providers::opencode::clone::OpenCodeRowCloneOpts {
             new_session_id: opts.new_id.clone(),
             cwd: opts.cwd.clone(),
             overwrite: opts.overwrite,
+        },
+        |conn, new_session_id| {
+            let validation = super::native_validate::validate_opencode_connection(
+                &src.source,
+                new_session_id,
+                conn,
+            );
+            if validation.ok {
+                Ok(validation)
+            } else {
+                Err(ConvertError::Other(format!(
+                    "{} clone artifact failed native validation: {}",
+                    Provider::OpenCode.as_str(),
+                    validation.failure_summary()
+                )))
+            }
         },
     )?;
     let new_id = report.new_session_id.clone();
@@ -479,13 +530,6 @@ fn clone_opencode_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<C
         db_path: report.db_path,
         session_id: new_id.clone(),
     };
-    let validation = ensure_clone_artifact_native_or_cleanup(
-        Provider::OpenCode,
-        &new_id,
-        &new_cwd,
-        &artifact,
-        opts,
-    )?;
     crate::debug::log(
         "clone_to_live_ok",
         serde_json::json!({
@@ -545,11 +589,19 @@ fn clone_pi_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneRe
         ),
     );
 
-    let install_opts = pi_install_opts_from_source(&src.source, opts.overwrite);
-    let install = providers::pi::install::install_to_user_dir(&session, &install_opts)?;
-    let artifact = ArtifactPath::File(install.jsonl_path.clone());
-    let validation =
-        ensure_clone_artifact_native_or_cleanup(Provider::Pi, &new_id, &new_cwd, &artifact, opts)?;
+    let native_opts = pi_install_opts_from_source(&src.source, opts.overwrite);
+    let install = install_universal_session(
+        Provider::Pi,
+        &session,
+        &InstallSessionOpts {
+            overwrite: opts.overwrite,
+            pi_agent_dir: native_opts.pi_agent_dir,
+            pi_session_dir: native_opts.pi_session_dir,
+            ..Default::default()
+        },
+    )?;
+    let artifact = install.artifact;
+    let validation = install.validation;
     crate::debug::log(
         "clone_to_live_ok",
         serde_json::json!({
@@ -611,11 +663,19 @@ fn clone_gjc_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneR
         ),
     );
 
-    let install_opts = gjc_install_opts_from_source(&src.source, opts.overwrite);
-    let install = providers::gjc::install::install_to_user_dir(&session, &install_opts)?;
-    let artifact = ArtifactPath::File(install.jsonl_path.clone());
-    let validation =
-        ensure_clone_artifact_native_or_cleanup(Provider::Gjc, &new_id, &new_cwd, &artifact, opts)?;
+    let native_opts = gjc_install_opts_from_source(&src.source, opts.overwrite);
+    let install = install_universal_session(
+        Provider::Gjc,
+        &session,
+        &InstallSessionOpts {
+            overwrite: opts.overwrite,
+            gjc_agent_dir: native_opts.gjc_agent_dir,
+            gjc_session_dir: native_opts.gjc_session_dir,
+            ..Default::default()
+        },
+    )?;
+    let artifact = install.artifact;
+    let validation = install.validation;
     crate::debug::log(
         "clone_to_live_ok",
         serde_json::json!({
@@ -729,8 +789,252 @@ fn read_jsonl_lines(path: &Path) -> Result<Vec<JsonLine>> {
     Ok(lines)
 }
 
+#[derive(Debug)]
+enum ClonePathPreviousState {
+    Absent,
+    Backup(PathBuf),
+    Untouched,
+}
+
+#[derive(Debug)]
+struct ClonePathRollbackEntry {
+    path: PathBuf,
+    previous: ClonePathPreviousState,
+}
+
+/// Keeps a private, complete copy of every overwritten native artifact until
+/// all provider-specific follow-up work and validation succeeds. This is a
+/// small local transaction across files/directories; an error restores the
+/// previous user data instead of deleting the newly written path and losing
+/// both generations.
+#[derive(Debug)]
+pub(super) struct ClonePathRollback {
+    entries: Vec<ClonePathRollbackEntry>,
+}
+
+impl ClonePathRollback {
+    pub(super) fn capture(paths: &[PathBuf], overwrite: bool) -> Result<Self> {
+        let mut entries = Vec::with_capacity(paths.len());
+        for path in paths {
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    cleanup_clone_rollback_backups(&entries);
+                    return Err(error.into());
+                }
+            };
+            let previous = if metadata.is_none() {
+                ClonePathPreviousState::Absent
+            } else if !overwrite {
+                ClonePathPreviousState::Untouched
+            } else {
+                let backup = clone_rollback_backup_path(path);
+                if let Err(error) = copy_path_for_clone_rollback(path, &backup) {
+                    let _ = remove_clone_path_entry(&backup);
+                    cleanup_clone_rollback_backups(&entries);
+                    return Err(error);
+                }
+                ClonePathPreviousState::Backup(backup)
+            };
+            entries.push(ClonePathRollbackEntry {
+                path: path.clone(),
+                previous,
+            });
+        }
+        Ok(Self { entries })
+    }
+
+    pub(super) fn rollback(self) -> Result<()> {
+        let mut failures = Vec::new();
+        for entry in self.entries.into_iter().rev() {
+            match entry.previous {
+                ClonePathPreviousState::Absent => {
+                    if let Err(error) = remove_clone_path_entry(&entry.path) {
+                        failures.push(format!("remove {} failed: {error}", entry.path.display()));
+                    }
+                }
+                ClonePathPreviousState::Backup(backup) => {
+                    if let Err(error) = remove_clone_path_entry(&entry.path) {
+                        failures.push(format!("remove {} failed: {error}", entry.path.display()));
+                        continue;
+                    }
+                    if let Err(error) = fs::rename(&backup, &entry.path) {
+                        failures.push(format!(
+                            "restore {} from {} failed: {error}",
+                            entry.path.display(),
+                            backup.display()
+                        ));
+                    }
+                }
+                ClonePathPreviousState::Untouched => {}
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ConvertError::Other(failures.join("; ")))
+        }
+    }
+
+    pub(super) fn commit(self) {
+        cleanup_clone_rollback_backups(&self.entries);
+    }
+}
+
+fn clone_rollback_backup_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session");
+    path.with_file_name(format!(
+        ".{name}.rollback-{}",
+        uuid::Uuid::now_v7().simple()
+    ))
+}
+
+fn copy_path_for_clone_rollback(source: &Path, target: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    let file_type = metadata.file_type();
+    if file_type.is_dir() && !file_type.is_symlink() {
+        copy_dir_private(source, target)?;
+    } else if file_type.is_symlink() {
+        copy_symlink(source, target)?;
+    } else if file_type.is_file() {
+        copy_file_private(source, target)?;
+    } else {
+        return Err(ConvertError::Other(format!(
+            "unsupported clone rollback artifact: {}",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn copy_dir_private(source: &Path, target: &Path) -> Result<()> {
+    create_private_dir(target)?;
+
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            copy_dir_private(&source_path, &target_path)?;
+        } else if file_type.is_symlink() {
+            copy_symlink(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            copy_file_private(&source_path, &target_path)?;
+        } else {
+            return Err(ConvertError::Other(format!(
+                "unsupported filesystem entry while cloning sidecar or rollback data: {}",
+                source_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir(path)?;
+    Ok(())
+}
+
+fn copy_file_private(source: &Path, target: &Path) -> Result<()> {
+    let mut source_file = File::open(source)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut target_file = options.open(target)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        target_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    std::io::copy(&mut source_file, &mut target_file)?;
+    target_file.sync_all()?;
+    Ok(())
+}
+
+pub(super) fn remove_clone_path_entry(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn clone_path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cleanup_clone_rollback_backups(entries: &[ClonePathRollbackEntry]) {
+    for entry in entries {
+        if let ClonePathPreviousState::Backup(backup) = &entry.previous {
+            if let Err(error) = remove_clone_path_entry(backup) {
+                crate::debug::log(
+                    "clone_rollback_backup_cleanup_failed",
+                    serde_json::json!({
+                        "path": entry.path.display().to_string(),
+                        "backup": backup.display().to_string(),
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+}
+
+fn error_after_clone_rollback(error: ConvertError, rollback: ClonePathRollback) -> ConvertError {
+    let rollback_error = rollback.rollback().err();
+    error_with_rollback_failures(error, rollback_error)
+}
+
+fn error_with_rollback_failures<I>(error: ConvertError, rollback_errors: I) -> ConvertError
+where
+    I: IntoIterator<Item = ConvertError>,
+{
+    let failures = rollback_errors
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        error
+    } else {
+        ConvertError::Other(format!(
+            "{error}; clone rollback failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
 fn write_jsonl_lines_atomic(path: &Path, overwrite: bool, lines: &[JsonLine]) -> Result<u64> {
-    if path.exists() && !overwrite {
+    if clone_path_exists(path)? && !overwrite {
         return Err(ConvertError::Other(format!(
             "clone target already exists at {} (set overwrite=true to replace)",
             path.display()
@@ -745,10 +1049,14 @@ fn write_jsonl_lines_atomic(path: &Path, overwrite: bool, lines: &[JsonLine]) ->
         .unwrap_or("clone.jsonl");
     let tmp_path = path.with_file_name(format!(".{}.tmp-{}", file_name, uuid::Uuid::now_v7()));
     let result = (|| -> Result<u64> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp_path)?;
         for line in lines {
             match line {
                 JsonLine::Blank => {
@@ -761,16 +1069,66 @@ fn write_jsonl_lines_atomic(path: &Path, overwrite: bool, lines: &[JsonLine]) ->
             }
         }
         file.sync_all()?;
-        if path.exists() && overwrite {
-            fs::remove_file(path)?;
+        publish_clone_temp_file(&tmp_path, path, overwrite)?;
+        if let Some(parent) = path.parent() {
+            let _ = File::open(parent).and_then(|dir| dir.sync_all());
         }
-        fs::rename(&tmp_path, path)?;
         Ok(fs::metadata(path).map(|m| m.len()).unwrap_or(0))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
     }
     result
+}
+
+/// Publish a complete temporary file without ever deleting the previous
+/// destination first. Unix normally replaces in one rename. Platforms that
+/// reject replacement get a same-directory displacement/restore fallback.
+fn publish_clone_temp_file(tmp_path: &Path, path: &Path, overwrite: bool) -> Result<()> {
+    if !overwrite {
+        // A hard-link publication is an atomic create-if-absent operation.
+        // Unlike a preflight exists check followed by rename, it cannot
+        // clobber a destination created concurrently (including a symlink).
+        fs::hard_link(tmp_path, path)?;
+        fs::remove_file(tmp_path)?;
+        return Ok(());
+    }
+
+    let first_error = match fs::rename(tmp_path, path) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if !clone_path_exists(path)? {
+        return Err(first_error.into());
+    }
+
+    let displaced = clone_rollback_backup_path(path);
+    fs::rename(path, &displaced)?;
+    match fs::rename(tmp_path, path) {
+        Ok(()) => {
+            if let Err(error) = remove_clone_path_entry(&displaced) {
+                crate::debug::log(
+                    "clone_displaced_file_cleanup_failed",
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "displaced": displaced.display().to_string(),
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+            Ok(())
+        }
+        Err(publish_error) => match fs::rename(&displaced, path) {
+            Ok(()) => Err(publish_error.into()),
+            Err(restore_error) => Err(ConvertError::Other(format!(
+                "failed to publish {}: {}; failed to restore previous destination from {}: {}",
+                path.display(),
+                publish_error,
+                displaced.display(),
+                restore_error
+            ))),
+        },
+    }
 }
 
 fn claude_line_uuid_map(lines: &[JsonLine]) -> HashMap<String, String> {
@@ -1066,35 +1424,27 @@ fn claude_jsonl_path(claude_home: &Path, cwd: &str, session_id: &str) -> PathBuf
         .join(format!("{session_id}.jsonl"))
 }
 
-fn codex_rollout_path(codex_home: &Path, ts: DateTime<Utc>, session_id: &str) -> PathBuf {
-    codex_home
-        .join("sessions")
-        .join(format!("{:04}", ts.format("%Y")))
-        .join(format!("{:02}", ts.format("%m")))
-        .join(format!("{:02}", ts.format("%d")))
-        .join(format!(
-            "rollout-{}-{session_id}.jsonl",
-            ts.format("%Y-%m-%dT%H-%M-%S")
-        ))
-}
-
 fn clone_claude_sidecar(source_jsonl: &Path, target_jsonl: &Path, overwrite: bool) -> Result<()> {
     let source_sidecar = source_jsonl.with_extension("");
+    let target_sidecar = target_jsonl.with_extension("");
     if !source_sidecar.is_dir() {
+        if clone_path_exists(&target_sidecar)? {
+            if !overwrite {
+                return Err(ConvertError::Other(format!(
+                    "claude sidecar target already exists at {} (set overwrite=true to replace)",
+                    target_sidecar.display()
+                )));
+            }
+            remove_clone_path_entry(&target_sidecar)?;
+        }
         return Ok(());
     }
-    let target_sidecar = target_jsonl.with_extension("");
-    if target_sidecar.exists() {
+    if clone_path_exists(&target_sidecar)? {
         if !overwrite {
             return Err(ConvertError::Other(format!(
                 "claude sidecar target already exists at {} (set overwrite=true to replace)",
                 target_sidecar.display()
             )));
-        }
-        if target_sidecar.is_dir() {
-            fs::remove_dir_all(&target_sidecar)?;
-        } else {
-            fs::remove_file(&target_sidecar)?;
         }
     }
     let sidecar_name = target_sidecar
@@ -1103,17 +1453,13 @@ fn clone_claude_sidecar(source_jsonl: &Path, target_jsonl: &Path, overwrite: boo
         .unwrap_or("sidecar");
     let tmp_sidecar =
         target_sidecar.with_file_name(format!(".{}.tmp-{}", sidecar_name, uuid::Uuid::now_v7()));
-    let copy_result = copy_dir_recursive(&source_sidecar, &tmp_sidecar);
+    let copy_result = copy_dir_private(&source_sidecar, &tmp_sidecar);
     if let Err(error) = copy_result {
         let _ = fs::remove_dir_all(&tmp_sidecar);
         return Err(error);
     }
-    if target_sidecar.exists() && overwrite {
-        if target_sidecar.is_dir() {
-            fs::remove_dir_all(&target_sidecar)?;
-        } else {
-            fs::remove_file(&target_sidecar)?;
-        }
+    if clone_path_exists(&target_sidecar)? && overwrite {
+        remove_clone_path_entry(&target_sidecar)?;
     }
     if let Err(error) = fs::rename(&tmp_sidecar, &target_sidecar) {
         let _ = fs::remove_dir_all(&tmp_sidecar);
@@ -1123,38 +1469,16 @@ fn clone_claude_sidecar(source_jsonl: &Path, target_jsonl: &Path, overwrite: boo
 }
 
 fn ensure_claude_sidecar_target_available(
-    source_jsonl: &Path,
+    _source_jsonl: &Path,
     target_jsonl: &Path,
     overwrite: bool,
 ) -> Result<()> {
-    let source_sidecar = source_jsonl.with_extension("");
-    if !source_sidecar.is_dir() {
-        return Ok(());
-    }
     let target_sidecar = target_jsonl.with_extension("");
-    if target_sidecar.exists() && !overwrite {
+    if clone_path_exists(&target_sidecar)? && !overwrite {
         return Err(ConvertError::Other(format!(
             "claude sidecar target already exists at {} (set overwrite=true to replace)",
             target_sidecar.display()
         )));
-    }
-    Ok(())
-}
-
-fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_dir_recursive(&source_path, &target_path)?;
-        } else if file_type.is_symlink() {
-            copy_symlink(&source_path, &target_path)?;
-        } else if file_type.is_file() {
-            fs::copy(&source_path, &target_path)?;
-        }
     }
     Ok(())
 }
@@ -1249,6 +1573,132 @@ fn hex_digit(nibble: u8) -> char {
 }
 
 #[cfg(feature = "opencode")]
+#[derive(Debug)]
+pub(super) struct CodexStateThreadRollback {
+    state_5: Option<PathBuf>,
+    columns: Vec<String>,
+    new_session_id: String,
+    previous_values: Option<Vec<rusqlite::types::Value>>,
+}
+
+#[cfg(feature = "opencode")]
+impl CodexStateThreadRollback {
+    pub(super) fn inactive() -> Self {
+        Self {
+            state_5: None,
+            columns: Vec::new(),
+            new_session_id: String::new(),
+            previous_values: None,
+        }
+    }
+
+    pub(super) fn rollback(self) -> Result<()> {
+        let Some(state_5) = self.state_5 else {
+            return Ok(());
+        };
+        let mut conn = rusqlite::Connection::open_with_flags(
+            &state_5,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM threads WHERE id = ?1",
+            rusqlite::params![self.new_session_id],
+        )?;
+        if let Some(previous_values) = self.previous_values {
+            insert_codex_thread_values(&tx, &self.columns, &previous_values)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn commit(self) {}
+}
+
+#[cfg(not(feature = "opencode"))]
+#[derive(Debug)]
+pub(super) struct CodexStateThreadRollback;
+
+#[cfg(not(feature = "opencode"))]
+impl CodexStateThreadRollback {
+    pub(super) fn inactive() -> Self {
+        Self
+    }
+
+    pub(super) fn rollback(self) -> Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn commit(self) {}
+}
+
+/// Capture the exact pre-install Codex index row before a file overwrite is
+/// allowed. The returned guard restores that row (or removes a newly-created
+/// row) if publication or native validation later fails.
+#[cfg(feature = "opencode")]
+pub(super) fn capture_codex_state_thread_row(
+    state_5: &Path,
+    session_id: &str,
+    overwrite: bool,
+) -> Result<CodexStateThreadRollback> {
+    if !state_5.exists() {
+        return Ok(CodexStateThreadRollback::inactive());
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        state_5,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
+    let columns = ordered_table_columns(&conn, "threads")?;
+    if !columns.iter().any(|column| column == "id") {
+        return Err(ConvertError::Other(
+            "threads table missing expected column `id` (state_5.sqlite schema drift?)".into(),
+        ));
+    }
+    let select_sql = format!(
+        "SELECT {} FROM threads WHERE id = ?1",
+        columns
+            .iter()
+            .map(|column| quote_sql_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let previous_values = {
+        let mut stmt = conn.prepare(&select_sql)?;
+        match stmt.query_row(rusqlite::params![session_id], |row| {
+            let mut values = Vec::with_capacity(columns.len());
+            for idx in 0..columns.len() {
+                values.push(row.get::<_, rusqlite::types::Value>(idx)?);
+            }
+            Ok(values)
+        }) {
+            Ok(values) => Some(values),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if previous_values.is_some() && !overwrite {
+        return Err(ConvertError::Other(format!(
+            "codex state row already exists for {session_id} (set overwrite=true to replace)"
+        )));
+    }
+    Ok(CodexStateThreadRollback {
+        state_5: Some(state_5.to_path_buf()),
+        columns,
+        new_session_id: session_id.to_string(),
+        previous_values,
+    })
+}
+
+#[cfg(not(feature = "opencode"))]
+pub(super) fn capture_codex_state_thread_row(
+    _state_5: &Path,
+    _session_id: &str,
+    _overwrite: bool,
+) -> Result<CodexStateThreadRollback> {
+    Ok(CodexStateThreadRollback)
+}
+
+#[cfg(feature = "opencode")]
 fn copy_codex_state_thread_row(
     codex_home: &Path,
     source_session_id: &str,
@@ -1256,7 +1706,7 @@ fn copy_codex_state_thread_row(
     rollout_path: &Path,
     cwd: &str,
     overwrite: bool,
-) -> Result<bool> {
+) -> Result<CodexStateThreadRollback> {
     use rusqlite::types::Value as SqlValue;
 
     let state_5 = codex_home.join("state_5.sqlite");
@@ -1268,9 +1718,12 @@ fn copy_codex_state_thread_row(
                 "reason": "missing",
             }),
         );
-        return Ok(false);
+        return Ok(CodexStateThreadRollback::inactive());
     }
-    let mut conn = rusqlite::Connection::open(&state_5)?;
+    let mut conn = rusqlite::Connection::open_with_flags(
+        &state_5,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
     let columns = ordered_table_columns(&conn, "threads")?;
     for required in ["id", "rollout_path", "cwd"] {
         if !columns.iter().any(|column| column == required) {
@@ -1280,18 +1733,6 @@ fn copy_codex_state_thread_row(
         }
     }
     let tx = conn.transaction()?;
-    let existing = tx.query_row(
-        "SELECT COUNT(*) FROM threads WHERE id = ?1",
-        rusqlite::params![new_session_id],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if existing > 0 && !overwrite {
-        return Err(ConvertError::Other(format!(
-            "codex state row already exists for {} (set overwrite=true to replace)",
-            new_session_id
-        )));
-    }
-
     let select_sql = format!(
         "SELECT {} FROM threads WHERE id = ?1",
         columns
@@ -1300,24 +1741,22 @@ fn copy_codex_state_thread_row(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let mut stmt = tx.prepare(&select_sql)?;
-    let mut values = match stmt.query_row(rusqlite::params![source_session_id], |row| {
-        let mut values = Vec::with_capacity(columns.len());
-        for idx in 0..columns.len() {
-            values.push(row.get::<_, SqlValue>(idx)?);
-        }
-        Ok(values)
-    }) {
-        Ok(values) => values,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Err(ConvertError::Other(format!(
-                "source Codex state row not found for {}; native clone cannot rebuild it",
-                source_session_id
-            )));
-        }
-        Err(error) => return Err(error.into()),
-    };
-    drop(stmt);
+    let previous_values =
+        select_codex_thread_values(&tx, &select_sql, new_session_id, columns.len())?;
+    if previous_values.is_some() && !overwrite {
+        return Err(ConvertError::Other(format!(
+            "codex state row already exists for {} (set overwrite=true to replace)",
+            new_session_id
+        )));
+    }
+    let mut values =
+        select_codex_thread_values(&tx, &select_sql, source_session_id, columns.len())?
+            .ok_or_else(|| {
+                ConvertError::Other(format!(
+                    "source Codex state row not found for {}; native clone cannot rebuild it",
+                    source_session_id
+                ))
+            })?;
 
     for (column, value) in columns.iter().zip(values.iter_mut()) {
         match column.as_str() {
@@ -1328,12 +1767,72 @@ fn copy_codex_state_thread_row(
         }
     }
 
-    if overwrite {
+    if previous_values.is_some() {
         tx.execute(
             "DELETE FROM threads WHERE id = ?1",
             rusqlite::params![new_session_id],
         )?;
     }
+    insert_codex_thread_values(&tx, &columns, &values)?;
+    tx.commit()?;
+    crate::debug::log(
+        "codex_clone_state_index_ok",
+        serde_json::json!({
+            "state_5": state_5.display().to_string(),
+            "source_session_id": source_session_id,
+            "new_session_id": new_session_id,
+            "rollout_path": rollout_path.display().to_string(),
+        }),
+    );
+    Ok(CodexStateThreadRollback {
+        state_5: Some(state_5),
+        columns,
+        new_session_id: new_session_id.to_string(),
+        previous_values,
+    })
+}
+
+#[cfg(not(feature = "opencode"))]
+fn copy_codex_state_thread_row(
+    _codex_home: &Path,
+    _source_session_id: &str,
+    _new_session_id: &str,
+    _rollout_path: &Path,
+    _cwd: &str,
+    _overwrite: bool,
+) -> Result<CodexStateThreadRollback> {
+    Ok(CodexStateThreadRollback)
+}
+
+#[cfg(feature = "opencode")]
+fn select_codex_thread_values(
+    tx: &rusqlite::Transaction<'_>,
+    select_sql: &str,
+    session_id: &str,
+    column_count: usize,
+) -> Result<Option<Vec<rusqlite::types::Value>>> {
+    use rusqlite::types::Value as SqlValue;
+
+    let mut stmt = tx.prepare(select_sql)?;
+    match stmt.query_row(rusqlite::params![session_id], |row| {
+        let mut values = Vec::with_capacity(column_count);
+        for idx in 0..column_count {
+            values.push(row.get::<_, SqlValue>(idx)?);
+        }
+        Ok(values)
+    }) {
+        Ok(values) => Ok(Some(values)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(feature = "opencode")]
+fn insert_codex_thread_values(
+    tx: &rusqlite::Transaction<'_>,
+    columns: &[String],
+    values: &[rusqlite::types::Value],
+) -> Result<()> {
     let placeholders = (1..=columns.len())
         .map(|idx| format!("?{idx}"))
         .collect::<Vec<_>>()
@@ -1348,29 +1847,7 @@ fn copy_codex_state_thread_row(
         placeholders
     );
     tx.execute(&insert_sql, rusqlite::params_from_iter(values.iter()))?;
-    tx.commit()?;
-    crate::debug::log(
-        "codex_clone_state_index_ok",
-        serde_json::json!({
-            "state_5": state_5.display().to_string(),
-            "source_session_id": source_session_id,
-            "new_session_id": new_session_id,
-            "rollout_path": rollout_path.display().to_string(),
-        }),
-    );
-    Ok(true)
-}
-
-#[cfg(not(feature = "opencode"))]
-fn copy_codex_state_thread_row(
-    _codex_home: &Path,
-    _source_session_id: &str,
-    _new_session_id: &str,
-    _rollout_path: &Path,
-    _cwd: &str,
-    _overwrite: bool,
-) -> Result<bool> {
-    Ok(false)
+    Ok(())
 }
 
 #[cfg(feature = "opencode")]
@@ -1408,12 +1885,12 @@ fn ensure_clone_artifact_native_or_cleanup(
         Err(validation_error) => {
             let cleanup_error = if opts.overwrite {
                 crate::debug::log(
-                    "clone_validation_failed_cleanup_skipped",
+                    "clone_validation_failed_outer_rollback_required",
                     serde_json::json!({
                         "target_provider": target_provider.as_str(),
                         "session_id": session_id,
                         "artifact": format!("{:?}", artifact),
-                        "reason": "overwrite_enabled",
+                        "reason": "previous artifact is owned by the caller's overwrite rollback guard",
                         "error": validation_error.to_string(),
                     }),
                 );
@@ -1570,6 +2047,85 @@ mod tests {
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn clone_path_rollback_restores_previous_file_and_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_file = dir.path().join("session.jsonl");
+        let target_dir = dir.path().join("session");
+        fs::write(&target_file, "old-file").unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        fs::write(target_dir.join("old-sidecar.txt"), "old-sidecar").unwrap();
+
+        let rollback =
+            ClonePathRollback::capture(&[target_file.clone(), target_dir.clone()], true).unwrap();
+        fs::write(&target_file, "new-file").unwrap();
+        fs::remove_dir_all(&target_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        fs::write(target_dir.join("new-sidecar.txt"), "new-sidecar").unwrap();
+
+        rollback.rollback().unwrap();
+
+        assert_eq!(fs::read_to_string(&target_file).unwrap(), "old-file");
+        assert_eq!(
+            fs::read_to_string(target_dir.join("old-sidecar.txt")).unwrap(),
+            "old-sidecar"
+        );
+        assert!(!target_dir.join("new-sidecar.txt").exists());
+        assert!(
+            fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".rollback-")),
+            "successful rollback must consume its private backups"
+        );
+    }
+
+    #[test]
+    fn claude_sidecar_overwrite_removes_stale_target_when_source_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jsonl");
+        let target = dir.path().join("target.jsonl");
+        fs::write(&source, "source").unwrap();
+        fs::write(&target, "target").unwrap();
+        let stale_sidecar = target.with_extension("");
+        fs::create_dir(&stale_sidecar).unwrap();
+        fs::write(stale_sidecar.join("stale.txt"), "stale").unwrap();
+
+        clone_claude_sidecar(&source, &target, true).unwrap();
+
+        assert!(!stale_sidecar.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_path_rollback_refuses_incomplete_backup_of_special_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("session");
+        fs::create_dir(&target_dir).unwrap();
+        fs::write(target_dir.join("old-sidecar.txt"), "old-sidecar").unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(target_dir.join("live.sock"))
+            .expect("create unsupported sidecar entry");
+
+        let error = ClonePathRollback::capture(std::slice::from_ref(&target_dir), true)
+            .expect_err("an incomplete rollback copy must never authorize overwrite");
+
+        assert!(error.to_string().contains("unsupported filesystem entry"));
+        assert_eq!(
+            fs::read_to_string(target_dir.join("old-sidecar.txt")).unwrap(),
+            "old-sidecar"
+        );
+        assert!(target_dir.join("live.sock").exists());
+        assert!(
+            fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".rollback-")),
+            "failed capture must remove its partial private backup"
+        );
     }
 
     #[test]
@@ -2119,6 +2675,97 @@ mod tests {
         assert_eq!(row.1, "/new/cwd");
         assert_eq!(row.2, "old title");
         assert_eq!(row.3, "native-value");
+    }
+
+    #[cfg(feature = "opencode")]
+    #[test]
+    fn codex_state_clone_rollback_restores_previous_target_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join(".codex");
+        fs::create_dir(&codex_home).unwrap();
+        let state_5 = codex_home.join("state_5.sqlite");
+        let conn = rusqlite::Connection::open(&state_5).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                title TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title)
+             VALUES ('source', '/source.jsonl', '/source', 'source title')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title)
+             VALUES ('target', '/old.jsonl', '/old', 'old target title')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let rollback = copy_codex_state_thread_row(
+            &codex_home,
+            "source",
+            "target",
+            Path::new("/new.jsonl"),
+            "/new",
+            true,
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(&state_5).unwrap();
+        let replaced = conn
+            .query_row(
+                "SELECT rollout_path, cwd, title FROM threads WHERE id = 'target'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            replaced,
+            (
+                "/new.jsonl".to_string(),
+                "/new".to_string(),
+                "source title".to_string()
+            )
+        );
+        drop(conn);
+
+        rollback.rollback().unwrap();
+
+        let conn = rusqlite::Connection::open(&state_5).unwrap();
+        let restored = conn
+            .query_row(
+                "SELECT rollout_path, cwd, title FROM threads WHERE id = 'target'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            restored,
+            (
+                "/old.jsonl".to_string(),
+                "/old".to_string(),
+                "old target title".to_string()
+            )
+        );
     }
 
     #[cfg(feature = "opencode")]

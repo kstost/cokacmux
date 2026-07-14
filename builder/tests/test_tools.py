@@ -641,6 +641,43 @@ class ToolDownloadTests(unittest.TestCase):
 
 
 class ZigArchiveTests(unittest.TestCase):
+    def test_interrupted_commit_with_backup_only_restores_prior_install(self):
+        with tempfile.TemporaryDirectory() as root:
+            installer = ToolInstaller(_Config(), Path(root), MagicMock())
+            installer.tools_dir.mkdir(parents=True)
+            backup = installer._staged_directory_backup_path(installer.zig_dir)
+            backup.mkdir()
+            marker = backup / "prior-install"
+            marker.write_bytes(b"preserve")
+
+            self.assertTrue(
+                installer._recover_staged_directory_backup(installer.zig_dir, "Zig")
+            )
+
+            self.assertEqual(
+                (installer.zig_dir / "prior-install").read_bytes(), b"preserve"
+            )
+            self.assertFalse(backup.exists())
+
+    def test_interrupted_commit_with_new_destination_cleans_old_backup(self):
+        with tempfile.TemporaryDirectory() as root:
+            installer = ToolInstaller(_Config(), Path(root), MagicMock())
+            installer.tools_dir.mkdir(parents=True)
+            installer.zig_dir.mkdir()
+            (installer.zig_dir / "new-install").write_bytes(b"new")
+            backup = installer._staged_directory_backup_path(installer.zig_dir)
+            backup.mkdir()
+            (backup / "prior-install").write_bytes(b"old")
+
+            self.assertTrue(
+                installer._recover_staged_directory_backup(installer.zig_dir, "Zig")
+            )
+
+            self.assertEqual(
+                (installer.zig_dir / "new-install").read_bytes(), b"new"
+            )
+            self.assertFalse(backup.exists())
+
     def test_existing_checksum_mismatch_preserves_archive_and_install(self):
         with tempfile.TemporaryDirectory() as root:
             installer = ToolInstaller(_Config(), Path(root), MagicMock())

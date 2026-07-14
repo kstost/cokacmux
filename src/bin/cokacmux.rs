@@ -322,15 +322,23 @@ const DAEMON_REQUEST_READ_BUDGET_BYTES: usize = 64 * 1024;
 /// is roughly four bytes per input byte. Keep chunks comfortably below the
 /// authenticated request-frame cap while preserving FIFO byte order.
 const AGENT_INPUT_REQUEST_CHUNK_BYTES: usize = 256 * 1024;
-/// New daemons acknowledge input only after it has entered the PTY writer
-/// FIFO. Keep an independent client-side copy until that acknowledgement so
-/// a stalled socket writer cannot silently discard already-reported input.
+/// New daemons acknowledge input only after the PTY writer completes
+/// write_all + flush. Keep an independent client-side copy until that
+/// acknowledgement so a stalled or failed PTY write cannot silently discard
+/// already-reported input.
 /// This covers the daemon's 4 MiB worker queue plus 4 MiB pending FIFO while
 /// keeping paste preflight and memory use bounded.
 const AGENT_CLIENT_UNACKNOWLEDGED_INPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 const AGENT_CLIENT_UNACKNOWLEDGED_INPUT_MAX_FRAMES: usize = 4_096;
 const AGENT_GLOBAL_UNACKNOWLEDGED_INPUT_MAX_BYTES: usize = 32 * 1024 * 1024;
 const AGENT_GLOBAL_UNACKNOWLEDGED_INPUT_MAX_FRAMES: usize = 16_384;
+/// Terminal input produced while the focused process is changing owners cannot
+/// be sent to the still-visible old client. Retain it until the requested
+/// target is active, with the same per-client bounds used by the
+/// acknowledged-input recovery queue.
+const DEFERRED_AGENT_INPUT_MAX_BYTES: usize = AGENT_CLIENT_UNACKNOWLEDGED_INPUT_MAX_BYTES;
+const DEFERRED_AGENT_INPUT_MAX_EVENTS: usize = AGENT_CLIENT_UNACKNOWLEDGED_INPUT_MAX_FRAMES;
+const DEFERRED_AGENT_KEY_ACCOUNTED_BYTES: usize = 16;
 const DAEMON_INPUT_DEDUPE_CLIENTS_MAX: usize = 32;
 /// The PTY master may block forever when a child stops reading stdin. Keep
 /// writes on one FIFO worker and bound queued input to roughly 4 MiB.
@@ -370,6 +378,10 @@ const DAEMON_CLIENT_OUTBOUND_RESYNC_BYTES: usize = 16 * 1024;
 /// exit ordering. Drop the connection once one full maximum-sized frame plus
 /// one in-flight replacement can no longer fit in a fixed memory budget.
 const DAEMON_CLIENT_OUTBOUND_HARD_BYTES: usize = 2 * AGENT_CLIENT_FRAME_MAX_BYTES;
+/// After waitpid reports the child dead, wait for the dedicated PTY reader to
+/// observe EOF and drain every queued chunk. The timeout is only a bound for a
+/// broken platform reader; ordinary completion is driven by channel closure.
+const DAEMON_FINAL_OUTPUT_DRAIN_TIMEOUT_MS: u64 = 2_000;
 /// On child exit the daemon flushes the queued exit notice for at most
 /// this long before cleaning up its runtime files; a peer that cannot
 /// drain by then learns of the exit from the socket EOF instead.
@@ -383,12 +395,18 @@ const DAEMON_DISK_SHUTDOWN_TIMEOUT_MS: u64 = 1_000;
 /// Exact runtime cleanup runs off the daemon loop because a stalled
 /// filesystem must not keep a childless, live-looking daemon around forever.
 const DAEMON_RUNTIME_CLEANUP_TIMEOUT_MS: u64 = 1_000;
+/// Runtime repair must never remain permanently pending after a filesystem or
+/// endpoint operation stalls. One replacement may run alongside one abandoned
+/// observation; late results still release capacity and can be applied.
+const DAEMON_RUNTIME_REPAIR_WATCHDOG_TIMEOUT_MS: u64 = 60_000;
+const DAEMON_RUNTIME_REPAIR_MAX_OUTSTANDING: usize = 2;
 #[cfg(windows)]
 const WINDOWS_PROCESS_IDENTITY_TIMEOUT_MS: u64 = 2_000;
 #[cfg(all(unix, not(target_os = "linux")))]
 const PROCESS_PROBE_COMMAND_TIMEOUT_MS: u64 = 2_000;
 const PROGRAM_RESOLVE_COMMAND_TIMEOUT_MS: u64 = 5_000;
 const COKACDIR_DOWNLOAD_TIMEOUT_MS: u64 = 120_000;
+const COKACDIR_VERSION_TIMEOUT_MS: u64 = 10_000;
 /// PTY setup can fail after the child has started. Cleanup must never turn
 /// that recoverable error into an unbounded wait, even when platform group
 /// termination is unavailable or fails.
@@ -5317,11 +5335,33 @@ fn app_runtime_snapshot_debug_value(app: &App, verbose: bool) -> serde_json::Val
             .unwrap_or(serde_json::Value::Null),
     );
     snapshot.insert(
+        "attach_terminal_input_target".into(),
+        app.attach_terminal_input_target
+            .as_ref()
+            .map(|(seq, target)| {
+                serde_json::json!({
+                    "seq": seq,
+                    "key": agent_key_debug_value(&target.key),
+                    "attach_target": attach_target_debug_value(&target.attach_target),
+                })
+            })
+            .unwrap_or(serde_json::Value::Null),
+    );
+    snapshot.insert(
         "queued_attach".into(),
         app.queued_attach
             .as_ref()
             .map(attach_job_debug_value)
             .unwrap_or(serde_json::Value::Null),
+    );
+    snapshot.insert(
+        "deferred_agent_input".into(),
+        serde_json::json!({
+            "events": app.deferred_agent_input.len(),
+            "bytes": app.deferred_agent_input_bytes,
+            "rejected_events": app.deferred_agent_input_rejected_events,
+            "rejected_bytes": app.deferred_agent_input_rejected_bytes,
+        }),
     );
     snapshot.insert(
         "agent_kill_pending".into(),
@@ -5817,6 +5857,23 @@ struct AgentPtyOutputDrain {
     chunks: Vec<Vec<u8>>,
     activity_changed: bool,
     has_more: bool,
+    output_closed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DaemonPtyInputAcknowledgement {
+    client_instance_id: String,
+    input_seq: u64,
+}
+
+struct DaemonPtyInputJob {
+    bytes: Vec<u8>,
+    acknowledgement: Option<DaemonPtyInputAcknowledgement>,
+}
+
+enum DaemonPtyInputCompletion {
+    Written(DaemonPtyInputAcknowledgement),
+    Failed(DaemonPtyInputAcknowledgement),
 }
 
 struct AgentSession {
@@ -5833,10 +5890,12 @@ struct AgentSession {
     parser: vt100::Parser,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send>,
-    input_tx: Option<SyncSender<Vec<u8>>>,
+    input_tx: Option<SyncSender<DaemonPtyInputJob>>,
     input_thread: Option<JoinHandle<()>>,
     input_writer_failed: Arc<AtomicBool>,
-    pending_input: VecDeque<Vec<u8>>,
+    input_completion_rx: Receiver<DaemonPtyInputCompletion>,
+    input_sequences_in_flight: HashSet<DaemonPtyInputAcknowledgement>,
+    pending_input: VecDeque<DaemonPtyInputJob>,
     pending_input_bytes: usize,
     output_rx: Receiver<Vec<u8>>,
     /// All daemon disk writes (pty log appends, meta snapshots) go through
@@ -5900,7 +5959,8 @@ impl DaemonRuntimeFileFlags {
 }
 
 fn run_daemon_pty_input_writer(
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<DaemonPtyInputJob>,
+    completion_tx: Sender<DaemonPtyInputCompletion>,
     mut writer: Box<dyn Write + Send>,
     provider: Provider,
     session_id: String,
@@ -5915,22 +5975,28 @@ fn run_daemon_pty_input_writer(
     );
     let mut jobs = 0usize;
     let mut bytes_written = 0usize;
-    while let Ok(bytes) = rx.recv() {
+    while let Ok(job) = rx.recv() {
         jobs = jobs.saturating_add(1);
-        let result = writer.write_all(&bytes).and_then(|_| writer.flush());
+        let result = writer.write_all(&job.bytes).and_then(|_| writer.flush());
         match result {
             Ok(()) => {
-                bytes_written = bytes_written.saturating_add(bytes.len());
+                bytes_written = bytes_written.saturating_add(job.bytes.len());
+                if let Some(acknowledgement) = job.acknowledgement {
+                    let _ = completion_tx.send(DaemonPtyInputCompletion::Written(acknowledgement));
+                }
             }
             Err(error) => {
                 failed.store(true, Ordering::Release);
+                if let Some(acknowledgement) = job.acknowledgement {
+                    let _ = completion_tx.send(DaemonPtyInputCompletion::Failed(acknowledgement));
+                }
                 debug_log(
                     "daemon_pty_input_writer_failed",
                     serde_json::json!({
                         "provider": provider.as_str(),
                         "session_id": &session_id,
                         "job": jobs,
-                        "len": bytes.len(),
+                        "len": job.bytes.len(),
                         "error_kind": format!("{:?}", error.kind()),
                         "error": error.to_string(),
                     }),
@@ -6802,7 +6868,10 @@ impl AgentSession {
                 return Err(e);
             }
         };
-        let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(DAEMON_PTY_INPUT_QUEUE_MAX_JOBS);
+        let (input_tx, input_rx) =
+            mpsc::sync_channel::<DaemonPtyInputJob>(DAEMON_PTY_INPUT_QUEUE_MAX_JOBS);
+        let (input_completion_tx, input_completion_rx) =
+            mpsc::channel::<DaemonPtyInputCompletion>();
         let input_writer_failed = Arc::new(AtomicBool::new(false));
         let input_failed_for_thread = Arc::clone(&input_writer_failed);
         let input_provider = info.provider;
@@ -6816,6 +6885,7 @@ impl AgentSession {
             .spawn(move || {
                 run_daemon_pty_input_writer(
                     input_rx,
+                    input_completion_tx,
                     writer,
                     input_provider,
                     input_session_id,
@@ -7032,6 +7102,8 @@ impl AgentSession {
             input_tx: Some(input_tx),
             input_thread: Some(input_thread),
             input_writer_failed,
+            input_completion_rx,
+            input_sequences_in_flight: HashSet::new(),
             pending_input: VecDeque::new(),
             pending_input_bytes: 0,
             output_rx,
@@ -7130,7 +7202,11 @@ impl AgentSession {
                     }
                     drain.chunks.push(bytes);
                 }
-                Err(_) => break,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    drain.output_closed = true;
+                    break;
+                }
             }
         }
         drain.has_more = !drain.chunks.is_empty()
@@ -7473,7 +7549,7 @@ impl AgentSession {
         self.last_input_epoch_ms = current_epoch_ms();
         let result = self.write_to_agent(bytes, true);
         debug_log(
-            "daemon_agent_input_write",
+            "daemon_agent_input_admitted",
             serde_json::json!({
                 "provider": self.info.provider.as_str(),
                 "session_id": &self.info.session_id,
@@ -7487,8 +7563,76 @@ impl AgentSession {
         result
     }
 
-    fn write_to_agent(&mut self, bytes: &[u8], preserve_over_limit: bool) -> io::Result<()> {
+    /// Admit one acknowledged client frame to the FIFO exactly once. `Ok(false)`
+    /// means the same client sequence is already waiting for its PTY write
+    /// completion; the caller must not enqueue or acknowledge it again.
+    fn send_sequenced_bytes(
+        &mut self,
+        bytes: &[u8],
+        client_instance_id: &str,
+        input_seq: u64,
+    ) -> io::Result<bool> {
+        let acknowledgement = DaemonPtyInputAcknowledgement {
+            client_instance_id: client_instance_id.to_string(),
+            input_seq,
+        };
         if self.input_writer_failed.load(Ordering::Acquire) {
+            self.input_sequences_in_flight.clear();
+            return Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "agent PTY input writer stopped",
+            ));
+        }
+        if self.input_sequences_in_flight.contains(&acknowledgement) {
+            return Ok(false);
+        }
+        self.last_input_epoch_ms = current_epoch_ms();
+        self.input_sequences_in_flight
+            .insert(acknowledgement.clone());
+        let result = self.write_input_job(
+            DaemonPtyInputJob {
+                bytes: bytes.to_vec(),
+                acknowledgement: Some(acknowledgement.clone()),
+            },
+            true,
+        );
+        if result.is_err() {
+            self.input_sequences_in_flight.remove(&acknowledgement);
+        }
+        debug_log(
+            "daemon_agent_sequenced_input_admitted",
+            serde_json::json!({
+                "provider": self.info.provider.as_str(),
+                "session_id": &self.info.session_id,
+                "client_instance_id": client_instance_id,
+                "input_seq": input_seq,
+                "len": bytes.len(),
+                "ok": result.is_ok(),
+                "error_kind": result.as_ref().err().map(|e| format!("{:?}", e.kind())),
+                "error": result.as_ref().err().map(|e| e.to_string()),
+                "last_input_epoch_ms": self.last_input_epoch_ms,
+            }),
+        );
+        result.map(|()| true)
+    }
+
+    fn write_to_agent(&mut self, bytes: &[u8], preserve_over_limit: bool) -> io::Result<()> {
+        self.write_input_job(
+            DaemonPtyInputJob {
+                bytes: bytes.to_vec(),
+                acknowledgement: None,
+            },
+            preserve_over_limit,
+        )
+    }
+
+    fn write_input_job(
+        &mut self,
+        job: DaemonPtyInputJob,
+        preserve_over_limit: bool,
+    ) -> io::Result<()> {
+        if self.input_writer_failed.load(Ordering::Acquire) {
+            self.input_sequences_in_flight.clear();
             return Err(io::Error::new(
                 ErrorKind::BrokenPipe,
                 "agent PTY input writer stopped",
@@ -7501,15 +7645,14 @@ impl AgentSession {
             ));
         };
         if !self.pending_input.is_empty() {
-            return self.push_pending_input(bytes.to_vec(), preserve_over_limit);
+            return self.push_pending_input(job, preserve_over_limit);
         }
-        match input_tx.try_send(bytes.to_vec()) {
+        match input_tx.try_send(job) {
             Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(bytes)) => {
-                self.push_pending_input(bytes, preserve_over_limit)
-            }
+            Err(mpsc::TrySendError::Full(job)) => self.push_pending_input(job, preserve_over_limit),
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 self.input_writer_failed.store(true, Ordering::Release);
+                self.input_sequences_in_flight.clear();
                 Err(io::Error::new(
                     ErrorKind::BrokenPipe,
                     "agent PTY input writer disconnected",
@@ -7518,8 +7661,13 @@ impl AgentSession {
         }
     }
 
-    fn push_pending_input(&mut self, bytes: Vec<u8>, preserve_over_limit: bool) -> io::Result<()> {
-        let next_bytes = self.pending_input_bytes.saturating_add(bytes.len());
+    fn push_pending_input(
+        &mut self,
+        job: DaemonPtyInputJob,
+        preserve_over_limit: bool,
+    ) -> io::Result<()> {
+        let job_len = job.bytes.len();
+        let next_bytes = self.pending_input_bytes.saturating_add(job_len);
         if next_bytes > DAEMON_PTY_INPUT_PENDING_MAX_BYTES && !preserve_over_limit {
             return Err(io::Error::new(
                 ErrorKind::WouldBlock,
@@ -7533,18 +7681,19 @@ impl AgentSession {
                     "provider": self.info.provider.as_str(),
                     "session_id": &self.info.session_id,
                     "pending_bytes_before": self.pending_input_bytes,
-                    "added_bytes": bytes.len(),
+                    "added_bytes": job_len,
                     "limit_bytes": DAEMON_PTY_INPUT_PENDING_MAX_BYTES,
                 }),
             );
         }
         self.pending_input_bytes = next_bytes;
-        self.pending_input.push_back(bytes);
+        self.pending_input.push_back(job);
         Ok(())
     }
 
     fn flush_pending_input(&mut self) -> io::Result<()> {
         if self.input_writer_failed.load(Ordering::Acquire) {
+            self.input_sequences_in_flight.clear();
             return Err(io::Error::new(
                 ErrorKind::BrokenPipe,
                 "agent PTY input writer stopped",
@@ -7556,19 +7705,20 @@ impl AgentSession {
                 "agent PTY input writer is unavailable",
             ));
         };
-        while let Some(bytes) = self.pending_input.pop_front() {
-            let len = bytes.len();
-            match input_tx.try_send(bytes) {
+        while let Some(job) = self.pending_input.pop_front() {
+            let len = job.bytes.len();
+            match input_tx.try_send(job) {
                 Ok(()) => {
                     self.pending_input_bytes = self.pending_input_bytes.saturating_sub(len);
                 }
-                Err(mpsc::TrySendError::Full(bytes)) => {
-                    self.pending_input.push_front(bytes);
+                Err(mpsc::TrySendError::Full(job)) => {
+                    self.pending_input.push_front(job);
                     break;
                 }
-                Err(mpsc::TrySendError::Disconnected(bytes)) => {
-                    self.pending_input.push_front(bytes);
+                Err(mpsc::TrySendError::Disconnected(job)) => {
+                    self.pending_input.push_front(job);
                     self.input_writer_failed.store(true, Ordering::Release);
+                    self.input_sequences_in_flight.clear();
                     return Err(io::Error::new(
                         ErrorKind::BrokenPipe,
                         "agent PTY input writer disconnected",
@@ -7577,6 +7727,28 @@ impl AgentSession {
             }
         }
         Ok(())
+    }
+
+    fn drain_input_completions(&mut self) -> Vec<DaemonPtyInputCompletion> {
+        let mut completions = Vec::new();
+        loop {
+            match self.input_completion_rx.try_recv() {
+                Ok(DaemonPtyInputCompletion::Written(acknowledgement)) => {
+                    self.input_sequences_in_flight.remove(&acknowledgement);
+                    completions.push(DaemonPtyInputCompletion::Written(acknowledgement));
+                }
+                Ok(DaemonPtyInputCompletion::Failed(acknowledgement)) => {
+                    // The writer exits on its first failure, so every later
+                    // queued sequence is unavailable too. A reconnect must be
+                    // allowed to replay all of those still-unacknowledged
+                    // frames against a replacement daemon.
+                    self.input_sequences_in_flight.clear();
+                    completions.push(DaemonPtyInputCompletion::Failed(acknowledgement));
+                }
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        completions
     }
 
     fn input_backpressured(&self) -> bool {
@@ -8333,8 +8505,9 @@ enum AgentDaemonEvent {
         session_id: String,
         nonce: String,
     },
-    /// Confirms that the identified input frame has entered the daemon's PTY
-    /// input FIFO. It does not merely confirm a client socket write.
+    /// Confirms that the daemon's PTY writer completed write_all + flush for
+    /// the identified frame. It does not merely confirm queue admission or a
+    /// client socket write.
     InputAccepted {
         input_seq: u64,
     },
@@ -11163,6 +11336,34 @@ struct AttachInFlight {
     started_at: Instant,
 }
 
+enum DeferredAgentInputKind {
+    Key(KeyEvent),
+    Paste(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeferredAgentInputTarget {
+    key: AgentKey,
+    attach_target: AttachTarget,
+}
+
+struct DeferredAgentInput {
+    target: DeferredAgentInputTarget,
+    kind: DeferredAgentInputKind,
+}
+
+impl DeferredAgentInput {
+    fn accounted_bytes(&self) -> usize {
+        match &self.kind {
+            // Escape sequences emitted for a key are small, but account a
+            // fixed envelope so a long key burst still reaches the event cap
+            // well before becoming a memory concern.
+            DeferredAgentInputKind::Key(_) => DEFERRED_AGENT_KEY_ACCOUNTED_BYTES,
+            DeferredAgentInputKind::Paste(text) => text.len(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AgentKillTarget {
     MainAgent,
@@ -11728,8 +11929,20 @@ struct App {
     attach_seq: u64,
     /// The attach job currently running on the worker thread, if any.
     attach_in_flight: Option<AttachInFlight>,
+    /// Attach target that owns terminal input arriving after the initiating
+    /// UI command. Main switches always capture; auxiliary attaches capture
+    /// only when they will receive focus on completion.
+    attach_terminal_input_target: Option<(u64, DeferredAgentInputTarget)>,
     /// Newest attach request received while one was in flight (latest wins).
     queued_attach: Option<AttachJob>,
+    /// Raw terminal input that reached the forwarding boundary after a
+    /// focus-changing attach was requested but before its new connection
+    /// became active. Each event carries the intended target so a failed or
+    /// superseded attach is discarded rather than misrouted to another PTY.
+    deferred_agent_input: VecDeque<DeferredAgentInput>,
+    deferred_agent_input_bytes: usize,
+    deferred_agent_input_rejected_events: usize,
+    deferred_agent_input_rejected_bytes: usize,
     agent_kill_seq: u64,
     agent_kill_pending: Option<AgentKillPending>,
     killall_seq: u64,
@@ -11886,7 +12099,12 @@ impl App {
             live_shell_discovery_abandoned_seqs: HashSet::new(),
             attach_seq: 0,
             attach_in_flight: None,
+            attach_terminal_input_target: None,
             queued_attach: None,
+            deferred_agent_input: VecDeque::new(),
+            deferred_agent_input_bytes: 0,
+            deferred_agent_input_rejected_events: 0,
+            deferred_agent_input_rejected_bytes: 0,
             agent_kill_seq: 0,
             agent_kill_pending: None,
             killall_seq: 0,
@@ -17404,6 +17622,8 @@ impl App {
     /// resolves a second later).
     fn cancel_pending_attach(&mut self, reason: &'static str) {
         if self.attach_in_flight.is_none() && self.queued_attach.is_none() {
+            self.attach_terminal_input_target = None;
+            self.discard_deferred_agent_input(reason);
             return;
         }
         debug_log(
@@ -17426,7 +17646,9 @@ impl App {
             }),
         );
         self.attach_in_flight = None;
+        self.attach_terminal_input_target = None;
         self.queued_attach = None;
+        self.discard_deferred_agent_input(reason);
     }
 
     /// Queue an attach job. Jobs run one at a time on a worker thread so
@@ -17583,6 +17805,16 @@ impl App {
             settings,
             ctx,
         } = job;
+        self.attach_terminal_input_target =
+            (ctx.target.is_main_agent() || ctx.focus_auxiliary_on_ready).then(|| {
+                (
+                    seq,
+                    DeferredAgentInputTarget {
+                        key: ctx.key.clone(),
+                        attach_target: ctx.target.clone(),
+                    },
+                )
+            });
         self.attach_in_flight = Some(AttachInFlight {
             seq,
             key: ctx.key.clone(),
@@ -17646,6 +17878,7 @@ impl App {
             });
         if let Err(e) = spawn_result {
             self.attach_in_flight = None;
+            self.attach_terminal_input_target = None;
             self.finish_new_session_launch_for_key(
                 &attach_key_for_pending,
                 "attach_worker_spawn_failed",
@@ -17697,6 +17930,7 @@ impl App {
         }
         self.finish_new_session_launch_for_key(&result.ctx.key, "attach_result");
         self.attach_in_flight = None;
+        self.attach_terminal_input_target = None;
         if let Some(queued) = self.queued_attach.take() {
             let result_seq = result.seq;
             let result_provider = result.ctx.key.provider;
@@ -17742,6 +17976,13 @@ impl App {
                     ctx.status_attached
                 };
                 self.show_sessions_view = false;
+                // The terminal may have resized while the attach worker was
+                // connecting. Resolve layout against the current dimensions,
+                // not the stale geometry captured when the job started.
+                let (terminal_cols, terminal_rows) = crossterm::terminal::size().unwrap_or((
+                    cols.max(80),
+                    rows.saturating_add(AGENT_STATUS_HEIGHT).max(24),
+                ));
                 match ctx.target {
                     AttachTarget::MainAgent => {
                         let fallback_focus = self.valid_agent_focus_for_current(self.agent_focus);
@@ -17752,11 +17993,6 @@ impl App {
                             self.select_visible_session(&ctx.key);
                         }
                         self.refresh_agent_runtime_states();
-                        let (terminal_cols, terminal_rows) =
-                            crossterm::terminal::size().unwrap_or((
-                                cols.max(80),
-                                rows.saturating_add(AGENT_STATUS_HEIGHT).max(24),
-                            ));
                         let _ = self.restore_hidden_auxiliary_for_active_agent(
                             terminal_cols,
                             terminal_rows,
@@ -17833,6 +18069,10 @@ impl App {
                         }
                     }
                 }
+                // Installing an auxiliary changes the main pane's width too;
+                // synchronize both PTYs before replaying any input that was
+                // serialized behind this attach.
+                let _ = self.sync_agent_viewports(terminal_cols, terminal_rows);
                 let replay_result =
                     self.agent_client_mut_by_reader_id(reader_id)
                         .and_then(|agent| {
@@ -22407,7 +22647,9 @@ impl App {
     fn clear_live_runtime_after_killall(&mut self) {
         self.agent_kill_pending = None;
         self.attach_in_flight = None;
+        self.attach_terminal_input_target = None;
         self.queued_attach = None;
+        self.discard_deferred_agent_input("killall_clear");
         self.new_session_launch = None;
         self.pending_runtime_action = None;
         self.pending_runtime_action_last_slow_log_at = None;
@@ -22489,6 +22731,231 @@ impl App {
                     .filter(|attach| attach.target.is_main_agent())
                     .map(|attach| attach.key.clone())
             })
+    }
+
+    fn pending_terminal_input_attach_target(&self) -> Option<DeferredAgentInputTarget> {
+        self.queued_attach
+            .as_ref()
+            .filter(|job| job.ctx.target.is_main_agent() || job.ctx.focus_auxiliary_on_ready)
+            .map(|job| DeferredAgentInputTarget {
+                key: job.ctx.key.clone(),
+                attach_target: job.ctx.target.clone(),
+            })
+            .or_else(|| {
+                let in_flight = self.attach_in_flight.as_ref()?;
+                self.attach_terminal_input_target
+                    .as_ref()
+                    .filter(|(seq, _)| *seq == in_flight.seq)
+                    .map(|(_, target)| target.clone())
+                    .or_else(|| {
+                        in_flight
+                            .target
+                            .is_main_agent()
+                            .then(|| DeferredAgentInputTarget {
+                                key: in_flight.key.clone(),
+                                attach_target: in_flight.target.clone(),
+                            })
+                    })
+            })
+    }
+
+    fn deferred_agent_input_target_is_ready(&self, target: &DeferredAgentInputTarget) -> bool {
+        match &target.attach_target {
+            AttachTarget::MainAgent => self
+                .active_agent
+                .as_ref()
+                .is_some_and(|agent| AgentKey::new(&agent.info).eq(&target.key)),
+            AttachTarget::Auxiliary { parent, .. } => {
+                self.agent_focus == AgentFocusPane::Auxiliary
+                    && self
+                        .active_agent
+                        .as_ref()
+                        .is_some_and(|agent| AgentKey::new(&agent.info).eq(parent))
+                    && self.agent_aux.as_ref().is_some_and(|aux| {
+                        aux.parent.eq(parent) && AgentKey::new(&aux.agent.info).eq(&target.key)
+                    })
+            }
+        }
+    }
+
+    fn defer_agent_input_for_pending_attach<F>(
+        &mut self,
+        accounted_bytes: usize,
+        kind_label: &'static str,
+        make_kind: F,
+    ) -> bool
+    where
+        F: FnOnce() -> DeferredAgentInputKind,
+    {
+        let Some(target) = self.pending_terminal_input_attach_target() else {
+            return false;
+        };
+        let next_bytes = self
+            .deferred_agent_input_bytes
+            .saturating_add(accounted_bytes);
+        if self.deferred_agent_input.len() >= DEFERRED_AGENT_INPUT_MAX_EVENTS
+            || next_bytes > DEFERRED_AGENT_INPUT_MAX_BYTES
+        {
+            self.deferred_agent_input_rejected_events =
+                self.deferred_agent_input_rejected_events.saturating_add(1);
+            self.deferred_agent_input_rejected_bytes = self
+                .deferred_agent_input_rejected_bytes
+                .saturating_add(accounted_bytes);
+            self.status = "focused process is still connecting; input buffer is full and new input was not sent".into();
+            debug_log(
+                "agent_input_deferred_rejected",
+                serde_json::json!({
+                    "target": agent_key_debug_value(&target.key),
+                    "attach_target": attach_target_debug_value(&target.attach_target),
+                    "kind": kind_label,
+                    "event_bytes": accounted_bytes,
+                    "queued_events": self.deferred_agent_input.len(),
+                    "queued_bytes": self.deferred_agent_input_bytes,
+                    "rejected_events": self.deferred_agent_input_rejected_events,
+                    "rejected_bytes": self.deferred_agent_input_rejected_bytes,
+                    "max_events": DEFERRED_AGENT_INPUT_MAX_EVENTS,
+                    "max_bytes": DEFERRED_AGENT_INPUT_MAX_BYTES,
+                }),
+            );
+            return true;
+        }
+        let deferred = DeferredAgentInput {
+            target,
+            kind: make_kind(),
+        };
+        self.deferred_agent_input_bytes = next_bytes;
+        let target = deferred.target.clone();
+        self.deferred_agent_input.push_back(deferred);
+        debug_log(
+            "agent_input_deferred_for_attach",
+            serde_json::json!({
+                "target": agent_key_debug_value(&target.key),
+                "attach_target": attach_target_debug_value(&target.attach_target),
+                "kind": kind_label,
+                "event_bytes": accounted_bytes,
+                "queued_events": self.deferred_agent_input.len(),
+                "queued_bytes": self.deferred_agent_input_bytes,
+            }),
+        );
+        true
+    }
+
+    fn discard_deferred_agent_input(&mut self, reason: &'static str) {
+        if self.deferred_agent_input.is_empty() && self.deferred_agent_input_rejected_events == 0 {
+            return;
+        }
+        debug_log(
+            "agent_input_deferred_discarded",
+            serde_json::json!({
+                "reason": reason,
+                "events": self.deferred_agent_input.len(),
+                "bytes": self.deferred_agent_input_bytes,
+                "rejected_events": self.deferred_agent_input_rejected_events,
+                "rejected_bytes": self.deferred_agent_input_rejected_bytes,
+            }),
+        );
+        self.deferred_agent_input.clear();
+        self.deferred_agent_input_bytes = 0;
+        self.deferred_agent_input_rejected_events = 0;
+        self.deferred_agent_input_rejected_bytes = 0;
+    }
+
+    fn flush_deferred_agent_input(&mut self) {
+        if self.pending_terminal_input_attach_target().is_some() {
+            return;
+        }
+        if self.deferred_agent_input.is_empty() && self.deferred_agent_input_rejected_events == 0 {
+            return;
+        }
+
+        let rejected_events = std::mem::take(&mut self.deferred_agent_input_rejected_events);
+        let rejected_bytes = std::mem::take(&mut self.deferred_agent_input_rejected_bytes);
+
+        let active_key = self
+            .active_agent
+            .as_ref()
+            .map(|agent| AgentKey::new(&agent.info));
+        let mut retained = VecDeque::new();
+        let mut retained_bytes = 0usize;
+        let mut discarded_events = 0usize;
+        let mut discarded_bytes = 0usize;
+        for deferred in std::mem::take(&mut self.deferred_agent_input) {
+            let bytes = deferred.accounted_bytes();
+            if self.deferred_agent_input_target_is_ready(&deferred.target) {
+                retained_bytes = retained_bytes.saturating_add(bytes);
+                retained.push_back(deferred);
+            } else {
+                discarded_events = discarded_events.saturating_add(1);
+                discarded_bytes = discarded_bytes.saturating_add(bytes);
+            }
+        }
+        self.deferred_agent_input = retained;
+        self.deferred_agent_input_bytes = retained_bytes;
+        if discarded_events > 0 {
+            let notice = format!(
+                "{} buffered input event(s) were not sent because their requested agent did not become active",
+                discarded_events
+            );
+            self.status = if self.status.is_empty() {
+                notice
+            } else {
+                format!("{}; {}", self.status, notice)
+            };
+            debug_log(
+                "agent_input_deferred_target_unavailable",
+                serde_json::json!({
+                    "active_target": active_key.as_ref().map(agent_key_debug_value),
+                    "discarded_events": discarded_events,
+                    "discarded_bytes": discarded_bytes,
+                    "retained_events": self.deferred_agent_input.len(),
+                    "retained_bytes": self.deferred_agent_input_bytes,
+                }),
+            );
+        }
+        if rejected_events > 0 {
+            let notice = format!(
+                "{} input event(s) exceeded the process-transition buffer and were not sent",
+                rejected_events
+            );
+            self.status = if self.status.is_empty() {
+                notice
+            } else {
+                format!("{}; {}", self.status, notice)
+            };
+            debug_log(
+                "agent_input_deferred_capacity_loss_reported",
+                serde_json::json!({
+                    "active_target": active_key.as_ref().map(agent_key_debug_value),
+                    "rejected_events": rejected_events,
+                    "rejected_bytes": rejected_bytes,
+                }),
+            );
+        }
+
+        let mut replayed_events = 0usize;
+        let mut replayed_bytes = 0usize;
+        while let Some(deferred) = self.deferred_agent_input.pop_front() {
+            let bytes = deferred.accounted_bytes();
+            self.deferred_agent_input_bytes = self.deferred_agent_input_bytes.saturating_sub(bytes);
+            match deferred.kind {
+                DeferredAgentInputKind::Key(key) => self.send_key_to_focused_agent(key),
+                DeferredAgentInputKind::Paste(text) => self.send_paste_to_focused_agent(&text),
+            }
+            replayed_events = replayed_events.saturating_add(1);
+            replayed_bytes = replayed_bytes.saturating_add(bytes);
+        }
+        if replayed_events > 0 {
+            debug_log(
+                "agent_input_deferred_replayed",
+                serde_json::json!({
+                    "active_target": active_key.as_ref().map(agent_key_debug_value),
+                    "replayed_events": replayed_events,
+                    "replayed_bytes": replayed_bytes,
+                    "remaining_events": self.deferred_agent_input.len(),
+                    "remaining_bytes": self.deferred_agent_input_bytes,
+                }),
+            );
+        }
     }
 
     // Keep the completed-kill identity and next-attach geometry explicit.
@@ -22984,6 +23451,15 @@ impl App {
     }
 
     fn send_key_to_focused_agent(&mut self, key: KeyEvent) {
+        if self.agent_focus != AgentFocusPane::Sidebar
+            && self.defer_agent_input_for_pending_attach(
+                DEFERRED_AGENT_KEY_ACCOUNTED_BYTES,
+                "key",
+                || DeferredAgentInputKind::Key(key),
+            )
+        {
+            return;
+        }
         debug_log(
             "agent_key_forward_route",
             serde_json::json!({
@@ -23045,6 +23521,13 @@ impl App {
     }
 
     fn send_paste_to_focused_agent(&mut self, text: &str) {
+        if self.agent_focus != AgentFocusPane::Sidebar
+            && self.defer_agent_input_for_pending_attach(text.len(), "paste", || {
+                DeferredAgentInputKind::Paste(text.to_string())
+            })
+        {
+            return;
+        }
         debug_log(
             "agent_paste_forward_route",
             serde_json::json!({
@@ -28127,6 +28610,7 @@ fn handle_main_event(
         }
         MainEvent::AttachResult(result) => {
             app.on_attach_result(result);
+            app.flush_deferred_agent_input();
         }
         MainEvent::AgentKillResult(result) => {
             app.on_agent_kill_result(result);
@@ -28651,6 +29135,83 @@ impl AcceptedAgentInputSequences {
     }
 }
 
+fn apply_daemon_pty_input_completions(
+    agent: &mut AgentSession,
+    client: &mut Option<DaemonConnection>,
+    attached_client_pid: &mut Option<u32>,
+    attached_client_instance_id: &mut Option<String>,
+    accepted_input_sequences: &mut AcceptedAgentInputSequences,
+    meta_path: &Path,
+) {
+    for completion in agent.drain_input_completions() {
+        match completion {
+            DaemonPtyInputCompletion::Written(acknowledgement) => {
+                accepted_input_sequences.record(
+                    &acknowledgement.client_instance_id,
+                    acknowledgement.input_seq,
+                );
+                let acknowledgement_targets_attached_client = attached_client_instance_id
+                    .as_deref()
+                    == Some(acknowledgement.client_instance_id.as_str());
+                let send_result = if acknowledgement_targets_attached_client {
+                    client.as_mut().map(|conn| {
+                        conn.send_event(&AgentDaemonEvent::InputAccepted {
+                            input_seq: acknowledgement.input_seq,
+                        })
+                    })
+                } else {
+                    None
+                };
+                let acknowledgement_send_failed =
+                    send_result.as_ref().is_some_and(|result| result.is_err());
+                debug_log(
+                    "daemon_pty_input_write_completed",
+                    serde_json::json!({
+                        "provider": agent.info.provider.as_str(),
+                        "session_id": &agent.info.session_id,
+                        "client_instance_id": &acknowledgement.client_instance_id,
+                        "input_seq": acknowledgement.input_seq,
+                        "targets_attached_client": acknowledgement_targets_attached_client,
+                        "acknowledgement_queued": send_result.as_ref().is_some_and(|result| result.is_ok()),
+                        "acknowledgement_error": send_result
+                            .as_ref()
+                            .and_then(|result| result.as_ref().err())
+                            .map(|error| error.to_string()),
+                    }),
+                );
+                if acknowledgement_send_failed {
+                    let disconnected_client_pid = attached_client_pid.take();
+                    let disconnected_client_instance_id = attached_client_instance_id.take();
+                    *client = None;
+                    let _ = write_agent_meta(meta_path, agent, false, None, None);
+                    debug_log(
+                        "daemon_client_detached_input_acknowledgement_failed",
+                        serde_json::json!({
+                            "provider": agent.info.provider.as_str(),
+                            "session_id": &agent.info.session_id,
+                            "client_pid": disconnected_client_pid,
+                            "client_instance_id": disconnected_client_instance_id,
+                            "input_seq": acknowledgement.input_seq,
+                        }),
+                    );
+                }
+            }
+            DaemonPtyInputCompletion::Failed(acknowledgement) => {
+                debug_log(
+                    "daemon_pty_input_write_completion_failed",
+                    serde_json::json!({
+                        "provider": agent.info.provider.as_str(),
+                        "session_id": &agent.info.session_id,
+                        "client_instance_id": acknowledgement.client_instance_id,
+                        "input_seq": acknowledgement.input_seq,
+                        "action": "leave_unacknowledged_and_disconnect_client",
+                    }),
+                );
+            }
+        }
+    }
+}
+
 /// Adopt the attaching client's debug/trace mode so daemon logging always
 /// follows the most recent client. Without this a daemon spawned by a
 /// `--debug` TUI would keep logging forever, even after the user restarts
@@ -28922,8 +29483,20 @@ fn handle_daemon_client_request(
                     "already_accepted": already_accepted,
                 }),
             );
+            let mut already_in_flight = false;
             if !already_accepted {
-                if let Err(error) = agent.send_bytes(&data) {
+                let admission = if let Some((input_seq, instance_id)) =
+                    input_seq.zip(input_client_instance_id.as_deref())
+                {
+                    agent
+                        .send_sequenced_bytes(&data, instance_id, input_seq)
+                        .map(|admitted| {
+                            already_in_flight = !admitted;
+                        })
+                } else {
+                    agent.send_bytes(&data)
+                };
+                if let Err(error) = admission {
                     let disconnected_client_pid = attached_client_pid.take();
                     let disconnected_client_instance_id = attached_client_instance_id.take();
                     let _ = write_agent_meta(meta_path, agent, false, None, None);
@@ -28942,16 +29515,13 @@ fn handle_daemon_client_request(
                     );
                     return DaemonRequestOutcome::RejectConnection;
                 }
-                if let Some((input_seq, instance_id)) =
-                    input_seq.zip(input_client_instance_id.as_deref())
-                {
-                    accepted_input_sequences.record(instance_id, input_seq);
-                }
             }
-            // Only acknowledge after `send_bytes` has admitted the complete
-            // frame to the PTY writer queue/pending FIFO. A successful client
-            // socket write alone is deliberately insufficient.
-            if let Some(input_seq) = input_seq {
+            // A retry whose sequence was already completed can be
+            // acknowledged immediately. Newly admitted and in-flight frames
+            // are acknowledged by the daemon loop only after the PTY writer
+            // reports successful write_all + flush.
+            if already_accepted {
+                let input_seq = input_seq.expect("accepted input has a sequence");
                 if let Err(error) = conn.send_event(&AgentDaemonEvent::InputAccepted { input_seq })
                 {
                     debug_log(
@@ -29001,6 +29571,7 @@ fn handle_daemon_client_request(
                     "input_len": data.len(),
                     "input_seq": input_seq,
                     "already_accepted": already_accepted,
+                    "already_in_flight": already_in_flight,
                     "meta_write_attempted": meta_write_attempted,
                     "meta_write_ok": meta_write_ok,
                     "meta_write_error": meta_write_error,
@@ -29419,41 +29990,58 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     let (runtime_repair_tx, runtime_repair_rx) = mpsc::channel::<AgentDaemonRuntimeRepairResult>();
     let mut runtime_repair_seq = 0u64;
     let mut runtime_repair_in_flight = false;
+    let mut runtime_repair_started_at: Option<Instant> = None;
+    let mut runtime_repair_abandoned_seqs = HashSet::new();
+    let mut runtime_listener_repair_applied_seq = 0u64;
     #[cfg(windows)]
     let mut last_windows_ctrl_event_count = windows_console_ctrl_event_snapshot().0;
 
     let exit_status = loop {
-        while let Ok(result) = runtime_repair_rx.try_recv() {
-            if result.seq != runtime_repair_seq {
-                debug_log(
-                    "daemon_runtime_repair_result_ignored",
-                    serde_json::json!({
-                        "seq": result.seq,
-                        "current_seq": runtime_repair_seq,
-                        "reason": "stale",
-                    }),
-                );
-                continue;
+        while let Ok(mut result) = runtime_repair_rx.try_recv() {
+            let is_current = result.seq == runtime_repair_seq;
+            let was_abandoned = runtime_repair_abandoned_seqs.remove(&result.seq);
+            if is_current {
+                runtime_repair_in_flight = false;
+                runtime_repair_started_at = None;
             }
-            runtime_repair_in_flight = false;
-            if let Some((next_listener, next_publication)) = result.listener {
-                listener = next_listener;
-                listener_publication = next_publication.clone();
-                agent.runtime_endpoint = Some((socket_path.clone(), next_publication));
+            let mut listener_applied = false;
+            if let Some((next_listener, next_publication)) = result.listener.take() {
+                if result.seq >= runtime_listener_repair_applied_seq {
+                    listener = next_listener;
+                    listener_publication = next_publication.clone();
+                    agent.runtime_endpoint = Some((socket_path.clone(), next_publication));
+                    runtime_listener_repair_applied_seq = result.seq;
+                    listener_applied = true;
+                } else {
+                    debug_log(
+                        "daemon_runtime_repair_listener_ignored",
+                        serde_json::json!({
+                            "seq": result.seq,
+                            "latest_listener_seq": runtime_listener_repair_applied_seq,
+                            "reason": "older_than_adopted_listener",
+                        }),
+                    );
+                }
             }
-            if result.socket_ready {
+            let socket_repaired =
+                result.socket_repair_requested && result.socket_ready && listener_applied;
+            let meta_repaired =
+                result.meta_repair_requested && result.meta_ready && result.endpoint_owned;
+            let auth_repaired =
+                result.auth_repair_requested && result.auth_ready && result.endpoint_owned;
+            if socket_repaired {
                 agent
                     .runtime_file_flags
                     .socket_missing
                     .store(false, Ordering::Relaxed);
             }
-            if result.meta_ready {
+            if meta_repaired {
                 agent
                     .runtime_file_flags
                     .meta_missing
                     .store(false, Ordering::Relaxed);
             }
-            if result.auth_ready {
+            if auth_repaired {
                 agent
                     .runtime_file_flags
                     .auth_missing
@@ -29463,14 +30051,50 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 "daemon_runtime_repair_result_applied",
                 serde_json::json!({
                     "seq": result.seq,
+                    "current_seq": runtime_repair_seq,
+                    "is_current": is_current,
+                    "was_abandoned": was_abandoned,
                     "socket_ready": result.socket_ready,
                     "meta_ready": result.meta_ready,
                     "auth_ready": result.auth_ready,
+                    "socket_repaired": socket_repaired,
+                    "meta_repaired": meta_repaired,
+                    "auth_repaired": auth_repaired,
+                    "listener_applied": listener_applied,
                     "endpoint_owned": result.endpoint_owned,
+                    "abandoned_workers": runtime_repair_abandoned_seqs.len(),
                     "errors": result.errors,
                 }),
             );
         }
+        if runtime_repair_in_flight
+            && runtime_repair_started_at.is_some_and(|started| {
+                started.elapsed()
+                    >= Duration::from_millis(DAEMON_RUNTIME_REPAIR_WATCHDOG_TIMEOUT_MS)
+            })
+        {
+            runtime_repair_abandoned_seqs.insert(runtime_repair_seq);
+            runtime_repair_in_flight = false;
+            runtime_repair_started_at = None;
+            debug_log(
+                "daemon_runtime_repair_watchdog_expired",
+                serde_json::json!({
+                    "seq": runtime_repair_seq,
+                    "timeout_ms": DAEMON_RUNTIME_REPAIR_WATCHDOG_TIMEOUT_MS,
+                    "abandoned_workers": runtime_repair_abandoned_seqs.len(),
+                    "max_outstanding": DAEMON_RUNTIME_REPAIR_MAX_OUTSTANDING,
+                    "action": "preserve_runtime_state_and_allow_bounded_retry",
+                }),
+            );
+        }
+        apply_daemon_pty_input_completions(
+            &mut agent,
+            &mut client,
+            &mut attached_client_pid,
+            &mut attached_client_instance_id,
+            &mut accepted_input_sequences,
+            &meta_path,
+        );
         if let Err(error) = agent.flush_pending_input() {
             if client.take().is_some() {
                 let disconnected_client_pid = attached_client_pid.take();
@@ -29506,8 +30130,22 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 .runtime_file_flags
                 .auth_missing
                 .load(Ordering::Relaxed);
-            if (meta_missing || socket_missing || auth_missing) && !runtime_repair_in_flight {
-                let meta_contents = if meta_missing {
+            let any_runtime_file_missing = meta_missing || socket_missing || auth_missing;
+            if can_start_agent_daemon_runtime_repair(
+                any_runtime_file_missing,
+                runtime_repair_in_flight,
+                runtime_repair_abandoned_seqs.len(),
+            ) {
+                // Return a rebound listener to the accept loop immediately.
+                // Auth/meta writes may touch a stalled filesystem and are
+                // repaired in a later worker once the socket is live again.
+                let (repair_meta, repair_socket, repair_auth) =
+                    staged_agent_daemon_runtime_repair_flags(
+                        meta_missing,
+                        socket_missing,
+                        auth_missing,
+                    );
+                let meta_contents = if repair_meta {
                     let now_ms = current_epoch_ms();
                     match render_agent_meta_parts_with_start_tokens(
                         &agent.info,
@@ -29560,11 +30198,15 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                     publication: listener_publication.clone(),
                     auth_token: agent.auth_token.clone(),
                     meta_contents,
-                    meta_missing,
-                    socket_missing,
-                    auth_missing,
+                    meta_missing: repair_meta,
+                    socket_missing: repair_socket,
+                    auth_missing: repair_auth,
                 };
                 let result_tx = runtime_repair_tx.clone();
+                let repair_seq = request.seq;
+                let socket_repair_requested = request.socket_missing;
+                let meta_repair_requested = request.meta_missing;
+                let auth_repair_requested = request.auth_missing;
                 match thread::Builder::new()
                     .name(format!(
                         "cokacmux-agent-repair-{}-{}",
@@ -29572,12 +30214,29 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                         truncate_width(&key.session_id, 8)
                     ))
                     .spawn(move || {
-                        let result = run_agent_daemon_runtime_repair(request);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_agent_daemon_runtime_repair(request)
+                        }))
+                        .unwrap_or_else(|_| {
+                            AgentDaemonRuntimeRepairResult {
+                                seq: repair_seq,
+                                listener: None,
+                                socket_ready: false,
+                                meta_ready: false,
+                                auth_ready: false,
+                                socket_repair_requested,
+                                meta_repair_requested,
+                                auth_repair_requested,
+                                endpoint_owned: false,
+                                errors: vec!["runtime repair worker panicked".to_string()],
+                            }
+                        });
                         let _ = result_tx.send(result);
                     }) {
                     Ok(handle) => {
                         drop(handle);
                         runtime_repair_in_flight = true;
+                        runtime_repair_started_at = Some(Instant::now());
                     }
                     Err(error) => {
                         debug_log(
@@ -30273,17 +30932,21 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     );
 
     // The per-tick drain is budget-limited, so the child's final words may
-    // still be in flight from the PTY reader thread. Flush them to the
-    // client (and the pty log, via drain) before announcing the exit:
-    // losing an agent's last output made self-exits look mishandled.
+    // still be in flight from the PTY reader thread. waitpid alone is not a
+    // complete pane-exit condition: wait for that reader to observe PTY EOF
+    // and drain the channel before announcing the exit. Keep a timeout only
+    // for a broken platform reader that never reports closure.
     let final_drain_started = Instant::now();
-    let mut last_chunk_at = Instant::now();
     let mut final_drain_chunks = 0usize;
     let mut final_drain_bytes = 0usize;
     let mut final_drain_send_failures = 0usize;
-    while final_drain_started.elapsed() < Duration::from_secs(2) {
+    let mut output_reader_closed = false;
+    while final_drain_started.elapsed()
+        < Duration::from_millis(DAEMON_FINAL_OUTPUT_DRAIN_TIMEOUT_MS)
+    {
         let drain = agent.drain_output_chunks();
         let received_chunks = !drain.chunks.is_empty();
+        output_reader_closed |= drain.output_closed;
         for bytes in drain.chunks {
             final_drain_chunks = final_drain_chunks.saturating_add(1);
             final_drain_bytes = final_drain_bytes.saturating_add(bytes.len());
@@ -30297,14 +30960,14 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 }
             }
         }
-        if received_chunks {
-            last_chunk_at = Instant::now();
-            continue;
-        }
-        if last_chunk_at.elapsed() >= Duration::from_millis(250) {
+        if output_reader_closed {
             break;
         }
-        thread::sleep(Duration::from_millis(10));
+        if received_chunks || drain.has_more {
+            thread::yield_now();
+        } else {
+            thread::sleep(Duration::from_millis(10));
+        }
     }
     debug_log(
         "daemon_final_output_drain_done",
@@ -30315,8 +30978,35 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             "bytes": final_drain_bytes,
             "send_failures": final_drain_send_failures,
             "elapsed_ms": final_drain_started.elapsed().as_millis(),
+            "output_reader_closed": output_reader_closed,
+            "timed_out": !output_reader_closed,
+            "timeout_ms": DAEMON_FINAL_OUTPUT_DRAIN_TIMEOUT_MS,
             "client_attached": client.is_some(),
         }),
+    );
+
+    // Resolve every PTY input job that was already handed to the writer
+    // before ordering the terminal exit notice. Successful jobs receive their
+    // acknowledgement; pending-only jobs remain unacknowledged because they
+    // never crossed the PTY write boundary.
+    if !agent.shutdown_input_writer() {
+        debug_log(
+            "daemon_pty_input_writer_shutdown_timeout",
+            serde_json::json!({
+                "provider": key.provider.as_str(),
+                "session_id": &key.session_id,
+                "daemon_pid": std::process::id(),
+                "timeout_ms": DAEMON_DISK_SHUTDOWN_TIMEOUT_MS,
+            }),
+        );
+    }
+    apply_daemon_pty_input_completions(
+        &mut agent,
+        &mut client,
+        &mut attached_client_pid,
+        &mut attached_client_instance_id,
+        &mut accepted_input_sequences,
+        &meta_path,
     );
 
     if let Some(conn) = client.as_mut() {
@@ -30362,17 +31052,6 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     // forever. If the writer cannot stop within its I/O bound, preserve the
     // runtime contract and exit; a later sweep can remove it only after this
     // daemon is definitively dead.
-    if !agent.shutdown_input_writer() {
-        debug_log(
-            "daemon_pty_input_writer_shutdown_timeout",
-            serde_json::json!({
-                "provider": key.provider.as_str(),
-                "session_id": &key.session_id,
-                "daemon_pid": std::process::id(),
-                "timeout_ms": DAEMON_DISK_SHUTDOWN_TIMEOUT_MS,
-            }),
-        );
-    }
     if !agent.shutdown_disk_writer() {
         debug_log(
             "daemon_child_exit_runtime_preserved",
@@ -32076,8 +32755,37 @@ struct AgentDaemonRuntimeRepairResult {
     socket_ready: bool,
     meta_ready: bool,
     auth_ready: bool,
+    socket_repair_requested: bool,
+    meta_repair_requested: bool,
+    auth_repair_requested: bool,
     endpoint_owned: bool,
     errors: Vec<String>,
+}
+
+fn staged_agent_daemon_runtime_repair_flags(
+    meta_missing: bool,
+    socket_missing: bool,
+    auth_missing: bool,
+) -> (bool, bool, bool) {
+    // A new listener must reach the accept loop before any potentially slow
+    // file repair. Once the socket is live, the next observation repairs the
+    // remaining files.
+    (
+        meta_missing && !socket_missing,
+        socket_missing,
+        auth_missing && !socket_missing,
+    )
+}
+
+fn can_start_agent_daemon_runtime_repair(
+    any_missing: bool,
+    in_flight: bool,
+    abandoned_workers: usize,
+) -> bool {
+    any_missing
+        && !in_flight
+        && abandoned_workers.saturating_add(usize::from(in_flight))
+            < DAEMON_RUNTIME_REPAIR_MAX_OUTSTANDING
 }
 
 fn run_agent_daemon_runtime_repair(
@@ -32125,6 +32833,9 @@ fn run_agent_daemon_runtime_repair(
             socket_ready: false,
             meta_ready: !request.meta_missing,
             auth_ready: !request.auth_missing,
+            socket_repair_requested: request.socket_missing,
+            meta_repair_requested: request.meta_missing,
+            auth_repair_requested: request.auth_missing,
             endpoint_owned: false,
             errors,
         };
@@ -32183,6 +32894,9 @@ fn run_agent_daemon_runtime_repair(
             "socket_ready": socket_ready,
             "meta_ready": meta_ready,
             "auth_ready": auth_ready,
+            "socket_repair_requested": request.socket_missing,
+            "meta_repair_requested": request.meta_missing,
+            "auth_repair_requested": request.auth_missing,
             "listener_rebound": repaired_listener.is_some(),
             "errors": &errors,
         }),
@@ -32193,6 +32907,9 @@ fn run_agent_daemon_runtime_repair(
         socket_ready,
         meta_ready,
         auth_ready,
+        socket_repair_requested: request.socket_missing,
+        meta_repair_requested: request.meta_missing,
+        auth_repair_requested: request.auth_missing,
         endpoint_owned: true,
         errors,
     }
@@ -44660,8 +45377,21 @@ fn ensure_cokacdir_program(settings: &CokacmuxSettings) -> Result<PathBuf> {
             )
         });
     }
-    if let Some(path) = resolve_cokacdir_default_program() {
+    if let Some(path) = resolve_cokacdir_program_candidate(COKACDIR_PROGRAM_NAME) {
         return Ok(path);
+    }
+    if let Some(path) = cokacdir_installed_existing_path() {
+        match validate_cokacdir_program(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) => debug_log(
+                "cokacdir_installed_validation_failed",
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "error": error.to_string(),
+                    "action": "replace_from_distribution",
+                }),
+            ),
+        }
     }
     download_cokacdir_program()
 }
@@ -44757,32 +45487,23 @@ fn download_cokacdir_program() -> Result<PathBuf> {
         let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     }
 
-    let tmp = target.with_file_name(format!(
-        ".{}.download-{}",
-        target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(cokacdir_local_filename()),
-        std::process::id()
-    ));
-    let _ = fs::remove_file(&tmp);
+    let tmp = unique_cokacdir_sibling_path(&target, "download")?;
 
     if let Err(e) = download_cokacdir_to(&url, &tmp) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
     #[cfg(unix)]
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
-
-    if target.exists() {
-        fs::remove_file(&target)?;
+    if let Err(error) = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error.into());
     }
-    fs::rename(&tmp, &target)?;
-    #[cfg(unix)]
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
 
-    if !target.is_file() {
-        anyhow::bail!("downloaded cokacdir is not a file: {}", target.display());
+    if let Err(error) =
+        publish_cokacdir_program_with_validator(&tmp, &target, validate_cokacdir_program)
+    {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
     debug_log(
         "cokacdir_downloaded",
@@ -44792,6 +45513,287 @@ fn download_cokacdir_program() -> Result<PathBuf> {
         }),
     );
     Ok(target)
+}
+
+fn validate_cokacdir_program(path: &Path) -> Result<()> {
+    let is_regular_file = fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false);
+    if !is_regular_file || !program_path_is_runnable(path) {
+        anyhow::bail!(
+            "cokacdir is not a runnable regular file: {}",
+            path.display()
+        );
+    }
+
+    let mut command = Command::new(path);
+    command.arg("--version");
+    let output =
+        command_output_with_timeout(command, Duration::from_millis(COKACDIR_VERSION_TIMEOUT_MS))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "run downloaded cokacdir at {} failed: {}",
+                    path.display(),
+                    error
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "downloaded cokacdir at {} timed out during --version",
+                    path.display()
+                )
+            })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "downloaded cokacdir failed --version: {}",
+            command_output_error("cokacdir", &output)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let version_output = if stderr.trim().is_empty() {
+        stdout.trim().to_string()
+    } else if stdout.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        format!("{}\n{}", stdout.trim(), stderr.trim())
+    };
+    if !binary_version_output_identifies(&version_output, COKACDIR_PROGRAM_NAME) {
+        anyhow::bail!(
+            "downloaded cokacdir returned an unexpected version: {}",
+            truncate_width(&version_output, 160)
+        );
+    }
+    Ok(())
+}
+
+fn binary_version_output_identifies(output: &str, name: &str) -> bool {
+    let output = output.trim_start();
+    let Some(suffix) = output.strip_prefix(name) else {
+        return false;
+    };
+    suffix
+        .chars()
+        .next()
+        .map(char::is_whitespace)
+        .unwrap_or(true)
+}
+
+fn publish_cokacdir_program_with_validator<F>(
+    staged: &Path,
+    target: &Path,
+    validate: F,
+) -> Result<()>
+where
+    F: Fn(&Path) -> Result<()>,
+{
+    let result = publish_cokacdir_program_inner(staged, target, &validate);
+    if result.is_err() {
+        let _ = fs::remove_file(staged);
+    }
+    result
+}
+
+fn publish_cokacdir_program_inner<F>(staged: &Path, target: &Path, validate: &F) -> Result<()>
+where
+    F: Fn(&Path) -> Result<()>,
+{
+    validate(staged).map_err(|error| {
+        anyhow::anyhow!(
+            "downloaded cokacdir failed validation before install: {}",
+            error
+        )
+    })?;
+
+    let target_exists = match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_file() => true,
+        Ok(_) => {
+            anyhow::bail!(
+                "refusing to replace non-file cokacdir destination: {}",
+                target.display()
+            )
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect cokacdir destination {} failed: {}",
+                target.display(),
+                error
+            ))
+        }
+    };
+
+    let backup = if target_exists {
+        let backup = unique_cokacdir_sibling_path(target, "backup")?;
+        fs::rename(target, &backup).map_err(|error| {
+            anyhow::anyhow!(
+                "back up existing cokacdir {} to {} failed: {}",
+                target.display(),
+                backup.display(),
+                error
+            )
+        })?;
+        Some(backup)
+    } else {
+        None
+    };
+
+    if let Err(publish_error) = fs::rename(staged, target) {
+        if let Some(backup) = backup.as_deref() {
+            if let Err(restore_error) = restore_cokacdir_backup(target, backup) {
+                return Err(anyhow::anyhow!(
+                    "publish cokacdir to {} failed: {}; additionally, {}",
+                    target.display(),
+                    publish_error,
+                    restore_error
+                ));
+            }
+        }
+        return Err(anyhow::anyhow!(
+            "publish cokacdir to {} failed: {}",
+            target.display(),
+            publish_error
+        ));
+    }
+
+    if let Err(validation_error) = validate(target) {
+        let rollback = if let Some(backup) = backup.as_deref() {
+            restore_cokacdir_backup(target, backup)
+        } else {
+            fs::remove_file(target).map_err(|error| {
+                anyhow::anyhow!(
+                    "remove invalid newly installed cokacdir {} failed: {}",
+                    target.display(),
+                    error
+                )
+            })
+        };
+        if let Err(rollback_error) = rollback {
+            return Err(anyhow::anyhow!(
+                "installed cokacdir failed final validation: {}; additionally, {}",
+                validation_error,
+                rollback_error
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "installed cokacdir failed final validation; previous file was restored: {}",
+            validation_error
+        ));
+    }
+
+    if let Some(backup) = backup {
+        if let Err(error) = fs::remove_file(&backup) {
+            debug_log(
+                "cokacdir_backup_cleanup_failed",
+                serde_json::json!({
+                    "backup": backup.display().to_string(),
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn restore_cokacdir_backup(target: &Path, backup: &Path) -> Result<()> {
+    let displaced = match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let displaced = unique_cokacdir_sibling_path(target, "failed")?;
+            fs::rename(target, &displaced).map_err(|error| {
+                anyhow::anyhow!(
+                    "move failed cokacdir {} aside before rollback failed: {}; prior file remains at {}",
+                    target.display(),
+                    error,
+                    backup.display()
+                )
+            })?;
+            Some(displaced)
+        }
+        Ok(_) => {
+            anyhow::bail!(
+                "cannot restore prior cokacdir because {} became a non-file; prior file remains at {}",
+                target.display(),
+                backup.display()
+            )
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect {} during cokacdir rollback failed: {}; prior file remains at {}",
+                target.display(),
+                error,
+                backup.display()
+            ))
+        }
+    };
+
+    if let Err(error) = fs::rename(backup, target) {
+        if let Some(displaced) = displaced.as_deref() {
+            let _ = fs::rename(displaced, target);
+        }
+        return Err(anyhow::anyhow!(
+            "restore prior cokacdir from {} to {} failed: {}; prior file remains at {}",
+            backup.display(),
+            target.display(),
+            error,
+            backup.display()
+        ));
+    }
+    if let Some(displaced) = displaced {
+        if let Err(error) = fs::remove_file(&displaced) {
+            debug_log(
+                "cokacdir_failed_download_cleanup_failed",
+                serde_json::json!({
+                    "path": displaced.display().to_string(),
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn unique_cokacdir_sibling_path(target: &Path, purpose: &str) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid cokacdir install path: {}", target.display()))?;
+    let stem = target
+        .file_stem()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| COKACDIR_PROGRAM_NAME.into());
+    let extension = target.extension().map(|value| value.to_string_lossy());
+    for _ in 0..128 {
+        let base = format!(
+            ".{}.{}-{}-{}",
+            stem,
+            purpose,
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        );
+        // Keep `.exe` as the final suffix on Windows: the runnable-path
+        // preflight intentionally rejects arbitrary extensions.
+        let candidate = parent.join(match extension.as_deref() {
+            Some(extension) => format!("{base}.{extension}"),
+            None => base,
+        });
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(candidate),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "inspect temporary cokacdir path {} failed: {}",
+                    candidate.display(),
+                    error
+                ))
+            }
+        }
+    }
+    anyhow::bail!(
+        "cannot allocate a private {} path next to {}",
+        purpose,
+        target.display()
+    )
 }
 
 fn download_cokacdir_to(url: &str, output_path: &Path) -> Result<()> {
@@ -57566,6 +58568,7 @@ mod tests {
                 .expect("attach worker should send a result");
             if let MainEvent::AttachResult(result) = event {
                 app.on_attach_result(result);
+                app.flush_deferred_agent_input();
                 return;
             }
         }
@@ -57585,6 +58588,7 @@ mod tests {
                 }
                 MainEvent::AttachResult(result) => {
                     app.on_attach_result(result);
+                    app.flush_deferred_agent_input();
                 }
                 _ => {}
             }
@@ -57691,7 +58695,12 @@ mod tests {
             live_shell_discovery_abandoned_seqs: HashSet::new(),
             attach_seq: 0,
             attach_in_flight: None,
+            attach_terminal_input_target: None,
             queued_attach: None,
+            deferred_agent_input: VecDeque::new(),
+            deferred_agent_input_bytes: 0,
+            deferred_agent_input_rejected_events: 0,
+            deferred_agent_input_rejected_bytes: 0,
             agent_kill_seq: 0,
             agent_kill_pending: None,
             killall_seq: 0,
@@ -66460,6 +67469,128 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn binary_version_output_requires_an_exact_program_name_boundary() {
+        assert!(binary_version_output_identifies(
+            "cokacdir 1.2.3",
+            "cokacdir"
+        ));
+        assert!(binary_version_output_identifies(
+            "  cokacdir\t1.2.3",
+            "cokacdir"
+        ));
+        assert!(binary_version_output_identifies("cokacdir", "cokacdir"));
+        assert!(!binary_version_output_identifies(
+            "cokacdirx 1.2.3",
+            "cokacdir"
+        ));
+        assert!(!binary_version_output_identifies(
+            "tool cokacdir 1.2.3",
+            "cokacdir"
+        ));
+    }
+
+    #[test]
+    fn cokacdir_sibling_path_preserves_executable_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cokacdir.exe");
+
+        let sibling = unique_cokacdir_sibling_path(&target, "download").unwrap();
+
+        assert_eq!(
+            sibling.extension().and_then(|value| value.to_str()),
+            Some("exe")
+        );
+        assert_eq!(sibling.parent(), target.parent());
+        assert_ne!(sibling, target);
+    }
+
+    #[test]
+    fn cokacdir_publish_replaces_a_file_only_after_both_validations() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cokacdir");
+        let staged = dir.path().join("staged");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+
+        publish_cokacdir_program_with_validator(&staged, &target, |path| {
+            if fs::read(path)? == b"new" {
+                Ok(())
+            } else {
+                anyhow::bail!("unexpected contents")
+            }
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert!(!staged.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cokacdir_publish_restores_old_file_after_final_validation_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cokacdir");
+        let staged = dir.path().join("staged");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+
+        let error = publish_cokacdir_program_with_validator(&staged, &target, |path| {
+            if path == target {
+                anyhow::bail!("path-dependent failure")
+            }
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("failed final validation"));
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert!(!staged.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cokacdir_publish_restores_old_file_when_staged_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cokacdir");
+        let staged = dir.path().join("staged");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+        let first_validation = std::cell::Cell::new(true);
+
+        let error = publish_cokacdir_program_with_validator(&staged, &target, |path| {
+            if first_validation.replace(false) {
+                fs::remove_file(path)?;
+            }
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("publish cokacdir"));
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert!(!staged.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cokacdir_publish_refuses_a_non_file_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cokacdir");
+        let staged = dir.path().join("staged");
+        fs::create_dir(&target).unwrap();
+        fs::write(&staged, b"new").unwrap();
+
+        let error = publish_cokacdir_program_with_validator(&staged, &target, |_| Ok(()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("non-file"));
+        assert!(target.is_dir());
+        assert!(!staged.exists());
+    }
+
+    #[test]
     fn cokacdir_launch_spec_uses_configured_runnable_program() {
         let dir = tempfile::tempdir().unwrap();
         let program = dir.path().join(cokacdir_local_filename());
@@ -68699,6 +69830,33 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn daemon_runtime_repair_prioritizes_listener_before_runtime_files() {
+        assert_eq!(
+            staged_agent_daemon_runtime_repair_flags(true, true, true),
+            (false, true, false),
+            "a missing listener must be returned before potentially stalled file writes"
+        );
+        assert_eq!(
+            staged_agent_daemon_runtime_repair_flags(true, false, true),
+            (true, false, true),
+            "meta and auth may be repaired together after the listener is live"
+        );
+    }
+
+    #[test]
+    fn daemon_runtime_repair_watchdog_allows_only_one_bounded_replacement() {
+        assert!(can_start_agent_daemon_runtime_repair(true, false, 0));
+        assert!(can_start_agent_daemon_runtime_repair(true, false, 1));
+        assert!(!can_start_agent_daemon_runtime_repair(
+            true,
+            false,
+            DAEMON_RUNTIME_REPAIR_MAX_OUTSTANDING
+        ));
+        assert!(!can_start_agent_daemon_runtime_repair(true, true, 0));
+        assert!(!can_start_agent_daemon_runtime_repair(false, false, 0));
+    }
+
+    #[test]
     fn stalled_live_discovery_retries_without_late_result_clobbering_it() {
         let mut app = app_for_key_tests();
         let cached = shell_session_info_for_cwd("/repo/watchdog-live".into());
@@ -70609,6 +71767,160 @@ IF EXIST "%~dp0\node.exe" (
             }
             other => panic!("expected bracketed paste input request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn terminal_input_waits_for_requested_main_agent_instead_of_old_agent() {
+        let mut app = app_for_key_tests();
+        let (old_client, old_requests) =
+            buffered_output_test_client_with_requests("old-agent", 801);
+        app.active_agent = Some(old_client);
+        app.show_sessions_view = false;
+        app.agent_focus = AgentFocusPane::Main;
+        let target = AgentKey {
+            provider: Provider::Claude,
+            session_id: "new-agent".into(),
+        };
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 1,
+            key: target.clone(),
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+
+        app.send_key_to_focused_agent(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert!(matches!(
+            old_requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(app.deferred_agent_input.len(), 1);
+        assert_eq!(app.deferred_agent_input.front().unwrap().target.key, target);
+    }
+
+    #[test]
+    fn deferred_terminal_input_replays_only_after_target_becomes_active() {
+        let mut app = app_for_key_tests();
+        let (old_client, old_requests) =
+            buffered_output_test_client_with_requests("old-agent", 802);
+        app.active_agent = Some(old_client);
+        app.show_sessions_view = false;
+        app.agent_focus = AgentFocusPane::Main;
+        let target = AgentKey {
+            provider: Provider::Claude,
+            session_id: "new-agent".into(),
+        };
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 1,
+            key: target.clone(),
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+        app.send_key_to_focused_agent(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(
+            old_requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let (target_client, target_requests) =
+            buffered_output_test_client_with_requests("new-agent", 803);
+        app.active_agent = Some(target_client);
+        app.attach_in_flight = None;
+        app.flush_deferred_agent_input();
+
+        let request = target_requests.try_recv().unwrap();
+        match request.request {
+            AgentDaemonRequest::Input { data, .. } => assert_eq!(data.as_slice(), b"x"),
+            other => panic!("expected deferred input request, got {other:?}"),
+        }
+        assert!(app.deferred_agent_input.is_empty());
+        assert_eq!(app.deferred_agent_input_bytes, 0);
+    }
+
+    #[test]
+    fn deferred_terminal_input_is_not_fallen_back_to_old_agent_after_attach_failure() {
+        let mut app = app_for_key_tests();
+        let (old_client, old_requests) =
+            buffered_output_test_client_with_requests("old-agent", 804);
+        app.active_agent = Some(old_client);
+        app.show_sessions_view = false;
+        app.agent_focus = AgentFocusPane::Main;
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 1,
+            key: AgentKey {
+                provider: Provider::Claude,
+                session_id: "failed-agent".into(),
+            },
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+        app.send_paste_to_focused_agent("do-not-misroute");
+
+        app.attach_in_flight = None;
+        app.status = "switch failed".into();
+        app.flush_deferred_agent_input();
+
+        assert!(matches!(
+            old_requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(app.deferred_agent_input.is_empty());
+        assert!(app.status.contains("were not sent"));
+    }
+
+    #[test]
+    fn terminal_input_waits_for_auxiliary_that_will_receive_focus() {
+        let mut app = app_for_key_tests();
+        let (main_client, main_requests) =
+            buffered_output_test_client_with_requests("parent-agent", 805);
+        let parent = AgentKey::new(&main_client.info);
+        app.active_agent = Some(main_client);
+        app.show_sessions_view = false;
+        app.agent_focus = AgentFocusPane::Main;
+        let auxiliary_key = AgentKey {
+            provider: Provider::Claude,
+            session_id: "focused-auxiliary".into(),
+        };
+        let attach_target = AttachTarget::Auxiliary {
+            kind: AgentAuxKind::Terminal,
+            parent: parent.clone(),
+        };
+        let deferred_target = DeferredAgentInputTarget {
+            key: auxiliary_key.clone(),
+            attach_target: attach_target.clone(),
+        };
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 1,
+            key: auxiliary_key,
+            target: attach_target,
+            started_at: Instant::now(),
+        });
+        app.attach_terminal_input_target = Some((1, deferred_target));
+
+        app.send_key_to_focused_agent(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(
+            main_requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let (auxiliary_client, auxiliary_requests) =
+            buffered_output_test_client_with_requests("focused-auxiliary", 806);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: auxiliary_client,
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+        app.attach_in_flight = None;
+        app.attach_terminal_input_target = None;
+        app.flush_deferred_agent_input();
+
+        let request = auxiliary_requests.try_recv().unwrap();
+        assert!(matches!(
+            request.request,
+            AgentDaemonRequest::Input { data, .. } if data.as_slice() == b"r"
+        ));
+        assert!(app.deferred_agent_input.is_empty());
     }
 
     #[cfg(unix)]
@@ -75583,6 +76895,20 @@ IF EXIST "%~dp0\node.exe" (
         let _ = drain_agent_until(&mut agent, Duration::from_millis(500), |_| false);
         let _ = agent.child.kill();
         let _ = agent.child.wait();
+        let reader_close_deadline = Instant::now() + Duration::from_secs(2);
+        let mut output_reader_closed = false;
+        while Instant::now() < reader_close_deadline {
+            let drain = agent.drain_output_chunks();
+            output_reader_closed |= drain.output_closed;
+            if output_reader_closed {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            output_reader_closed,
+            "PTY output reader did not report channel closure after child exit"
+        );
         agent.shutdown_disk_writer();
         let _ = remove_agent_pty_log(&key);
     }
@@ -75630,6 +76956,175 @@ IF EXIST "%~dp0\node.exe" (
         let _ = agent.shutdown_input_writer();
         let _ = agent.shutdown_disk_writer();
         let _ = remove_agent_pty_log(&key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_does_not_acknowledge_sequenced_input_at_queue_admission() {
+        let sleep = PathBuf::from("/bin/sleep");
+        if !sleep.is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = format!("pty-input-ack-boundary-{}", uuid::Uuid::now_v7());
+        let mut info = session_info(
+            Provider::Claude,
+            &session_id,
+            &dir.path().display().to_string(),
+        );
+        info.source = PathBuf::from(SHELL_SESSION_SOURCE_MARKER);
+        let key = AgentKey::new(&info);
+        let spec = AgentLaunchSpec {
+            program: sleep.display().to_string(),
+            args: vec!["30".to_string()],
+            env: Vec::new(),
+            cwd: Some(dir.path().to_path_buf()),
+        };
+        let mut agent =
+            AgentSession::spawn_with_spec(info, spec, 40, 6, AgentLaunchMode::Normal).unwrap();
+        let meta_path = dir.path().join("ack-boundary.json");
+        let (server, mut peer) = AgentStream::pair().unwrap();
+        let mut conn = DaemonConnection::new(server).unwrap();
+        let mut attached_pid = Some(123);
+        let mut attached_instance = Some("ack-boundary-client".to_string());
+        let mut accepted = AcceptedAgentInputSequences::default();
+
+        let outcome = handle_daemon_client_request(
+            AgentDaemonRequest::Input {
+                data: b"queued-not-yet-acknowledged".to_vec(),
+                input_seq: Some(91),
+            },
+            &mut conn,
+            &mut agent,
+            &meta_path,
+            &mut attached_pid,
+            &mut attached_instance,
+            &mut accepted,
+        );
+
+        assert!(matches!(outcome, DaemonRequestOutcome::Continue));
+        assert!(!accepted.already_accepted("ack-boundary-client", 91));
+        let early_event =
+            read_agent_daemon_event_with_timeout(&mut peer, Duration::from_millis(20));
+        assert!(matches!(
+            early_event,
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+        ));
+
+        let mut client = Some(conn);
+        let completion_deadline = Instant::now() + Duration::from_secs(2);
+        while !accepted.already_accepted("ack-boundary-client", 91) {
+            apply_daemon_pty_input_completions(
+                &mut agent,
+                &mut client,
+                &mut attached_pid,
+                &mut attached_instance,
+                &mut accepted,
+                &meta_path,
+            );
+            if accepted.already_accepted("ack-boundary-client", 91) {
+                break;
+            }
+            assert!(
+                Instant::now() < completion_deadline,
+                "PTY input writer did not report completion"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let acknowledged =
+            read_agent_daemon_event_with_timeout(&mut peer, Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            acknowledged,
+            AgentDaemonEvent::InputAccepted { input_seq: 91 }
+        ));
+
+        let _ = agent.child.kill();
+        let _ = agent.child.wait();
+        let _ = agent.shutdown_input_writer();
+        let _ = agent.shutdown_disk_writer();
+        let _ = remove_agent_pty_log(&key);
+    }
+
+    #[test]
+    fn pty_input_writer_reports_acknowledgeable_completion_after_successful_write() {
+        let (job_tx, job_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let acknowledgement = DaemonPtyInputAcknowledgement {
+            client_instance_id: "client-success".into(),
+            input_seq: 41,
+        };
+        job_tx
+            .send(DaemonPtyInputJob {
+                bytes: b"written".to_vec(),
+                acknowledgement: Some(acknowledgement.clone()),
+            })
+            .unwrap();
+        drop(job_tx);
+        let failed = Arc::new(AtomicBool::new(false));
+
+        run_daemon_pty_input_writer(
+            job_rx,
+            completion_tx,
+            Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+            Provider::Claude,
+            "writer-success".into(),
+            Arc::clone(&failed),
+        );
+
+        match completion_rx.try_recv().unwrap() {
+            DaemonPtyInputCompletion::Written(completed) => {
+                assert_eq!(completed, acknowledgement)
+            }
+            DaemonPtyInputCompletion::Failed(_) => panic!("successful write reported failure"),
+        }
+        assert!(!failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pty_input_writer_never_reports_failed_write_as_accepted() {
+        struct RejectingWriter;
+
+        impl Write for RejectingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(ErrorKind::BrokenPipe, "rejected"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (job_tx, job_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let acknowledgement = DaemonPtyInputAcknowledgement {
+            client_instance_id: "client-failure".into(),
+            input_seq: 42,
+        };
+        job_tx
+            .send(DaemonPtyInputJob {
+                bytes: b"lost".to_vec(),
+                acknowledgement: Some(acknowledgement.clone()),
+            })
+            .unwrap();
+        drop(job_tx);
+        let failed = Arc::new(AtomicBool::new(false));
+
+        run_daemon_pty_input_writer(
+            job_rx,
+            completion_tx,
+            Box::new(RejectingWriter),
+            Provider::Claude,
+            "writer-failure".into(),
+            Arc::clone(&failed),
+        );
+
+        match completion_rx.try_recv().unwrap() {
+            DaemonPtyInputCompletion::Failed(completed) => {
+                assert_eq!(completed, acknowledgement)
+            }
+            DaemonPtyInputCompletion::Written(_) => panic!("failed write was reported accepted"),
+        }
+        assert!(failed.load(Ordering::Acquire));
     }
 
     #[cfg(unix)]

@@ -53,7 +53,7 @@ esac
         path.chmod(0o755)
         return path
 
-    def run_installer(self, app_payload, helper_payload):
+    def run_installer(self, app_payload, helper_payload, extra_env=None):
         env = os.environ.copy()
         env.update(
             {
@@ -67,6 +67,8 @@ esac
                 "FAKE_COKACDIR_PAYLOAD": str(helper_payload),
             }
         )
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(
             ["bash", str(PROJECT_ROOT / "manage.sh")],
             capture_output=True,
@@ -119,6 +121,92 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(app_dest.read_text(encoding="utf-8"), "old-app")
         self.assertEqual(helper_dest.read_text(encoding="utf-8"), "old-helper")
+
+    def test_directory_destination_is_rejected_without_touching_pair(self):
+        app_dest = self.install_dir / "cokacmux"
+        helper_dest = self.home / ".cokacmux" / "bin" / "cokacdir"
+        app_dest.mkdir()
+        (app_dest / "keep.txt").write_text("keep", encoding="utf-8")
+        helper_dest.parent.mkdir(parents=True)
+        helper_dest.write_text("old-helper", encoding="utf-8")
+        app = self.payload("new-app", "new-app")
+        helper = self.payload("new-helper", "new-helper", product="cokacdir")
+
+        result = self.run_installer(app, helper)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((app_dest / "keep.txt").read_text(encoding="utf-8"), "keep")
+        self.assertEqual(helper_dest.read_text(encoding="utf-8"), "old-helper")
+
+    def test_second_commit_failure_restores_both_previous_programs(self):
+        app_dest = self.install_dir / "cokacmux"
+        helper_dest = self.home / ".cokacmux" / "bin" / "cokacdir"
+        helper_dest.parent.mkdir(parents=True)
+        app_dest.write_text("old-app", encoding="utf-8")
+        helper_dest.write_text("old-helper", encoding="utf-8")
+        app = self.payload("new-app", "new-app")
+        helper = self.payload("new-helper", "new-helper", product="cokacdir")
+        fail_marker = self.root / "mv-failed-once"
+        fake_mv = self.fake_bin / "mv"
+        fake_mv.write_text(
+            """#!/bin/sh
+last=''
+for arg in "$@"; do last="$arg"; done
+if [ "${FAIL_APP_COMMIT_ONCE:-}" = 1 ] && \
+   [ "$last" = "$COKACMUX_INSTALL_DIR/cokacmux" ] && \
+   [ ! -e "$FAIL_APP_COMMIT_MARKER" ]; then
+    : > "$FAIL_APP_COMMIT_MARKER"
+    exit 1
+fi
+exec /bin/mv "$@"
+""",
+            encoding="utf-8",
+        )
+        fake_mv.chmod(0o755)
+
+        result = self.run_installer(
+            app,
+            helper,
+            {
+                "FAIL_APP_COMMIT_ONCE": "1",
+                "FAIL_APP_COMMIT_MARKER": str(fail_marker),
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(app_dest.read_text(encoding="utf-8"), "old-app")
+        self.assertEqual(helper_dest.read_text(encoding="utf-8"), "old-helper")
+        self.assertEqual(list(self.install_dir.glob(".cokacmux.*")), [])
+        self.assertEqual(list(helper_dest.parent.glob(".cokacdir.*")), [])
+
+    def test_post_install_validation_failure_restores_both_previous_programs(self):
+        app_dest = self.install_dir / "cokacmux"
+        helper_dest = self.home / ".cokacmux" / "bin" / "cokacdir"
+        helper_dest.parent.mkdir(parents=True)
+        app_dest.write_text("old-app", encoding="utf-8")
+        helper_dest.write_text("old-helper", encoding="utf-8")
+        app = self.payload("new-app", "new-app")
+        helper = self.root / "location-sensitive-helper"
+        helper.write_text(
+            """#!/bin/sh
+if [ "${1:-}" = --version ]; then
+    echo 'cokacdir 1.0'
+    case "$0" in */.cokacmux/bin/cokacdir) exit 1 ;; esac
+    exit 0
+fi
+exit 0
+""",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+
+        result = self.run_installer(app, helper)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(app_dest.read_text(encoding="utf-8"), "old-app")
+        self.assertEqual(helper_dest.read_text(encoding="utf-8"), "old-helper")
+        self.assertEqual(list(self.install_dir.glob(".cokacmux.*")), [])
+        self.assertEqual(list(helper_dest.parent.glob(".cokacdir.*")), [])
 
 
 if __name__ == "__main__":

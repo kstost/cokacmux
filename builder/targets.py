@@ -375,7 +375,7 @@ class TargetManager:
         - "native" - current platform
         - "macos" - both macOS targets
         - "linux" - both Linux targets
-        - "all" - all targets
+        - "all" - all macOS and Linux targets (Windows remains explicit)
         - "macos-arm64", "linux-x86_64" etc. - specific targets
         """
         resolved: List[Target] = []

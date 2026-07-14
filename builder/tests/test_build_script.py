@@ -95,6 +95,18 @@ class BuildCliTests(unittest.TestCase):
         installer.setup_all.assert_called_once_with()
         run_build.assert_not_called()
 
+    def test_all_with_windows_keeps_explicit_windows_request(self):
+        parser = build.create_parser()
+        args = parser.parse_args(["--all", "--windows"])
+
+        self.assertEqual(build.collect_targets(args), ["all", "windows"])
+
+    def test_all_with_one_windows_arch_keeps_explicit_architecture(self):
+        parser = build.create_parser()
+        args = parser.parse_args(["--all", "--windows-arm64"])
+
+        self.assertEqual(build.collect_targets(args), ["all", "windows-arm64"])
+
     def test_existing_rust_is_accepted_when_default_toolchain_setup_fails(self):
         installer = MagicMock()
         installer.is_rust_installed.return_value = True

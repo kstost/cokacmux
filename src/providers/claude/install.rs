@@ -35,16 +35,17 @@ pub fn install_to_user_dir(
     session: &UniversalSession,
     opts: &InstallOpts,
 ) -> Result<InstallReport> {
-    crate::debug::log(
-        "provider_claude_install_start",
-        serde_json::json!({
-            "session_id": &session.session_id,
-            "messages": session.messages.len(),
-            "cwd": &session.cwd,
-            "overwrite": opts.overwrite,
-            "home_override": opts.claude_home.as_ref().map(|p| p.display().to_string()),
-        }),
-    );
+    let jsonl = planned_jsonl_path(session, opts)?;
+    install_to_planned_path(session, opts, &jsonl)
+}
+
+/// Resolve and validate the native destination without creating or replacing
+/// anything. Session-level installers use this to capture the previous
+/// artifact before authorizing an overwrite.
+pub(crate) fn planned_jsonl_path(
+    session: &UniversalSession,
+    opts: &InstallOpts,
+) -> Result<PathBuf> {
     let home = opts
         .claude_home
         .clone()
@@ -57,9 +58,34 @@ pub fn install_to_user_dir(
         return Err(ConvertError::MissingField("session.session_id"));
     }
     validate_session_id(&session.session_id)?;
-    let project = home.join("projects").join(encode_cwd(&session.cwd));
+    Ok(home
+        .join("projects")
+        .join(encode_cwd(&session.cwd))
+        .join(format!("{}.jsonl", session.session_id)))
+}
+
+pub(crate) fn install_to_planned_path(
+    session: &UniversalSession,
+    opts: &InstallOpts,
+    jsonl: &Path,
+) -> Result<InstallReport> {
+    crate::debug::log(
+        "provider_claude_install_start",
+        serde_json::json!({
+            "session_id": &session.session_id,
+            "messages": session.messages.len(),
+            "cwd": &session.cwd,
+            "overwrite": opts.overwrite,
+            "home_override": opts.claude_home.as_ref().map(|p| p.display().to_string()),
+        }),
+    );
+    let project = jsonl.parent().ok_or_else(|| {
+        ConvertError::Other(format!(
+            "claude install path has no parent: {}",
+            jsonl.display()
+        ))
+    })?;
     std::fs::create_dir_all(&project)?;
-    let jsonl = project.join(format!("{}.jsonl", session.session_id));
     if jsonl.exists() && !opts.overwrite {
         return Err(ConvertError::Other(format!(
             "session JSONL already exists at {} (set overwrite=true to replace)",
@@ -78,8 +104,8 @@ pub fn install_to_user_dir(
         }),
     );
     Ok(InstallReport {
-        project_dir: project,
-        jsonl_path: jsonl,
+        project_dir: project.to_path_buf(),
+        jsonl_path: jsonl.to_path_buf(),
         bytes_written,
     })
 }

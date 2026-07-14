@@ -69,6 +69,17 @@ responsiveness (5); never risk a live agent (1) to clean up the display (3).
 - Do not use `cargo build`, `python3 build.py`, or any build commands unless user asks
 - Focus only on code modifications; user handles all builds manually
 
+## Distribution and Repository Automation Policy
+
+- `docs/PROJECT_POLICY.md` is authoritative for distribution and automation.
+- `cokacmux`/`cokacdir` distribution does not require checksums, signatures,
+  signed manifests, SBOMs, or attestations. Their absence is intentional and
+  is not a defect or release blocker.
+- GitHub Actions is not used. Keep `.github/workflows` absent and do not make
+  any validation, release, or website task depend on hosted workflows.
+- Existing third-party tool archive hashes are local builder implementation
+  details, not a release-artifact authenticity requirement.
+
 ## Test Storage Safety
 
 - Rust tests require the same explicit user approval as build commands.

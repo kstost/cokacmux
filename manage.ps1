@@ -73,23 +73,6 @@ function Download-Binary {
     }
 }
 
-function Install-BinaryAtomically {
-    param(
-        [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Destination
-    )
-
-    $targetDir = Split-Path -Parent $Destination
-    $targetName = Split-Path -Leaf $Destination
-    $staged = Join-Path $targetDir ".$targetName-$PID-$([IO.Path]::GetRandomFileName()).tmp"
-    try {
-        Copy-Item -LiteralPath $Source -Destination $staged
-        Move-Item -LiteralPath $staged -Destination $Destination -Force
-    } finally {
-        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
-    }
-}
-
 function Assert-BinaryVersion {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -106,6 +89,112 @@ function Assert-BinaryVersion {
     }
 }
 
+function Install-BinaryPairAtomically {
+    param(
+        [Parameter(Mandatory = $true)][string]$AppSource,
+        [Parameter(Mandatory = $true)][string]$AppDestination,
+        [Parameter(Mandatory = $true)][string]$HelperSource,
+        [Parameter(Mandatory = $true)][string]$HelperDestination
+    )
+
+    $appDir = Split-Path -Parent $AppDestination
+    $appName = Split-Path -Leaf $AppDestination
+    $helperDir = Split-Path -Parent $HelperDestination
+    $helperName = Split-Path -Leaf $HelperDestination
+    $appStaged = Join-Path $appDir ".$appName-$PID-$([IO.Path]::GetRandomFileName()).tmp"
+    $helperStaged = Join-Path $helperDir ".$helperName-$PID-$([IO.Path]::GetRandomFileName()).tmp"
+    $appBackup = Join-Path $appDir ".$appName-$PID-$([IO.Path]::GetRandomFileName()).backup"
+    $helperBackup = Join-Path $helperDir ".$helperName-$PID-$([IO.Path]::GetRandomFileName()).backup"
+    $appExisted = Test-Path -LiteralPath $AppDestination
+    $helperExisted = Test-Path -LiteralPath $HelperDestination
+    $appBackupMoved = $false
+    $helperBackupMoved = $false
+    $appInstalled = $false
+    $helperInstalled = $false
+    $committed = $false
+
+    if ($appExisted -and -not (Test-Path -LiteralPath $AppDestination -PathType Leaf)) {
+        throw "App destination is not a file: $AppDestination"
+    }
+    if ($helperExisted -and -not (Test-Path -LiteralPath $HelperDestination -PathType Leaf)) {
+        throw "Helper destination is not a file: $HelperDestination"
+    }
+
+    try {
+        # Prepare both files in their destination filesystems before changing
+        # either installed program.
+        Copy-Item -LiteralPath $AppSource -Destination $appStaged
+        Copy-Item -LiteralPath $HelperSource -Destination $helperStaged
+
+        if ($helperExisted) {
+            Move-Item -LiteralPath $HelperDestination -Destination $helperBackup
+            $helperBackupMoved = $true
+        }
+        Move-Item -LiteralPath $helperStaged -Destination $HelperDestination
+        $helperInstalled = $true
+
+        if ($appExisted) {
+            Move-Item -LiteralPath $AppDestination -Destination $appBackup
+            $appBackupMoved = $true
+        }
+        Move-Item -LiteralPath $appStaged -Destination $AppDestination
+        $appInstalled = $true
+
+        Assert-BinaryVersion -Name $app -Path $AppDestination
+        Assert-BinaryVersion -Name $cokacdirApp -Path $HelperDestination
+        $committed = $true
+    } catch {
+        $installError = $_.Exception.Message
+        $rollbackErrors = [System.Collections.Generic.List[string]]::new()
+
+        try {
+            if ($appInstalled -and (Test-Path -LiteralPath $AppDestination)) {
+                Remove-Item -LiteralPath $AppDestination -Force
+            }
+            if ($appBackupMoved) {
+                Move-Item -LiteralPath $appBackup -Destination $AppDestination -Force
+                $appBackupMoved = $false
+            }
+        } catch {
+            $rollbackErrors.Add("app rollback failed: $($_.Exception.Message)")
+        }
+
+        try {
+            if ($helperInstalled -and (Test-Path -LiteralPath $HelperDestination)) {
+                Remove-Item -LiteralPath $HelperDestination -Force
+            }
+            if ($helperBackupMoved) {
+                Move-Item -LiteralPath $helperBackup -Destination $HelperDestination -Force
+                $helperBackupMoved = $false
+            }
+        } catch {
+            $rollbackErrors.Add("helper rollback failed: $($_.Exception.Message)")
+        }
+
+        $rollbackSuffix = if ($rollbackErrors.Count -gt 0) {
+            "; " + ($rollbackErrors -join "; ")
+        } else {
+            "; previous pair restored"
+        }
+        throw "$installError$rollbackSuffix"
+    } finally {
+        Remove-Item -LiteralPath $appStaged -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $helperStaged -Force -ErrorAction SilentlyContinue
+        if ($committed) {
+            foreach ($backup in @($appBackup, $helperBackup)) {
+                if (-not (Test-Path -LiteralPath $backup)) {
+                    continue
+                }
+                try {
+                    Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
+                } catch {
+                    Write-Warning "Installed pair is valid, but old backup remains at ${backup}: $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+}
+
 try {
     try {
         [Net.ServicePointManager]::SecurityProtocol =
@@ -118,11 +207,11 @@ try {
     Assert-BinaryVersion -Name $app -Path $tmp
     Assert-BinaryVersion -Name $cokacdirApp -Path $cokacdirTmp
 
-    Install-BinaryAtomically -Source $cokacdirTmp -Destination $cokacdirDest
-    Install-BinaryAtomically -Source $tmp -Destination $dest
-
-    Assert-BinaryVersion -Name $app -Path $dest
-    Assert-BinaryVersion -Name $cokacdirApp -Path $cokacdirDest
+    Install-BinaryPairAtomically `
+        -AppSource $tmp `
+        -AppDestination $dest `
+        -HelperSource $cokacdirTmp `
+        -HelperDestination $cokacdirDest
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if (($userPath -split ";") -notcontains $dir) {

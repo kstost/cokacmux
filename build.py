@@ -142,7 +142,7 @@ Note: All tools are installed locally in builder/tools/ directory.
     target_group.add_argument(
         "--all",
         action="store_true",
-        help="Build for all supported platforms",
+        help="Build all macOS and Linux targets (add --windows for Windows)",
     )
 
     # Setup
@@ -209,6 +209,16 @@ def collect_targets(args: argparse.Namespace) -> list:
     # Flag-based targets
     if args.all:
         targets.append("all")
+        # `all` intentionally means macOS + Linux in TargetManager.  Windows
+        # is opt-in because its toolchain is substantially larger, but an
+        # explicit Windows flag must never be swallowed by `--all`.
+        if args.windows:
+            targets.append("windows")
+        else:
+            if args.windows_x86_64:
+                targets.append("windows-x86_64")
+            if args.windows_arm64:
+                targets.append("windows-arm64")
     else:
         if args.macos:
             targets.append("macos")
@@ -255,7 +265,7 @@ def ensure_rust_installed(tool_installer: ToolInstaller, logger: Logger, auto_se
 
     if not auto_setup:
         logger.error("Rust is not installed. Run with --setup or --setup-rust first.")
-        logger.info("Or use --no-auto-setup=false to allow automatic installation.")
+        logger.info("Or rerun without --no-auto-setup to allow automatic installation.")
         return False
 
     logger.warning("Rust is not installed. Installing automatically...")

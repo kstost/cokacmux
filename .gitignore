@@ -45,6 +45,9 @@ Thumbs.db
 /website/node_modules/
 /website/dist/
 
+# Hosted CI is intentionally not used; see docs/PROJECT_POLICY.md.
+/.github/workflows/
+
 # Environment
 .env
 .env.local

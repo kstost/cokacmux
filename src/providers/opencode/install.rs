@@ -38,45 +38,41 @@ pub fn install_to_default_db(
             "overwrite": opts.overwrite,
         }),
     );
-    let db = opts
-        .db_path
-        .clone()
-        .or_else(default_db_path)
-        .ok_or_else(|| ConvertError::Other("could not determine opencode db path".into()))?;
+    let db = planned_db_path(opts)?;
     if !db.exists() {
         // Create a fresh DB with our minimal schema. opencode will migrate
         // it further on next launch.
-        if let Some(parent) = db.parent() {
+        if let Some(parent) = db.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
     }
-    // Probe for write access — bail with a clear message if opencode holds an
-    // exclusive lock.
-    {
-        let conn = super::db::open_readwrite(&db)?;
-        if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
+    let mut conn = super::db::open_readwrite(&db)?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| {
             crate::debug::log(
                 "provider_opencode_install_lock_error",
                 serde_json::json!({
                     "session_id": &session.session_id,
                     "db_path": db.display().to_string(),
-                    "error": e.to_string(),
+                    "error": error.to_string(),
                 }),
             );
-            return Err(ConvertError::Other(format!(
+            ConvertError::Other(format!(
                 "could not acquire write lock on {} (is opencode running?): {}",
                 db.display(),
-                e
-            )));
-        }
-    }
-    super::write::to_db_path_with_opts(
+                error
+            ))
+        })?;
+    super::db::ensure_schema(&tx)?;
+    super::write::to_db_transaction_with_opts(
+        &tx,
         session,
-        &db,
         &super::write::WriteOpts {
             overwrite: opts.overwrite,
         },
     )?;
+    tx.commit()?;
     crate::debug::log(
         "provider_opencode_install_ok",
         serde_json::json!({
@@ -89,6 +85,15 @@ pub fn install_to_default_db(
         db_path: db,
         messages: session.messages.len(),
     })
+}
+
+/// Resolve the live database path without creating it. Session-level install
+/// uses this to start one immediate transaction spanning write and validation.
+pub(crate) fn planned_db_path(opts: &InstallOpts) -> Result<PathBuf> {
+    opts.db_path
+        .clone()
+        .or_else(default_db_path)
+        .ok_or_else(|| ConvertError::Other("could not determine opencode db path".into()))
 }
 
 #[cfg(feature = "discovery")]

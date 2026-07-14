@@ -52,6 +52,22 @@ pub fn clone_session_rows(
     src_session_id: &str,
     opts: &OpenCodeRowCloneOpts,
 ) -> Result<OpenCodeRowCloneReport> {
+    clone_session_rows_with_validation(db_path, src_session_id, opts, |_conn, _session_id| Ok(()))
+        .map(|(report, ())| report)
+}
+
+/// Clone and run a caller-provided native validator against the uncommitted
+/// rows. Returning an error from the validator rolls back the complete target
+/// replacement, including any prior target rows and todo state.
+pub(crate) fn clone_session_rows_with_validation<T, F>(
+    db_path: &Path,
+    src_session_id: &str,
+    opts: &OpenCodeRowCloneOpts,
+    validate: F,
+) -> Result<(OpenCodeRowCloneReport, T)>
+where
+    F: FnOnce(&Connection, &str) -> Result<T>,
+{
     debug::log(
         "opencode_row_clone_start",
         serde_json::json!({
@@ -74,24 +90,21 @@ pub fn clone_session_rows(
     }
 
     let mut conn = super::db::open_existing_readwrite(db_path)?;
-    // Lock probe — bail with a clear message if opencode holds an
-    // exclusive lock. Use a separate scope so the probe txn is dropped
-    // before we open our real one.
-    {
-        let probe = super::db::open_existing_readwrite(db_path)?;
-        if let Err(e) = probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
-            return Err(ConvertError::Other(format!(
+    // Acquire the actual write transaction immediately. A separate lock probe
+    // followed by a deferred transaction leaves a race in which another
+    // writer can take the lock between the two operations.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| {
+            ConvertError::Other(format!(
                 "could not acquire write lock on {} (is opencode running?): {}",
                 db_path.display(),
-                e
-            )));
-        }
-    }
-    let session_message_exists = super::db::table_exists(&conn, "session_message")?;
+                error
+            ))
+        })?;
+    let session_message_exists = super::db::table_exists(&tx, "session_message")?;
     let session_message_has_seq =
-        session_message_exists && super::db::table_has_column(&conn, "session_message", "seq")?;
-
-    let tx = conn.transaction()?;
+        session_message_exists && super::db::table_has_column(&tx, "session_message", "seq")?;
 
     // 1. Read origin session row (28 columns)
     let session_row = read_session_row(&tx, src_session_id)?;
@@ -308,6 +321,7 @@ pub fn clone_session_rows(
         None => 0,
     };
 
+    let validation = validate(&tx, &new_session_id)?;
     tx.commit()?;
 
     debug::log(
@@ -323,13 +337,16 @@ pub fn clone_session_rows(
         }),
     );
 
-    Ok(OpenCodeRowCloneReport {
-        db_path: db_path.to_path_buf(),
-        new_session_id,
-        messages_copied,
-        parts_copied,
-        session_messages_copied,
-    })
+    Ok((
+        OpenCodeRowCloneReport {
+            db_path: db_path.to_path_buf(),
+            new_session_id,
+            messages_copied,
+            parts_copied,
+            session_messages_copied,
+        },
+        validation,
+    ))
 }
 
 struct SessionRow {
@@ -994,6 +1011,93 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn validation_failure_rolls_back_complete_overwritten_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oc.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            seed_origin(&conn);
+            conn.execute_batch(
+                "CREATE TABLE todo (
+                    session_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, position)
+                 );
+                 INSERT INTO todo
+                    (session_id, content, status, priority, position,
+                     time_created, time_updated)
+                 VALUES ('ses_origin', 'source todo', 'pending', 'medium', 1, 1, 1);
+                 INSERT INTO session
+                    (id, project_id, directory, title, slug, version,
+                     time_created, time_updated)
+                 VALUES ('ses_target', 'global', '/old', 'old target',
+                         'old-slug', 'old-version', 10, 20);
+                 INSERT INTO message
+                    (id, session_id, time_created, time_updated, data)
+                 VALUES ('msg_old_target', 'ses_target', 10, 10,
+                         '{\"role\":\"user\",\"old\":true}');
+                 INSERT INTO todo
+                    (session_id, content, status, priority, position,
+                     time_created, time_updated)
+                 VALUES ('ses_target', 'old target todo', 'in_progress',
+                         'high', 7, 10, 20);",
+            )
+            .unwrap();
+        }
+
+        let error = clone_session_rows_with_validation(
+            &path,
+            "ses_origin",
+            &OpenCodeRowCloneOpts {
+                new_session_id: Some("ses_target".into()),
+                overwrite: true,
+                ..Default::default()
+            },
+            |_conn, _session_id| -> Result<()> {
+                Err(ConvertError::Other(
+                    "forced native validation failure".into(),
+                ))
+            },
+        )
+        .expect_err("validator failure must abort the row clone transaction");
+        assert!(error
+            .to_string()
+            .contains("forced native validation failure"));
+
+        let conn = Connection::open(&path).unwrap();
+        let target: (String, String) = conn
+            .query_row(
+                "SELECT title, directory FROM session WHERE id = 'ses_target'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(target, ("old target".into(), "/old".into()));
+        let old_messages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message
+                 WHERE session_id = 'ses_target' AND id = 'msg_old_target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_messages, 1);
+        let old_todo: String = conn
+            .query_row(
+                "SELECT content FROM todo WHERE session_id = 'ses_target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_todo, "old target todo");
     }
 
     #[test]

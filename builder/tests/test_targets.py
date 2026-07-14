@@ -15,6 +15,24 @@ class _HostConfig:
 
 
 class TargetClassificationTests(unittest.TestCase):
+    def test_all_plus_windows_resolves_every_distribution_target(self):
+        manager = TargetManager(_HostConfig("linux"), MagicMock())
+
+        targets = manager.resolve_targets(
+            ["all", "windows"],
+            allow_system_probe=False,
+        )
+
+        self.assertEqual(len(targets), 6)
+        self.assertEqual(
+            {target.platform for target in targets},
+            {"linux", "macos", "windows"},
+        )
+        self.assertEqual(
+            sum(target.platform == "windows" for target in targets),
+            2,
+        )
+
     def test_linux_targets_always_use_zigbuild(self):
         for host_os in ("linux", "macos", "windows"):
             with self.subTest(host_os=host_os):

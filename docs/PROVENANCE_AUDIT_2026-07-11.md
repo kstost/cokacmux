@@ -91,8 +91,10 @@ website/src/copy-command.test.js
 - multi-target 일부 성공 결과의 publish 거부
 - 두 프로그램 다운로드 후 실행/이름 검증과 atomic install
 
-Installer의 mutable `main` URL과 checksum/signature 부재는 현재 snapshot에서도 해결되지
-않았다.
+Installer의 mutable `main` URL 사용과 checksum/signature 부재는 의도적인 프로젝트
+정책이다. 둘 다 해결 대상이나 릴리스 차단 사유가 아니며, 배포 진위용 checksum, 디지털
+서명, signed manifest 및 attestation은 요구하지 않는다. 자세한 정책은
+`docs/PROJECT_POLICY.md`에 있다.
 
 ### Website
 

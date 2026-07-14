@@ -27,7 +27,7 @@
 
 ```text
 M0 provenance 기준점
-  -> M1 고정된 입력과 자동 검증
+  -> M1 고정된 입력과 로컬 검증
        +-> M2 private filesystem / 개인정보
        +-> M3 세션 데이터 무결성
        +-> M4 프로세스 수명주기 / 파괴 경로
@@ -46,7 +46,7 @@ M2, M3, M4는 M1이 녹색이 된 뒤 병렬 진행할 수 있다. M5는 세 작
 - 현재 snapshot을 재구성할 수 있는 patch, source manifest, baseline commit을 보존한다.
 - 기존 0.2.39 배포 파일은 `legacy/unverified`로 동결한다.
 - 다음 릴리스는 기존 버전을 덮어쓰지 않고 새 patch 버전을 사용한다.
-- `cokacdir`의 호환 버전과 digest도 릴리스 입력으로 취급한다.
+- `cokacdir`의 호환 버전도 함께 확인한다. 배포 digest는 요구하지 않는다.
 
 ### 완료 기준
 
@@ -65,19 +65,24 @@ snapshot commit으로 보존했다. 이 branch는 아직 원격에 push하지 �
 M0는 완료 상태다. M1 검증 승인을 받아 로컬 baseline과 입력 고정을 진행했으며, 결과는
 `docs/BASELINE_VERIFICATION_2026-07-11.md`에 기록했다.
 
-## 5. M1 - 고정된 입력과 자동 검증
+## 5. M1 - 고정된 입력과 로컬 검증
+
+2026-07-14 정책 결정에 따라 GitHub Actions, `.github/workflows`, 배포 checksum/서명,
+signed manifest 및 attestation은 요구사항이 아니다. 이 문서의 이전 기록과 충돌할 때는
+`docs/PROJECT_POLICY.md`가 우선한다.
 
 ### 작업
 
 - `Cargo.lock`을 릴리스 입력으로 추적하고 모든 Cargo 검증에 `--locked`를 사용한다.
 - Rust/rustfmt/clippy 버전을 `rust-toolchain.toml`에 고정한다.
 - MSRV는 `Cargo.toml`의 `rust-version`으로 별도 명시한다.
-- Node와 CI Python 버전을 고정한다.
-- Zig, macOS SDK, cargo-zigbuild, cargo-xwin의 버전과 archive digest를 고정한다.
-- CI 릴리스 경로에서는 builder의 자동 setup을 금지한다.
-- Linux 빠른 gate와 Linux/macOS/Windows native matrix를 추가한다.
-- Rust, Python builder, Node, Bash, PowerShell 검증을 자동화한다.
-- 실제 사용자 저장소를 쓰는 ignored live test는 일반 CI에서 실행하지 않는다.
+- Node와 로컬 검증용 Python 버전을 기록한다.
+- Zig, macOS SDK, cargo-zigbuild, cargo-xwin의 버전과 현재 builder용 archive digest를
+  기록한다. 이는 제3자 도구 cache의 구현 세부사항이며 배포 조건이 아니다.
+- 로컬 builder의 자동 setup은 허용하고 `--no-auto-setup` 선택은 존중한다.
+- Rust, Python builder, Node, Bash, PowerShell 검증 명령을 로컬에서 유지한다.
+- 실제 사용자 저장소를 쓰는 ignored live test는 일반 로컬 검증에서 실행하지 않는다.
+- `.github/workflows`나 다른 GitHub Actions gate를 추가하지 않는다.
 
 ### 기본 검증 계약
 
@@ -96,10 +101,9 @@ bash / PowerShell 정적 검사
 
 ### 완료 기준
 
-- required gate가 실패하면 main에 병합할 수 없다.
 - fresh checkout에서 lockfile 변경 없이 검증된다.
-- 세 OS의 platform-specific 경로가 native runner에서 컴파일되고 테스트된다.
-- 릴리스 경로에 unpinned tool download가 없다.
+- 지원 OS의 platform-specific 경로는 필요할 때 해당 로컬 환경에서 검증한다.
+- hosted CI 없이도 로컬 명령으로 검증 범위를 재현할 수 있다.
 
 ### 진행 상태 - 2026-07-11
 
@@ -110,17 +114,14 @@ bash / PowerShell 정적 검사
 - system Rust 1.93.1: 두 check와 842 test 통과
 - Python builder 107개, Node 6개, Bash 구문 검사 통과
 - Rust/Node/Python과 rustup/cross-builder 버전, Cargo lockfile, rustup/Zig/SDK SHA 고정
-- release/CI implicit setup 금지, receipted local rustup + exact Rust Cargo offline 실행,
-  rustup 조회 실패 fail-closed
-- receipt 없는 모든 non-native release 경로를 clean/tool probe 전에 fail-closed
+- local rustup + exact Rust Cargo offline 실행과 rustup 조회 실패 fail-closed
+- `--no-auto-setup`에서 준비된 도구가 없는 non-native 경로를 clean/tool probe 전에
+  fail-closed
 - noninteractive compiler/output override, Cargo config, forged/unknown target fail-closed
-- SHA-pinned official action과 격리 storage를 사용하는 CI workflow 구현
 
-M1은 아직 완료 상태가 아니다. branch를 push하지 않아 native Linux/macOS/Windows workflow,
-PowerShell parser, ephemeral website publish build가 실제 runner에서 실행되지 않았다. 또한
-zigbuild, Windows GNU/LLVM, cargo-xwin SDK/CRT payload receipt, native system tool attestation,
-OS-level release network sandbox, 별도 승인 대상인 6-target release build가 남아 있다.
-이 gate가 닫히기 전에는 M2/M3/M4 구현을 시작하지 않는다.
+GitHub workflow, hosted runner, attestation은 완료 조건에서 제외한다. 남은 검증은 로컬
+PowerShell parser와 별도 승인 대상인 6-target release build이며, 둘 다 hosted CI를 요구하지
+않는다.
 
 ## 6. M2 - private filesystem과 개인정보
 
@@ -197,15 +198,14 @@ snapshot 삭제, parent/auxiliary 정리를 모두 감사한다. 각 경로는 �
 ## 9. M5 - 검증 가능한 릴리스
 
 - 새 버전과 `vX.Y.Z` tag를 정확히 일치시킨다.
-- tag의 단일 SHA에서 6개 artifact를 clean build한다.
+- 요청한 6개 artifact를 로컬에서 clean build한다.
 - architecture, ABI, `--version`, `--help`, 격리 HOME의 `--check`를 검증한다.
-- SHA-256, size, target, Git SHA, toolchain을 담은 manifest와 SBOM을 생성한다.
-- draft release에서 전 target을 확인한 후 한 번에 publish한다.
 - 일부 target만 성공한 partial release는 허용하지 않는다.
-- installer는 mutable branch URL 대신 immutable release manifest를 사용한다.
-- 하나의 manifest가 cokacmux와 호환 cokacdir의 version, URL, size, digest를 함께 고정한다.
 - 두 프로그램을 모두 검증한 뒤 pair 단위로 교체하고 실패 시 둘 다 복원한다.
-- checksum을 발행자 인증으로 오해하지 않도록 signed manifest 또는 CI attestation을 추가한다.
+- installer의 현재 mutable branch URL 사용은 허용한다.
+- checksum, 디지털 서명, signed manifest, SBOM 및 attestation은 생성하거나 검증할 필요가
+  없으며, 부재를 결함이나 릴리스 차단 사유로 취급하지 않는다.
+- GitHub Actions와 `.github/workflows`는 릴리스 과정에 사용하지 않는다.
 
 공개된 tag와 asset은 교체하지 않는다. 수정은 새 patch release로만 배포한다.
 

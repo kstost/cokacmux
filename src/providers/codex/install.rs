@@ -15,7 +15,7 @@
 //! use `INSERT OR REPLACE` so re-installing the same UUID overwrites the
 //! prior row cleanly.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
@@ -60,9 +60,62 @@ pub struct InstallReport {
     pub indexed: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InstallPlan {
+    pub rollout_path: PathBuf,
+    pub index_path: PathBuf,
+}
+
 pub fn install_to_user_dir(
     session: &UniversalSession,
     opts: &InstallOpts,
+) -> Result<InstallReport> {
+    let plan = planned_install(session, opts)?;
+    install_planned(session, opts, &plan)
+}
+
+/// Resolve the rollout and index destinations without changing either. An
+/// existing rollout is selected by session identity rather than by the new
+/// session timestamp, so overwrite cannot create duplicate files for one id.
+pub(crate) fn planned_install(
+    session: &UniversalSession,
+    opts: &InstallOpts,
+) -> Result<InstallPlan> {
+    let home = opts
+        .codex_home
+        .clone()
+        .or_else(default_codex_home)
+        .ok_or_else(|| ConvertError::Other("could not determine codex home".into()))?;
+    if session.session_id.is_empty() {
+        return Err(ConvertError::MissingField("session.session_id"));
+    }
+    validate_session_id(&session.session_id)?;
+
+    let existing = find_rollout_by_session_id(&home.join("sessions"), &session.session_id)?;
+    let rollout_path = if let Some(existing) = existing {
+        existing
+    } else {
+        let ts = session.created_at.unwrap_or_else(Utc::now);
+        home.join("sessions")
+            .join(format!("{:04}", ts.format("%Y")))
+            .join(format!("{:02}", ts.format("%m")))
+            .join(format!("{:02}", ts.format("%d")))
+            .join(rollout_filename(ts, &session.session_id))
+    };
+    let index_path = opts
+        .state_5_path
+        .clone()
+        .unwrap_or_else(|| home.join("state_5.sqlite"));
+    Ok(InstallPlan {
+        rollout_path,
+        index_path,
+    })
+}
+
+pub(crate) fn install_planned(
+    session: &UniversalSession,
+    opts: &InstallOpts,
+    plan: &InstallPlan,
 ) -> Result<InstallReport> {
     crate::debug::log(
         "provider_codex_install_start",
@@ -75,40 +128,34 @@ pub fn install_to_user_dir(
             "state_5_override": opts.state_5_path.as_ref().map(|p| p.display().to_string()),
         }),
     );
-    let home = opts
-        .codex_home
-        .clone()
-        .or_else(default_codex_home)
-        .ok_or_else(|| ConvertError::Other("could not determine codex home".into()))?;
-    if session.session_id.is_empty() {
-        return Err(ConvertError::MissingField("session.session_id"));
-    }
-    validate_session_id(&session.session_id)?;
-
-    let ts = session.created_at.unwrap_or_else(Utc::now);
-    let dir = home
-        .join("sessions")
-        .join(format!("{:04}", ts.format("%Y")))
-        .join(format!("{:02}", ts.format("%m")))
-        .join(format!("{:02}", ts.format("%d")));
+    let path = &plan.rollout_path;
+    let dir = path.parent().ok_or_else(|| {
+        ConvertError::Other(format!(
+            "codex install path has no parent: {}",
+            path.display()
+        ))
+    })?;
     std::fs::create_dir_all(&dir)?;
-
-    let fname = rollout_filename(ts, &session.session_id);
-    let path = dir.join(fname);
     if path.exists() && !opts.overwrite {
         return Err(ConvertError::Other(format!(
             "rollout already exists at {} (set overwrite=true to replace)",
             path.display()
         )));
     }
+    if opts.update_index
+        && !opts.overwrite
+        && codex_thread_row_exists(&plan.index_path, &session.session_id)?
+    {
+        return Err(ConvertError::Other(format!(
+            "codex state row already exists for {} (set overwrite=true to replace)",
+            session.session_id
+        )));
+    }
     super::write::to_install_jsonl_path(session, &path, &CodexWriteOpts::default())?;
     let bytes_written = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
     // Try to update the index.
-    let index_path = opts
-        .state_5_path
-        .clone()
-        .unwrap_or_else(|| home.join("state_5.sqlite"));
+    let index_path = plan.index_path.clone();
     let indexed = if opts.update_index {
         match index_threads_row(session, &path, &index_path) {
             Ok(()) => {
@@ -148,7 +195,7 @@ pub fn install_to_user_dir(
         }),
     );
     Ok(InstallReport {
-        rollout_path: path,
+        rollout_path: path.to_path_buf(),
         bytes_written,
         index_path: if opts.update_index {
             Some(index_path)
@@ -157,6 +204,80 @@ pub fn install_to_user_dir(
         },
         indexed,
     })
+}
+
+fn find_rollout_by_session_id(sessions: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    if !sessions.exists() {
+        return Ok(None);
+    }
+    if !sessions.is_dir() {
+        return Err(ConvertError::Other(format!(
+            "codex sessions path is not a directory: {}",
+            sessions.display()
+        )));
+    }
+    let mut matches = Vec::new();
+    collect_rollouts_by_session_id(sessions, session_id, &mut matches)?;
+    matches.sort();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        count => Err(ConvertError::Other(format!(
+            "found {count} Codex rollouts for session {}; refusing ambiguous overwrite: {}",
+            session_id,
+            matches
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+fn collect_rollouts_by_session_id(
+    dir: &Path,
+    session_id: &str,
+    matches: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let suffix = format!("-{session_id}.jsonl");
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_rollouts_by_session_id(&path, session_id, matches)?;
+        } else if file_type.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&suffix))
+        {
+            matches.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "opencode")]
+fn codex_thread_row_exists(state_5_path: &Path, session_id: &str) -> Result<bool> {
+    if !state_5_path.exists() {
+        return Ok(false);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        state_5_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)",
+        rusqlite::params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+#[cfg(not(feature = "opencode"))]
+fn codex_thread_row_exists(_state_5_path: &Path, _session_id: &str) -> Result<bool> {
+    Ok(false)
 }
 
 fn rollout_filename(ts: DateTime<Utc>, sid: &str) -> String {
@@ -582,6 +703,60 @@ mod tests {
 
         assert!(error.to_string().contains("session.session_id"));
         assert!(!temp.path().join("escape.jsonl").exists());
+    }
+
+    #[test]
+    fn planned_install_reuses_existing_rollout_for_same_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let session_id = "11111111-1111-7111-8111-111111111111";
+        let existing = home
+            .join("sessions/2025/01/02")
+            .join(format!("rollout-2025-01-02T03-04-05-{session_id}.jsonl"));
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, "old").unwrap();
+        let session = UniversalSession::new(session_id, Provider::Codex, "/repo");
+
+        let plan = planned_install(
+            &session,
+            &InstallOpts {
+                codex_home: Some(home),
+                overwrite: true,
+                update_index: false,
+                state_5_path: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.rollout_path, existing);
+    }
+
+    #[test]
+    fn planned_install_refuses_duplicate_rollouts_for_one_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let session_id = "11111111-1111-7111-8111-111111111111";
+        for day in ["01", "02"] {
+            let path = home
+                .join(format!("sessions/2025/01/{day}"))
+                .join(format!("rollout-2025-01-{day}T03-04-05-{session_id}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "old").unwrap();
+        }
+        let session = UniversalSession::new(session_id, Provider::Codex, "/repo");
+
+        let error = planned_install(
+            &session,
+            &InstallOpts {
+                codex_home: Some(home),
+                overwrite: true,
+                update_index: false,
+                state_5_path: None,
+            },
+        )
+        .expect_err("duplicate identity must not select an arbitrary rollout");
+
+        assert!(error.to_string().contains("2 Codex rollouts"));
     }
 
     #[test]

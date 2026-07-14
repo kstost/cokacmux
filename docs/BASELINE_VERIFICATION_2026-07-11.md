@@ -1,15 +1,19 @@
 # M1 Baseline Verification - 2026-07-11
 
+> 정책 변경(2026-07-14): 이 문서의 GitHub Actions, hosted CI, artifact checksum/서명,
+> manifest 또는 attestation 관련 미완료 항목은 더 이상 프로젝트 요구사항이 아니다.
+> 로컬 검증만 사용하며 `docs/PROJECT_POLICY.md`가 이 역사적 기록보다 우선한다.
+
 ## 1. 결론
 
 Linux aarch64의 로컬 기준선은 녹색이다. 릴리스 검증 툴체인은 Rust `1.96.1`, MSRV는
 upstream Rust `1.93.0`에서 검증한 `1.93`으로 분리한다. 최종 격리 실행에서 Rust 테스트
 842개가 통과했고 9개 live/환경 의존 테스트는 명시적으로 ignored 상태를 유지했다.
 
-M1 전체가 완료된 것은 아니다. GitHub Actions의 Linux/macOS/Windows native 실행, 로컬에 없는
-PowerShell parser, website publish build, 승인되지 않은 6-target release build가 남아 있다.
-Zig/cargo-zigbuild, Windows GNU/LLVM, cargo-xwin SDK/CRT의 content-addressed receipt가 없으므로
-모든 cross-release 경로는 재현 가능하다고 판정하지 않고 의도적으로 차단했다.
+이 문서를 작성한 2026-07-11 당시에는 GitHub Actions 실행과 attestation도 M1 완료 조건으로
+분류했지만, 2026-07-14 정책 변경으로 모두 폐기했다. 현재 남은 로컬 확인 항목은 이 환경에
+없는 PowerShell parser와 별도 승인이 필요한 6-target release build뿐이다. checksum, 서명,
+receipt, attestation 또는 hosted runner의 부재는 미완료 항목이나 차단 사유가 아니다.
 
 ## 2. 승인된 검증 범위
 
@@ -19,8 +23,8 @@ Zig/cargo-zigbuild, Windows GNU/LLVM, cargo-xwin SDK/CRT의 content-addressed re
 - 실제 사용자 저장소를 쓰지 않는 격리 테스트
 
 `python3 build.py`를 통한 release 또는 multi-target build는 이 단계의 승인 범위에 포함하지
-않았다. website build도 tracked publish output을 바꾸므로 로컬에서는 실행하지 않고 ephemeral
-CI job으로 옮겼다.
+않았다. website build도 tracked publish output을 바꾸므로 당시 실행하지 않았다. 향후 확인이
+필요하면 hosted workflow가 아니라 로컬 임시 출력에서 수행한다.
 
 ## 3. 최초 기준선
 
@@ -147,20 +151,20 @@ total:           842 passed, 9 ignored
 842 test가 통과했다. Python builder test는 고정 입력 회귀가 추가된 뒤 107/107, website test는
 6/6으로 통과했다.
 
-## 7. 고정한 입력과 CI 계약
+## 7. 고정한 입력과 로컬 검증 계약
 
 - `rust-toolchain.toml`: Rust/rustfmt/Clippy `1.96.1`
 - `Cargo.toml`: `rust-version = "1.93"`
 - `.node-version`: Node `24.18.0`
 - `.python-version`: Python `3.14.4`
-- CI npm: `11.17.0`
+- 로컬 검증 npm: `11.17.0`
 - builder: rustup `1.29.0`, Rust `1.96.1`, cargo-zigbuild/cargo-xwin `0.23.0`, Zig `0.13.0`,
   macOS SDK `14.0`
 - rustup-init: exact archive URL과 Linux/macOS/Windows x86_64/aarch64 6개 host의 공식
   SHA-256 고정, digest 불일치 시 실행 전 차단
 - Zig: Linux/macOS/Windows의 x86_64/aarch64 6개 host archive SHA-256 고정
 - macOS SDK archive: SHA-256 고정; download/cache/existing archive 모두 추출 전 검증
-- release/CI/`--no-auto-setup`: official rustup-init digest와 일치하는 project-local rustup만
+- `--no-auto-setup`: 준비된 project-local rustup만
   허용하고 `rustup run 1.96.1 cargo`, `--locked --offline`, `CARGO_NET_OFFLINE=true` 적용
 - noninteractive 실행 전 `rustc`/Cargo가 모두 exact `1.96.1`을 보고하는지 검증
 - rustup distribution/update root를 `static.rust-lang.org`로 강제하고 inherited toolchain/host
@@ -170,28 +174,24 @@ total:           842 passed, 9 ignored
   gnullvm target std를 추가
 - Zig/SDK directory 교체는 same-filesystem backup과 rollback 적용
 - `Cargo.lock`과 `website/package-lock.json`: tracked input, 모든 Cargo 검증에 `--locked`
-- GitHub Actions: official action도 release tag의 commit SHA로 고정
-- 일반 CI: ignored test를 활성화하는 인자를 사용하지 않음
-- release/CI는 builder auto-setup을 강제로 끄고, receipt가 없는 모든 non-native
-  target을 clean, rustup query, PATH tool probe 전에 fail-closed 처리
+- 일반 로컬 검증은 ignored test를 활성화하는 인자를 사용하지 않음
+- 로컬 build는 auto-setup을 사용할 수 있고 `--no-auto-setup`은 이를 강제로 끈다.
+- `.github/workflows`와 GitHub Actions는 사용하지 않음
 - noninteractive 경로에서 compiler/linker/output override 환경변수와 unreceipted Cargo
   config를 거부하고, target 분류와 artifact name을 경계에서 다시 검증
 
-## 8. 남은 gate와 후속 이슈
+## 8. 남은 로컬 확인과 후속 이슈
 
-### M1 완료 전 필수
+### 로컬 확인
 
-- GitHub Actions에서 Linux/macOS/Windows native job을 실제 실행한다.
-- PowerShell parser와 ephemeral website publish build 결과를 확인한다.
-- Zig/cargo-zigbuild, Windows GNU/LLVM import library/tool, cargo-xwin SDK/CRT의 exact payload
-  receipt와 project-local cache를 결정한다.
-- Cargo 외 build script의 네트워크까지 막을 OS-level release sandbox를 구성한다.
-- native macOS/Windows compiler, linker, SDK를 content-addressed receipt 또는 immutable runner
-  attestation에 포함한다. 현재 native prerequisite는 CI compatibility gate용이며
-  bit-reproducible release 근거가 아니다.
-- Zig/SDK directory 교체의 일반 예외 rollback은 검증했지만, backup rename 직후
-  SIGKILL/power loss에서 orphan backup을 자동 복구하는 crash journal은 추가로 필요하다.
+- PowerShell parser와 로컬 임시 website publish build 결과를 필요할 때 확인한다.
+- Zig/SDK directory 교체는 일반 예외 rollback과 deterministic backup 복구를 모두 사용한다.
+  backup rename 직후 중단되면 다음 설치 시 이전 설치를 복원하고, 새 directory 공개 직후
+  중단되면 남은 backup을 정리한다.
 - 별도 승인 뒤 6-target release build를 수행한다.
+
+GitHub Actions, hosted runner, checksum, 서명, signed manifest, SBOM, receipt 및 attestation은
+이 목록의 gate가 아니며 추가할 필요가 없다.
 
 ### M4로 이관할 runtime 설계
 

@@ -21,6 +21,38 @@ pub fn install_to_user_dir(
     session: &UniversalSession,
     opts: &InstallOpts,
 ) -> Result<InstallReport> {
+    let path = planned_jsonl_path(session, opts)?;
+    install_to_planned_path(session, opts, &path)
+}
+
+/// Resolve the exact file that an install will replace, without mutating the
+/// session store. This keeps overwrite backup and publication on one path.
+pub(crate) fn planned_jsonl_path(
+    session: &UniversalSession,
+    opts: &InstallOpts,
+) -> Result<PathBuf> {
+    if !super::session_id_is_safe_path_component(&session.session_id) {
+        return Err(ConvertError::Other(format!(
+            "pi session id is not a safe filename component: {}",
+            session.session_id
+        )));
+    }
+    let dir = target_session_dir(session, opts)?;
+    Ok(
+        super::find_session_file_by_id(&dir, &session.session_id).unwrap_or_else(|| {
+            dir.join(super::session_file_name(
+                &session.session_id,
+                session.created_at,
+            ))
+        }),
+    )
+}
+
+pub(crate) fn install_to_planned_path(
+    session: &UniversalSession,
+    opts: &InstallOpts,
+    path: &std::path::Path,
+) -> Result<InstallReport> {
     crate::debug::log(
         "provider_pi_install_start",
         serde_json::json!({
@@ -29,21 +61,10 @@ pub fn install_to_user_dir(
             "overwrite": opts.overwrite,
         }),
     );
-    if !super::session_id_is_safe_path_component(&session.session_id) {
-        return Err(ConvertError::Other(format!(
-            "pi session id is not a safe filename component: {}",
-            session.session_id
-        )));
-    }
-    let dir = target_session_dir(session, opts)?;
+    let dir = path.parent().ok_or_else(|| {
+        ConvertError::Other(format!("pi install path has no parent: {}", path.display()))
+    })?;
     std::fs::create_dir_all(&dir)?;
-    let existing = super::find_session_file_by_id(&dir, &session.session_id);
-    let path = existing.unwrap_or_else(|| {
-        dir.join(super::session_file_name(
-            &session.session_id,
-            session.created_at,
-        ))
-    });
     if path.exists() && !opts.overwrite {
         return Err(ConvertError::Other(format!(
             "pi session already exists: {}",
@@ -58,7 +79,9 @@ pub fn install_to_user_dir(
             "path": path.display().to_string(),
         }),
     );
-    Ok(InstallReport { jsonl_path: path })
+    Ok(InstallReport {
+        jsonl_path: path.to_path_buf(),
+    })
 }
 
 fn target_session_dir(session: &UniversalSession, opts: &InstallOpts) -> Result<PathBuf> {

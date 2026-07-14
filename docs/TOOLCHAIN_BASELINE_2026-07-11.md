@@ -1,5 +1,10 @@
 # Toolchain Baseline - 2026-07-11
 
+> 정책 변경(2026-07-14): GitHub Actions와 `.github/workflows`는 사용하지 않는다.
+> 아래 SHA-256 기록은 제3자 tool archive/local cache 확인을 위한 역사적 구현 정보일 뿐,
+> `cokacmux`/`cokacdir` 배포 checksum·서명 요구가 아니다. 배포에는 checksum, signature,
+> signed manifest 또는 attestation이 필요하지 않다. `docs/PROJECT_POLICY.md`가 우선한다.
+
 ## 1. 목적
 
 M1에서 toolchain을 고정하기 전에 현재 host, 기존 debug artifact, local cross-builder가 실제로
@@ -17,8 +22,8 @@ zsh: 5.9
 bash: 5.3.9
 ```
 
-`pwsh`와 `shellcheck`는 현재 host PATH에 없다. 따라서 PowerShell parser 검증과
-ShellCheck는 현재 host만으로 M1 gate를 충족할 수 없다.
+`pwsh`와 `shellcheck`는 현재 host PATH에 없다. 따라서 이 host에서는 PowerShell parser와
+ShellCheck를 실행하지 못했다. 이는 hosted CI를 요구하는 근거가 아니다.
 
 ## 3. System Rust
 
@@ -74,7 +79,7 @@ clippy: 0.1.96 (31fca3adb2 2026-06-26)
 현재 local builder에는 `stable`이라는 rolling alias만 저장되어 있어 이 directory 자체만으로는
 동일 환경을 나중에 재현할 수 없다.
 local rustup proxy를 위 environment 없이 직접 실행하면 다른 toolchain 정보가 관측될 수
-있으므로, 모든 builder 진입점과 CI는 두 environment 변수를 명시해야 한다.
+있으므로, builder 진입점은 두 environment 변수를 명시해야 한다.
 
 설치된 target:
 
@@ -109,7 +114,7 @@ M1 구현에서는 builder의 입력 계약을 다음처럼 강화했다.
 - noninteractive는 rustup-init archive digest와 일치하는 project-local rustup만 허용
 - 모든 Cargo build variant를 `rustup run 1.96.1 cargo`로 실행하고 rustc/Cargo
   reported version도 exact 검증
-- release/CI/`--no-auto-setup`에 `--locked --offline`과 `CARGO_NET_OFFLINE=true` 적용
+- `--no-auto-setup`에 `--locked --offline`과 `CARGO_NET_OFFLINE=true` 적용
 - cargo-zigbuild/cargo-xwin `0.23.0` exact install과 reported version 검증
 - Zig 0.13.0의 지원 host 6개 archive SHA-256 검증
 - macOS SDK 14.0 archive SHA-256 검증
@@ -118,9 +123,9 @@ M1 구현에서는 builder의 입력 계약을 다음처럼 강화했다.
 - rustup dist/update root를 공식 static server로 강제하고 inherited override 제거
 - Windows gnullvm을 native Rust `1.96.1` toolchain의 target std로 준비
 - Zig/SDK staged directory 교체 실패 시 기존 설치 rollback
-- release/CI의 implicit setup 금지
-- content-addressed receipt가 없는 모든 non-native release/CI 경로를 clean/tool probe
-  전에 fail-closed 처리
+- 로컬 auto-setup 허용, `--no-auto-setup`에서는 implicit setup 금지
+- 준비된 도구가 없는 non-native `--no-auto-setup` 경로를 clean/tool probe 전에
+  fail-closed 처리
 - noninteractive compiler/linker/output override와 unreceipted Cargo config, forged/unknown target 거부
 
 Python builder 회귀 테스트 107개가 이 계약을 검증한다. 실제 cross-build는 실행하지 않았다.
@@ -164,16 +169,17 @@ download, cache copy, 기존 archive는 모두 추출 전에 이 값과 대조�
 3. builder 1.96.1: fmt, all-target/all-feature check, 842 test, full Clippy 통과
 4. 세 full test 모두 실제 runtime mutation 신규 0개
 
-따라서 release/CI toolchain은 `1.96.1`, Cargo MSRV는 `1.93`으로 결정했다. repository에는
+따라서 로컬 release toolchain은 `1.96.1`, Cargo MSRV는 `1.93`으로 결정했다. repository에는
 `rust-toolchain.toml`과 `Cargo.toml`의 `rust-version`을 별도 계약으로 기록한다.
 
-6-target compile은 아직 실행하지 않았다. 또한 zigbuild, Windows GNU/LLVM,
-cargo-xwin SDK/CRT payload receipt가 없으므로 cross-release 재현성 gate는 열린
-상태이며 해당 release 경로는 clean/tool probe 전에 의도적으로 차단된다. Cargo
-외 build script 네트워크를 완전히 차단하려면 추가 OS-level sandbox도 필요하다.
-native macOS/Windows system compiler/linker/SDK는 현재 compatibility prerequisite로만 취급하며,
-content receipt 또는 immutable runner attestation 전에는 bit-reproducible release 증거가 아니다.
-Zig/SDK 교체는 예외 발생 시 기존 directory를 복원하지만, process interruption 사이의
-orphan `.backup`을 자동 복구하는 crash journal은 후속 과제다.
+6-target compile은 아직 실행하지 않았다. `--no-auto-setup`에서는 준비된 zigbuild,
+Windows GNU/LLVM, cargo-xwin SDK/CRT가 없으면 안전하게 중단하며, 일반 로컬 build는 필요한
+project-local 도구를 setup할 수 있다. bit-reproducibility나 Cargo 외 네트워크 차단은 이
+프로젝트의 release gate가 아니다.
+native macOS/Windows system compiler/linker/SDK는 compatibility prerequisite로만 취급한다.
+content receipt나 attestation은 프로젝트 요구사항이 아니며, 부재가 release를 차단하지 않는다.
+Zig/SDK 교체는 예외 발생 시 기존 directory를 복원하며, deterministic `.backup` 상태로
+process interruption도 복구한다. backup만 남으면 이전 설치를 복원하고 destination과 backup이
+함께 남으면 완료된 새 설치를 유지한 채 backup을 정리한다.
 상세 결과는
 `docs/BASELINE_VERIFICATION_2026-07-11.md`에 기록했다.

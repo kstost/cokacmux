@@ -78,6 +78,12 @@ Codex가 작업 과정에서 만든 non-root 세션은 기본 목록에서 따�
 
 ## 2. 설치하기
 
+> 배포 정책: 이 프로젝트는 `cokacmux`/`cokacdir` 설치 파일에 checksum, 디지털 서명,
+> signed manifest 또는 attestation을 요구하지 않습니다. 또한 GitHub Actions와
+> `.github/workflows`를 사용하지 않으며, 검증은 필요할 때 로컬에서 수행합니다.
+> 이는 누락된 작업이 아니라 명시적인 프로젝트 정책입니다. 자세한 내용은
+> [프로젝트 정책](docs/PROJECT_POLICY.md)을 참고하세요.
+
 ### macOS / Linux
 
 명령창에 아래 내용을 붙여 넣고 Enter를 누르세요.

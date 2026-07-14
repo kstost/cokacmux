@@ -1,7 +1,7 @@
 //! Per-session working-directory snapshots managed by cokacmux.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -235,18 +235,6 @@ fn create_snapshot_for_clone_at_with_progress(
         return Err(error);
     }
 
-    if let Err(error) = remove_path_if_exists(&snapshot_path)
-        .and_then(|_| fs::rename(&tmp_path, &snapshot_path).map_err(Into::into))
-    {
-        let _ = remove_path_if_exists(&tmp_path);
-        return Err(error);
-    }
-
-    if let Err(error) = check_cancelled(cancel) {
-        let _ = remove_path_if_exists(&snapshot_path);
-        return Err(error);
-    }
-
     let snapshot = SessionDataSnapshot {
         version: DATA_STORE_VERSION,
         provider: report.target_provider,
@@ -257,16 +245,27 @@ fn create_snapshot_for_clone_at_with_progress(
         snapshot_path: snapshot_path.clone(),
         created_at_epoch_s: current_epoch_s(),
     };
-    let content = serde_json::to_vec_pretty(&snapshot)?;
-    if let Err(error) = fs::write(&tmp_meta_path, content)
-        .map_err(ConvertError::from)
-        .and_then(|_| {
-            set_private_file_permissions(&tmp_meta_path);
-            fs::rename(&tmp_meta_path, &meta_path).map_err(Into::into)
-        })
+    let content = match serde_json::to_vec_pretty(&snapshot) {
+        Ok(content) => content,
+        Err(error) => {
+            let _ = remove_path_if_exists(&tmp_path);
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = write_private_snapshot_metadata(&tmp_meta_path, &content) {
+        let _ = remove_path_if_exists(&tmp_meta_path);
+        let _ = remove_path_if_exists(&tmp_path);
+        return Err(error);
+    }
+    if let Err(error) = check_cancelled(cancel) {
+        let _ = remove_path_if_exists(&tmp_meta_path);
+        let _ = remove_path_if_exists(&tmp_path);
+        return Err(error);
+    }
+    if let Err(error) = commit_snapshot_pair(&tmp_path, &snapshot_path, &tmp_meta_path, &meta_path)
     {
         let _ = remove_path_if_exists(&tmp_meta_path);
-        let _ = remove_path_if_exists(&snapshot_path);
+        let _ = remove_path_if_exists(&tmp_path);
         return Err(error);
     }
 
@@ -287,6 +286,235 @@ fn create_snapshot_for_clone_at_with_progress(
     );
 
     Ok(SessionDataSnapshotReport { snapshot, stats })
+}
+
+fn write_private_snapshot_metadata(path: &Path, content: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(content)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn commit_snapshot_pair(
+    staged_snapshot: &Path,
+    snapshot_path: &Path,
+    staged_meta: &Path,
+    meta_path: &Path,
+) -> Result<()> {
+    commit_snapshot_pair_with_hook(
+        staged_snapshot,
+        snapshot_path,
+        staged_meta,
+        meta_path,
+        || Ok(()),
+    )
+}
+
+fn commit_snapshot_pair_with_hook<F>(
+    staged_snapshot: &Path,
+    snapshot_path: &Path,
+    staged_meta: &Path,
+    meta_path: &Path,
+    after_snapshot_commit: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let suffix = temp_suffix();
+    let snapshot_backup = snapshot_pair_backup_path(snapshot_path, &suffix)?;
+    let meta_backup = snapshot_pair_backup_path(meta_path, &suffix)?;
+    let mut previous_snapshot = None;
+    let mut previous_meta = None;
+    // Complete every fallible existence preflight before moving either old
+    // artifact. Once the first rename happens, every later error path must go
+    // through the paired rollback below.
+    let snapshot_exists = path_entry_exists_checked(snapshot_path)?;
+    let meta_exists = path_entry_exists_checked(meta_path)?;
+
+    if snapshot_exists {
+        fs::rename(snapshot_path, &snapshot_backup)?;
+        previous_snapshot = Some(snapshot_backup);
+    }
+    if meta_exists {
+        if let Err(error) = fs::rename(meta_path, &meta_backup) {
+            let rollback_errors = rollback_snapshot_pair(
+                snapshot_path,
+                previous_snapshot.as_deref(),
+                false,
+                meta_path,
+                None,
+                false,
+            );
+            return Err(snapshot_pair_error(error.into(), rollback_errors));
+        }
+        previous_meta = Some(meta_backup);
+    }
+
+    if let Err(error) = fs::rename(staged_snapshot, snapshot_path) {
+        let rollback_errors = rollback_snapshot_pair(
+            snapshot_path,
+            previous_snapshot.as_deref(),
+            false,
+            meta_path,
+            previous_meta.as_deref(),
+            false,
+        );
+        return Err(snapshot_pair_error(error.into(), rollback_errors));
+    }
+
+    if let Err(error) = after_snapshot_commit()
+        .and_then(|_| fs::rename(staged_meta, meta_path).map_err(ConvertError::from))
+    {
+        let rollback_errors = rollback_snapshot_pair(
+            snapshot_path,
+            previous_snapshot.as_deref(),
+            true,
+            meta_path,
+            previous_meta.as_deref(),
+            false,
+        );
+        return Err(snapshot_pair_error(error, rollback_errors));
+    }
+
+    for backup in [previous_snapshot.as_deref(), previous_meta.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(error) = remove_path_if_exists(backup) {
+            crate::debug::log(
+                "session_data_snapshot_backup_cleanup_failed",
+                serde_json::json!({
+                    "backup": backup.display().to_string(),
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    }
+    if let Some(parent) = snapshot_path.parent() {
+        let _ = File::open(parent).and_then(|dir| dir.sync_all());
+    }
+    Ok(())
+}
+
+fn snapshot_pair_backup_path(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        ConvertError::Other(format!(
+            "cannot allocate snapshot backup for {}",
+            path.display()
+        ))
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            ConvertError::Other(format!(
+                "cannot allocate snapshot backup for {}",
+                path.display()
+            ))
+        })?;
+    let backup = parent.join(format!(".{name}.rollback-{suffix}"));
+    if path_entry_exists_checked(&backup)? {
+        return Err(ConvertError::Other(format!(
+            "snapshot backup path already exists: {}",
+            backup.display()
+        )));
+    }
+    Ok(backup)
+}
+
+fn rollback_snapshot_pair(
+    snapshot_path: &Path,
+    previous_snapshot: Option<&Path>,
+    snapshot_installed: bool,
+    meta_path: &Path,
+    previous_meta: Option<&Path>,
+    meta_installed: bool,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    rollback_snapshot_pair_entry(
+        meta_path,
+        previous_meta,
+        meta_installed,
+        "metadata",
+        &mut errors,
+    );
+    rollback_snapshot_pair_entry(
+        snapshot_path,
+        previous_snapshot,
+        snapshot_installed,
+        "snapshot",
+        &mut errors,
+    );
+    errors
+}
+
+fn rollback_snapshot_pair_entry(
+    target: &Path,
+    backup: Option<&Path>,
+    installed: bool,
+    label: &str,
+    errors: &mut Vec<String>,
+) {
+    if installed {
+        if let Err(error) = remove_path_if_exists(target) {
+            errors.push(format!(
+                "failed to remove new {label} {}: {error}",
+                target.display()
+            ));
+            return;
+        }
+    }
+    let Some(backup) = backup else {
+        return;
+    };
+    let target_exists = match path_entry_exists_checked(target) {
+        Ok(exists) => exists,
+        Err(error) => {
+            errors.push(format!(
+                "cannot inspect {label} destination {} before restore: {error}",
+                target.display()
+            ));
+            return;
+        }
+    };
+    if target_exists {
+        errors.push(format!(
+            "cannot restore {label} backup {} because {} is occupied",
+            backup.display(),
+            target.display()
+        ));
+        return;
+    }
+    if let Err(error) = fs::rename(backup, target) {
+        errors.push(format!(
+            "failed to restore {label} {} from {}: {error}",
+            target.display(),
+            backup.display()
+        ));
+    }
+}
+
+fn snapshot_pair_error(error: ConvertError, rollback_errors: Vec<String>) -> ConvertError {
+    if rollback_errors.is_empty() {
+        error
+    } else {
+        ConvertError::Other(format!(
+            "{error}; snapshot rollback failed: {}",
+            rollback_errors.join("; ")
+        ))
+    }
 }
 
 fn clone_working_dir_for_session_at_with_progress(
@@ -1179,16 +1407,6 @@ fn set_private_dir_permissions(path: &Path) {
 #[cfg(not(unix))]
 fn set_private_dir_permissions(_path: &Path) {}
 
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) {}
-
 fn unique_backup_path(target: &Path) -> Result<PathBuf> {
     let parent = target
         .parent()
@@ -1273,6 +1491,14 @@ fn canonical_or_existing_parent(path: &Path) -> PathBuf {
 
 fn path_entry_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+fn path_entry_exists_checked(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn current_epoch_s() -> u64 {
@@ -1814,6 +2040,59 @@ mod tests {
                 .collect();
             assert!(leftovers.is_empty(), "leftover temp entries: {leftovers:?}");
         }
+    }
+
+    #[test]
+    fn snapshot_pair_commit_failure_restores_previous_snapshot_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        fs::create_dir(&data_root).unwrap();
+        let snapshot_path = data_root.join("codex-target");
+        let meta_path = data_root.join("codex-target.json");
+        let staged_snapshot = data_root.join(".codex-target.tmp");
+        let staged_meta = data_root.join(".codex-target.json.tmp");
+
+        fs::create_dir(&snapshot_path).unwrap();
+        fs::write(snapshot_path.join("old.txt"), "old snapshot").unwrap();
+        fs::write(&meta_path, "old metadata").unwrap();
+        fs::create_dir(&staged_snapshot).unwrap();
+        fs::write(staged_snapshot.join("new.txt"), "new snapshot").unwrap();
+        fs::write(&staged_meta, "new metadata").unwrap();
+
+        let error = commit_snapshot_pair_with_hook(
+            &staged_snapshot,
+            &snapshot_path,
+            &staged_meta,
+            &meta_path,
+            || {
+                Err(ConvertError::Other(
+                    "injected metadata commit failure".into(),
+                ))
+            },
+        )
+        .expect_err("metadata commit failure must roll back the whole pair");
+
+        assert!(error
+            .to_string()
+            .contains("injected metadata commit failure"));
+        assert_eq!(
+            fs::read_to_string(snapshot_path.join("old.txt")).unwrap(),
+            "old snapshot"
+        );
+        assert!(!snapshot_path.join("new.txt").exists());
+        assert_eq!(fs::read_to_string(&meta_path).unwrap(), "old metadata");
+        assert!(
+            staged_meta.exists(),
+            "uncommitted staging remains caller-owned"
+        );
+        assert!(
+            fs::read_dir(&data_root).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".rollback-")),
+            "successful rollback must consume both backups"
+        );
     }
 
     #[test]

@@ -681,13 +681,36 @@ fn validate_opencode_db(db_path: &Path, session_id: &str) -> Result<NativeValida
                 return Ok(report);
             }
         };
-        validate_opencode_db_connection(&mut report, &conn, session_id);
+        return Ok(validate_opencode_connection(db_path, session_id, &conn));
     }
     #[cfg(not(feature = "opencode"))]
     {
         report.check("open_db", false, "opencode feature disabled".to_string());
     }
     Ok(report)
+}
+
+/// Validate rows visible through a caller-owned connection or transaction.
+/// This lets an installer prove a replacement is native-valid before its
+/// SQLite transaction is committed.
+#[cfg(feature = "opencode")]
+pub(crate) fn validate_opencode_connection(
+    db_path: &Path,
+    session_id: &str,
+    conn: &rusqlite::Connection,
+) -> NativeValidationReport {
+    let mut report = NativeValidationReport::new(
+        Provider::OpenCode,
+        session_id,
+        format!("{}#{}", db_path.display(), session_id),
+    );
+    report.check(
+        "db_exists",
+        db_path.is_file(),
+        db_path.display().to_string(),
+    );
+    validate_opencode_db_connection(&mut report, conn, session_id);
+    report
 }
 
 #[cfg(feature = "opencode")]
