@@ -355,6 +355,10 @@ const AGENT_AUXILIARY_REGISTRY_MAX_BYTES: usize = 1024 * 1024;
 /// output before jobs start being dropped, which covers tens of seconds of
 /// disk stall without ever blocking the output pump.
 const DAEMON_DISK_QUEUE_MAX_JOBS: usize = 512;
+/// Retry a failed lifecycle-critical metadata publication on the dedicated
+/// disk writer without blocking the daemon output pump. Readiness is driven by
+/// a successful write acknowledgement, never by this interval.
+const DAEMON_STARTUP_META_RETRY_MS: u64 = 500;
 /// Bound PTY reader buffering to roughly 1 MiB (128 × 8 KiB reads). When the
 /// daemon loop falls behind, blocking this dedicated reader naturally applies
 /// terminal backpressure instead of growing memory without limit.
@@ -407,15 +411,13 @@ const PROCESS_PROBE_COMMAND_TIMEOUT_MS: u64 = 2_000;
 const PROGRAM_RESOLVE_COMMAND_TIMEOUT_MS: u64 = 5_000;
 const COKACDIR_DOWNLOAD_TIMEOUT_MS: u64 = 120_000;
 const COKACDIR_VERSION_TIMEOUT_MS: u64 = 10_000;
-/// PTY setup can fail after the child has started. Cleanup must never turn
-/// that recoverable error into an unbounded wait, even when platform group
-/// termination is unavailable or fails.
+/// Bounded cleanup for short-lived owned helper processes and setup-failure
+/// regression tests. PTY setup itself now completes before the child starts.
 const AGENT_SETUP_FAILURE_CLEANUP_TIMEOUT_MS: u64 = 1_000;
 const AGENT_SETUP_FAILURE_CLEANUP_POLL_MS: u64 = 10;
-/// Grace period for explicit user-requested termination before escalating
-/// from SIGTERM to SIGKILL. This is not used to infer startup readiness or
-/// liveness; the process/group is polled and SIGKILL is skipped if it exits.
-#[cfg(unix)]
+/// Bound explicit user-requested termination: Unix uses this grace period
+/// before escalating from SIGTERM to SIGKILL, while Windows uses it to confirm
+/// exit after `TerminateProcess`. It is never used to infer ordinary liveness.
 const PROCESS_TERMINATE_GRACE_MS: u64 = 1_000;
 #[cfg(unix)]
 const PROCESS_TERMINATE_POLL_MS: u64 = 10;
@@ -4174,6 +4176,12 @@ enum AgentListState {
     Orphaned {
         child_pid: u32,
     },
+    /// The verified PTY/session leader exited, but its original Unix process
+    /// group or Windows descendant tree still has a live member. The recorded
+    /// value is the historic root child PID, not necessarily a live PID.
+    OrphanedGroup {
+        child_pgid: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4218,7 +4226,7 @@ impl AgentListState {
                 activity,
             } => activity.label(),
             AgentListState::Attached { mine: false, .. } => "other",
-            AgentListState::Orphaned { .. } => "lost",
+            AgentListState::Orphaned { .. } | AgentListState::OrphanedGroup { .. } => "lost",
         }
     }
 
@@ -4228,9 +4236,11 @@ impl AgentListState {
             AgentListState::Live { activity } | AgentListState::Attached { activity, .. } => {
                 activity.style()
             }
-            AgentListState::Orphaned { .. } => Style::default()
-                .fg(THEME_WARNING)
-                .add_modifier(Modifier::BOLD),
+            AgentListState::Orphaned { .. } | AgentListState::OrphanedGroup { .. } => {
+                Style::default()
+                    .fg(THEME_WARNING)
+                    .add_modifier(Modifier::BOLD)
+            }
         }
     }
 
@@ -4240,13 +4250,15 @@ impl AgentListState {
             AgentListState::Live { activity } | AgentListState::Attached { activity, .. } => {
                 activity
             }
-            AgentListState::Orphaned { .. } => AgentActivity::Quiet,
+            AgentListState::Orphaned { .. } | AgentListState::OrphanedGroup { .. } => {
+                AgentActivity::Quiet
+            }
         }
     }
 
     fn attached_mine(self) -> Self {
         match self {
-            AgentListState::Orphaned { .. } => self,
+            AgentListState::Orphaned { .. } | AgentListState::OrphanedGroup { .. } => self,
             _ => AgentListState::Attached {
                 mine: true,
                 activity: self.activity(),
@@ -4330,6 +4342,13 @@ fn agent_list_state_debug_value(state: AgentListState) -> serde_json::Value {
             "mine": serde_json::Value::Null,
             "label": "lost",
             "child_pid": child_pid,
+        }),
+        AgentListState::OrphanedGroup { child_pgid } => serde_json::json!({
+            "state": "orphaned_group",
+            "activity": serde_json::Value::Null,
+            "mine": serde_json::Value::Null,
+            "label": "lost",
+            "child_pgid": child_pgid,
         }),
     }
 }
@@ -5371,6 +5390,13 @@ fn app_runtime_snapshot_debug_value(app: &App, verbose: bool) -> serde_json::Val
             .unwrap_or(serde_json::Value::Null),
     );
     snapshot.insert(
+        "agent_kill_replacement".into(),
+        app.agent_kill_replacement
+            .as_ref()
+            .map(|replacement| session_info_debug_value(&replacement.target))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    snapshot.insert(
         "killall_pending".into(),
         app.killall_pending
             .as_ref()
@@ -5882,6 +5908,7 @@ struct AgentSession {
     launch_mode: AgentLaunchMode,
     auth_token: String,
     daemon_pid_start_ticks: Option<u64>,
+    child_pid: Option<u32>,
     child_pid_start_ticks: Option<u64>,
     /// The endpoint generation this daemon owns. Every asynchronous meta
     /// publication carries a snapshot of this identity so an old daemon whose
@@ -5907,6 +5934,7 @@ struct AgentSession {
     /// the bounded PTY queue so a full queue can coalesce rather than lose the
     /// only cwd/activity transition that may occur.
     pending_meta_write: Arc<Mutex<Option<DaemonMetaWrite>>>,
+    meta_write_completion_rx: Receiver<DaemonMetaWriteCompletion>,
     disk_thread: Option<JoinHandle<()>>,
     pty_log_enabled: bool,
     /// Updated by the disk writer thread; the daemon loop reads these
@@ -5936,6 +5964,27 @@ struct DaemonMetaWrite {
     meta_path: PathBuf,
     contents: String,
     runtime_endpoint: Option<(PathBuf, AgentEndpointPublication)>,
+    child_pid: Option<u32>,
+    child_pid_start_ticks: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DaemonMetaWriteCompletion {
+    child_pid: Option<u32>,
+    child_pid_start_ticks: Option<u64>,
+    error: Option<String>,
+}
+
+fn daemon_meta_completion_commits_exact_child(
+    completion: &DaemonMetaWriteCompletion,
+    expected_child_pid: Option<u32>,
+    expected_child_pid_start_ticks: Option<u64>,
+) -> bool {
+    completion.error.is_none()
+        && expected_child_pid.is_some()
+        && completion.child_pid == expected_child_pid
+        && expected_child_pid_start_ticks.is_some()
+        && completion.child_pid_start_ticks == expected_child_pid_start_ticks
 }
 
 /// Shared between the daemon loop and its disk writer thread: the writer
@@ -6022,6 +6071,7 @@ fn run_daemon_pty_input_writer(
 fn run_daemon_disk_writer(
     rx: Receiver<DaemonDiskJob>,
     pending_meta_write: Arc<Mutex<Option<DaemonMetaWrite>>>,
+    meta_write_completion_tx: Sender<DaemonMetaWriteCompletion>,
     mut pty_log: Option<fs::File>,
     provider: Provider,
     session_id: String,
@@ -6063,6 +6113,8 @@ fn run_daemon_disk_writer(
             meta_path,
             contents,
             runtime_endpoint,
+            child_pid,
+            child_pid_start_ticks,
         }) = pending_meta
         {
             meta_write_jobs = meta_write_jobs.saturating_add(1);
@@ -6086,7 +6138,13 @@ fn run_daemon_disk_writer(
                 &contents,
                 runtime_endpoint.as_ref(),
             );
-            if let Err(e) = result {
+            let completion_error = result.as_ref().err().map(ToString::to_string);
+            let _ = meta_write_completion_tx.send(DaemonMetaWriteCompletion {
+                child_pid,
+                child_pid_start_ticks,
+                error: completion_error.clone(),
+            });
+            if let Some(error) = completion_error {
                 meta_write_errors = meta_write_errors.saturating_add(1);
                 debug_log(
                     "daemon_disk_writer_meta_write_failed",
@@ -6095,7 +6153,7 @@ fn run_daemon_disk_writer(
                         "session_id": &session_id,
                         "job": meta_write_jobs,
                         "meta_path": meta_path.display().to_string(),
-                        "error": e.to_string(),
+                        "error": error,
                     }),
                 );
             } else if TRACE_ENABLED.load(Ordering::Relaxed) || meta_write_jobs <= 20 {
@@ -6387,6 +6445,7 @@ impl ScreenHistory {
     }
 }
 
+#[cfg(test)]
 fn terminate_spawned_agent_child_on_setup_failure(
     child: &mut dyn Child,
     key: &AgentKey,
@@ -6409,6 +6468,7 @@ fn terminate_spawned_agent_child_on_setup_failure(
     );
 }
 
+#[cfg(test)]
 fn terminate_spawned_agent_child_on_setup_failure_with<F>(
     child: &mut dyn Child,
     key: &AgentKey,
@@ -6449,7 +6509,7 @@ fn terminate_spawned_agent_child_on_setup_failure_with<F>(
 
     // A failed try_wait cannot prove that the numeric pid still belongs to
     // this child. In that case skip group signalling and use only the exact
-    // process handle below. The production callback performs a second start
+    // process handle below. The default test callback performs a second start
     // token check immediately before every numeric-pid termination attempt.
     let group_termination_attempted = initial_running && child_pid.is_some();
     let group_terminated = if initial_running {
@@ -6538,6 +6598,8 @@ fn queue_daemon_meta_write(
     pending_meta_write: &Arc<Mutex<Option<DaemonMetaWrite>>>,
     meta_path: &Path,
     contents: String,
+    child_pid: Option<u32>,
+    child_pid_start_ticks: Option<u64>,
     provider: Provider,
     session_id: &str,
     runtime_endpoint: Option<(PathBuf, AgentEndpointPublication)>,
@@ -6571,6 +6633,8 @@ fn queue_daemon_meta_write(
                 meta_path: meta_path.to_path_buf(),
                 contents,
                 runtime_endpoint,
+                child_pid,
+                child_pid_start_ticks,
             })
             .is_some()
     };
@@ -6793,39 +6857,6 @@ impl AgentSession {
                 "pty_rows": pty_size.rows,
             }),
         );
-        let mut child = match pair.slave.spawn_command(command) {
-            Ok(child) => child,
-            Err(e) => {
-                debug_log(
-                    "agent_spawn_command_failed",
-                    serde_json::json!({
-                        "provider": info.provider.as_str(),
-                        "session_id": &info.session_id,
-                        "command": spec.command_line(),
-                        "launch_mode": launch_mode.as_str(),
-                        "argv": &debug_argv,
-                        "env": &spec.env,
-                        "cwd": spec.cwd.as_ref().map(|path| path.display().to_string()),
-                        "error": e.to_string(),
-                    }),
-                );
-                return Err(e);
-            }
-        };
-        let child_pid = child.process_id();
-        let child_pid_start_ticks = child_pid.and_then(process_start_ticks);
-        debug_log(
-            "agent_spawn_command_started",
-            serde_json::json!({
-                "provider": info.provider.as_str(),
-                "session_id": &info.session_id,
-                "command": spec.command_line(),
-                "child_pid": child_pid,
-                "child_pid_start_ticks": child_pid_start_ticks,
-            }),
-        );
-        drop(pair.slave);
-
         let mut reader = match pair.master.try_clone_reader() {
             Ok(reader) => reader,
             Err(e) => {
@@ -6834,15 +6865,8 @@ impl AgentSession {
                     serde_json::json!({
                         "provider": info.provider.as_str(),
                         "session_id": &info.session_id,
-                        "child_pid": child_pid,
                         "error": e.to_string(),
                     }),
-                );
-                terminate_spawned_agent_child_on_setup_failure(
-                    child.as_mut(),
-                    &key,
-                    "agent_spawn_reader_clone_failed",
-                    child_pid_start_ticks,
                 );
                 return Err(e);
             }
@@ -6855,15 +6879,8 @@ impl AgentSession {
                     serde_json::json!({
                         "provider": info.provider.as_str(),
                         "session_id": &info.session_id,
-                        "child_pid": child_pid,
                         "error": e.to_string(),
                     }),
-                );
-                terminate_spawned_agent_child_on_setup_failure(
-                    child.as_mut(),
-                    &key,
-                    "agent_spawn_writer_take_failed",
-                    child_pid_start_ticks,
                 );
                 return Err(e);
             }
@@ -6899,15 +6916,8 @@ impl AgentSession {
                     serde_json::json!({
                         "provider": info.provider.as_str(),
                         "session_id": &info.session_id,
-                        "child_pid": child_pid,
                         "error": error.to_string(),
                     }),
-                );
-                terminate_spawned_agent_child_on_setup_failure(
-                    child.as_mut(),
-                    &key,
-                    "daemon_pty_input_writer_spawn_failed",
-                    child_pid_start_ticks,
                 );
                 return Err(error.into());
             }
@@ -6991,15 +7001,8 @@ impl AgentSession {
                 serde_json::json!({
                     "provider": info.provider.as_str(),
                     "session_id": &info.session_id,
-                    "child_pid": child_pid,
                     "error": error.to_string(),
                 }),
-            );
-            terminate_spawned_agent_child_on_setup_failure(
-                child.as_mut(),
-                &key,
-                "agent_pty_reader_spawn_failed",
-                child_pid_start_ticks,
             );
             return Err(error.into());
         }
@@ -7008,6 +7011,8 @@ impl AgentSession {
         let (disk_tx, disk_rx) = mpsc::sync_channel::<DaemonDiskJob>(DAEMON_DISK_QUEUE_MAX_JOBS);
         let pending_meta_write = Arc::new(Mutex::new(None));
         let writer_pending_meta_write = Arc::clone(&pending_meta_write);
+        let (meta_write_completion_tx, meta_write_completion_rx) =
+            mpsc::channel::<DaemonMetaWriteCompletion>();
         let disk_provider = info.provider;
         let disk_session_id = info.session_id.clone();
         let agent_key = key.clone();
@@ -7035,6 +7040,7 @@ impl AgentSession {
                 run_daemon_disk_writer(
                     disk_rx,
                     writer_pending_meta_write,
+                    meta_write_completion_tx,
                     pty_log,
                     disk_provider,
                     disk_session_id,
@@ -7056,16 +7062,6 @@ impl AgentSession {
         let disk_thread = match disk_thread_result {
             Ok(handle) => Some(handle),
             Err(error) => {
-                // Runtime-file monitoring and generation-gated meta writes are
-                // part of the daemon contract, not an optional optimization.
-                // Do not leave a newly spawned child running under a partially
-                // initialized daemon when the dedicated writer cannot start.
-                terminate_spawned_agent_child_on_setup_failure(
-                    child.as_mut(),
-                    &key,
-                    "daemon_disk_writer_spawn_failed",
-                    child_pid_start_ticks,
-                );
                 return Err(error.into());
             }
         };
@@ -7083,6 +7079,42 @@ impl AgentSession {
                 })),
             }),
         );
+        // Finish every fallible PTY/thread/disk setup step before creating the
+        // managed process. A setup error can now return without ever producing
+        // a child whose handle and runtime identity would be lost.
+        let child = match pair.slave.spawn_command(command) {
+            Ok(child) => child,
+            Err(e) => {
+                debug_log(
+                    "agent_spawn_command_failed",
+                    serde_json::json!({
+                        "provider": info.provider.as_str(),
+                        "session_id": &info.session_id,
+                        "command": spec.command_line(),
+                        "launch_mode": launch_mode.as_str(),
+                        "argv": &debug_argv,
+                        "env": &spec.env,
+                        "cwd": spec.cwd.as_ref().map(|path| path.display().to_string()),
+                        "error": e.to_string(),
+                    }),
+                );
+                return Err(e);
+            }
+        };
+        let child_pid = child.process_id();
+        let child_pid_start_ticks = child_pid.and_then(process_start_ticks);
+        debug_log(
+            "agent_spawn_command_started",
+            serde_json::json!({
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "command": spec.command_line(),
+                "child_pid": child_pid,
+                "child_pid_start_ticks": child_pid_start_ticks,
+            }),
+        );
+        drop(pair.slave);
+
         let pty_log_enabled = pty_log_enabled && disk_thread.is_some();
         let screen_history = ScreenHistory::default();
         let screen_hash = screen_activity_hash(parser.screen());
@@ -7094,6 +7126,7 @@ impl AgentSession {
             launch_mode,
             auth_token,
             daemon_pid_start_ticks: process_start_ticks(std::process::id()),
+            child_pid,
             child_pid_start_ticks,
             runtime_endpoint,
             parser,
@@ -7109,6 +7142,7 @@ impl AgentSession {
             output_rx,
             disk_tx: disk_thread.is_some().then_some(disk_tx),
             pending_meta_write,
+            meta_write_completion_rx,
             disk_thread,
             pty_log_enabled,
             runtime_file_flags,
@@ -7334,6 +7368,8 @@ impl AgentSession {
             &self.pending_meta_write,
             meta_path,
             contents,
+            self.child_pid,
+            self.child_pid_start_ticks,
             self.info.provider,
             &self.info.session_id,
             self.runtime_endpoint.clone(),
@@ -7780,7 +7816,7 @@ impl AgentSession {
             return false;
         }
         self.last_cwd_refresh_at = Instant::now();
-        let Some(pid) = self.child.process_id() else {
+        let Some(pid) = self.child_pid else {
             return false;
         };
         #[cfg(target_os = "linux")]
@@ -11383,6 +11419,11 @@ struct AgentKillPending {
     started_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct AgentKillReplacement {
+    target: SessionInfo,
+}
+
 struct AgentKillWorkerResult {
     seq: u64,
     key: AgentKey,
@@ -11945,6 +11986,11 @@ struct App {
     deferred_agent_input_rejected_bytes: usize,
     agent_kill_seq: u64,
     agent_kill_pending: Option<AgentKillPending>,
+    /// Keeps the agent workspace visible after Ctrl+K removed the current
+    /// client but before the next verified live agent finishes attaching.
+    /// This is a UI transition only; the terminated client is never retained
+    /// or treated as live.
+    agent_kill_replacement: Option<AgentKillReplacement>,
     killall_seq: u64,
     killall_pending: Option<KillAllPending>,
     new_session_launch_seq: u64,
@@ -11965,11 +12011,11 @@ struct App {
     /// late events from a thread whose AgentClient has already been
     /// dropped/replaced.
     next_reader_id: u64,
-    /// When true the sessions list is rendered even if `active_agent` is
-    /// Some — i.e. the user toggled to the sessions view via Ctrl+] / Ctrl+[ but
-    /// the agent's daemon socket and reader thread stay alive in the
-    /// background. The next Ctrl+] / Ctrl+[ flips this back to the agent view
-    /// without re-attaching anything.
+    /// When true the sessions list is rendered even if an active agent or a
+    /// Ctrl+K replacement workspace exists — i.e. the user toggled to the
+    /// sessions view via Ctrl+] / Ctrl+[ while the daemon connection remains
+    /// alive or is being replaced. The next Ctrl+] / Ctrl+[ flips back without
+    /// starting another attach.
     show_sessions_view: bool,
 }
 
@@ -12107,6 +12153,7 @@ impl App {
             deferred_agent_input_rejected_bytes: 0,
             agent_kill_seq: 0,
             agent_kill_pending: None,
+            agent_kill_replacement: None,
             killall_seq: 0,
             killall_pending: None,
             new_session_launch_seq: 0,
@@ -12561,6 +12608,54 @@ impl App {
         self.active_agent
             .as_ref()
             .map(|agent| AgentKey::new(&agent.info))
+    }
+
+    fn agent_workspace_info(&self) -> Option<&SessionInfo> {
+        self.active_agent
+            .as_ref()
+            .map(|agent| &agent.info)
+            .or_else(|| {
+                self.agent_kill_replacement
+                    .as_ref()
+                    .map(|replacement| &replacement.target)
+            })
+    }
+
+    fn abandon_agent_kill_replacement_for(&mut self, key: &AgentKey, reason: &'static str) {
+        let matches = self
+            .agent_kill_replacement
+            .as_ref()
+            .is_some_and(|replacement| AgentKey::new(&replacement.target) == *key);
+        if !matches {
+            return;
+        }
+        self.agent_kill_replacement = None;
+        if self.active_agent.is_none() {
+            self.show_sessions_view = true;
+            self.agent_focus = AgentFocusPane::Main;
+        }
+        debug_log(
+            "agent_kill_replacement_abandoned",
+            serde_json::json!({
+                "reason": reason,
+                "key": agent_key_debug_value(key),
+                "show_sessions_view": self.show_sessions_view,
+                "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+            }),
+        );
+    }
+
+    fn route_after_active_agent_kill(&mut self, next_info: Option<&SessionInfo>) {
+        if let Some(target) = next_info {
+            self.agent_kill_replacement = Some(AgentKillReplacement {
+                target: target.clone(),
+            });
+            self.show_sessions_view = false;
+        } else {
+            self.agent_kill_replacement = None;
+            self.show_sessions_view = true;
+            self.agent_focus = AgentFocusPane::Main;
+        }
     }
 
     fn remember_current_agent_focus(&mut self) {
@@ -17626,6 +17721,11 @@ impl App {
             self.discard_deferred_agent_input(reason);
             return;
         }
+        let cancelled_in_flight = self
+            .attach_in_flight
+            .as_ref()
+            .map(|attach| attach.key.clone());
+        let cancelled_queued = self.queued_attach.as_ref().map(|job| job.ctx.key.clone());
         debug_log(
             "attach_cancelled",
             serde_json::json!({
@@ -17649,6 +17749,12 @@ impl App {
         self.attach_terminal_input_target = None;
         self.queued_attach = None;
         self.discard_deferred_agent_input(reason);
+        if let Some(key) = cancelled_in_flight.as_ref() {
+            self.abandon_agent_kill_replacement_for(key, reason);
+        }
+        if let Some(key) = cancelled_queued.as_ref() {
+            self.abandon_agent_kill_replacement_for(key, reason);
+        }
     }
 
     /// Queue an attach job. Jobs run one at a time on a worker thread so
@@ -17769,6 +17875,7 @@ impl App {
 
     fn start_attach_job(&mut self, job: AttachJob) {
         if self.main_tx.is_none() {
+            let failed_key = job.ctx.key.clone();
             self.status = format!(
                 "cannot attach {}; event loop is not ready",
                 live_agent_status_label(&job.info)
@@ -17781,6 +17888,7 @@ impl App {
                     "snapshot": app_runtime_snapshot_debug_value(self, false),
                 }),
             );
+            self.abandon_agent_kill_replacement_for(&failed_key, "attach_start_missing_event_loop");
             return;
         }
         debug_log(
@@ -17893,6 +18001,10 @@ impl App {
                     "snapshot": app_runtime_snapshot_debug_value(self, false),
                 }),
             );
+            self.abandon_agent_kill_replacement_for(
+                &attach_key_for_pending,
+                "attach_worker_spawn_failed",
+            );
         }
     }
 
@@ -17932,14 +18044,32 @@ impl App {
         self.attach_in_flight = None;
         self.attach_terminal_input_target = None;
         if let Some(queued) = self.queued_attach.take() {
+            let replacement_was_superseded =
+                self.agent_kill_replacement
+                    .as_ref()
+                    .is_some_and(|replacement| {
+                        AgentKey::new(&replacement.target) == result.ctx.key
+                            && result.ctx.target.is_main_agent()
+                    });
             let result_seq = result.seq;
             let result_provider = result.ctx.key.provider;
             let result_session_id = result.ctx.key.session_id.clone();
             let queued_provider = queued.ctx.key.provider;
             let queued_session_id = queued.ctx.key.session_id.clone();
             if queued.ctx.target.is_main_agent() {
+                if replacement_was_superseded {
+                    if let Some(replacement) = self.agent_kill_replacement.as_mut() {
+                        replacement.target = queued.info.clone();
+                    }
+                }
                 self.hide_superseded_auxiliary_attach_result(result, "superseded_by_main_attach");
             } else {
+                if replacement_was_superseded {
+                    self.abandon_agent_kill_replacement_for(
+                        &result.ctx.key,
+                        "replacement_superseded_by_auxiliary_attach",
+                    );
+                }
                 self.cleanup_stale_auxiliary_attach_result(&result, "superseded");
                 drop(result);
             }
@@ -17967,6 +18097,11 @@ impl App {
             elapsed_ms,
             ..
         } = result;
+        let is_agent_kill_replacement = ctx.target.is_main_agent()
+            && self
+                .agent_kill_replacement
+                .as_ref()
+                .is_some_and(|replacement| AgentKey::new(&replacement.target) == ctx.key);
         match outcome {
             AttachWorkOutcome::Attached { agent, started } => {
                 let reader_id = agent.reader_id;
@@ -17975,7 +18110,11 @@ impl App {
                 } else {
                     ctx.status_attached
                 };
-                self.show_sessions_view = false;
+                // An explicit Ctrl+] / Ctrl+[ during the replacement wins.
+                // Ordinary replacement completion keeps the agent workspace.
+                if !is_agent_kill_replacement || !self.show_sessions_view {
+                    self.show_sessions_view = false;
+                }
                 // The terminal may have resized while the attach worker was
                 // connecting. Resolve layout against the current dimensions,
                 // not the stale geometry captured when the job started.
@@ -18006,6 +18145,9 @@ impl App {
                             self.set_agent_focus(focus);
                         } else {
                             self.restore_agent_focus_for_active_agent(fallback_focus);
+                        }
+                        if is_agent_kill_replacement {
+                            self.agent_kill_replacement = None;
                         }
                     }
                     AttachTarget::Auxiliary { kind, parent } => {
@@ -18159,6 +18301,12 @@ impl App {
                         "snapshot": app_runtime_snapshot_debug_value(self, false),
                     }),
                 );
+                if is_agent_kill_replacement {
+                    self.abandon_agent_kill_replacement_for(
+                        &ctx.key,
+                        "replacement_needs_restore_prompt",
+                    );
+                }
             }
             AttachWorkOutcome::NeedsCreateCwd { path, launch_mode } => {
                 let path_for_log = path.display().to_string();
@@ -18183,6 +18331,12 @@ impl App {
                         "snapshot": app_runtime_snapshot_debug_value(self, false),
                     }),
                 );
+                if is_agent_kill_replacement {
+                    self.abandon_agent_kill_replacement_for(
+                        &ctx.key,
+                        "replacement_needs_create_cwd",
+                    );
+                }
             }
             AttachWorkOutcome::Failed {
                 stage,
@@ -18223,6 +18377,9 @@ impl App {
                         "snapshot": app_runtime_snapshot_debug_value(self, false),
                     }),
                 );
+                if is_agent_kill_replacement {
+                    self.abandon_agent_kill_replacement_for(&ctx.key, "replacement_attach_failed");
+                }
             }
         }
     }
@@ -19246,10 +19403,10 @@ impl App {
     }
 
     fn agent_sidebar_candidates(&mut self) -> Vec<SessionInfo> {
-        let Some(active_agent) = self.active_agent.as_ref() else {
+        let Some(current_info) = self.agent_workspace_info().cloned() else {
             return Vec::new();
         };
-        let current_key = AgentKey::new(&active_agent.info);
+        let current_key = AgentKey::new(&current_info);
         // Hoisted out of the filter: probing aliases per entry would rescan
         // `live_shells` (with key clones) for every session on every frame.
         let backing_keys: HashSet<&AgentKey> = self
@@ -19291,7 +19448,7 @@ impl App {
             .iter()
             .any(|info| AgentKey::new(info) == current_key)
         {
-            candidates.insert(0, active_agent.info.clone());
+            candidates.insert(0, current_info);
         }
         // The pool's natural order is unstable: sessions reorder by
         // updated_at as agents work, and live shells arrive in directory
@@ -21038,6 +21195,22 @@ impl App {
                 );
                 return;
             }
+            AgentListState::OrphanedGroup { child_pgid } => {
+                self.status = format!(
+                    "{} process group/tree rooted at {} is still running, but its cokacmux daemon is gone; terminate it before relaunching.",
+                    live_agent_status_label(&runtime_info),
+                    child_pgid,
+                );
+                debug_log(
+                    "agent_launch_blocked_orphaned_group",
+                    serde_json::json!({
+                        "provider": key.provider.as_str(),
+                        "session_id": &key.session_id,
+                        "child_pgid": child_pgid,
+                    }),
+                );
+                return;
+            }
             AgentListState::Idle => {}
         }
         if allow_defer && self.agent_runtime_refresh_in_flight() {
@@ -21546,10 +21719,12 @@ impl App {
         });
     }
 
-    /// True when the agent pane is the visible view (active agent
-    /// exists AND user hasn't toggled to the sessions list with Ctrl+] / Ctrl+[).
+    /// True when the agent workspace is visible. A completed Ctrl+K may leave
+    /// no active client for a short time while the next live agent attaches;
+    /// that explicit replacement transition must not route through sessions.
     fn is_agent_view(&self) -> bool {
-        self.active_agent.is_some() && !self.show_sessions_view
+        (self.active_agent.is_some() || self.agent_kill_replacement.is_some())
+            && !self.show_sessions_view
     }
 
     fn prepare_sessions_view_after_transition(
@@ -21564,14 +21739,16 @@ impl App {
         *previous_is_agent_view = is_agent_view;
     }
 
-    /// Window toggle. Flips between sessions list and the active
-    /// agent pane *without* changing connection state: the daemon, socket
-    /// and reader thread all keep running while the sessions list is
-    /// shown, so toggling back is instant and the screen is up to date.
-    /// If no agent is currently active, reconnect to an already-live
-    /// daemon when one is known. Ctrl+] / Ctrl+[ still does not start a new daemon.
+    /// Window toggle. Flips between sessions list and the active agent
+    /// workspace *without* changing connection state: the daemon, socket
+    /// and reader thread all keep running while the sessions list is shown,
+    /// so toggling back is instant and the screen is up to date. The short
+    /// Ctrl+K replacement transition is also an existing workspace even
+    /// though its next socket is not attached yet. If neither exists,
+    /// reconnect to an already-live daemon when one is known. Ctrl+] /
+    /// Ctrl+[ still does not start a new daemon.
     fn toggle_screens(&mut self, cols: u16, rows: u16) {
-        if self.active_agent.is_some() {
+        if self.active_agent.is_some() || self.agent_kill_replacement.is_some() {
             let before = self.show_sessions_view;
             self.show_sessions_view = !self.show_sessions_view;
             debug_log(
@@ -21580,6 +21757,7 @@ impl App {
                     "before_show_sessions_view": before,
                     "after_show_sessions_view": self.show_sessions_view,
                     "active_agent": self.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+                    "kill_replacement": self.agent_kill_replacement.as_ref().map(|replacement| session_info_debug_value(&replacement.target)),
                     "agent_states": agent_state_entries_debug_value(&self.agent_states),
                 }),
             );
@@ -21790,6 +21968,7 @@ impl App {
                     self.terminate_auxiliaries_for_parent(&key, "main_agent_killed");
                 self.agent_states.remove(&key);
                 self.live_shells.retain(|info| AgentKey::new(info) != key);
+                self.route_after_active_agent_kill(next_info.as_ref());
                 self.discard_pending_agent_runtime_refresh();
                 self.refresh_agent_runtime_states();
                 let history_suffix = agent_history_deleted_suffix(outcome.pty_log_deleted);
@@ -22128,13 +22307,13 @@ impl App {
                 self.agent_states.remove(&key);
                 self.live_shells.retain(|info| AgentKey::new(info) != key);
                 self.agent_focus_by_agent.remove(&key);
+                let next_info = next_info.filter(|_| was_current);
                 if was_current {
-                    self.agent_focus = AgentFocusPane::Main;
+                    self.route_after_active_agent_kill(next_info.as_ref());
                 }
                 self.discard_pending_agent_runtime_refresh();
                 self.refresh_agent_runtime_states();
                 let history_suffix = agent_history_deleted_suffix(outcome.pty_log_deleted);
-                let next_info = next_info.filter(|_| was_current);
                 debug_log(
                     "kill_agent",
                     serde_json::json!({
@@ -22646,6 +22825,7 @@ impl App {
 
     fn clear_live_runtime_after_killall(&mut self) {
         self.agent_kill_pending = None;
+        self.agent_kill_replacement = None;
         self.attach_in_flight = None;
         self.attach_terminal_input_target = None;
         self.queued_attach = None;
@@ -29281,7 +29461,7 @@ fn handle_daemon_client_request(
             "request": request_debug,
             "attached_client_pid_before": *attached_client_pid,
             "attached_client_instance_id_before": attached_client_instance_id.as_deref(),
-            "child_pid": agent.child.process_id(),
+            "child_pid": agent.child_pid,
         }),
     );
     match request {
@@ -29311,7 +29491,7 @@ fn handle_daemon_client_request(
                     "session_id": &agent.info.session_id,
                     "attached_client_pid": *attached_client_pid,
                     "attached_client_instance_id": attached_client_instance_id.as_deref(),
-                    "child_pid": agent.child.process_id(),
+                    "child_pid": agent.child_pid,
                     "meta_write_ok": meta_write_ok,
                     "meta_write_error": meta_write_error,
                     "identity_send_ok": send_ok,
@@ -29327,7 +29507,7 @@ fn handle_daemon_client_request(
                     "outcome": "continue",
                     "attached_client_pid_after": *attached_client_pid,
                     "attached_client_instance_id_after": attached_client_instance_id.as_deref(),
-                    "child_pid": agent.child.process_id(),
+                    "child_pid": agent.child_pid,
                 }),
             );
             DaemonRequestOutcome::Continue
@@ -29396,7 +29576,7 @@ fn handle_daemon_client_request(
                     "outcome": if send_ok { "continue" } else { "reject_connection" },
                     "attached_client_pid_after": *attached_client_pid,
                     "attached_client_instance_id_after": attached_client_instance_id.as_deref(),
-                    "child_pid": agent.child.process_id(),
+                    "child_pid": agent.child_pid,
                     "meta_write_ok": meta_write_ok,
                     "meta_write_error": meta_write_error,
                     "snapshot_send_ok": send_ok,
@@ -29440,7 +29620,7 @@ fn handle_daemon_client_request(
                     "outcome": "continue",
                     "attached_client_pid_after": *attached_client_pid,
                     "attached_client_instance_id_after": attached_client_instance_id.as_deref(),
-                    "child_pid": agent.child.process_id(),
+                    "child_pid": agent.child_pid,
                     "snapshot_send_ok": send_ok,
                     "snapshot_send_error": send_error,
                 }),
@@ -29567,7 +29747,7 @@ fn handle_daemon_client_request(
                     "outcome": "continue",
                     "attached_client_pid_after": *attached_client_pid,
                     "attached_client_instance_id_after": attached_client_instance_id.as_deref(),
-                    "child_pid": agent.child.process_id(),
+                    "child_pid": agent.child_pid,
                     "input_len": data.len(),
                     "input_seq": input_seq,
                     "already_accepted": already_accepted,
@@ -29592,7 +29772,7 @@ fn handle_daemon_client_request(
                     "session_id": &agent.info.session_id,
                     "detached_client_pid": detached_client_pid,
                     "detached_client_instance_id": detached_client_instance_id.as_deref(),
-                    "child_pid": agent.child.process_id(),
+                    "child_pid": agent.child_pid,
                     "meta_write_ok": meta_write_ok,
                     "meta_write_error": meta_write_error.clone(),
                 }),
@@ -29608,7 +29788,7 @@ fn handle_daemon_client_request(
                     "attached_client_instance_id_after": attached_client_instance_id.as_deref(),
                     "detached_client_pid": detached_client_pid,
                     "detached_client_instance_id": detached_client_instance_id.as_deref(),
-                    "child_pid": agent.child.process_id(),
+                    "child_pid": agent.child_pid,
                     "meta_write_ok": meta_write_ok,
                     "meta_write_error": meta_write_error,
                 }),
@@ -29951,7 +30131,9 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             return Err(e);
         }
     };
-    if let Err(e) = write_agent_meta(&meta_path, &mut agent, false, None, None) {
+    let initial_meta_queue_error =
+        write_agent_meta(&meta_path, &mut agent, false, None, None).err();
+    if let Some(e) = initial_meta_queue_error.as_ref() {
         debug_log(
             "daemon_meta_write_failed",
             serde_json::json!({
@@ -29969,10 +30151,16 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             "session_id": &agent.info.session_id,
             "launch_mode": launch_mode.as_str(),
             "command": agent.spec.command_line(),
-            "child_pid": agent.child.process_id(),
+            "child_pid": agent.child_pid,
         }),
     );
-    notify_agent_daemon_ready(&key, &socket_path);
+    // Readiness is emitted only after the disk writer acknowledges a snapshot
+    // containing this exact child PID/start token. Until then the daemon keeps
+    // pumping the PTY and retrying publication without exposing a runtime that
+    // Ctrl+K/reset could mistake for childless.
+    let mut daemon_ready_notified = false;
+    let mut next_startup_meta_retry_at =
+        initial_meta_queue_error.is_some().then_some(Instant::now());
     let mut client: Option<DaemonConnection> = None;
     // Accepted connections wait here until they identify themselves with an
     // attach request; only then do they receive a snapshot and replace the
@@ -29995,8 +30183,85 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     let mut runtime_listener_repair_applied_seq = 0u64;
     #[cfg(windows)]
     let mut last_windows_ctrl_event_count = windows_console_ctrl_event_snapshot().0;
+    let mut direct_child_exit_status: Option<String> = None;
+    let mut direct_child_group_live = false;
+    let mut last_direct_child_group_check_at: Option<Instant> = None;
+    let mut pty_output_closed = false;
 
     let exit_status = loop {
+        loop {
+            match agent.meta_write_completion_rx.try_recv() {
+                Ok(completion) => {
+                    let expected_child_pid = agent.child_pid;
+                    let exact_child_published = daemon_meta_completion_commits_exact_child(
+                        &completion,
+                        expected_child_pid,
+                        agent.child_pid_start_ticks,
+                    );
+                    if !daemon_ready_notified && exact_child_published {
+                        notify_agent_daemon_ready(&key, &socket_path);
+                        daemon_ready_notified = true;
+                        next_startup_meta_retry_at = None;
+                        debug_log(
+                            "daemon_ready_after_child_meta_commit",
+                            serde_json::json!({
+                                "key": agent_key_debug_value(&key),
+                                "daemon_pid": std::process::id(),
+                                "child_pid": expected_child_pid,
+                                "child_pid_start_ticks": agent.child_pid_start_ticks,
+                            }),
+                        );
+                    } else if !daemon_ready_notified {
+                        next_startup_meta_retry_at = Some(
+                            Instant::now() + Duration::from_millis(DAEMON_STARTUP_META_RETRY_MS),
+                        );
+                        debug_log(
+                            "daemon_ready_child_meta_not_committed",
+                            serde_json::json!({
+                                "key": agent_key_debug_value(&key),
+                                "daemon_pid": std::process::id(),
+                                "expected_child_pid": expected_child_pid,
+                                "expected_child_pid_start_ticks": agent.child_pid_start_ticks,
+                                "written_child_pid": completion.child_pid,
+                                "written_child_pid_start_ticks": completion.child_pid_start_ticks,
+                                "error": completion.error,
+                            }),
+                        );
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if !daemon_ready_notified && next_startup_meta_retry_at.is_none() {
+                        next_startup_meta_retry_at = Some(Instant::now());
+                    }
+                    break;
+                }
+            }
+        }
+        if !daemon_ready_notified
+            && next_startup_meta_retry_at.is_some_and(|retry_at| Instant::now() >= retry_at)
+        {
+            if agent.child_pid_start_ticks.is_none() {
+                agent.child_pid_start_ticks = agent.child_pid.and_then(process_start_ticks);
+            }
+            match write_agent_meta(&meta_path, &mut agent, false, None, None) {
+                Ok(()) => next_startup_meta_retry_at = None,
+                Err(error) => {
+                    next_startup_meta_retry_at =
+                        Some(Instant::now() + Duration::from_millis(DAEMON_STARTUP_META_RETRY_MS));
+                    debug_log(
+                        "daemon_startup_meta_retry_queue_failed",
+                        serde_json::json!({
+                            "key": agent_key_debug_value(&key),
+                            "daemon_pid": std::process::id(),
+                            "child_pid": agent.child_pid,
+                            "child_pid_start_ticks": agent.child_pid_start_ticks,
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+            }
+        }
         while let Ok(mut result) = runtime_repair_rx.try_recv() {
             let is_current = result.seq == runtime_repair_seq;
             let was_abandoned = runtime_repair_abandoned_seqs.remove(&result.seq);
@@ -30169,7 +30434,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                             agent.last_output_epoch_ms,
                             agent.last_input_epoch_ms,
                         ),
-                        agent.child.process_id(),
+                        agent.child_pid,
                         agent.daemon_pid_start_ticks,
                         agent.child_pid_start_ticks,
                     ) {
@@ -30651,6 +30916,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
         }
 
         let output_drain = agent.drain_output_chunks();
+        pty_output_closed |= output_drain.output_closed;
         // Track shell cwd changes on every tick (cheap /proc readlink) and
         // force an immediate meta write on change so the sidebar reflects
         // `cd` without waiting for the activity-meta rate limit.
@@ -30779,7 +31045,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                                 "session_id": &agent.info.session_id,
                                 "count": requests.len(),
                                 "attached_client_pid": attached_client_pid,
-                                "child_pid": agent.child.process_id(),
+                                "child_pid": agent.child_pid,
                                 "requests": requests.iter().map(agent_daemon_request_debug_value).collect::<Vec<_>>(),
                             });
                             debug_log("daemon_requests_received", details);
@@ -30832,7 +31098,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                                 "session_id": &agent.info.session_id,
                                 "attached_client_pid": disconnected_client_pid,
                                 "attached_client_instance_id": disconnected_client_instance_id.as_deref(),
-                                "child_pid": agent.child.process_id(),
+                                "child_pid": agent.child_pid,
                                 "error_kind": format!("{:?}", e.kind()),
                                 "error": e.to_string(),
                             }),
@@ -30845,17 +31111,48 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
 
         match agent.child.try_wait() {
             Ok(Some(status)) => {
-                debug_log(
-                    "daemon_child_try_wait_exit",
-                    serde_json::json!({
-                        "provider": agent.info.provider.as_str(),
-                        "session_id": &agent.info.session_id,
-                        "child_pid": agent.child.process_id(),
-                        "status": status.to_string(),
-                        "attached_client_pid": attached_client_pid,
-                    }),
-                );
-                break status.to_string();
+                let status = status.to_string();
+                if direct_child_exit_status.is_none() {
+                    debug_log(
+                        "daemon_child_try_wait_exit",
+                        serde_json::json!({
+                            "provider": agent.info.provider.as_str(),
+                            "session_id": &agent.info.session_id,
+                            "child_pid": agent.child_pid,
+                            "status": &status,
+                            "attached_client_pid": attached_client_pid,
+                        }),
+                    );
+                    direct_child_exit_status = Some(status.clone());
+                }
+                // A surviving member of the exact Unix process group or Windows
+                // descendant tree remains managed even if the direct child
+                // exited. EOF/read failure alone is not proof of detachment.
+                let group_check_due = last_direct_child_group_check_at.is_none_or(|checked_at| {
+                    checked_at.elapsed() >= Duration::from_millis(AGENT_STATE_POLL_INTERVAL_MS)
+                });
+                if group_check_due {
+                    direct_child_group_live = agent.child_pid.is_some_and(|pid| {
+                        agent_child_runtime_may_have_live_member(pid, pty_output_closed)
+                    });
+                    last_direct_child_group_check_at = Some(Instant::now());
+                }
+                if direct_child_group_live {
+                    if group_check_due && TRACE_ENABLED.load(Ordering::Relaxed) {
+                        trace_log(
+                            "daemon_child_group_still_live",
+                            serde_json::json!({
+                                "provider": agent.info.provider.as_str(),
+                                "session_id": &agent.info.session_id,
+                                "child_pid": agent.child_pid,
+                                "status": &status,
+                                "pty_output_closed": pty_output_closed,
+                            }),
+                        );
+                    }
+                } else {
+                    break direct_child_exit_status.clone().unwrap_or(status);
+                }
             }
             Ok(None) => {
                 if agent.last_output_epoch_ms == 0
@@ -30881,7 +31178,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                     serde_json::json!({
                         "provider": agent.info.provider.as_str(),
                         "session_id": &agent.info.session_id,
-                        "child_pid": agent.child.process_id(),
+                        "child_pid": agent.child_pid,
                         "error": e.to_string(),
                         "attached_client_pid": attached_client_pid,
                     }),
@@ -30902,7 +31199,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                         "event_count": ctrl_event_count,
                         "last_event": last_ctrl_event,
                         "attached_client_pid": attached_client_pid,
-                        "child_pid": agent.child.process_id(),
+                        "child_pid": agent.child_pid,
                     }),
                 );
             }
@@ -30926,7 +31223,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
         serde_json::json!({
             "provider": agent.info.provider.as_str(),
             "session_id": &agent.info.session_id,
-            "child_pid": agent.child.process_id(),
+            "child_pid": agent.child_pid,
             "status": &exit_status,
         }),
     );
@@ -31165,7 +31462,7 @@ fn send_daemon_identity(
         command: agent.spec.command_line(),
         daemon_pid,
         daemon_pid_start_ticks: agent.daemon_pid_start_ticks,
-        child_pid: agent.child.process_id(),
+        child_pid: agent.child_pid,
         child_pid_start_ticks: agent.child_pid_start_ticks,
         attached,
         attached_client_pid,
@@ -31195,7 +31492,7 @@ fn send_daemon_attached(
                 "daemon_pid": std::process::id(),
                 "daemon_exe": debug_process_exe(std::process::id()),
                 "daemon_cmdline": debug_process_cmdline(std::process::id()),
-                "child_pid": agent.child.process_id(),
+                "child_pid": agent.child_pid,
                 "snapshot_len": snapshot.len(),
                 "snapshot": debug_terminal_data_summary(&snapshot, snapshot_sample_budget),
                 "include_scrollback": include_scrollback,
@@ -31214,7 +31511,7 @@ fn send_daemon_attached(
         command: agent.spec.command_line(),
         daemon_pid: std::process::id(),
         daemon_pid_start_ticks: agent.daemon_pid_start_ticks,
-        child_pid: agent.child.process_id(),
+        child_pid: agent.child_pid,
         snapshot_event: true,
         last_screen_change_epoch_ms: agent.last_screen_change_epoch_ms,
         last_output_epoch_ms: agent.last_output_epoch_ms,
@@ -31300,7 +31597,7 @@ fn write_agent_meta(
             agent.last_output_epoch_ms,
             agent.last_input_epoch_ms,
         ),
-        agent.child.process_id(),
+        agent.child_pid,
         agent.daemon_pid_start_ticks,
         agent.child_pid_start_ticks,
     )?;
@@ -33119,6 +33416,24 @@ fn agent_meta_verified_child_pid(meta: &AgentMetaSnapshot) -> Option<u32> {
         .then_some(child_pid)
 }
 
+/// Return the historic root child PID when the exact session leader is no
+/// longer live but its Unix process group or Windows descendant tree remains.
+/// This is preservation-only evidence for stale metadata: callers must not
+/// signal it without a fresh identity response from the owning daemon.
+fn agent_meta_surviving_child_process_group(meta: &AgentMetaSnapshot) -> Option<u32> {
+    let child_pid = meta.child_pid.filter(|pid| *pid > 0)?;
+    let expected_start_ticks = meta.child_pid_start_ticks?;
+    if process_is_alive(child_pid) {
+        return None;
+    }
+    if process_start_token_matches(expected_start_ticks, process_start_ticks(child_pid))
+        == Some(false)
+    {
+        return None;
+    }
+    agent_child_process_group_has_live_member(child_pid).then_some(child_pid)
+}
+
 fn agent_meta_child_pid_verified_for_termination(meta: &AgentMetaSnapshot) -> bool {
     agent_meta_verified_child_pid(meta).is_some()
 }
@@ -33163,6 +33478,121 @@ fn terminate_agent_meta_child_process(
         }),
     );
     Some(child_pid)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveAgentChildTermination {
+    pid: Option<u32>,
+    terminated: bool,
+    confirmed_gone: bool,
+}
+
+impl LiveAgentChildTermination {
+    fn unconfirmed(pid: Option<u32>) -> Self {
+        Self {
+            pid,
+            terminated: false,
+            confirmed_gone: false,
+        }
+    }
+}
+
+/// Terminate the child identity obtained directly from a live daemon. Unlike
+/// stale metadata cleanup, this may also finish a Unix process group or Windows
+/// descendant tree whose verified leader already exited while work remains.
+fn terminate_live_agent_identity_child_process(
+    meta: &AgentMetaSnapshot,
+    key: &AgentKey,
+    reason: &str,
+) -> LiveAgentChildTermination {
+    let Some(child_pid) = meta.child_pid.filter(|pid| *pid > 0) else {
+        return LiveAgentChildTermination::unconfirmed(meta.child_pid);
+    };
+    let Some(expected_start_ticks) = meta.child_pid_start_ticks else {
+        return LiveAgentChildTermination::unconfirmed(Some(child_pid));
+    };
+    if agent_meta_verified_child_pid(meta) == Some(child_pid) {
+        let terminated = terminate_agent_meta_child_process(meta, key, reason).is_some();
+        return LiveAgentChildTermination {
+            pid: Some(child_pid),
+            terminated,
+            confirmed_gone: terminated || agent_child_runtime_definitively_gone(child_pid),
+        };
+    }
+
+    match process_start_token_matches(expected_start_ticks, process_start_ticks(child_pid)) {
+        Some(true) => {
+            // The leader can be a zombie: process_is_alive deliberately reports
+            // false, but its exact /proc identity still authorizes group cleanup.
+            let mut terminated = terminate_process_group_if_start_token_matches(
+                child_pid,
+                Some(expected_start_ticks),
+                reason,
+            );
+            #[cfg(windows)]
+            if !terminated
+                && !process_is_alive(child_pid)
+                && agent_child_process_group_has_live_member(child_pid)
+            {
+                terminated =
+                    terminate_verified_windows_process_tree_after_leader_exit(child_pid, reason);
+            }
+            LiveAgentChildTermination {
+                pid: Some(child_pid),
+                terminated,
+                confirmed_gone: terminated || agent_child_runtime_definitively_gone(child_pid),
+            }
+        }
+        Some(false) => {
+            // The numeric PID was reused. On Unix an old process group cannot
+            // retain that same numeric PGID while the PID is reused; on other
+            // platforms the exact recorded child is likewise definitively gone.
+            LiveAgentChildTermination {
+                pid: Some(child_pid),
+                terminated: false,
+                confirmed_gone: true,
+            }
+        }
+        None => {
+            #[cfg(unix)]
+            {
+                if agent_child_process_group_has_live_member(child_pid) {
+                    let terminated =
+                        terminate_verified_unix_process_group_after_leader_exit(child_pid, reason);
+                    return LiveAgentChildTermination {
+                        pid: Some(child_pid),
+                        terminated,
+                        confirmed_gone: terminated,
+                    };
+                }
+            }
+            #[cfg(windows)]
+            {
+                if agent_child_process_group_has_live_member(child_pid) {
+                    let terminated = terminate_verified_windows_process_tree_after_leader_exit(
+                        child_pid, reason,
+                    );
+                    return LiveAgentChildTermination {
+                        pid: Some(child_pid),
+                        terminated,
+                        confirmed_gone: terminated,
+                    };
+                }
+            }
+            if process_is_alive(child_pid) {
+                return LiveAgentChildTermination::unconfirmed(Some(child_pid));
+            }
+            if agent_child_runtime_definitively_gone(child_pid) {
+                LiveAgentChildTermination {
+                    pid: Some(child_pid),
+                    terminated: false,
+                    confirmed_gone: true,
+                }
+            } else {
+                LiveAgentChildTermination::unconfirmed(Some(child_pid))
+            }
+        }
+    }
 }
 
 const CODING_AGENT_CWD_LOCK_VERSION: u32 = 1;
@@ -34430,7 +34860,9 @@ fn cleanup_stale_agent_runtime_files_at_except(
             continue;
         }
         let stale_key = agent_key_from_meta(&meta).filter(|key| agent_file_stem(key) == stem);
-        let child_process_preserved = stale_key.is_some() && agent_meta_child_pid_matches(&meta);
+        let child_process_preserved = stale_key.is_some()
+            && (agent_meta_child_pid_matches(&meta)
+                || agent_meta_surviving_child_process_group(&meta).is_some());
         // An endpoint pathname with a failed identity probe is still an
         // unknown live generation (a saturated daemon is a common example).
         // Startup binding owns stale-endpoint replacement; a background
@@ -34483,6 +34915,7 @@ fn cleanup_stale_agent_runtime_files_at_except(
                     "child_pid_start_ticks": meta.child_pid_start_ticks,
                     "child_alive": meta.child_pid.map(process_is_alive),
                     "child_pid_matches": agent_meta_child_pid_matches(&meta),
+                    "surviving_child_pgid": agent_meta_surviving_child_process_group(&meta),
                 }),
             );
             if child_process_preserved {
@@ -34869,6 +35302,47 @@ fn terminate_process_group_if_start_token_matches(
     false
 }
 
+/// The managed child can make its daemon exit naturally while an external
+/// Ctrl+K/killall/reset worker is still waiting for the child group to drain.
+/// Treat that exact daemon generation as gone without ever signalling a PID
+/// that has since been reused.
+fn terminate_agent_daemon_after_child_confirmed_gone(
+    pid: u32,
+    expected_start_ticks: Option<u64>,
+    reason: &str,
+) -> bool {
+    if process_start_token_still_matches(pid, expected_start_ticks)
+        && terminate_process_group_with_start_token(pid, expected_start_ticks)
+    {
+        return true;
+    }
+    let actual_start_ticks = process_start_ticks(pid);
+    let alive = process_is_alive(pid);
+    let process_group_live = agent_child_process_group_has_live_member(pid);
+    let original_daemon_gone = match (expected_start_ticks, actual_start_ticks) {
+        (Some(expected), Some(actual)) => expected != actual,
+        (Some(_), None) => !alive && !process_group_live,
+        _ => false,
+    };
+    debug_log(
+        if original_daemon_gone {
+            "agent_daemon_exited_after_child_termination"
+        } else {
+            "agent_daemon_termination_unverified"
+        },
+        serde_json::json!({
+            "reason": reason,
+            "pid": pid,
+            "expected_start_ticks": expected_start_ticks,
+            "actual_start_ticks": actual_start_ticks,
+            "alive": alive,
+            "process_group_live": process_group_live,
+            "original_daemon_gone": original_daemon_gone,
+        }),
+    );
+    original_daemon_gone
+}
+
 #[cfg(windows)]
 fn terminate_process_group_with_start_token(pid: u32, expected_start_ticks: Option<u64>) -> bool {
     terminate_windows_process_group(pid, expected_start_ticks)
@@ -35155,6 +35629,7 @@ fn agent_meta_snapshot_debug_value(meta: &AgentMetaSnapshot) -> serde_json::Valu
         "child_pid_alive": meta.child_pid.map(process_is_alive),
         "child_pid_start_ticks": meta.child_pid_start_ticks,
         "child_pid_matches": agent_meta_child_pid_matches(meta),
+        "surviving_child_pgid": agent_meta_surviving_child_process_group(meta),
         "cwd": meta.cwd.as_deref(),
         "source": meta.source.as_deref(),
         "attached": meta.attached,
@@ -35485,7 +35960,10 @@ fn read_agent_runtime_state_probe_at_for_key(
             let meta_key = agent_key_from_meta(&meta);
             let verified_child_pid = agent_meta_verified_child_pid(&meta)
                 .filter(|_| expected_key.is_none() || meta_key.as_ref() == expected_key);
-            let child_process_preserved = verified_child_pid.is_some();
+            let surviving_child_pgid = agent_meta_surviving_child_process_group(&meta)
+                .filter(|_| expected_key.is_none() || meta_key.as_ref() == expected_key);
+            let child_process_preserved =
+                verified_child_pid.is_some() || surviving_child_pgid.is_some();
             if let Some(child_pid) = verified_child_pid {
                 if debug_enabled {
                     debug_log(
@@ -35509,6 +35987,24 @@ fn read_agent_runtime_state_probe_at_for_key(
                     );
                 }
                 return AgentListState::Orphaned { child_pid };
+            }
+            if let Some(child_pgid) = surviving_child_pgid {
+                if debug_enabled {
+                    debug_log(
+                        "agent_meta_stale_child_group_orphaned",
+                        serde_json::json!({
+                            "provider": meta.provider.as_deref(),
+                            "session_id": meta.session_id.as_deref(),
+                            "daemon_pid": meta.pid,
+                            "current_pid": current_pid,
+                            "meta_path": meta_path.display().to_string(),
+                            "socket_path": socket_path.display().to_string(),
+                            "child_pgid": child_pgid,
+                            "meta_child_pid_start_ticks": meta.child_pid_start_ticks,
+                        }),
+                    );
+                }
+                return AgentListState::OrphanedGroup { child_pgid };
             }
             if let Some(key) = expected_key {
                 if let Some(runtime_dir) = meta_path.parent() {
@@ -35649,7 +36145,11 @@ fn read_agent_runtime_state_probe_at_for_key(
                 let verified_child_pid = (meta_key.as_ref() == Some(expected_key))
                     .then(|| agent_meta_verified_child_pid(&meta))
                     .flatten();
-                let child_process_preserved = verified_child_pid.is_some();
+                let surviving_child_pgid = (meta_key.as_ref() == Some(expected_key))
+                    .then(|| agent_meta_surviving_child_process_group(&meta))
+                    .flatten();
+                let child_process_preserved =
+                    verified_child_pid.is_some() || surviving_child_pgid.is_some();
                 if let Some(child_pid) = verified_child_pid {
                     if debug_enabled {
                         debug_log(
@@ -35676,6 +36176,28 @@ fn read_agent_runtime_state_probe_at_for_key(
                         );
                     }
                     return AgentListState::Orphaned { child_pid };
+                }
+                if let Some(child_pgid) = surviving_child_pgid {
+                    if debug_enabled {
+                        debug_log(
+                            "agent_meta_identity_mismatch_child_group_orphaned",
+                            serde_json::json!({
+                                "expected": agent_key_debug_value(expected_key),
+                                "meta_key": meta_key.as_ref().map(agent_key_debug_value),
+                                "daemon_identity": format!("{:?}", daemon_identity),
+                                "daemon_verified": daemon_verified,
+                                "daemon_possibly_live": daemon_possibly_live,
+                                "daemon_pid": meta.pid,
+                                "daemon_pid_start_ticks": meta.pid_start_ticks,
+                                "current_pid": current_pid,
+                                "meta_path": meta_path.display().to_string(),
+                                "socket_path": socket_path.display().to_string(),
+                                "child_pgid": child_pgid,
+                                "meta_child_pid_start_ticks": meta.child_pid_start_ticks,
+                            }),
+                        );
+                    }
+                    return AgentListState::OrphanedGroup { child_pgid };
                 }
                 if let Some(runtime_dir) = meta_path.parent() {
                     if agent_runtime_key_has_reachable_daemon_at(
@@ -36343,6 +36865,11 @@ type WinHandle = *mut std::ffi::c_void;
 
 #[cfg(windows)]
 fn windows_process_tree_pids(root_pid: u32) -> Vec<u32> {
+    windows_process_tree_pids_complete(root_pid).unwrap_or_else(|| vec![root_pid])
+}
+
+#[cfg(windows)]
+fn windows_process_tree_pids_complete(root_pid: u32) -> Option<Vec<u32>> {
     #[repr(C)]
     struct ProcessEntry32W {
         size: u32,
@@ -36359,6 +36886,7 @@ fn windows_process_tree_pids(root_pid: u32) -> Vec<u32> {
 
     const TH32CS_SNAPPROCESS: u32 = 0x00000002;
     const INVALID_HANDLE_VALUE: WinHandle = (-1isize) as WinHandle;
+    const ERROR_NO_MORE_FILES: i32 = 18;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -36379,7 +36907,7 @@ fn windows_process_tree_pids(root_pid: u32) -> Vec<u32> {
                 "error": error.to_string(),
             }),
         );
-        return vec![root_pid];
+        return None;
     }
 
     let mut parents: HashMap<u32, u32> = HashMap::new();
@@ -36396,14 +36924,43 @@ fn windows_process_tree_pids(root_pid: u32) -> Vec<u32> {
         exe_file: [0; 260],
     };
 
-    unsafe {
-        let mut ok = Process32FirstW(snapshot, &mut entry);
+    let first_ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+    if first_ok == 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            let _ = CloseHandle(snapshot);
+        }
+        trace_log(
+            "new_agent_backing_windows_process_snapshot_first_failed",
+            serde_json::json!({
+                "root_pid": root_pid,
+                "raw_os_error": error.raw_os_error(),
+                "error": error.to_string(),
+            }),
+        );
+        return None;
+    }
+    let terminal_error = unsafe {
+        let mut ok = first_ok;
         while ok != 0 {
             parents.insert(entry.process_id, entry.parent_process_id);
             entry.size = std::mem::size_of::<ProcessEntry32W>() as u32;
             ok = Process32NextW(snapshot, &mut entry);
         }
+        let error = io::Error::last_os_error();
         let _ = CloseHandle(snapshot);
+        error
+    };
+    if terminal_error.raw_os_error() != Some(ERROR_NO_MORE_FILES) {
+        trace_log(
+            "new_agent_backing_windows_process_snapshot_next_failed",
+            serde_json::json!({
+                "root_pid": root_pid,
+                "raw_os_error": terminal_error.raw_os_error(),
+                "error": terminal_error.to_string(),
+            }),
+        );
+        return None;
     }
 
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -36423,7 +36980,7 @@ fn windows_process_tree_pids(root_pid: u32) -> Vec<u32> {
             queue.extend(child_pids.iter().copied());
         }
     }
-    out
+    Some(out)
 }
 
 #[cfg(windows)]
@@ -37176,7 +37733,7 @@ fn debug_agent_session_state_value(
     let provider = agent.info.provider.as_str().to_string();
     let session_id = agent.info.session_id.clone();
     let command_line = agent.spec.command_line();
-    let child_pid = agent.child.process_id();
+    let child_pid = agent.child_pid;
     let pty_rows = agent.pty_size.rows;
     let pty_cols = agent.pty_size.cols;
     let last_screen_change_epoch_ms = agent.last_screen_change_epoch_ms;
@@ -38138,15 +38695,23 @@ fn stale_child_replacement_error(
 ) -> Option<anyhow::Error> {
     if agent_key_from_meta(meta).as_ref() != Some(key)
         || agent_runtime_meta_has_live_daemon_for_stem(meta, stem)
-        || !agent_meta_child_pid_matches(meta)
     {
         return None;
     }
-    Some(anyhow::anyhow!(
-        "previous {} is still running as child pid {}, but its daemon is not attachable; refusing to replace a background process",
-        live_agent_status_label(info),
-        meta.child_pid.unwrap_or_default()
-    ))
+    if agent_meta_child_pid_matches(meta) {
+        return Some(anyhow::anyhow!(
+            "previous {} is still running as child pid {}, but its daemon is not attachable; refusing to replace a background process",
+            live_agent_status_label(info),
+            meta.child_pid.unwrap_or_default()
+        ));
+    }
+    agent_meta_surviving_child_process_group(meta).map(|child_pgid| {
+        anyhow::anyhow!(
+            "previous {} still has a live process group {}, but its daemon is not attachable; refusing to replace background processes",
+            live_agent_status_label(info),
+            child_pgid,
+        )
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -38767,6 +39332,7 @@ fn start_agent_daemon_with_origin(
         }
         if !agent_runtime_meta_has_live_daemon_for_stem(meta, &stem) {
             let child_pid_matches = agent_meta_child_pid_matches(meta);
+            let surviving_child_pgid = agent_meta_surviving_child_process_group(meta);
             debug_log(
                 "daemon_start_stale_child_preserved",
                 serde_json::json!({
@@ -38776,6 +39342,7 @@ fn start_agent_daemon_with_origin(
                     "child_pid_start_ticks": meta.child_pid_start_ticks,
                     "child_alive": meta.child_pid.map(process_is_alive),
                     "child_pid_matches": child_pid_matches,
+                    "surviving_child_pgid": surviving_child_pgid,
                 }),
             );
             if let Some(error) = stale_child_replacement_error(info, &key, &stem, meta) {
@@ -38819,7 +39386,10 @@ fn start_agent_daemon_with_origin(
         );
     }
     if let Some(meta) = existing_meta.as_ref() {
-        if agent_meta_daemon_pid_matches(meta) || agent_meta_child_pid_matches(meta) {
+        if agent_meta_daemon_pid_matches(meta)
+            || agent_meta_child_pid_matches(meta)
+            || agent_meta_surviving_child_process_group(meta).is_some()
+        {
             anyhow::bail!(
                 "runtime process identity changed during startup cleanup; refusing replacement"
             );
@@ -39062,6 +39632,10 @@ fn cleanup_exited_spawned_agent_daemon_runtime(
         .as_ref()
         .is_some_and(|meta| spawned_agent_daemon_meta_matches(meta, key, &spawned));
     let child_survives = meta.as_ref().and_then(agent_meta_child_pid_liveness);
+    let surviving_child_pgid = meta
+        .as_ref()
+        .and_then(agent_meta_surviving_child_process_group);
+    let child_or_group_survives = child_survives.is_some() || surviving_child_pgid.is_some();
     let exact_runtime = !meta_exists || meta_matches;
     let replacement_reachable = agent_runtime_stem_has_reachable_daemon(runtime_dir, &stem);
 
@@ -39076,7 +39650,7 @@ fn cleanup_exited_spawned_agent_daemon_runtime(
         );
     let meta_removed = meta_matches
         && !replacement_reachable
-        && child_survives.is_none()
+        && !child_or_group_survives
         && remove_agent_runtime_file_logged(
             "daemon_exited_during_start_cleanup",
             Some(key),
@@ -39086,7 +39660,7 @@ fn cleanup_exited_spawned_agent_daemon_runtime(
         );
     let auth_removed = exact_runtime
         && !replacement_reachable
-        && child_survives.is_none()
+        && !child_or_group_survives
         && remove_agent_runtime_file_logged(
             "daemon_exited_during_start_cleanup",
             Some(key),
@@ -39096,7 +39670,7 @@ fn cleanup_exited_spawned_agent_daemon_runtime(
         );
     let cwd_lock_removed = exact_runtime
         && !replacement_reachable
-        && child_survives.is_none()
+        && !child_or_group_survives
         && remove_coding_agent_cwd_lock_for_info(
             info,
             "daemon_exited_during_start_cleanup",
@@ -39115,6 +39689,7 @@ fn cleanup_exited_spawned_agent_daemon_runtime(
             "meta_readable": meta.is_some(),
             "meta_matches": meta_matches,
             "child_liveness": format!("{:?}", child_survives),
+            "surviving_child_pgid": surviving_child_pgid,
             "replacement_reachable": replacement_reachable,
             "socket_removed": socket_removed,
             "meta_removed": meta_removed,
@@ -39548,8 +40123,11 @@ fn terminate_cokacmux_processes_at(
     let runtime_dir = config_dir.join("agents");
     let client_pids = cokacmux_client_pids_for_reset(&runtime_dir, current_pid);
     let killall = kill_all_agent_daemons_at(&runtime_dir, current_pid);
-    let untracked_daemon_report =
-        terminate_cokacmux_daemon_pids_for_reset(os_cokacmux_daemon_pids(current_pid), current_pid);
+    let untracked_daemon_report = terminate_cokacmux_daemon_pids_for_reset(
+        &runtime_dir,
+        os_cokacmux_daemon_pids(current_pid),
+        current_pid,
+    );
     let client_report = terminate_cokacmux_client_pids_for_reset(client_pids, current_pid);
 
     CokacmuxProcessTerminationReport {
@@ -39735,6 +40313,19 @@ struct ResetClientProcessReport {
     skipped_unverified: usize,
 }
 
+#[cfg(not(windows))]
+fn terminate_cokacmux_client_process_for_reset(pid: u32, start_ticks: Option<u64>) -> bool {
+    terminate_process_group_if_start_token_matches(pid, start_ticks, "reset_client_process")
+}
+
+#[cfg(windows)]
+fn terminate_cokacmux_client_process_for_reset(pid: u32, start_ticks: Option<u64>) -> bool {
+    // Daemons are deliberately detached/broken out and are terminated through
+    // the child-first daemon path. Windows taskkill /T on their original client
+    // could bypass that safety path, so reset terminates only the exact client.
+    terminate_windows_exact_process_with_start_token(pid, start_ticks, "reset_client_process")
+}
+
 fn terminate_cokacmux_client_pids_for_reset(
     pids: HashSet<u32>,
     current_pid: u32,
@@ -39767,12 +40358,11 @@ fn terminate_cokacmux_client_pids_for_reset(
             report.skipped_unverified = report.skipped_unverified.saturating_add(1);
             continue;
         }
-        if !terminate_process_group_if_start_token_matches(pid, start_ticks, "reset_client_process")
-        {
+        if !terminate_cokacmux_client_process_for_reset(pid, start_ticks) {
             report.skipped_unverified = report.skipped_unverified.saturating_add(1);
             continue;
         }
-        if process_is_alive(pid) {
+        if process_is_alive(pid) && process_start_token_still_matches(pid, start_ticks) {
             report.errors = report.errors.saturating_add(1);
         } else {
             report.terminated = report.terminated.saturating_add(1);
@@ -39782,6 +40372,7 @@ fn terminate_cokacmux_client_pids_for_reset(
 }
 
 fn terminate_cokacmux_daemon_pids_for_reset(
+    runtime_dir: &Path,
     pids: Vec<u32>,
     current_pid: u32,
 ) -> ResetClientProcessReport {
@@ -39813,11 +40404,51 @@ fn terminate_cokacmux_daemon_pids_for_reset(
             );
             continue;
         }
-        if !agent_daemon_process_has_agent_arg(pid) {
+        let Some(key) = agent_daemon_process_key(pid) else {
             report.skipped_unverified = report.skipped_unverified.saturating_add(1);
             continue;
+        };
+        let termination_identity = agent_daemon_identity_snapshot_for_key_at(
+            runtime_dir,
+            &key,
+            "reset_untracked_daemon_identity",
+        )
+        .filter(|identity| {
+            identity.pid == pid
+                && identity.pid_start_ticks == start_ticks
+                && process_start_token_still_matches(pid, start_ticks)
+        });
+        let child_termination = termination_identity
+            .as_ref()
+            .map(|identity| {
+                terminate_live_agent_identity_child_process(
+                    identity,
+                    &key,
+                    "reset_untracked_daemon_child",
+                )
+            })
+            .unwrap_or_else(|| LiveAgentChildTermination::unconfirmed(None));
+        if !child_termination.confirmed_gone {
+            report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+            debug_log(
+                "reset_daemon_child_survived_daemon_preserved",
+                serde_json::json!({
+                    "pid": pid,
+                    "pid_start_ticks": start_ticks,
+                    "key": agent_key_debug_value(&key),
+                    "identity_child_pid": termination_identity.as_ref().and_then(|identity| identity.child_pid),
+                    "identity_child_pid_start_ticks": termination_identity.as_ref().and_then(|identity| identity.child_pid_start_ticks),
+                    "child_termination": format!("{:?}", child_termination),
+                    "reason": if termination_identity.is_some() {
+                        "child_termination_not_confirmed"
+                    } else {
+                        "live_daemon_identity_unavailable"
+                    },
+                }),
+            );
+            continue;
         }
-        if !terminate_process_group_if_start_token_matches(
+        if !terminate_agent_daemon_after_child_confirmed_gone(
             pid,
             start_ticks,
             "reset_untracked_daemon",
@@ -39825,7 +40456,7 @@ fn terminate_cokacmux_daemon_pids_for_reset(
             report.skipped_unverified = report.skipped_unverified.saturating_add(1);
             continue;
         }
-        if process_is_alive(pid) {
+        if process_is_alive(pid) && process_start_token_still_matches(pid, start_ticks) {
             report.errors = report.errors.saturating_add(1);
         } else {
             report.terminated = report.terminated.saturating_add(1);
@@ -40308,6 +40939,7 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             report.stale = report.stale.saturating_add(1);
             let key = agent_key_from_meta(&meta).filter(|key| agent_file_stem(key) == stem);
             let child_liveness = agent_meta_child_pid_liveness(&meta);
+            let surviving_child_pgid = agent_meta_surviving_child_process_group(&meta);
             let mut child_terminated = false;
             if agent_runtime_stem_has_endpoint_entry(runtime_dir, stem)
                 || agent_runtime_stem_has_reachable_daemon(runtime_dir, stem)
@@ -40336,7 +40968,7 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
                         report.child_processes_terminated.saturating_add(1);
                 }
             }
-            if !child_terminated && child_liveness.is_some() {
+            if !child_terminated && (child_liveness.is_some() || surviving_child_pgid.is_some()) {
                 report.skipped_unverified = report.skipped_unverified.saturating_add(1);
                 preserved_unverified_stems.insert(stem.to_string());
                 debug_log(
@@ -40349,7 +40981,8 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
                         "child_pid": meta.child_pid,
                         "child_pid_start_ticks": meta.child_pid_start_ticks,
                         "child_liveness": child_liveness.map(|liveness| liveness.label()),
-                        "reason": "stale_daemon_child_not_verified_for_termination",
+                        "surviving_child_pgid": surviving_child_pgid,
+                        "reason": "stale_daemon_child_or_group_not_verified_for_termination",
                     }),
                 );
                 continue;
@@ -40433,12 +41066,53 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
         }
 
         let observed_endpoint = observe_agent_runtime_endpoint(runtime_dir, stem);
-        let terminated_child_pid =
-            terminate_agent_meta_child_process(&meta, &key, "killall_killed_cleanup");
+        let termination_identity = live_agent_daemon_identity_for_termination_at(
+            runtime_dir,
+            &key,
+            &meta,
+            "killall_live_identity",
+        );
+        let child_termination = termination_identity
+            .as_ref()
+            .map(|identity| {
+                terminate_live_agent_identity_child_process(
+                    identity,
+                    &key,
+                    "killall_killed_cleanup",
+                )
+            })
+            .unwrap_or_else(|| LiveAgentChildTermination::unconfirmed(meta.child_pid));
+        let terminated_child_pid = child_termination
+            .terminated
+            .then_some(child_termination.pid)
+            .flatten();
         if terminated_child_pid.is_some() {
             report.child_processes_terminated = report.child_processes_terminated.saturating_add(1);
         }
-        if !terminate_process_group_if_start_token_matches(
+        if !child_termination.confirmed_gone {
+            report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+            preserved_unverified_stems.insert(stem.to_string());
+            debug_log(
+                "killall_agent_child_survived_daemon_preserved",
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "daemon_pid": meta.pid,
+                    "provider": meta.provider.as_deref(),
+                    "session_id": meta.session_id.as_deref(),
+                    "observed_child_pid": meta.child_pid,
+                    "identity_child_pid": termination_identity.as_ref().and_then(|identity| identity.child_pid),
+                    "identity_child_pid_start_ticks": termination_identity.as_ref().and_then(|identity| identity.child_pid_start_ticks),
+                    "child_termination": format!("{:?}", child_termination),
+                    "reason": if termination_identity.is_some() {
+                        "child_termination_not_confirmed"
+                    } else {
+                        "live_daemon_identity_unavailable"
+                    },
+                }),
+            );
+            continue;
+        }
+        if !terminate_agent_daemon_after_child_confirmed_gone(
             meta.pid,
             meta.pid_start_ticks,
             "killall_agent_daemon",
@@ -40447,7 +41121,9 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             preserved_unverified_stems.insert(stem.to_string());
             continue;
         }
-        if process_is_alive(meta.pid) {
+        if process_is_alive(meta.pid)
+            && process_start_token_still_matches(meta.pid, meta.pid_start_ticks)
+        {
             report.errors = report.errors.saturating_add(1);
             debug_log(
                 "killall_agent_still_alive",
@@ -40714,6 +41390,7 @@ fn acquire_revalidated_stale_runtime_stem_guard_with_endpoint(
         )
         .is_some()
             || agent_meta_child_pid_liveness(&meta).is_some()
+            || agent_meta_surviving_child_process_group(&meta).is_some()
         {
             debug_log(
                 "agent_runtime_cleanup_revalidation_preserved",
@@ -40771,19 +41448,50 @@ fn remove_terminated_owned_agent_runtime_files_by_stem(
     observed_endpoint: &AgentEndpointObservation,
     reason: &str,
 ) -> Option<bool> {
-    let _guard = acquire_revalidated_stale_runtime_stem_guard_with_endpoint(
+    let guard = acquire_revalidated_stale_runtime_stem_guard_with_endpoint(
         runtime_dir,
         stem,
         observed_meta,
         observed_endpoint,
         reason,
-    )?;
+    );
+    let Some(_guard) = guard else {
+        // A daemon whose child was already terminated commonly wins the race
+        // and removes its own endpoint/meta before the external worker obtains
+        // the mutation guard. Complete absence is success; a changed or
+        // unreadable generation remains unverified and is preserved.
+        if agent_runtime_identity_files_absent(runtime_dir, stem) {
+            debug_log(
+                "terminated_agent_runtime_already_absent",
+                serde_json::json!({
+                    "reason": reason,
+                    "runtime_dir": runtime_dir.display().to_string(),
+                    "stem": stem,
+                }),
+            );
+            return Some(false);
+        }
+        return None;
+    };
     Some(remove_agent_runtime_files_by_stem_with_policy(
         runtime_dir,
         stem,
         reason,
         false,
     ))
+}
+
+fn agent_runtime_identity_files_absent(runtime_dir: &Path, stem: &str) -> bool {
+    let meta_path = runtime_dir.join(format!("{stem}.json"));
+    let meta_absent = matches!(
+        read_runtime_bytes_bounded(&meta_path, AGENT_RUNTIME_META_MAX_BYTES),
+        Err(error) if error.kind() == ErrorKind::NotFound
+    );
+    meta_absent
+        && matches!(
+            observe_agent_runtime_endpoint(runtime_dir, stem),
+            Ok(AgentEndpointObservation::Absent)
+        )
 }
 
 fn remove_stale_agent_runtime_files_by_stem_with_policy_with<F>(
@@ -40970,6 +41678,42 @@ fn terminate_agent_daemon_for_info(key: &AgentKey, info: &SessionInfo) -> Result
     terminate_agent_daemon_with_info(key, Some(info))
 }
 
+/// Resolve the child identity from the live daemon immediately before a
+/// destructive termination. Runtime metadata can still contain the
+/// pre-spawn `starting` snapshot while the daemon's asynchronous writer is
+/// stalled, so it is not sufficient authority for killing the daemon that
+/// owns the PTY child.
+fn live_agent_daemon_identity_for_termination_at(
+    runtime_dir: &Path,
+    key: &AgentKey,
+    observed_meta: &AgentMetaSnapshot,
+    reason: &str,
+) -> Option<AgentMetaSnapshot> {
+    let identity = agent_daemon_identity_snapshot_for_key_at(runtime_dir, key, reason)?;
+    let expected_daemon_start = observed_meta.pid_start_ticks?;
+    let same_daemon = identity.pid == observed_meta.pid
+        && identity.pid_start_ticks == Some(expected_daemon_start)
+        && process_start_token_still_matches(identity.pid, identity.pid_start_ticks);
+    let exact_child_identity = identity.child_pid.is_some()
+        && identity.child_pid_start_ticks.is_some()
+        && identity.child_pid != Some(0);
+    if same_daemon && exact_child_identity {
+        return Some(identity);
+    }
+    debug_log(
+        "agent_daemon_termination_identity_rejected",
+        serde_json::json!({
+            "reason": reason,
+            "key": agent_key_debug_value(key),
+            "observed_meta": agent_meta_snapshot_debug_value(observed_meta),
+            "identity_meta": agent_meta_snapshot_debug_value(&identity),
+            "same_daemon": same_daemon,
+            "exact_child_identity": exact_child_identity,
+        }),
+    );
+    None
+}
+
 fn terminate_agent_daemon_with_info(
     key: &AgentKey,
     expected_info: Option<&SessionInfo>,
@@ -41049,9 +41793,52 @@ fn terminate_agent_daemon_with_info(
                 );
             } else {
                 let pid = meta.pid;
-                terminated_child_pid =
-                    terminate_agent_meta_child_process(meta, key, "terminate_agent_cleanup");
-                if !terminate_process_group_if_start_token_matches(
+                let termination_identity = live_agent_daemon_identity_for_termination_at(
+                    runtime_dir,
+                    key,
+                    meta,
+                    "terminate_agent_live_identity",
+                );
+                let child_termination = termination_identity
+                    .as_ref()
+                    .map(|identity| {
+                        terminate_live_agent_identity_child_process(
+                            identity,
+                            key,
+                            "terminate_agent_cleanup",
+                        )
+                    })
+                    .unwrap_or_else(|| LiveAgentChildTermination::unconfirmed(meta.child_pid));
+                terminated_child_pid = child_termination
+                    .terminated
+                    .then_some(child_termination.pid)
+                    .flatten();
+                if !child_termination.confirmed_gone {
+                    // The daemon is still the only verified owner of the PTY
+                    // child. Keep it attachable when the child could not be
+                    // identified or confirmed terminated; killing the daemon
+                    // here would manufacture a `lost` process.
+                    skipped_unverified = true;
+                    preserve_runtime_files = true;
+                    debug_log(
+                        "terminate_agent_child_survived_daemon_preserved",
+                        serde_json::json!({
+                            "key": agent_key_debug_value(key),
+                            "expected_info": expected_info.map(session_info_debug_value),
+                            "daemon_pid": meta.pid,
+                            "daemon_pid_start_ticks": meta.pid_start_ticks,
+                            "observed_child_pid": meta.child_pid,
+                            "identity_child_pid": termination_identity.as_ref().and_then(|identity| identity.child_pid),
+                            "identity_child_pid_start_ticks": termination_identity.as_ref().and_then(|identity| identity.child_pid_start_ticks),
+                            "child_termination": format!("{:?}", child_termination),
+                            "reason": if termination_identity.is_some() {
+                                "child_termination_not_confirmed"
+                            } else {
+                                "live_daemon_identity_unavailable"
+                            },
+                        }),
+                    );
+                } else if !terminate_agent_daemon_after_child_confirmed_gone(
                     pid,
                     meta.pid_start_ticks,
                     "terminate_agent_daemon",
@@ -41084,6 +41871,7 @@ fn terminate_agent_daemon_with_info(
             }
         } else if meta_key.as_ref() == Some(key) {
             let child_liveness = agent_meta_child_pid_liveness(meta);
+            let surviving_child_pgid = agent_meta_surviving_child_process_group(meta);
             terminated_child_pid = terminate_agent_meta_child_process(
                 meta,
                 key,
@@ -41092,7 +41880,9 @@ fn terminate_agent_daemon_with_info(
             let possible_live_daemon = daemon_alive
                 && daemon_identity != Some(AgentDaemonProcessIdentity::Other)
                 && agent_meta_daemon_pid_matches(meta);
-            if possible_live_daemon || (terminated_child_pid.is_none() && child_liveness.is_some())
+            if possible_live_daemon
+                || (terminated_child_pid.is_none()
+                    && (child_liveness.is_some() || surviving_child_pgid.is_some()))
             {
                 skipped_unverified = true;
                 preserve_runtime_files = true;
@@ -41108,6 +41898,7 @@ fn terminate_agent_daemon_with_info(
                         "daemon_pid_matches": agent_meta_daemon_pid_matches(meta),
                         "child_pid": meta.child_pid,
                         "child_liveness": child_liveness.map(|liveness| liveness.label()),
+                        "surviving_child_pgid": surviving_child_pgid,
                     }),
                 );
             }
@@ -41868,6 +42659,41 @@ fn agent_daemon_process_has_agent_arg(pid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn agent_daemon_process_key(pid: u32) -> Option<AgentKey> {
+    let bytes = fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    let args = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect::<Vec<_>>();
+    agent_daemon_key_from_args(&args)
+}
+
+#[cfg(target_os = "macos")]
+fn agent_daemon_process_key(pid: u32) -> Option<AgentKey> {
+    macos_process_args(pid).and_then(|args| agent_daemon_key_from_args(&args))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn agent_daemon_process_key(pid: u32) -> Option<AgentKey> {
+    let mut command = Command::new("ps");
+    command
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .stdin(Stdio::null());
+    process_probe_command_output(command, "agent_daemon_process_key")
+        .filter(|output| output.status.success())
+        .and_then(|output| command_string_to_args(String::from_utf8_lossy(&output.stdout).trim()))
+        .and_then(|args| agent_daemon_key_from_args(&args))
+}
+
+#[cfg(windows)]
+fn agent_daemon_process_key(pid: u32) -> Option<AgentKey> {
+    windows_process_command_line(pid, "agent_daemon_process_key")
+        .and_then(|command_line| windows_command_line_to_args(&command_line))
+        .and_then(|args| agent_daemon_key_from_args(&args))
+}
+
+#[cfg(target_os = "linux")]
 fn agent_daemon_process_identity(pid: u32, key: &AgentKey) -> AgentDaemonProcessIdentity {
     let Ok(bytes) = fs::read(format!("/proc/{}/cmdline", pid)) else {
         return AgentDaemonProcessIdentity::Unknown;
@@ -42343,6 +43169,7 @@ fn cleanup_orphan_agent_pty_logs_at_except(
         )
         .is_some()
             || agent_meta_child_pid_liveness(&meta).is_some()
+            || agent_meta_surviving_child_process_group(&meta).is_some()
         {
             continue;
         }
@@ -42424,7 +43251,15 @@ fn linux_process_group_has_live_member(pgid: i32) -> bool {
     let Ok(entries) = fs::read_dir("/proc") else {
         return unix_signal_target_exists(-pgid);
     };
-    for entry in entries.flatten() {
+    let mut scan_incomplete = false;
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(_) => {
+                scan_incomplete = true;
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -42433,17 +43268,23 @@ fn linux_process_group_has_live_member(pgid: i32) -> bool {
             continue;
         }
         let stat_path = entry.path().join("stat");
-        let Ok(stat) = fs::read_to_string(stat_path) else {
-            continue;
+        let stat = match fs::read_to_string(stat_path) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(_) => {
+                scan_incomplete = true;
+                continue;
+            }
         };
         let Some((candidate_pgid, state)) = linux_process_stat_group_and_state(&stat) else {
+            scan_incomplete = true;
             continue;
         };
         if candidate_pgid == pgid && state != 'Z' {
             return true;
         }
     }
-    false
+    scan_incomplete && unix_signal_target_exists(-pgid)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -42501,6 +43342,66 @@ fn unix_process_or_group_has_live_member(pid: i32) -> bool {
 }
 
 #[cfg(unix)]
+fn agent_child_process_group_has_live_member(pid: u32) -> bool {
+    pid > 0 && pid <= i32::MAX as u32 && unix_process_group_has_live_member(pid as i32)
+}
+
+#[cfg(windows)]
+fn agent_child_process_group_has_live_member(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // The live daemon retains the portable-pty Child handle after the direct
+    // process exits, which pins that Windows process generation while we walk
+    // its recorded descendant tree. A failed snapshot is unknown, never proof
+    // that the managed tree is empty.
+    windows_process_tree_pids_complete(pid)
+        .map(|pids| pids.into_iter().any(process_is_alive))
+        .unwrap_or(true)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn agent_child_process_group_has_live_member(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn agent_child_runtime_may_have_live_member(pid: u32, _pty_output_closed: bool) -> bool {
+    agent_child_process_group_has_live_member(pid)
+}
+
+#[cfg(windows)]
+fn agent_child_runtime_may_have_live_member(pid: u32, _pty_output_closed: bool) -> bool {
+    windows_process_tree_pids_complete(pid)
+        .map(|pids| pids.into_iter().any(process_is_alive))
+        .unwrap_or(true)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn agent_child_runtime_may_have_live_member(_pid: u32, pty_output_closed: bool) -> bool {
+    // Without a trustworthy OS tree primitive, an open PTY is conservative
+    // evidence that a descendant may still be using the managed runtime.
+    !pty_output_closed
+}
+
+#[cfg(unix)]
+fn agent_child_runtime_definitively_gone(pid: u32) -> bool {
+    !process_is_alive(pid) && !agent_child_process_group_has_live_member(pid)
+}
+
+#[cfg(windows)]
+fn agent_child_runtime_definitively_gone(pid: u32) -> bool {
+    !process_is_alive(pid)
+        && windows_process_tree_pids_complete(pid)
+            .is_some_and(|pids| !pids.into_iter().any(process_is_alive))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn agent_child_runtime_definitively_gone(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn wait_for_unix_process_group_exit(pid: i32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -42529,6 +43430,139 @@ fn unix_process_start_token_allows_signal(pid: u32, expected_start_ticks: Option
     expected_start_ticks.is_none_or(|expected| {
         process_start_token_matches(expected, process_start_ticks(pid)) == Some(true)
     })
+}
+
+#[cfg(unix)]
+fn unix_verified_process_group_allows_followup_signal(
+    pid: u32,
+    expected_start_ticks: Option<u64>,
+) -> bool {
+    if unix_process_start_token_allows_signal(pid, expected_start_ticks) {
+        return true;
+    }
+    // The verified session/group leader may exit in response to SIGTERM while
+    // descendants that ignored SIGTERM keep the original process group alive.
+    // POSIX does not reuse that PGID while it still has members. Permit the
+    // follow-up group signal only when the leader PID is now absent; if that PID
+    // is alive with an unreadable or different token, it may have been reused
+    // and the group must be preserved.
+    !process_is_alive(pid) && unix_process_group_has_live_member(pid as i32)
+}
+
+#[cfg(unix)]
+fn terminate_verified_unix_process_group_after_leader_exit(pgid: u32, reason: &str) -> bool {
+    if pgid == 0 || pgid > i32::MAX as u32 || process_is_alive(pgid) {
+        return false;
+    }
+    let pgid_i32 = pgid as i32;
+    if !unix_process_group_has_live_member(pgid_i32) {
+        return true;
+    }
+    // The exact leader was supplied by a live daemon identity response. A PGID
+    // cannot be reused while that group still has members, so the surviving
+    // group remains the same target even though the leader has exited.
+    let result = unsafe { libc::kill(-pgid_i32, libc::SIGKILL) };
+    let error = (result != 0).then(|| io::Error::last_os_error().to_string());
+    let exited = result == 0
+        && wait_for_unix_process_group_exit(
+            pgid_i32,
+            Duration::from_millis(PROCESS_TERMINATE_GRACE_MS),
+        );
+    debug_log(
+        "process_group_terminate_after_leader_exit",
+        serde_json::json!({
+            "reason": reason,
+            "pgid": pgid,
+            "kill_status": result,
+            "kill_error": error,
+            "group_live_after": unix_process_group_has_live_member(pgid_i32),
+            "confirmed_exited": exited,
+        }),
+    );
+    exited
+}
+
+#[cfg(windows)]
+fn terminate_verified_windows_process_tree_after_leader_exit(root_pid: u32, reason: &str) -> bool {
+    const MAX_TREE_TERMINATION_PASSES: usize = 3;
+
+    if root_pid == 0 || process_is_alive(root_pid) {
+        return false;
+    }
+    // This path is authorized only by a fresh response from the live daemon.
+    // That daemon still owns the exited portable-pty Child handle, so Windows
+    // cannot recycle the root PID while these descendant snapshots are taken.
+    for pass in 1..=MAX_TREE_TERMINATION_PASSES {
+        let Some(mut descendants) = windows_process_tree_pids_complete(root_pid) else {
+            debug_log(
+                "process_tree_terminate_after_leader_exit_unverified",
+                serde_json::json!({
+                    "reason": reason,
+                    "root_pid": root_pid,
+                    "platform": "windows",
+                    "pass": pass,
+                    "cause": "process_snapshot_failed",
+                }),
+            );
+            return false;
+        };
+        descendants.retain(|pid| *pid != root_pid && process_is_alive(*pid));
+        if descendants.is_empty() {
+            return true;
+        }
+        // Work from leaves toward the root. Each exact, start-token-pinned
+        // taskkill also requests /T, and the next pass verifies that no child
+        // escaped a concurrent tree snapshot.
+        descendants.reverse();
+        let mut attempted = 0usize;
+        let mut terminated = 0usize;
+        let mut unverified = Vec::new();
+        for pid in descendants {
+            let Some(start_ticks) = process_start_ticks(pid) else {
+                unverified.push(pid);
+                continue;
+            };
+            attempted = attempted.saturating_add(1);
+            if terminate_process_group_if_start_token_matches(
+                pid,
+                Some(start_ticks),
+                "windows_agent_tree_descendant",
+            ) {
+                terminated = terminated.saturating_add(1);
+            }
+        }
+        debug_log(
+            "process_tree_terminate_after_leader_exit_pass",
+            serde_json::json!({
+                "reason": reason,
+                "root_pid": root_pid,
+                "platform": "windows",
+                "pass": pass,
+                "attempted": attempted,
+                "terminated": terminated,
+                "unverified_pids": unverified,
+            }),
+        );
+        if attempted == 0 {
+            return false;
+        }
+    }
+
+    let confirmed_exited = windows_process_tree_pids_complete(root_pid).is_some_and(|pids| {
+        !pids
+            .into_iter()
+            .any(|pid| pid != root_pid && process_is_alive(pid))
+    });
+    debug_log(
+        "process_tree_terminate_after_leader_exit_done",
+        serde_json::json!({
+            "reason": reason,
+            "root_pid": root_pid,
+            "platform": "windows",
+            "confirmed_exited": confirmed_exited,
+        }),
+    );
+    confirmed_exited
 }
 
 #[cfg(unix)]
@@ -42609,7 +43643,7 @@ fn terminate_process_group_with_start_token(pid: u32, expected_start_ticks: Opti
     let mut kill_pid_result = None;
     let mut kill_pid_error = None;
     if !exited_after_term {
-        if unix_process_start_token_allows_signal(pid_u32, expected_start_ticks) {
+        if unix_verified_process_group_allows_followup_signal(pid_u32, expected_start_ticks) {
             let result = unsafe { libc::kill(pgid, libc::SIGKILL) };
             kill_group_result = Some(result);
             if result != 0 {
@@ -42667,6 +43701,108 @@ fn terminate_process_group_with_start_token(pid: u32, expected_start_ticks: Opti
         }),
     );
     !unix_process_or_group_has_live_member(pid)
+}
+
+#[cfg(windows)]
+fn terminate_windows_exact_process_with_start_token(
+    pid: u32,
+    expected_start_ticks: Option<u64>,
+    reason: &str,
+) -> bool {
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> WinHandle;
+        fn GetProcessTimes(
+            process: WinHandle,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn TerminateProcess(process: WinHandle, exit_code: u32) -> i32;
+        fn WaitForSingleObject(handle: WinHandle, milliseconds: u32) -> u32;
+    }
+
+    let Some(expected_start_ticks) = expected_start_ticks else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        return false;
+    }
+    let handle = WindowsOwnedHandle(handle);
+    let mut creation = FileTime { low: 0, high: 0 };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    let times_ok =
+        unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) } != 0;
+    let actual_start_ticks =
+        times_ok.then_some(((creation.high as u64) << 32) | u64::from(creation.low));
+    if actual_start_ticks != Some(expected_start_ticks) {
+        debug_log(
+            "exact_process_terminate_revalidation_skipped",
+            serde_json::json!({
+                "reason": reason,
+                "pid": pid,
+                "platform": "windows",
+                "expected_start_ticks": expected_start_ticks,
+                "actual_start_ticks": actual_start_ticks,
+            }),
+        );
+        return false;
+    }
+    let wait_before = unsafe { WaitForSingleObject(handle.0, 0) };
+    if wait_before == WAIT_OBJECT_0 {
+        return true;
+    }
+    if wait_before != WAIT_TIMEOUT {
+        return false;
+    }
+    let terminate_result = unsafe { TerminateProcess(handle.0, 1) };
+    let terminate_error = (terminate_result == 0).then(|| io::Error::last_os_error().to_string());
+    let wait_after = unsafe {
+        WaitForSingleObject(
+            handle.0,
+            PROCESS_TERMINATE_GRACE_MS.min(u64::from(u32::MAX)) as u32,
+        )
+    };
+    let confirmed_exited = wait_after == WAIT_OBJECT_0;
+    debug_log(
+        "exact_process_terminate_done",
+        serde_json::json!({
+            "reason": reason,
+            "pid": pid,
+            "platform": "windows",
+            "terminate_status": terminate_result,
+            "terminate_error": terminate_error,
+            "wait_status": wait_after,
+            "confirmed_exited": confirmed_exited,
+        }),
+    );
+    confirmed_exited
 }
 
 #[cfg(windows)]
@@ -43241,25 +44377,38 @@ where
             ) {
                 out.push(info);
             } else {
-                let exact_orphan = agent_key_from_meta(&meta)
+                let orphan_info = agent_key_from_meta(&meta)
                     .filter(|key| agent_file_stem(key) == stem)
-                    .and_then(|_| {
-                        agent_meta_verified_child_pid(&meta)
-                            .zip(session_info_from_agent_meta_snapshot(&meta))
-                    });
-                if let Some((child_pid, info)) = exact_orphan {
-                    debug_log(
-                        "live_shell_discover_add_exact_orphan",
-                        serde_json::json!({
-                            "path": path.display().to_string(),
-                            "stem": stem,
-                            "child_pid": child_pid,
-                            "info": session_info_debug_value(&info),
-                            "meta": agent_meta_snapshot_debug_value(&meta),
-                        }),
-                    );
-                    out.push(info);
-                    continue;
+                    .and_then(|_| session_info_from_agent_meta_snapshot(&meta));
+                if let Some(info) = orphan_info {
+                    if let Some(child_pid) = agent_meta_verified_child_pid(&meta) {
+                        debug_log(
+                            "live_shell_discover_add_exact_orphan",
+                            serde_json::json!({
+                                "path": path.display().to_string(),
+                                "stem": stem,
+                                "child_pid": child_pid,
+                                "info": session_info_debug_value(&info),
+                                "meta": agent_meta_snapshot_debug_value(&meta),
+                            }),
+                        );
+                        out.push(info);
+                        continue;
+                    }
+                    if let Some(child_pgid) = agent_meta_surviving_child_process_group(&meta) {
+                        debug_log(
+                            "live_shell_discover_add_orphaned_group",
+                            serde_json::json!({
+                                "path": path.display().to_string(),
+                                "stem": stem,
+                                "child_pgid": child_pgid,
+                                "info": session_info_debug_value(&info),
+                                "meta": agent_meta_snapshot_debug_value(&meta),
+                            }),
+                        );
+                        out.push(info);
+                        continue;
+                    }
                 }
                 // `None` also covers identity-query timeouts and transiently
                 // unreachable endpoints. Leave stale-file deletion to the
@@ -48279,6 +49428,36 @@ fn render_main_agent_title_bar(
     );
 }
 
+fn render_agent_kill_replacement_pane(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    info: &SessionInfo,
+    focused: bool,
+) {
+    f.render_widget(Clear, area);
+    render_main_agent_title_bar(f, area, info, focused);
+    let content_area = main_agent_content_area(area);
+    let style = agent_pane_style_for_focus(
+        Style::default().fg(THEME_FG_DIM).bg(AGENT_DEFAULT_BG),
+        focused,
+    );
+    fill_area(f.buffer_mut(), content_area, style);
+    if content_area.width == 0 || content_area.height == 0 {
+        return;
+    }
+    let message = truncate_width(
+        &format!("Connecting to {}…", live_agent_status_label(info)),
+        content_area.width.saturating_sub(2) as usize,
+    );
+    f.buffer_mut().set_stringn(
+        content_area.x.saturating_add(1),
+        content_area.y,
+        message,
+        content_area.width.saturating_sub(1) as usize,
+        style,
+    );
+}
+
 fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
     let main_area = Rect::new(
@@ -48294,14 +49473,13 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         AGENT_STATUS_HEIGHT.min(area.height),
     );
 
-    let active_key = app
-        .active_agent
-        .as_ref()
-        .map(|agent| AgentKey::new(&agent.info));
+    let workspace_info = app.agent_workspace_info().cloned();
+    let workspace_key = workspace_info.as_ref().map(AgentKey::new);
+    let auxiliary_visible = app.active_agent.is_some() && app.agent_aux.is_some();
     let layout = agent_pane_layout_for_area(
         main_area,
         app.agent_sidebar_config_width(),
-        app.agent_aux.is_some(),
+        auxiliary_visible,
         app.agent_aux_width,
     );
     debug_log(
@@ -48314,13 +49492,14 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             "agent_focus": format!("{:?}", app.agent_focus),
             "agent_sidebar_width": app.agent_sidebar_config_width(),
             "agent_aux_width": app.agent_aux_width,
-            "auxiliary_visible": app.agent_aux.is_some(),
+            "auxiliary_visible": auxiliary_visible,
             "active_agent": app.active_agent.as_ref().map(|agent| session_info_debug_value(&agent.info)),
+            "kill_replacement": app.agent_kill_replacement.as_ref().map(|replacement| session_info_debug_value(&replacement.target)),
             "agent_aux": app.agent_aux.as_ref().map(agent_aux_pane_debug_value),
         }),
     );
 
-    if app.active_agent.is_none() {
+    if workspace_info.is_none() {
         f.render_widget(Clear, area);
         debug_log(
             "ui_agent_render_done",
@@ -48334,20 +49513,26 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         return;
     }
 
-    let main_outcome = {
-        let agent = app
-            .active_agent
-            .as_mut()
-            .expect("active_agent checked above");
+    let main_outcome = if let Some(agent) = app.active_agent.as_mut() {
         let main_focused = app.agent_focus == AgentFocusPane::Main;
         render_main_agent_title_bar(f, layout.main, &agent.info, main_focused);
-        render_agent_client_pane(
+        Some(render_agent_client_pane(
             f,
             agent,
             main_agent_content_area(layout.main),
             None,
             main_focused,
-        )
+        ))
+    } else {
+        render_agent_kill_replacement_pane(
+            f,
+            layout.main,
+            workspace_info
+                .as_ref()
+                .expect("agent workspace info checked above"),
+            app.agent_focus == AgentFocusPane::Main,
+        );
+        None
     };
 
     let auxiliary_outcome =
@@ -48364,7 +49549,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         };
 
     let focused_cursor = match app.agent_focus {
-        AgentFocusPane::Main => main_outcome.cursor,
+        AgentFocusPane::Main => main_outcome.as_ref().and_then(|outcome| outcome.cursor),
         AgentFocusPane::Auxiliary => auxiliary_outcome
             .as_ref()
             .and_then(|outcome| outcome.cursor),
@@ -48385,7 +49570,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
 
     app.poll_agent_runtime_states();
     let mut sidebar_candidates_len = None;
-    if let (Some(sidebar_area), Some(active_key)) = (layout.sidebar, active_key.as_ref()) {
+    if let (Some(sidebar_area), Some(workspace_key)) = (layout.sidebar, workspace_key.as_ref()) {
         let candidates = app.agent_sidebar_candidates();
         sidebar_candidates_len = Some(candidates.len());
         f.render_widget(Clear, sidebar_area);
@@ -48394,7 +49579,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             app,
             sidebar_area,
             &candidates,
-            active_key,
+            workspace_key,
             app.agent_focus == AgentFocusPane::Sidebar,
         );
     }
@@ -48469,7 +49654,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             "status_area": rect_debug_value(status_area),
             "layout": agent_pane_layout_debug_value(layout),
             "agent_focus": format!("{:?}", app.agent_focus),
-            "main": agent_render_outcome_debug_value(&main_outcome),
+            "main": main_outcome.as_ref().map(agent_render_outcome_debug_value),
             "auxiliary": auxiliary_outcome.as_ref().map(agent_render_outcome_debug_value),
             "focused_cursor": focused_cursor.map(|(x, y)| serde_json::json!({
                 "x": x,
@@ -48486,7 +49671,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             "agent_exit_overlay_drawn": agent_exit_overlay_drawn,
             "runtime_refresh_overlay_drawn": runtime_refresh_overlay_drawn,
             "session_refresh_overlay_drawn": session_refresh_overlay_drawn,
-            "sidebar_drawn": layout.sidebar.is_some() && active_key.is_some(),
+            "sidebar_drawn": layout.sidebar.is_some() && workspace_key.is_some(),
             "sidebar_candidates_len": sidebar_candidates_len,
             "status": app.display_status(),
             "snapshot": app_runtime_snapshot_debug_value(app, false),
@@ -58703,6 +59888,7 @@ mod tests {
             deferred_agent_input_rejected_bytes: 0,
             agent_kill_seq: 0,
             agent_kill_pending: None,
+            agent_kill_replacement: None,
             killall_seq: 0,
             killall_pending: None,
             new_session_launch_seq: 0,
@@ -68802,6 +69988,9 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert!(!is_switchable_agent_state(AgentListState::Orphaned {
             child_pid: 123
         }));
+        assert!(!is_switchable_agent_state(AgentListState::OrphanedGroup {
+            child_pgid: 123
+        }));
 
         assert!(!is_listed_agent_state(AgentListState::Idle));
         assert!(is_listed_agent_state(AgentListState::Attached {
@@ -68810,6 +69999,9 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         }));
         assert!(is_listed_agent_state(AgentListState::Orphaned {
             child_pid: 123
+        }));
+        assert!(is_listed_agent_state(AgentListState::OrphanedGroup {
+            child_pgid: 123
         }));
     }
 
@@ -70575,6 +71767,116 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
 
     #[cfg(unix)]
     #[test]
+    fn stale_agent_meta_lists_surviving_child_process_group_as_lost() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let descendant_ready_path = dir.path().join("descendant.ready");
+        let leader_exit_path = dir.path().join("leader.exit");
+        let mut command = Command::new(shell);
+        command
+            .args([
+                "-c",
+                r#"trap '' HUP; sh -c 'trap "" HUP TERM; while :; do sleep 1; done' & echo $! > "$DESCENDANT_READY_FILE"; while [ ! -e "$LEADER_EXIT_FILE" ]; do sleep 0.05; done"#,
+            ])
+            .env("DESCENDANT_READY_FILE", &descendant_ready_path)
+            .env("LEADER_EXIT_FILE", &leader_exit_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let child_pid = child.id();
+        let Some(child_start_ticks) = process_start_ticks(child_pid) else {
+            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            return;
+        };
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !descendant_ready_path.exists() && Instant::now() < ready_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !descendant_ready_path.exists() {
+            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            panic!("descendant did not start");
+        }
+        fs::write(&leader_exit_path, b"exit").unwrap();
+        assert_process_exits(&mut child, "session leader did not exit");
+        assert!(
+            agent_child_process_group_has_live_member(child_pid),
+            "test descendant did not remain in the leader's process group"
+        );
+
+        let key = AgentKey {
+            provider: Provider::Codex,
+            session_id: "surviving-child-group-session".into(),
+        };
+        let meta_path = dir.path().join(format!("{}.json", agent_file_stem(&key)));
+        let socket_path = agent_runtime_stem_endpoint_path(dir.path(), &agent_file_stem(&key));
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "pid": 3_000_000_000_u32,
+                "child_pid": child_pid,
+                "child_pid_start_ticks": child_start_ticks,
+                "provider": key.provider.as_str(),
+                "session_id": &key.session_id,
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let discovered = discover_live_shell_infos_at_with_liveness(dir.path(), |_, _, _| None);
+        let state = read_agent_runtime_state_at_for_key(
+            Some(&key),
+            &meta_path,
+            &socket_path,
+            std::process::id(),
+        );
+        let killall = kill_all_agent_daemons_at(dir.path(), std::process::id());
+        let meta_preserved = meta_path.exists();
+        let group_preserved = agent_child_process_group_has_live_member(child_pid);
+        if !terminate_verified_unix_process_group_after_leader_exit(
+            child_pid,
+            "test_orphaned_group_cleanup",
+        ) {
+            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+        }
+
+        assert_eq!(
+            state,
+            AgentListState::OrphanedGroup {
+                child_pgid: child_pid
+            }
+        );
+        assert!(
+            meta_preserved,
+            "runtime metadata must remain while a recorded child group survives"
+        );
+        assert!(
+            group_preserved && killall.skipped_unverified > 0,
+            "stale metadata alone must not authorize signalling a surviving process group"
+        );
+        assert!(
+            discovered.iter().any(|info| AgentKey::new(info) == key),
+            "cold discovery must retain a session whose child process group survives"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stale_agent_meta_with_wrong_child_start_token_is_not_orphaned() {
         let mut child = match Command::new("sleep")
             .arg("30")
@@ -72323,6 +73625,148 @@ IF EXIST "%~dp0\node.exe" (
 
         assert!(app.agent_kill_pending.is_none());
         assert!(app.active_agent.is_none());
+        assert!(app.agent_kill_replacement.is_none());
+        assert!(app.show_sessions_view);
+        assert!(!app.is_agent_view());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_kill_with_next_agent_keeps_workspace_until_attach_completes() {
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.agent_sidebar_visible = true;
+        app.show_sessions_view = false;
+        app.agent_focus = AgentFocusPane::Sidebar;
+        let (tx, _rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
+
+        let current_info = session_info(Provider::Codex, "kill-current", "/repo/current");
+        let current_key = AgentKey::new(&current_info);
+        let mut current = buffered_output_test_client("kill-current", 376);
+        current.info = current_info.clone();
+        app.set_active_agent(current);
+
+        let next_info = session_info(Provider::Claude, "kill-next", "/repo/next");
+        let next_key = AgentKey::new(&next_info);
+        let mut result = agent_kill_result_for_test(
+            current_key,
+            current_info,
+            AgentKillTarget::MainAgent,
+            Ok(AgentTermination {
+                pid: None,
+                child_pid: None,
+                pty_log_deleted: false,
+                skipped_unverified: false,
+            }),
+        );
+        result.next_info = Some(next_info.clone());
+
+        app.finish_active_agent_kill(result);
+
+        assert!(app.active_agent.is_none());
+        assert_eq!(
+            app.agent_kill_replacement
+                .as_ref()
+                .map(|replacement| AgentKey::new(&replacement.target)),
+            Some(next_key.clone())
+        );
+        assert_eq!(
+            app.attach_in_flight
+                .as_ref()
+                .map(|attach| attach.key.clone()),
+            Some(next_key)
+        );
+        assert!(app.is_agent_view());
+        assert!(!app.show_sessions_view);
+        assert_eq!(app.agent_focus, AgentFocusPane::Sidebar);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui_agent(frame, &mut app)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("Connecting"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_kill_replacement_attach_installs_next_agent_without_session_detour() {
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.agent_sidebar_visible = true;
+        app.show_sessions_view = false;
+        app.agent_focus = AgentFocusPane::Sidebar;
+
+        let next_info = session_info(Provider::Claude, "kill-ready", "/repo/next");
+        let next_key = AgentKey::new(&next_info);
+        app.agent_kill_replacement = Some(AgentKillReplacement {
+            target: next_info.clone(),
+        });
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 38,
+            key: next_key.clone(),
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+        let mut next = buffered_output_test_client("kill-ready", 377);
+        next.info = next_info.clone();
+
+        app.on_attach_result(Box::new(AttachWorkerResult {
+            seq: 38,
+            info: next_info,
+            cols: 100,
+            rows: 30,
+            ctx: main_attach_ui_ctx_for_test(next_key.clone()),
+            outcome: AttachWorkOutcome::Attached {
+                agent: next,
+                started: false,
+            },
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 0,
+        }));
+
+        assert_eq!(app.current_active_agent_key(), Some(next_key));
+        assert!(app.agent_kill_replacement.is_none());
+        assert!(app.is_agent_view());
+        assert!(!app.show_sessions_view);
+        assert_eq!(app.agent_focus, AgentFocusPane::Sidebar);
+    }
+
+    #[test]
+    fn active_kill_replacement_attach_failure_returns_to_sessions() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        app.agent_focus = AgentFocusPane::Sidebar;
+
+        let next_info = session_info(Provider::Claude, "kill-failed", "/repo/next");
+        let next_key = AgentKey::new(&next_info);
+        app.agent_kill_replacement = Some(AgentKillReplacement {
+            target: next_info.clone(),
+        });
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 39,
+            key: next_key.clone(),
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+
+        app.on_attach_result(Box::new(AttachWorkerResult {
+            seq: 39,
+            info: next_info,
+            cols: 100,
+            rows: 30,
+            ctx: main_attach_ui_ctx_for_test(next_key),
+            outcome: AttachWorkOutcome::Failed {
+                stage: AttachFailStage::Prepare,
+                message: "replacement unavailable".into(),
+                error_kind: None,
+            },
+            queued_at_epoch_ms: current_epoch_ms(),
+            elapsed_ms: 0,
+        }));
+
+        assert!(app.active_agent.is_none());
+        assert!(app.agent_kill_replacement.is_none());
+        assert!(app.show_sessions_view);
+        assert!(!app.is_agent_view());
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
     }
 
     #[cfg(unix)]
@@ -73201,6 +74645,25 @@ IF EXIST "%~dp0\node.exe" (
             auxiliary_outcomes: Vec::new(),
             queued_at_epoch_ms: current_epoch_ms(),
             elapsed_ms: 0,
+        }
+    }
+
+    fn main_attach_ui_ctx_for_test(key: AgentKey) -> AttachUiCtx {
+        AttachUiCtx {
+            key,
+            target: AttachTarget::MainAgent,
+            status_attached: "switched after kill".into(),
+            status_started: "switched after kill".into(),
+            status_err_prefix: "switch failed: ".into(),
+            status_prepare_err_prefix: "switch failed: ".into(),
+            focus_auxiliary_on_ready: false,
+            main_focus_override_on_ready: None,
+            select_visible: false,
+            cokacdir_dialog_on_error: false,
+            remove_dead_on_notfound: true,
+            log_origin: None,
+            ready_event: "agent_kill_replacement_ready",
+            failed_event: "agent_kill_replacement_failed",
         }
     }
 
@@ -75771,6 +77234,14 @@ IF EXIST "%~dp0\node.exe" (
         assert!(!switch_keys.contains(&foreign_key));
         assert!(!switch_keys.contains(&orphan_key));
         assert!(switch_keys.contains(&regular_key));
+
+        app.live_shells
+            .retain(|info| AgentKey::new(info) != regular_key);
+        app.agent_states.remove(&regular_key);
+        assert!(
+            app.next_agent_after_current().is_none(),
+            "other/lost entries must count as no replacement after Ctrl+K"
+        );
     }
 
     #[cfg(unix)]
@@ -77397,6 +78868,8 @@ IF EXIST "%~dp0\node.exe" (
             &pending,
             &meta_path,
             "old snapshot".into(),
+            Some(11),
+            Some(22),
             Provider::Codex,
             "coalesced-meta",
             None,
@@ -77407,6 +78880,8 @@ IF EXIST "%~dp0\node.exe" (
             &pending,
             &meta_path,
             "latest snapshot".into(),
+            Some(11),
+            Some(22),
             Provider::Codex,
             "coalesced-meta",
             None,
@@ -77414,9 +78889,11 @@ IF EXIST "%~dp0\node.exe" (
         .unwrap();
         drop(tx);
 
+        let (completion_tx, completion_rx) = mpsc::channel();
         run_daemon_disk_writer(
             rx,
             Arc::clone(&pending),
+            completion_tx,
             None,
             Provider::Codex,
             "coalesced-meta".into(),
@@ -77427,6 +78904,77 @@ IF EXIST "%~dp0\node.exe" (
 
         assert_eq!(fs::read_to_string(&meta_path).unwrap(), "latest snapshot");
         assert!(pending.lock().unwrap().is_none());
+        let completion = completion_rx.try_recv().unwrap();
+        assert_eq!(completion.child_pid, Some(11));
+        assert_eq!(completion.child_pid_start_ticks, Some(22));
+        assert!(completion.error.is_none());
+    }
+
+    #[test]
+    fn daemon_readiness_requires_successful_exact_child_meta_commit() {
+        let exact = DaemonMetaWriteCompletion {
+            child_pid: Some(11),
+            child_pid_start_ticks: Some(22),
+            error: None,
+        };
+        assert!(daemon_meta_completion_commits_exact_child(
+            &exact,
+            Some(11),
+            Some(22)
+        ));
+
+        let failed = DaemonMetaWriteCompletion {
+            child_pid: Some(11),
+            child_pid_start_ticks: Some(22),
+            error: Some("disk full".into()),
+        };
+        assert!(!daemon_meta_completion_commits_exact_child(
+            &failed,
+            Some(11),
+            Some(22)
+        ));
+
+        let stale_child = DaemonMetaWriteCompletion {
+            child_pid: Some(10),
+            child_pid_start_ticks: Some(21),
+            error: None,
+        };
+        assert!(!daemon_meta_completion_commits_exact_child(
+            &stale_child,
+            Some(11),
+            Some(22)
+        ));
+
+        let missing_start_token = DaemonMetaWriteCompletion {
+            child_pid: Some(11),
+            child_pid_start_ticks: None,
+            error: None,
+        };
+        assert!(!daemon_meta_completion_commits_exact_child(
+            &missing_start_token,
+            Some(11),
+            None
+        ));
+    }
+
+    #[test]
+    fn live_daemon_termination_never_confirms_a_child_without_exact_identity() {
+        let key = AgentKey {
+            provider: Provider::Codex,
+            session_id: "missing-child-identity".into(),
+        };
+        let meta = AgentMetaSnapshot {
+            child_pid: Some(123),
+            child_pid_start_ticks: None,
+            provider: Some(key.provider.as_str().into()),
+            session_id: Some(key.session_id.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            terminate_live_agent_identity_child_process(&meta, &key, "test_missing_child_identity"),
+            LiveAgentChildTermination::unconfirmed(Some(123))
+        );
     }
 
     #[test]
@@ -77805,6 +79353,34 @@ IF EXIST "%~dp0\node.exe" (
         let _ = fs::remove_file(&lock_path);
     }
 
+    #[test]
+    fn daemon_exit_race_accepts_absent_or_reused_pid_without_signalling_replacement() {
+        let current_pid = std::process::id();
+        let Some(actual_start_ticks) = process_start_ticks(current_pid) else {
+            return;
+        };
+
+        assert!(terminate_agent_daemon_after_child_confirmed_gone(
+            current_pid,
+            Some(actual_start_ticks.wrapping_add(1)),
+            "test_reused_daemon_pid"
+        ));
+        assert!(
+            process_is_alive(current_pid),
+            "a reused numeric PID must never be signalled"
+        );
+        assert!(!terminate_agent_daemon_after_child_confirmed_gone(
+            current_pid,
+            None,
+            "test_missing_daemon_identity"
+        ));
+        assert!(terminate_agent_daemon_after_child_confirmed_gone(
+            3_000_000_000,
+            Some(1),
+            "test_daemon_already_exited"
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn terminate_agent_child_process_kills_separate_process_group() {
@@ -77834,6 +79410,75 @@ IF EXIST "%~dp0\node.exe" (
         terminate_process_group(child_pid);
 
         assert_process_exits(&mut child, "PTY child process group survived termination");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_group_termination_kills_descendants_after_leader_exits_on_term() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let descendant_pid_path = dir.path().join("descendant.pid");
+        let mut command = Command::new(shell);
+        command
+            .args([
+                "-c",
+                r#"trap 'exit 0' TERM; trap '' HUP; sh -c 'trap "" HUP TERM; while :; do sleep 1; done' & echo $! > "$DESCENDANT_PID_FILE"; while :; do sleep 1; done"#,
+            ])
+            .env("DESCENDANT_PID_FILE", &descendant_pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let child_pid = child.id();
+        let Some(start_ticks) = process_start_ticks(child_pid) else {
+            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !descendant_pid_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !descendant_pid_path.exists() {
+            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            panic!("descendant did not start");
+        }
+
+        // Reap the leader concurrently, as the live daemon does while an
+        // external Ctrl+K worker is waiting on this process group.
+        let leader_reaper = thread::spawn(move || {
+            let mut child = child;
+            child.wait()
+        });
+        let terminated = terminate_process_group_with_start_token(child_pid, Some(start_ticks));
+        let group_still_live = agent_child_process_group_has_live_member(child_pid);
+        if group_still_live {
+            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+        }
+        let leader_reaped = leader_reaper.join().unwrap();
+
+        assert!(leader_reaped.is_ok(), "session leader could not be reaped");
+        assert!(
+            terminated,
+            "termination must continue with SIGKILL after the verified leader exits"
+        );
+        assert!(
+            !group_still_live,
+            "TERM-resistant descendants survived the verified group termination"
+        );
     }
 
     #[cfg(unix)]
@@ -78411,6 +80056,23 @@ IF EXIST "%~dp0\node.exe" (
         assert_eq!(outcome, None);
         assert!(meta_path.exists());
         assert!(endpoint_path.exists());
+    }
+
+    #[test]
+    fn terminated_owned_cleanup_accepts_runtime_generation_already_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale_meta: &[u8] =
+            br#"{"pid":3000000000,"provider":"codex","session_id":"already-gone"}"#;
+
+        let outcome = remove_terminated_owned_agent_runtime_files_by_stem(
+            dir.path(),
+            "codex-already-gone",
+            Some(stale_meta),
+            &AgentEndpointObservation::Absent,
+            "test_terminated_runtime_already_absent",
+        );
+
+        assert_eq!(outcome, Some(false));
     }
 
     #[test]
