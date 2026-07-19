@@ -20243,6 +20243,29 @@ impl App {
             return;
         }
 
+        // A forced kill commonly closes the daemon socket before the kill
+        // worker reports completion. Treating that EOF as an ordinary
+        // connection loss races the worker: we drop the current client and
+        // try to reconnect to the process that is being terminated, exposing
+        // the sessions view in the gap. Keep the matching client mounted until
+        // the kill result chooses the real replacement (or reports failure).
+        let pending_kill_connection_ended =
+            self.agent_kill_pending.as_ref().is_some_and(|pending| {
+                self.active_agent
+                    .as_ref()
+                    .into_iter()
+                    .chain(self.agent_aux.as_ref().map(|aux| &aux.agent))
+                    .chain(self.hidden_agent_aux.iter().map(|aux| &aux.agent))
+                    .any(|agent| {
+                        agent.exited.is_none()
+                            && agent.connection_ended.is_some()
+                            && AgentKey::new(&agent.info) == pending.key
+                    })
+            });
+        if pending_kill_connection_ended {
+            return;
+        }
+
         if self
             .active_agent
             .as_ref()
@@ -73684,6 +73707,46 @@ IF EXIST "%~dp0\node.exe" (
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| ui_agent(frame, &mut app)).unwrap();
         assert!(buffer_text(terminal.backend().buffer()).contains("Connecting"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_ctrl_k_reader_eof_before_worker_result_does_not_reconnect_or_leave_workspace() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let (tx, _rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
+
+        let current_info = session_info(Provider::Codex, "kill-eof-current", "/repo/current");
+        let current_key = AgentKey::new(&current_info);
+        let mut current = buffered_output_test_client("kill-eof-current", 478);
+        current.info = current_info;
+        current.set_exit_request(AgentExitRequestKind::ForcedKill);
+        app.set_active_agent(current);
+        app.agent_kill_pending = Some(AgentKillPending {
+            seq: 1,
+            key: current_key,
+            target: AgentKillTarget::MainAgent,
+            label: "kill-eof-current".into(),
+            started_at: Instant::now(),
+        });
+
+        // Killing the daemon can close its socket before the worker result is
+        // delivered. That EOF belongs to the pending kill, so it must not
+        // launch a doomed reconnect or create a client-less sessions frame.
+        app.on_agent_reader_ended(478, "eof".into());
+        app.poll_agent_sessions();
+
+        let active = app
+            .active_agent
+            .as_ref()
+            .expect("the terminating client must stay mounted until the kill result");
+        assert!(active.connection_ended.is_some());
+        assert!(app.attach_in_flight.is_none());
+        assert!(app.queued_attach.is_none());
+        assert!(app.agent_kill_replacement.is_none());
+        assert!(app.is_agent_view());
+        assert!(!app.show_sessions_view);
     }
 
     #[cfg(unix)]
