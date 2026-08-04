@@ -1,6 +1,6 @@
 [package]
 name = "cokacmux"
-version = "0.3.4"
+version = "0.3.7"
 edition = "2021"
 rust-version = "1.93"
 authors = ["cokac <monogatree@gmail.com>"]
@@ -58,6 +58,6 @@ vt100 = { path = "vendor/vt100-cokac" }
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"
 codegen-units = 1
 strip = true

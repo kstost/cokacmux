@@ -349,6 +349,16 @@ const AGENT_RUNTIME_SMALL_FILE_MAX_BYTES: usize = 1_024;
 /// cwd/command strings. Bound reads so a corrupted runtime entry cannot make
 /// discovery or cleanup allocate without limit.
 const AGENT_RUNTIME_META_MAX_BYTES: usize = 256 * 1024;
+const AGENT_CHILD_RUNTIME_WITNESS_LIMIT: usize = 64;
+/// The disk worker, never the daemon/UI loop, periodically snapshots exact
+/// descendant generations while the direct PTY child is alive. The daemon also
+/// reuses its mandatory group/tree liveness snapshot when it first reaps that
+/// child, closing the interval after the last periodic scan. Metadata is
+/// rewritten only when the witness set changes, and stable generations back
+/// off so idle agents do not repeatedly scan the process table on low-spec
+/// machines.
+const AGENT_CHILD_RUNTIME_WITNESS_REFRESH_INITIAL_MS: u64 = 1_000;
+const AGENT_CHILD_RUNTIME_WITNESS_REFRESH_MAX_MS: u64 = 30_000;
 const AGENT_AUXILIARY_REGISTRY_MAX_BYTES: usize = 1024 * 1024;
 /// Queue depth for the per-daemon disk writer thread (pty log appends +
 /// meta snapshots). At the 8KB PTY read size this absorbs roughly 4MB of
@@ -5544,6 +5554,7 @@ fn agent_daemon_event_debug_value(event: &AgentDaemonEvent) -> serde_json::Value
             daemon_pid_start_ticks,
             child_pid,
             child_pid_start_ticks,
+            child_runtime_witnesses,
             attached,
             attached_client_pid,
             attached_client_instance_id,
@@ -5562,6 +5573,7 @@ fn agent_daemon_event_debug_value(event: &AgentDaemonEvent) -> serde_json::Value
             "daemon_pid_start_ticks": daemon_pid_start_ticks,
             "child_pid": child_pid,
             "child_pid_start_ticks": child_pid_start_ticks,
+            "child_runtime_witnesses": child_runtime_witnesses,
             "attached": attached,
             "attached_client_pid": attached_client_pid,
             "attached_client_instance_id": attached_client_instance_id.as_deref(),
@@ -5959,13 +5971,14 @@ enum DaemonDiskJob {
     WakeMeta,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DaemonMetaWrite {
     meta_path: PathBuf,
     contents: String,
     runtime_endpoint: Option<(PathBuf, AgentEndpointPublication)>,
     child_pid: Option<u32>,
     child_pid_start_ticks: Option<u64>,
+    child_runtime_witness_seeds: Vec<AgentChildRuntimeWitness>,
 }
 
 #[derive(Debug)]
@@ -5995,6 +6008,8 @@ struct DaemonRuntimeFileFlags {
     meta_missing: Arc<AtomicBool>,
     socket_missing: Arc<AtomicBool>,
     auth_missing: Arc<AtomicBool>,
+    child_runtime_witnesses: Arc<Mutex<Vec<AgentChildRuntimeWitness>>>,
+    child_exit_runtime_witnesses: Arc<Mutex<Vec<AgentChildRuntimeWitness>>>,
 }
 
 impl DaemonRuntimeFileFlags {
@@ -6003,7 +6018,51 @@ impl DaemonRuntimeFileFlags {
             meta_missing: Arc::new(AtomicBool::new(false)),
             socket_missing: Arc::new(AtomicBool::new(false)),
             auth_missing: Arc::new(AtomicBool::new(false)),
+            child_runtime_witnesses: Arc::new(Mutex::new(Vec::new())),
+            child_exit_runtime_witnesses: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn publish_child_runtime_witnesses(&self, witnesses: &[AgentChildRuntimeWitness]) {
+        if let Ok(mut published) = self.child_runtime_witnesses.lock() {
+            published.clear();
+            published.extend_from_slice(witnesses);
+        }
+    }
+
+    /// Preserve the exact descendants captured after the daemon reaps its
+    /// direct child. This snapshot is separate from the writer's periodically
+    /// replaceable cache so an immediate Identify or runtime-file repair cannot
+    /// miss a final or retried observation while its metadata write is queued.
+    /// A newer revalidated observation has priority over older entries when the
+    /// bounded witness set is full.
+    fn record_child_exit_runtime_witnesses(&self, witnesses: &[AgentChildRuntimeWitness]) {
+        if let Ok(mut observed) = self.child_exit_runtime_witnesses.lock() {
+            let previous = std::mem::take(&mut *observed);
+            *observed = prioritized_agent_child_runtime_witnesses(witnesses, &previous);
+        }
+    }
+
+    fn child_runtime_witnesses(&self) -> Vec<AgentChildRuntimeWitness> {
+        let mut witnesses = self
+            .child_exit_runtime_witnesses
+            .lock()
+            .map(|witnesses| witnesses.clone())
+            .unwrap_or_default();
+        if witnesses.len() < AGENT_CHILD_RUNTIME_WITNESS_LIMIT {
+            if let Ok(published) = self.child_runtime_witnesses.lock() {
+                for witness in published.iter().copied() {
+                    if witnesses.len() >= AGENT_CHILD_RUNTIME_WITNESS_LIMIT {
+                        break;
+                    }
+                    if !witnesses.contains(&witness) {
+                        witnesses.push(witness);
+                    }
+                }
+            }
+        }
+        witnesses.sort_unstable_by_key(|witness| (witness.pid, witness.start_ticks));
+        witnesses
     }
 }
 
@@ -6104,19 +6163,67 @@ fn run_daemon_disk_writer(
     let mut socket_missing_logged = false;
     let mut auth_missing_logged = false;
     let mut runtime_stat_checks = 0usize;
+    let mut child_runtime_witness_generation = None;
+    let mut child_runtime_witnesses = Vec::new();
+    let mut published_child_runtime_witness_generation = None;
+    let mut published_child_runtime_witnesses = Vec::new();
+    let mut latest_meta_write = None;
+    let mut last_child_runtime_witness_refresh_at = Instant::now();
+    let mut child_runtime_witness_refresh_interval =
+        Duration::from_millis(AGENT_CHILD_RUNTIME_WITNESS_REFRESH_INITIAL_MS);
     loop {
         let pending_meta = pending_meta_write
             .lock()
             .ok()
             .and_then(|mut pending| pending.take());
-        if let Some(DaemonMetaWrite {
-            meta_path,
-            contents,
-            runtime_endpoint,
-            child_pid,
-            child_pid_start_ticks,
-        }) = pending_meta
-        {
+        if let Some(meta_write) = pending_meta {
+            latest_meta_write = Some(meta_write.clone());
+            let DaemonMetaWrite {
+                meta_path,
+                mut contents,
+                runtime_endpoint,
+                child_pid,
+                child_pid_start_ticks,
+                child_runtime_witness_seeds,
+            } = meta_write;
+            let requested_witness_generation = child_pid
+                .filter(|pid| *pid > 0)
+                .zip(child_pid_start_ticks);
+            let witness_refresh_due = child_runtime_witness_generation
+                != requested_witness_generation
+                || last_child_runtime_witness_refresh_at.elapsed()
+                    >= child_runtime_witness_refresh_interval;
+            let previous_witness_generation = child_runtime_witness_generation;
+            let previous_witnesses = child_runtime_witnesses.clone();
+            if witness_refresh_due {
+                refresh_agent_child_runtime_witness_cache(
+                    &mut child_runtime_witness_generation,
+                    &mut child_runtime_witnesses,
+                    child_pid,
+                    child_pid_start_ticks,
+                );
+            }
+            merge_agent_child_runtime_witness_seeds(
+                &mut child_runtime_witnesses,
+                child_pid,
+                &child_runtime_witness_seeds,
+            );
+            let witness_state_changed = child_runtime_witness_generation
+                != previous_witness_generation
+                || child_runtime_witnesses != previous_witnesses;
+            if witness_refresh_due || witness_state_changed {
+                child_runtime_witness_refresh_interval =
+                    next_agent_child_runtime_witness_refresh_interval(
+                        child_runtime_witness_refresh_interval,
+                        witness_state_changed,
+                    );
+                last_child_runtime_witness_refresh_at = Instant::now();
+            }
+            file_flags.publish_child_runtime_witnesses(&child_runtime_witnesses);
+            contents = agent_meta_contents_with_child_runtime_witnesses(
+                &contents,
+                &child_runtime_witnesses,
+            );
             meta_write_jobs = meta_write_jobs.saturating_add(1);
             meta_write_bytes = meta_write_bytes.saturating_add(contents.len());
             if TRACE_ENABLED.load(Ordering::Relaxed) || meta_write_jobs <= 20 {
@@ -6139,6 +6246,10 @@ fn run_daemon_disk_writer(
                 runtime_endpoint.as_ref(),
             );
             let completion_error = result.as_ref().err().map(ToString::to_string);
+            if result.is_ok() {
+                published_child_runtime_witness_generation = child_runtime_witness_generation;
+                published_child_runtime_witnesses.clone_from(&child_runtime_witnesses);
+            }
             let _ = meta_write_completion_tx.send(DaemonMetaWriteCompletion {
                 child_pid,
                 child_pid_start_ticks,
@@ -6225,6 +6336,85 @@ fn run_daemon_disk_writer(
                             "auth_missing": auth_missing,
                         }),
                     );
+                }
+            }
+        }
+        if last_child_runtime_witness_refresh_at.elapsed() >= child_runtime_witness_refresh_interval
+        {
+            let newer_meta_is_pending = pending_meta_write
+                .lock()
+                .map(|pending| pending.is_some())
+                .unwrap_or(true);
+            if !newer_meta_is_pending {
+                if let Some(latest) = latest_meta_write.as_ref() {
+                    let previous_witness_generation = child_runtime_witness_generation;
+                    let previous_witnesses = child_runtime_witnesses.clone();
+                    refresh_agent_child_runtime_witness_cache(
+                        &mut child_runtime_witness_generation,
+                        &mut child_runtime_witnesses,
+                        latest.child_pid,
+                        latest.child_pid_start_ticks,
+                    );
+                    last_child_runtime_witness_refresh_at = Instant::now();
+                    let cached_witness_state_changed = child_runtime_witness_generation
+                        != previous_witness_generation
+                        || child_runtime_witnesses != previous_witnesses;
+                    child_runtime_witness_refresh_interval =
+                        next_agent_child_runtime_witness_refresh_interval(
+                            child_runtime_witness_refresh_interval,
+                            cached_witness_state_changed,
+                        );
+                    file_flags.publish_child_runtime_witnesses(&child_runtime_witnesses);
+                    let witness_state_changed = published_child_runtime_witness_generation
+                        != child_runtime_witness_generation
+                        || published_child_runtime_witnesses != child_runtime_witnesses;
+                    if witness_state_changed {
+                        let contents = agent_meta_contents_with_child_runtime_witnesses(
+                            &latest.contents,
+                            &child_runtime_witnesses,
+                        );
+                        meta_write_jobs = meta_write_jobs.saturating_add(1);
+                        meta_write_bytes = meta_write_bytes.saturating_add(contents.len());
+                        let result = persist_daemon_meta_write(
+                            &latest.meta_path,
+                            provider.as_str(),
+                            &session_id,
+                            &contents,
+                            latest.runtime_endpoint.as_ref(),
+                        );
+                        let completion_error = result.as_ref().err().map(ToString::to_string);
+                        let _ = meta_write_completion_tx.send(DaemonMetaWriteCompletion {
+                            child_pid: latest.child_pid,
+                            child_pid_start_ticks: latest.child_pid_start_ticks,
+                            error: completion_error.clone(),
+                        });
+                        if let Some(error) = completion_error {
+                            meta_write_errors = meta_write_errors.saturating_add(1);
+                            debug_log(
+                                "daemon_disk_writer_witness_write_failed",
+                                serde_json::json!({
+                                    "provider": provider.as_str(),
+                                    "session_id": &session_id,
+                                    "meta_path": latest.meta_path.display().to_string(),
+                                    "witnesses": child_runtime_witnesses.len(),
+                                    "error": error,
+                                }),
+                            );
+                        } else {
+                            published_child_runtime_witness_generation =
+                                child_runtime_witness_generation;
+                            published_child_runtime_witnesses.clone_from(&child_runtime_witnesses);
+                            debug_log(
+                                "daemon_disk_writer_witness_write_done",
+                                serde_json::json!({
+                                    "provider": provider.as_str(),
+                                    "session_id": &session_id,
+                                    "meta_path": latest.meta_path.display().to_string(),
+                                    "witnesses": child_runtime_witnesses.len(),
+                                }),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -6600,10 +6790,19 @@ fn queue_daemon_meta_write(
     contents: String,
     child_pid: Option<u32>,
     child_pid_start_ticks: Option<u64>,
+    child_runtime_witness_seeds: Vec<AgentChildRuntimeWitness>,
     provider: Provider,
     session_id: &str,
     runtime_endpoint: Option<(PathBuf, AgentEndpointPublication)>,
 ) -> io::Result<()> {
+    let contents = if child_runtime_witness_seeds.is_empty() {
+        contents
+    } else {
+        agent_meta_contents_with_child_runtime_witnesses(
+            &contents,
+            &child_runtime_witness_seeds,
+        )
+    };
     let contents_len = contents.len();
     let Some(disk_tx) = disk_tx else {
         debug_log(
@@ -6628,15 +6827,29 @@ fn queue_daemon_meta_write(
         let mut pending = pending_meta_write
             .lock()
             .map_err(|_| io::Error::other("daemon pending meta snapshot lock was poisoned"))?;
-        pending
-            .replace(DaemonMetaWrite {
-                meta_path: meta_path.to_path_buf(),
-                contents,
-                runtime_endpoint,
-                child_pid,
-                child_pid_start_ticks,
-            })
-            .is_some()
+        let mut next = DaemonMetaWrite {
+            meta_path: meta_path.to_path_buf(),
+            contents,
+            runtime_endpoint,
+            child_pid,
+            child_pid_start_ticks,
+            child_runtime_witness_seeds,
+        };
+        let replaced = if let Some(previous) = pending.take() {
+            if previous.child_pid == next.child_pid
+                && previous.child_pid_start_ticks == next.child_pid_start_ticks
+            {
+                next.child_runtime_witness_seeds = prioritized_agent_child_runtime_witnesses(
+                    &next.child_runtime_witness_seeds,
+                    &previous.child_runtime_witness_seeds,
+                );
+            }
+            true
+        } else {
+            false
+        };
+        *pending = Some(next);
+        replaced
     };
     match disk_tx.try_send(DaemonDiskJob::WakeMeta) {
         Ok(()) => {
@@ -7362,7 +7575,12 @@ impl AgentSession {
     /// Publish the latest meta snapshot to the disk writer. The slot is
     /// coalescing: a newer snapshot replaces an older pending one, but a full
     /// PTY queue can never discard the latest cwd/activity transition.
-    fn queue_meta_write(&self, meta_path: &Path, contents: String) -> io::Result<()> {
+    fn queue_meta_write_with_child_runtime_witnesses(
+        &self,
+        meta_path: &Path,
+        contents: String,
+        child_runtime_witness_seeds: Vec<AgentChildRuntimeWitness>,
+    ) -> io::Result<()> {
         queue_daemon_meta_write(
             self.disk_tx.as_ref(),
             &self.pending_meta_write,
@@ -7370,6 +7588,7 @@ impl AgentSession {
             contents,
             self.child_pid,
             self.child_pid_start_ticks,
+            child_runtime_witness_seeds,
             self.info.provider,
             &self.info.session_id,
             self.runtime_endpoint.clone(),
@@ -8495,6 +8714,11 @@ enum AgentDaemonEvent {
         child_pid: Option<u32>,
         #[serde(default)]
         child_pid_start_ticks: Option<u64>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_agent_child_runtime_witnesses"
+        )]
+        child_runtime_witnesses: Vec<AgentChildRuntimeWitness>,
         #[serde(default)]
         attached: bool,
         #[serde(default)]
@@ -29976,31 +30200,93 @@ fn cleanup_owned_agent_daemon_runtime_after_child_exit(
     }
 
     // Once the endpoint pathname is gone, new attaches cannot mistake this
-    // childless daemon for live even if a slow filesystem stalls one of the
-    // best-effort history/identity removals below.
-    let pty_log_deleted = remove_agent_pty_log_file(key, pty_log_path);
-
+    // childless daemon for live. Remove and verify the owned metadata before
+    // deleting bearer/history files; otherwise a metadata failure would leave
+    // a partial runtime without the evidence needed for a safe later retry.
     let current_pid = std::process::id();
     let current_start_ticks = process_start_ticks(current_pid);
-    if let Some(meta) = read_agent_meta_snapshot_at(meta_path) {
-        let owned = meta.pid == current_pid
-            && meta.pid_start_ticks.is_some()
-            && meta.pid_start_ticks == current_start_ticks
-            && agent_key_from_meta(&meta).as_ref() == Some(key);
-        if owned {
-            let _ = remove_agent_runtime_file_logged(reason, Some(key), None, "meta", meta_path);
-        } else {
+    let meta_absent = match read_optional_runtime_bytes_bounded(
+        meta_path,
+        AGENT_RUNTIME_META_MAX_BYTES,
+    ) {
+        Ok(None) => true,
+        Ok(Some(meta_bytes)) => match serde_json::from_slice::<AgentMetaSnapshot>(&meta_bytes) {
+            Ok(meta) => {
+                let owned = meta.pid == current_pid
+                    && meta.pid_start_ticks.is_some()
+                    && meta.pid_start_ticks == current_start_ticks
+                    && agent_key_from_meta(&meta).as_ref() == Some(key);
+                if !owned {
+                    debug_log(
+                        "daemon_meta_cleanup_preserved",
+                        serde_json::json!({
+                            "reason": reason,
+                            "key": agent_key_debug_value(key),
+                            "meta_path": meta_path.display().to_string(),
+                            "cause": "meta_replaced_or_unowned",
+                            "meta": agent_meta_snapshot_debug_value(&meta),
+                        }),
+                    );
+                    false
+                } else {
+                    let removed = remove_agent_runtime_file_logged(
+                        reason,
+                        Some(key),
+                        None,
+                        "meta",
+                        meta_path,
+                    );
+                    let absent = matches!(
+                        fs::symlink_metadata(meta_path),
+                        Err(error) if error.kind() == ErrorKind::NotFound
+                    );
+                    if !absent {
+                        debug_log(
+                            "daemon_meta_cleanup_preserved",
+                            serde_json::json!({
+                                "reason": reason,
+                                "key": agent_key_debug_value(key),
+                                "meta_path": meta_path.display().to_string(),
+                                "cause": "owned_meta_remove_failed_or_absence_unverified",
+                                "removed": removed,
+                            }),
+                        );
+                    }
+                    absent
+                }
+            }
+            Err(error) => {
+                debug_log(
+                    "daemon_meta_cleanup_preserved",
+                    serde_json::json!({
+                        "reason": reason,
+                        "key": agent_key_debug_value(key),
+                        "meta_path": meta_path.display().to_string(),
+                        "cause": "meta_unparseable",
+                        "error": error.to_string(),
+                    }),
+                );
+                false
+            }
+        },
+        Err(error) => {
             debug_log(
                 "daemon_meta_cleanup_preserved",
                 serde_json::json!({
                     "reason": reason,
                     "key": agent_key_debug_value(key),
                     "meta_path": meta_path.display().to_string(),
-                    "cause": "meta_replaced_or_unowned",
-                    "meta": agent_meta_snapshot_debug_value(&meta),
+                    "cause": "meta_read_failed",
+                    "error_kind": format!("{:?}", error.kind()),
+                    "error": error.to_string(),
                 }),
             );
+            false
         }
+    };
+    if !meta_absent {
+        drop(listener);
+        return false;
     }
 
     let auth_matches = read_runtime_text_bounded(auth_path, AGENT_RUNTIME_SMALL_FILE_MAX_BYTES)
@@ -30010,6 +30296,7 @@ fn cleanup_owned_agent_daemon_runtime_after_child_exit(
     if auth_matches {
         let _ = remove_agent_runtime_file_logged(reason, Some(key), None, "auth", auth_path);
     }
+    let pty_log_deleted = remove_agent_pty_log_file(key, pty_log_path);
     drop(listener);
     pty_log_deleted
 }
@@ -30328,6 +30615,22 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                     .runtime_file_flags
                     .meta_missing
                     .store(false, Ordering::Relaxed);
+                if let Err(error) = write_agent_meta(
+                    &meta_path,
+                    &mut agent,
+                    attached_client_pid.is_some(),
+                    attached_client_pid,
+                    attached_client_instance_id.as_deref(),
+                ) {
+                    debug_log(
+                        "daemon_runtime_repair_meta_republish_failed",
+                        serde_json::json!({
+                            "seq": result.seq,
+                            "key": agent_key_debug_value(&key),
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
             }
             if auth_repaired {
                 agent
@@ -30461,7 +30764,10 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                         agent.daemon_pid_start_ticks,
                         agent.child_pid_start_ticks,
                     ) {
-                        Ok(contents) => Some(contents),
+                        Ok(contents) => Some(agent_meta_contents_with_child_runtime_witnesses(
+                            &contents,
+                            &agent.runtime_file_flags.child_runtime_witnesses(),
+                        )),
                         Err(error) => {
                             debug_log(
                                 "daemon_runtime_repair_meta_render_failed",
@@ -31135,7 +31441,8 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
         match agent.child.try_wait() {
             Ok(Some(status)) => {
                 let status = status.to_string();
-                if direct_child_exit_status.is_none() {
+                let first_direct_child_exit_observation = direct_child_exit_status.is_none();
+                if first_direct_child_exit_observation {
                     debug_log(
                         "daemon_child_try_wait_exit",
                         serde_json::json!({
@@ -31154,13 +31461,53 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 let group_check_due = last_direct_child_group_check_at.is_none_or(|checked_at| {
                     checked_at.elapsed() >= Duration::from_millis(AGENT_STATE_POLL_INTERVAL_MS)
                 });
+                let recorded_runtime_witnesses =
+                    agent.runtime_file_flags.child_runtime_witnesses();
+                let mut exit_witnesses = Vec::new();
                 if group_check_due {
                     direct_child_group_live = agent.child_pid.is_some_and(|pid| {
-                        agent_child_runtime_may_have_live_member(pid, pty_output_closed)
+                        let observation = observe_agent_child_runtime_after_leader_exit(
+                            pid,
+                            pty_output_closed,
+                            &recorded_runtime_witnesses,
+                        );
+                        exit_witnesses = observation.witnesses;
+                        observation.live
                     });
                     last_direct_child_group_check_at = Some(Instant::now());
                 }
                 if direct_child_group_live {
+                    let has_new_exit_witness = exit_witnesses
+                        .iter()
+                        .any(|witness| !recorded_runtime_witnesses.contains(witness));
+                    if !exit_witnesses.is_empty()
+                        && (first_direct_child_exit_observation || has_new_exit_witness)
+                    {
+                        agent
+                            .runtime_file_flags
+                            .record_child_exit_runtime_witnesses(&exit_witnesses);
+                        let write_result = write_agent_meta_with_child_runtime_witnesses(
+                            &meta_path,
+                            &mut agent,
+                            attached_client_pid.is_some(),
+                            attached_client_pid,
+                            attached_client_instance_id.as_deref(),
+                            &exit_witnesses,
+                        );
+                        debug_log(
+                            "daemon_child_exit_witnesses_queued",
+                            serde_json::json!({
+                                "provider": agent.info.provider.as_str(),
+                                "session_id": &agent.info.session_id,
+                                "child_pid": agent.child_pid,
+                                "witnesses": exit_witnesses.len(),
+                                "first_observation": first_direct_child_exit_observation,
+                                "new_witness": has_new_exit_witness,
+                                "ok": write_result.is_ok(),
+                                "error": write_result.err().map(|error| error.to_string()),
+                            }),
+                        );
+                    }
                     if group_check_due && TRACE_ENABLED.load(Ordering::Relaxed) {
                         trace_log(
                             "daemon_child_group_still_live",
@@ -31487,6 +31834,7 @@ fn send_daemon_identity(
         daemon_pid_start_ticks: agent.daemon_pid_start_ticks,
         child_pid: agent.child_pid,
         child_pid_start_ticks: agent.child_pid_start_ticks,
+        child_runtime_witnesses: agent.runtime_file_flags.child_runtime_witnesses(),
         attached,
         attached_client_pid,
         attached_client_instance_id: attached_client_instance_id.map(str::to_string),
@@ -31599,6 +31947,24 @@ fn write_agent_meta(
     attached_client_pid: Option<u32>,
     attached_client_instance_id: Option<&str>,
 ) -> io::Result<()> {
+    write_agent_meta_with_child_runtime_witnesses(
+        meta_path,
+        agent,
+        attached,
+        attached_client_pid,
+        attached_client_instance_id,
+        &[],
+    )
+}
+
+fn write_agent_meta_with_child_runtime_witnesses(
+    meta_path: &Path,
+    agent: &mut AgentSession,
+    attached: bool,
+    attached_client_pid: Option<u32>,
+    attached_client_instance_id: Option<&str>,
+    child_runtime_witnesses: &[AgentChildRuntimeWitness],
+) -> io::Result<()> {
     let now_ms = current_epoch_ms();
     // Serialize here (CPU only); the actual disk write happens on the
     // daemon's disk writer thread so the output pump never blocks on it.
@@ -31624,7 +31990,11 @@ fn write_agent_meta(
         agent.daemon_pid_start_ticks,
         agent.child_pid_start_ticks,
     )?;
-    agent.queue_meta_write(meta_path, contents)
+    agent.queue_meta_write_with_child_runtime_witnesses(
+        meta_path,
+        contents,
+        child_runtime_witnesses.to_vec(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -33235,6 +33605,12 @@ fn run_agent_daemon_runtime_repair(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct AgentChildRuntimeWitness {
+    pid: u32,
+    start_ticks: u64,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct AgentMetaSnapshot {
     #[serde(default)]
@@ -33245,6 +33621,14 @@ struct AgentMetaSnapshot {
     child_pid: Option<u32>,
     #[serde(default)]
     child_pid_start_ticks: Option<u64>,
+    /// Exact descendant identities observed while the direct child generation
+    /// was still live. A matching survivor proves that an orphaned Unix PGID or
+    /// Windows tree is still the recorded runtime rather than a reused number.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_agent_child_runtime_witnesses"
+    )]
+    child_runtime_witnesses: Vec<AgentChildRuntimeWitness>,
     provider: Option<String>,
     session_id: Option<String>,
     #[serde(default)]
@@ -33264,6 +33648,169 @@ struct AgentMetaSnapshot {
     last_input_epoch_ms: u64,
     #[serde(default)]
     updated_at_epoch_s: u64,
+}
+
+fn deserialize_agent_child_runtime_witnesses<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<AgentChildRuntimeWitness>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut witnesses = Vec::<AgentChildRuntimeWitness>::deserialize(deserializer)?;
+    // Runtime metadata and identity frames are bounded, but a corrupt array
+    // could still turn one state read into thousands of PID/start-token probes.
+    // Keep the same hard limit used by every producer before any verification.
+    witnesses.truncate(AGENT_CHILD_RUNTIME_WITNESS_LIMIT);
+    witnesses.sort_unstable_by_key(|witness| (witness.pid, witness.start_ticks));
+    witnesses.dedup();
+    Ok(witnesses)
+}
+
+/// Merge two already trustworthy witness sets without allowing older or
+/// lower-numbered PIDs to displace the caller's higher-priority observation at
+/// the fixed metadata bound. Ordering within each input remains stable.
+fn prioritized_agent_child_runtime_witnesses(
+    primary: &[AgentChildRuntimeWitness],
+    secondary: &[AgentChildRuntimeWitness],
+) -> Vec<AgentChildRuntimeWitness> {
+    let mut merged = Vec::with_capacity(
+        primary
+            .len()
+            .saturating_add(secondary.len())
+            .min(AGENT_CHILD_RUNTIME_WITNESS_LIMIT),
+    );
+    for witness in primary.iter().chain(secondary).copied() {
+        if merged.len() >= AGENT_CHILD_RUNTIME_WITNESS_LIMIT {
+            break;
+        }
+        if !merged.contains(&witness) {
+            merged.push(witness);
+        }
+    }
+    merged
+}
+
+fn agent_child_runtime_witness_should_be_preserved(
+    witness: AgentChildRuntimeWitness,
+) -> bool {
+    let process_alive = process_is_alive(witness.pid);
+    let start_token_matches =
+        process_start_token_matches(witness.start_ticks, process_start_ticks(witness.pid));
+    #[cfg(windows)]
+    {
+        child_runtime_witness_identity_may_match(process_alive, start_token_matches)
+    }
+    #[cfg(not(windows))]
+    {
+        process_alive && start_token_matches == Some(true)
+    }
+}
+
+fn next_agent_child_runtime_witness_refresh_interval(
+    current: Duration,
+    witness_state_changed: bool,
+) -> Duration {
+    if witness_state_changed {
+        Duration::from_millis(AGENT_CHILD_RUNTIME_WITNESS_REFRESH_INITIAL_MS)
+    } else {
+        current.saturating_mul(2).min(Duration::from_millis(
+            AGENT_CHILD_RUNTIME_WITNESS_REFRESH_MAX_MS,
+        ))
+    }
+}
+
+fn merge_agent_child_runtime_witness_seeds(
+    cached_witnesses: &mut Vec<AgentChildRuntimeWitness>,
+    child_pid: Option<u32>,
+    seeds: &[AgentChildRuntimeWitness],
+) {
+    let Some(child_pid) = child_pid.filter(|pid| *pid > 0) else {
+        return;
+    };
+    let valid_seeds = seeds
+        .iter()
+        .copied()
+        .filter(|witness| {
+            witness.pid != child_pid
+                && agent_child_runtime_witness_should_be_preserved(*witness)
+        })
+        .collect::<Vec<_>>();
+    let valid_cached = cached_witnesses
+        .iter()
+        .copied()
+        .filter(|witness| {
+            witness.pid != child_pid
+                && agent_child_runtime_witness_should_be_preserved(*witness)
+        })
+        .collect::<Vec<_>>();
+    *cached_witnesses =
+        prioritized_agent_child_runtime_witnesses(&valid_seeds, &valid_cached);
+}
+
+fn refresh_agent_child_runtime_witness_cache(
+    cached_generation: &mut Option<(u32, u64)>,
+    cached_witnesses: &mut Vec<AgentChildRuntimeWitness>,
+    child_pid: Option<u32>,
+    child_pid_start_ticks: Option<u64>,
+) {
+    let generation = child_pid.filter(|pid| *pid > 0).zip(child_pid_start_ticks);
+    if *cached_generation != generation {
+        *cached_generation = generation;
+        cached_witnesses.clear();
+    }
+    let Some((child_pid, child_start_ticks)) = generation else {
+        return;
+    };
+
+    cached_witnesses.retain(|witness| {
+        witness.pid != child_pid
+            && agent_child_runtime_witness_should_be_preserved(*witness)
+    });
+    if process_start_token_matches(child_start_ticks, process_start_ticks(child_pid)) == Some(true) {
+        let witnesses = capture_agent_child_runtime_witnesses(child_pid, child_start_ticks);
+        merge_agent_child_runtime_witness_seeds(cached_witnesses, Some(child_pid), &witnesses);
+    }
+    cached_witnesses.sort_unstable_by_key(|witness| (witness.pid, witness.start_ticks));
+    cached_witnesses.dedup();
+    cached_witnesses.truncate(AGENT_CHILD_RUNTIME_WITNESS_LIMIT);
+}
+
+fn agent_meta_contents_with_child_runtime_witnesses(
+    contents: &str,
+    witnesses: &[AgentChildRuntimeWitness],
+) -> String {
+    let mut value = match serde_json::from_str::<serde_json::Value>(contents) {
+        Ok(serde_json::Value::Object(value)) => value,
+        Ok(_) => return contents.to_string(),
+        Err(error) => {
+            debug_log(
+                "agent_meta_witness_injection_parse_failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            return contents.to_string();
+        }
+    };
+    let witness_value = match serde_json::to_value(witnesses) {
+        Ok(value) => value,
+        Err(error) => {
+            debug_log(
+                "agent_meta_witness_injection_serialize_failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            return contents.to_string();
+        }
+    };
+    value.insert("child_runtime_witnesses".to_string(), witness_value);
+    match serde_json::to_string(&serde_json::Value::Object(value)) {
+        Ok(contents) => format!("{contents}\n"),
+        Err(error) => {
+            debug_log(
+                "agent_meta_witness_injection_render_failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            contents.to_string()
+        }
+    }
 }
 
 fn read_agent_meta_snapshot_at(meta_path: &Path) -> Option<AgentMetaSnapshot> {
@@ -33441,11 +33988,21 @@ fn agent_meta_verified_child_pid(meta: &AgentMetaSnapshot) -> Option<u32> {
 
 /// Return the historic root child PID when the exact session leader is no
 /// longer live but its Unix process group or Windows descendant tree remains.
-/// This is preservation-only evidence for stale metadata: callers must not
-/// signal it without a fresh identity response from the owning daemon.
+/// This is preservation evidence by itself: an explicit termination also needs
+/// a live PID/start-token witness recorded while the child generation existed,
+/// otherwise a numeric PGID/root PID could refer to a later reused generation.
 fn agent_meta_surviving_child_process_group(meta: &AgentMetaSnapshot) -> Option<u32> {
     let child_pid = meta.child_pid.filter(|pid| *pid > 0)?;
     let expected_start_ticks = meta.child_pid_start_ticks?;
+    #[cfg(windows)]
+    if agent_meta_child_runtime_witness_may_survive(meta) {
+        // Windows can recycle the exited root PID while its descendants are
+        // still alive. An exact or temporarily unreadable recorded descendant
+        // remains preservation evidence even when that numeric root now names
+        // another process. Only an exact witness authorizes a `lost` label or
+        // termination later.
+        return Some(child_pid);
+    }
     if process_is_alive(child_pid) {
         return None;
     }
@@ -33455,6 +34012,15 @@ fn agent_meta_surviving_child_process_group(meta: &AgentMetaSnapshot) -> Option<
         return None;
     }
     agent_child_process_group_has_live_member(child_pid).then_some(child_pid)
+}
+
+/// A `lost` label is stronger than preservation-only evidence: require one
+/// exact recorded descendant that is still a member of this runtime. This
+/// prevents a long-lived stale metadata file from turning an unrelated reused
+/// PGID/root PID into a false `lost` entry.
+fn agent_meta_verified_surviving_child_process_group(meta: &AgentMetaSnapshot) -> Option<u32> {
+    let child_runtime_id = agent_meta_surviving_child_process_group(meta)?;
+    verified_agent_meta_child_runtime_witnesses(meta).map(|_| child_runtime_id)
 }
 
 fn agent_meta_child_pid_verified_for_termination(meta: &AgentMetaSnapshot) -> bool {
@@ -33503,6 +34069,91 @@ fn terminate_agent_meta_child_process(
     Some(child_pid)
 }
 
+/// Terminate child runtime that an explicit Ctrl+K/killall/reset request
+/// identifies exactly enough. A missing leader requires a surviving recorded
+/// witness even when the daemon is still answering; automatic stale sweeps must
+/// continue to call neither this function nor any group signalling primitive.
+fn terminate_explicit_agent_meta_child_runtime(
+    meta: &AgentMetaSnapshot,
+    key: &AgentKey,
+    reason: &str,
+) -> Option<u32> {
+    let direct_child_terminated = terminate_agent_meta_child_process(meta, key, reason);
+    if direct_child_terminated.is_some() && agent_meta_child_runtime_definitively_gone(meta) {
+        return direct_child_terminated;
+    }
+
+    let Some(child_runtime_id) = agent_meta_surviving_child_process_group(meta) else {
+        return None;
+    };
+    let Some(witnesses) = verified_agent_meta_child_runtime_witnesses(meta) else {
+        debug_log(
+            "kill_agent_meta_child_runtime_unwitnessed",
+            serde_json::json!({
+                "reason": reason,
+                "key": agent_key_debug_value(key),
+                "daemon_pid": meta.pid,
+                "child_runtime_id": child_runtime_id,
+                "recorded_witnesses": meta.child_runtime_witnesses.len(),
+            }),
+        );
+        return None;
+    };
+
+    #[cfg(unix)]
+    {
+        let child_pgid = child_runtime_id;
+        if terminate_verified_unix_process_group_after_leader_exit(
+            child_pgid,
+            &witnesses,
+            reason,
+        ) {
+            debug_log(
+                "kill_agent_meta_child_process_group",
+                serde_json::json!({
+                    "reason": reason,
+                    "key": agent_key_debug_value(key),
+                    "daemon_pid": meta.pid,
+                    "child_pgid": child_pgid,
+                    "child_pid_start_ticks": meta.child_pid_start_ticks,
+                    "verified_witnesses": witnesses,
+                }),
+            );
+            return Some(child_pgid);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut terminated_any = direct_child_terminated.is_some();
+        for witness in &witnesses {
+            terminated_any |= terminate_process_group_if_start_token_matches(
+                witness.pid,
+                Some(witness.start_ticks),
+                "kill_agent_meta_child_runtime_witness",
+            );
+        }
+        let confirmed_gone = agent_meta_child_runtime_definitively_gone(meta);
+        debug_log(
+            "kill_agent_meta_child_process_tree_witnesses",
+            serde_json::json!({
+                "reason": reason,
+                "key": agent_key_debug_value(key),
+                "daemon_pid": meta.pid,
+                "child_root_pid": child_runtime_id,
+                "verified_witnesses": witnesses,
+                "terminated_any": terminated_any,
+                "confirmed_gone": confirmed_gone,
+            }),
+        );
+        if terminated_any && confirmed_gone {
+            return Some(child_runtime_id);
+        }
+    }
+
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LiveAgentChildTermination {
     pid: Option<u32>,
@@ -33535,11 +34186,27 @@ fn terminate_live_agent_identity_child_process(
         return LiveAgentChildTermination::unconfirmed(Some(child_pid));
     };
     if agent_meta_verified_child_pid(meta) == Some(child_pid) {
-        let terminated = terminate_agent_meta_child_process(meta, key, reason).is_some();
+        let terminated =
+            terminate_explicit_agent_meta_child_runtime(meta, key, reason).is_some();
+        #[cfg(windows)]
+        let terminated = {
+            let mut terminated = terminated;
+            if !agent_meta_child_runtime_definitively_gone(meta)
+                && !process_is_alive(child_pid)
+                && agent_child_process_group_has_live_member(child_pid)
+            {
+                // The live daemon still owns the exact Child handle, so finish
+                // a visible tree that raced taskkill even when no periodic
+                // witness had reached metadata yet.
+                terminated |=
+                    terminate_verified_windows_process_tree_after_leader_exit(child_pid, reason);
+            }
+            terminated
+        };
         return LiveAgentChildTermination {
             pid: Some(child_pid),
             terminated,
-            confirmed_gone: terminated || agent_child_runtime_definitively_gone(child_pid),
+            confirmed_gone: agent_meta_child_runtime_definitively_gone(meta),
         };
     }
 
@@ -33560,52 +34227,43 @@ fn terminate_live_agent_identity_child_process(
                 terminated =
                     terminate_verified_windows_process_tree_after_leader_exit(child_pid, reason);
             }
+            if !agent_meta_child_runtime_definitively_gone(meta) {
+                terminated |=
+                    terminate_explicit_agent_meta_child_runtime(meta, key, reason).is_some();
+            }
             LiveAgentChildTermination {
                 pid: Some(child_pid),
                 terminated,
-                confirmed_gone: terminated || agent_child_runtime_definitively_gone(child_pid),
+                confirmed_gone: agent_meta_child_runtime_definitively_gone(meta),
             }
         }
         Some(false) => {
-            // The numeric PID was reused. On Unix an old process group cannot
-            // retain that same numeric PGID while the PID is reused; on other
-            // platforms the exact recorded child is likewise definitively gone.
+            // The exact root generation is gone. A Unix group cannot retain
+            // the same PGID while that PID is reused, but Windows descendants
+            // may outlive a recycled root PID; an exact recorded witness keeps
+            // that runtime unconfirmed and its daemon attachable.
+            let terminated =
+                terminate_explicit_agent_meta_child_runtime(meta, key, reason).is_some();
             LiveAgentChildTermination {
                 pid: Some(child_pid),
-                terminated: false,
-                confirmed_gone: true,
+                terminated,
+                confirmed_gone: agent_meta_child_runtime_definitively_gone(meta),
             }
         }
         None => {
-            #[cfg(unix)]
-            {
-                if agent_child_process_group_has_live_member(child_pid) {
-                    let terminated =
-                        terminate_verified_unix_process_group_after_leader_exit(child_pid, reason);
-                    return LiveAgentChildTermination {
-                        pid: Some(child_pid),
-                        terminated,
-                        confirmed_gone: terminated,
-                    };
-                }
-            }
-            #[cfg(windows)]
-            {
-                if agent_child_process_group_has_live_member(child_pid) {
-                    let terminated = terminate_verified_windows_process_tree_after_leader_exit(
-                        child_pid, reason,
-                    );
-                    return LiveAgentChildTermination {
-                        pid: Some(child_pid),
-                        terminated,
-                        confirmed_gone: terminated,
-                    };
-                }
+            if agent_meta_surviving_child_process_group(meta).is_some() {
+                let terminated =
+                    terminate_explicit_agent_meta_child_runtime(meta, key, reason).is_some();
+                return LiveAgentChildTermination {
+                    pid: Some(child_pid),
+                    terminated,
+                    confirmed_gone: agent_meta_child_runtime_definitively_gone(meta),
+                };
             }
             if process_is_alive(child_pid) {
                 return LiveAgentChildTermination::unconfirmed(Some(child_pid));
             }
-            if agent_child_runtime_definitively_gone(child_pid) {
+            if agent_meta_child_runtime_definitively_gone(meta) {
                 LiveAgentChildTermination {
                     pid: Some(child_pid),
                     terminated: false,
@@ -35652,7 +36310,17 @@ fn agent_meta_snapshot_debug_value(meta: &AgentMetaSnapshot) -> serde_json::Valu
         "child_pid_alive": meta.child_pid.map(process_is_alive),
         "child_pid_start_ticks": meta.child_pid_start_ticks,
         "child_pid_matches": agent_meta_child_pid_matches(meta),
+        "child_runtime_witnesses": meta.child_runtime_witnesses.iter().map(|witness| serde_json::json!({
+            "pid": witness.pid,
+            "start_ticks": witness.start_ticks,
+            "alive": process_is_alive(witness.pid),
+            "start_token_matches": process_start_token_matches(
+                witness.start_ticks,
+                process_start_ticks(witness.pid),
+            ),
+        })).collect::<Vec<_>>(),
         "surviving_child_pgid": agent_meta_surviving_child_process_group(meta),
+        "verified_surviving_child_pgid": agent_meta_verified_surviving_child_process_group(meta),
         "cwd": meta.cwd.as_deref(),
         "source": meta.source.as_deref(),
         "attached": meta.attached,
@@ -35983,10 +36651,12 @@ fn read_agent_runtime_state_probe_at_for_key(
             let meta_key = agent_key_from_meta(&meta);
             let verified_child_pid = agent_meta_verified_child_pid(&meta)
                 .filter(|_| expected_key.is_none() || meta_key.as_ref() == expected_key);
-            let surviving_child_pgid = agent_meta_surviving_child_process_group(&meta)
+            let possible_surviving_child_pgid = agent_meta_surviving_child_process_group(&meta)
                 .filter(|_| expected_key.is_none() || meta_key.as_ref() == expected_key);
+            let surviving_child_pgid = possible_surviving_child_pgid
+                .filter(|_| verified_agent_meta_child_runtime_witnesses(&meta).is_some());
             let child_process_preserved =
-                verified_child_pid.is_some() || surviving_child_pgid.is_some();
+                verified_child_pid.is_some() || possible_surviving_child_pgid.is_some();
             if let Some(child_pid) = verified_child_pid {
                 if debug_enabled {
                     debug_log(
@@ -36168,11 +36838,13 @@ fn read_agent_runtime_state_probe_at_for_key(
                 let verified_child_pid = (meta_key.as_ref() == Some(expected_key))
                     .then(|| agent_meta_verified_child_pid(&meta))
                     .flatten();
-                let surviving_child_pgid = (meta_key.as_ref() == Some(expected_key))
+                let possible_surviving_child_pgid = (meta_key.as_ref() == Some(expected_key))
                     .then(|| agent_meta_surviving_child_process_group(&meta))
                     .flatten();
+                let surviving_child_pgid = possible_surviving_child_pgid
+                    .filter(|_| verified_agent_meta_child_runtime_witnesses(&meta).is_some());
                 let child_process_preserved =
-                    verified_child_pid.is_some() || surviving_child_pgid.is_some();
+                    verified_child_pid.is_some() || possible_surviving_child_pgid.is_some();
                 if let Some(child_pid) = verified_child_pid {
                     if debug_enabled {
                         debug_log(
@@ -40963,10 +41635,9 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
             let key = agent_key_from_meta(&meta).filter(|key| agent_file_stem(key) == stem);
             let child_liveness = agent_meta_child_pid_liveness(&meta);
             let surviving_child_pgid = agent_meta_surviving_child_process_group(&meta);
+            let observed_endpoint = observe_agent_runtime_endpoint(runtime_dir, stem);
             let mut child_terminated = false;
-            if agent_runtime_stem_has_endpoint_entry(runtime_dir, stem)
-                || agent_runtime_stem_has_reachable_daemon(runtime_dir, stem)
-            {
+            if agent_runtime_stem_has_reachable_daemon(runtime_dir, stem) {
                 report.skipped_unverified = report.skipped_unverified.saturating_add(1);
                 preserved_unverified_stems.insert(stem.to_string());
                 debug_log(
@@ -40977,21 +41648,29 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
                         "key": key.as_ref().map(agent_key_debug_value),
                         "daemon_pid": meta.pid,
                         "child_pid": meta.child_pid,
-                        "reason": "stale_meta_has_unverified_daemon_endpoint",
+                        "reason": "stale_meta_endpoint_is_reachable",
                     }),
                 );
                 continue;
             }
             if let Some(key) = key.as_ref() {
-                if terminate_agent_meta_child_process(&meta, key, "killall_stale_daemon_cleanup")
-                    .is_some()
+                if terminate_explicit_agent_meta_child_runtime(
+                    &meta,
+                    key,
+                    "killall_stale_daemon_cleanup",
+                )
+                .is_some()
                 {
                     child_terminated = true;
                     report.child_processes_terminated =
                         report.child_processes_terminated.saturating_add(1);
                 }
             }
-            if !child_terminated && (child_liveness.is_some() || surviving_child_pgid.is_some()) {
+            let child_liveness_after = agent_meta_child_pid_liveness(&meta);
+            let surviving_child_pgid_after = agent_meta_surviving_child_process_group(&meta);
+            if !child_terminated
+                && (child_liveness_after.is_some() || surviving_child_pgid_after.is_some())
+            {
                 report.skipped_unverified = report.skipped_unverified.saturating_add(1);
                 preserved_unverified_stems.insert(stem.to_string());
                 debug_log(
@@ -41005,30 +41684,44 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
                         "child_pid_start_ticks": meta.child_pid_start_ticks,
                         "child_liveness": child_liveness.map(|liveness| liveness.label()),
                         "surviving_child_pgid": surviving_child_pgid,
+                        "child_liveness_after": child_liveness_after.map(|liveness| liveness.label()),
+                        "surviving_child_pgid_after": surviving_child_pgid_after,
                         "reason": "stale_daemon_child_or_group_not_verified_for_termination",
                     }),
                 );
                 continue;
             }
-            let runtime_cleanup_succeeded =
-                match remove_stale_agent_runtime_files_by_stem_with_policy(
+            let cleanup = if let Some(key) = key.as_ref() {
+                observed_endpoint.as_ref().ok().and_then(|endpoint| {
+                    remove_verified_inactive_agent_runtime_files_after_refresh(
+                        runtime_dir,
+                        stem,
+                        key,
+                        endpoint,
+                        "killall_stale_daemon_cleanup",
+                    )
+                })
+            } else {
+                remove_stale_agent_runtime_files_by_stem_with_policy(
                     runtime_dir,
                     stem,
                     Some(content.as_bytes()),
                     "killall_stale_daemon_cleanup",
                     false,
-                ) {
-                    Some(true) => {
-                        report.pty_logs_deleted = report.pty_logs_deleted.saturating_add(1);
-                        true
-                    }
-                    Some(false) => true,
-                    None => {
-                        report.skipped_unverified = report.skipped_unverified.saturating_add(1);
-                        preserved_unverified_stems.insert(stem.to_string());
-                        false
-                    }
-                };
+                )
+            };
+            let runtime_cleanup_succeeded = match cleanup {
+                Some(true) => {
+                    report.pty_logs_deleted = report.pty_logs_deleted.saturating_add(1);
+                    true
+                }
+                Some(false) => true,
+                None => {
+                    report.skipped_unverified = report.skipped_unverified.saturating_add(1);
+                    preserved_unverified_stems.insert(stem.to_string());
+                    false
+                }
+            };
             if runtime_cleanup_succeeded {
                 if let Some(observed) = observed_cwd_lock.as_ref() {
                     let _ = release_observed_coding_agent_cwd_lock(observed);
@@ -41159,10 +41852,10 @@ fn kill_all_agent_daemons_at(runtime_dir: &Path, current_pid: u32) -> KillAllAge
         }
         report.killed = report.killed.saturating_add(1);
         let cleanup = observed_endpoint.as_ref().ok().and_then(|endpoint| {
-            remove_terminated_owned_agent_runtime_files_by_stem(
+            remove_verified_inactive_agent_runtime_files_after_refresh(
                 runtime_dir,
                 stem,
-                Some(content.as_bytes()),
+                &key,
                 endpoint,
                 "killall_killed_cleanup",
             )
@@ -41460,11 +42153,12 @@ fn remove_stale_agent_runtime_files_by_stem_with_policy(
     )
 }
 
-/// Cleanup after this caller has verified and terminated the daemon that owned
-/// the observed endpoint generation. Unlike background stale cleanup, this may
-/// remove a present endpoint, but only while the exact dev+inode/marker and
-/// metadata bytes still match under the per-stem mutation guard.
-fn remove_terminated_owned_agent_runtime_files_by_stem(
+/// Cleanup after this caller has proved that the observed runtime generation
+/// has no live daemon or child, either by terminating its exact owner or by
+/// verifying stale metadata. Unlike background stale cleanup, this may remove a
+/// present but unreachable endpoint, and only while the exact dev+inode/marker
+/// and metadata bytes still match under the per-stem mutation guard.
+fn remove_verified_inactive_agent_runtime_files_by_stem(
     runtime_dir: &Path,
     stem: &str,
     observed_meta: Option<&[u8]>,
@@ -41479,13 +42173,13 @@ fn remove_terminated_owned_agent_runtime_files_by_stem(
         reason,
     );
     let Some(_guard) = guard else {
-        // A daemon whose child was already terminated commonly wins the race
-        // and removes its own endpoint/meta before the external worker obtains
-        // the mutation guard. Complete absence is success; a changed or
-        // unreadable generation remains unverified and is preserved.
+        // A daemon that exits commonly wins the race and removes its own
+        // endpoint/meta before the external worker obtains the mutation guard.
+        // Complete absence is success; a changed or unreadable generation
+        // remains unverified and is preserved.
         if agent_runtime_identity_files_absent(runtime_dir, stem) {
             debug_log(
-                "terminated_agent_runtime_already_absent",
+                "verified_inactive_agent_runtime_already_absent",
                 serde_json::json!({
                     "reason": reason,
                     "runtime_dir": runtime_dir.display().to_string(),
@@ -41496,12 +42190,145 @@ fn remove_terminated_owned_agent_runtime_files_by_stem(
         }
         return None;
     };
-    Some(remove_agent_runtime_files_by_stem_with_policy(
+    let pty_log_deleted = remove_agent_runtime_files_by_stem_with_policy(
         runtime_dir,
         stem,
         reason,
         false,
-    ))
+    );
+    agent_runtime_identity_files_absent(runtime_dir, stem).then_some(pty_log_deleted)
+}
+
+/// Refresh metadata and endpoint only after the owning process generation is
+/// confirmed inactive. Identify/final writes can replace the metadata, and a
+/// terminating daemon can unlink its endpoint before leaving the metadata
+/// behind; requiring either pre-termination observation would turn successful
+/// termination into a false "unverified" result. A replacement that starts
+/// after these refreshes is still rejected by exact byte, endpoint, and
+/// start-lock revalidation under the per-stem mutation guard.
+fn remove_verified_inactive_agent_runtime_files_after_refresh(
+    runtime_dir: &Path,
+    stem: &str,
+    expected_key: &AgentKey,
+    previously_observed_endpoint: &AgentEndpointObservation,
+    reason: &str,
+) -> Option<bool> {
+    if agent_file_stem(expected_key) != stem {
+        return None;
+    }
+    let meta_path = runtime_dir.join(format!("{stem}.json"));
+    let observed_meta =
+        match read_optional_runtime_bytes_bounded(&meta_path, AGENT_RUNTIME_META_MAX_BYTES) {
+            Ok(observed_meta) => observed_meta,
+            Err(error) => {
+                debug_log(
+                    "verified_inactive_agent_runtime_meta_refresh_failed",
+                    serde_json::json!({
+                        "reason": reason,
+                        "runtime_dir": runtime_dir.display().to_string(),
+                        "stem": stem,
+                        "meta_path": meta_path.display().to_string(),
+                        "error_kind": format!("{:?}", error.kind()),
+                        "error": error.to_string(),
+                    }),
+                );
+                return None;
+            }
+        };
+    if let Some(meta_bytes) = observed_meta.as_deref() {
+        let meta = match serde_json::from_slice::<AgentMetaSnapshot>(meta_bytes) {
+            Ok(meta) if agent_key_from_meta(&meta).as_ref() == Some(expected_key) => meta,
+            Ok(meta) => {
+                debug_log(
+                    "verified_inactive_agent_runtime_meta_refresh_rejected",
+                    serde_json::json!({
+                        "reason": reason,
+                        "runtime_dir": runtime_dir.display().to_string(),
+                        "stem": stem,
+                        "expected_key": agent_key_debug_value(expected_key),
+                        "observed_meta": agent_meta_snapshot_debug_value(&meta),
+                        "cause": "meta_key_changed",
+                    }),
+                );
+                return None;
+            }
+            Err(error) => {
+                debug_log(
+                    "verified_inactive_agent_runtime_meta_refresh_rejected",
+                    serde_json::json!({
+                        "reason": reason,
+                        "runtime_dir": runtime_dir.display().to_string(),
+                        "stem": stem,
+                        "expected_key": agent_key_debug_value(expected_key),
+                        "cause": "meta_unparseable",
+                        "error": error.to_string(),
+                    }),
+                );
+                return None;
+            }
+        };
+        if agent_runtime_meta_liveness_for_stem_at(
+            runtime_dir,
+            &meta,
+            stem,
+            "verified_inactive_agent_runtime_meta_refresh",
+        )
+        .is_some()
+            || agent_meta_child_pid_liveness(&meta).is_some()
+            || agent_meta_surviving_child_process_group(&meta).is_some()
+        {
+            return None;
+        }
+    }
+    if possible_agent_daemon_meta_from_os_process(expected_key).is_some() {
+        debug_log(
+            "verified_inactive_agent_runtime_os_daemon_preserved",
+            serde_json::json!({
+                "reason": reason,
+                "runtime_dir": runtime_dir.display().to_string(),
+                "stem": stem,
+                "expected_key": agent_key_debug_value(expected_key),
+            }),
+        );
+        return None;
+    }
+    let refreshed_endpoint = match observe_agent_runtime_endpoint(runtime_dir, stem) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            debug_log(
+                "verified_inactive_agent_runtime_endpoint_refresh_failed",
+                serde_json::json!({
+                    "reason": reason,
+                    "runtime_dir": runtime_dir.display().to_string(),
+                    "stem": stem,
+                    "expected_key": agent_key_debug_value(expected_key),
+                    "error_kind": format!("{:?}", error.kind()),
+                    "error": error.to_string(),
+                }),
+            );
+            return None;
+        }
+    };
+    if &refreshed_endpoint != previously_observed_endpoint {
+        debug_log(
+            "verified_inactive_agent_runtime_endpoint_refreshed",
+            serde_json::json!({
+                "reason": reason,
+                "runtime_dir": runtime_dir.display().to_string(),
+                "stem": stem,
+                "expected_key": agent_key_debug_value(expected_key),
+                "previously_present": matches!(previously_observed_endpoint, AgentEndpointObservation::Present(_)),
+                "refreshed_present": matches!(&refreshed_endpoint, AgentEndpointObservation::Present(_)),
+            }),
+        );
+    }
+    remove_verified_inactive_agent_runtime_files_by_stem(
+        runtime_dir,
+        stem,
+        observed_meta.as_deref(),
+        &refreshed_endpoint,
+        reason,
+    )
 }
 
 fn agent_runtime_identity_files_absent(runtime_dir: &Path, stem: &str) -> bool {
@@ -41540,12 +42367,13 @@ where
         &observed_endpoint,
         reason,
     )?;
-    Some(remove_agent_runtime_files_by_stem_with_policy(
+    let pty_log_deleted = remove_agent_runtime_files_by_stem_with_policy(
         runtime_dir,
         stem,
         reason,
         preserve_pty_log,
-    ))
+    );
+    agent_runtime_identity_files_absent(runtime_dir, stem).then_some(pty_log_deleted)
 }
 
 fn remove_orphan_runtime_file_after_stem_revalidation(
@@ -41605,20 +42433,63 @@ fn remove_agent_runtime_files_by_stem_with_policy(
     reason: &str,
     preserve_pty_log: bool,
 ) -> bool {
+    // Remove the attach endpoint first. If that fails, retain metadata and the
+    // bearer/history files so a later explicit cleanup can still identify and
+    // retry the same inert generation instead of leaving an endpoint-only
+    // tombstone that blocks startup indefinitely.
+    let endpoint_path = agent_runtime_stem_endpoint_path(runtime_dir, stem);
+    let endpoint_removed = remove_agent_runtime_file_logged(
+        reason,
+        None,
+        Some(stem),
+        "endpoint",
+        &endpoint_path,
+    );
+    let endpoint_absent = matches!(
+        observe_agent_runtime_endpoint(runtime_dir, stem),
+        Ok(AgentEndpointObservation::Absent)
+    );
+    if !endpoint_absent {
+        debug_log(
+            "agent_runtime_files_by_stem_remove_incomplete",
+            serde_json::json!({
+                "reason": reason,
+                "runtime_dir": runtime_dir.display().to_string(),
+                "stem": stem,
+                "endpoint_path": endpoint_path.display().to_string(),
+                "endpoint_removed": endpoint_removed,
+                "cause": "endpoint_remove_failed_or_absence_unverified",
+            }),
+        );
+        return false;
+    }
+    let meta_path = runtime_dir.join(format!("{}.json", stem));
     let meta_removed = remove_agent_runtime_file_logged(
         reason,
         None,
         Some(stem),
         "meta",
-        &runtime_dir.join(format!("{}.json", stem)),
+        &meta_path,
     );
-    let socket_removed = remove_agent_runtime_file_logged(
-        reason,
-        None,
-        Some(stem),
-        "socket",
-        &runtime_dir.join(format!("{}.sock", stem)),
+    let meta_absent = matches!(
+        fs::symlink_metadata(&meta_path),
+        Err(error) if error.kind() == ErrorKind::NotFound
     );
+    if !meta_absent {
+        debug_log(
+            "agent_runtime_files_by_stem_remove_incomplete",
+            serde_json::json!({
+                "reason": reason,
+                "runtime_dir": runtime_dir.display().to_string(),
+                "stem": stem,
+                "meta_path": meta_path.display().to_string(),
+                "endpoint_removed": endpoint_removed,
+                "meta_removed": meta_removed,
+                "cause": "meta_remove_failed_or_absence_unverified",
+            }),
+        );
+        return false;
+    }
     let pty_log_deleted = remove_agent_runtime_extra_files_by_stem_with_policy(
         runtime_dir,
         stem,
@@ -41631,8 +42502,8 @@ fn remove_agent_runtime_files_by_stem_with_policy(
             "reason": reason,
             "runtime_dir": runtime_dir.display().to_string(),
             "stem": stem,
+            "endpoint_removed": endpoint_removed,
             "meta_removed": meta_removed,
-            "socket_removed": socket_removed,
             "pty_log_deleted": pty_log_deleted,
             "pty_log_preserved": preserve_pty_log,
         }),
@@ -41646,6 +42517,16 @@ fn remove_agent_runtime_extra_files_by_stem_with_policy(
     reason: &str,
     preserve_pty_log: bool,
 ) -> bool {
+    // Also remove the non-current platform's endpoint suffix. This preserves
+    // the old cross-platform cleanup behavior after the active endpoint was
+    // moved ahead of metadata removal above.
+    let legacy_socket_removed = remove_agent_runtime_file_logged(
+        reason,
+        None,
+        Some(stem),
+        "socket",
+        &runtime_dir.join(format!("{}.sock", stem)),
+    );
     let auth_removed = remove_agent_runtime_file_logged(
         reason,
         None,
@@ -41683,6 +42564,7 @@ fn remove_agent_runtime_extra_files_by_stem_with_policy(
             "reason": reason,
             "runtime_dir": runtime_dir.display().to_string(),
             "stem": stem,
+            "socket_removed": legacy_socket_removed,
             "auth_removed": auth_removed,
             "tcp_marker_removed": tcp_marker_removed,
             "pty_log_deleted": pty_log_deleted,
@@ -41712,7 +42594,7 @@ fn live_agent_daemon_identity_for_termination_at(
     observed_meta: &AgentMetaSnapshot,
     reason: &str,
 ) -> Option<AgentMetaSnapshot> {
-    let identity = agent_daemon_identity_snapshot_for_key_at(runtime_dir, key, reason)?;
+    let mut identity = agent_daemon_identity_snapshot_for_key_at(runtime_dir, key, reason)?;
     let expected_daemon_start = observed_meta.pid_start_ticks?;
     let same_daemon = identity.pid == observed_meta.pid
         && identity.pid_start_ticks == Some(expected_daemon_start)
@@ -41720,7 +42602,15 @@ fn live_agent_daemon_identity_for_termination_at(
     let exact_child_identity = identity.child_pid.is_some()
         && identity.child_pid_start_ticks.is_some()
         && identity.child_pid != Some(0);
+    let observed_child_generation_matches = observed_meta.child_pid == identity.child_pid
+        && observed_meta.child_pid_start_ticks == identity.child_pid_start_ticks;
     if same_daemon && exact_child_identity {
+        if observed_child_generation_matches {
+            identity.child_runtime_witnesses = prioritized_agent_child_runtime_witnesses(
+                &identity.child_runtime_witnesses,
+                &observed_meta.child_runtime_witnesses,
+            );
+        }
         return Some(identity);
     }
     debug_log(
@@ -41732,6 +42622,7 @@ fn live_agent_daemon_identity_for_termination_at(
             "identity_meta": agent_meta_snapshot_debug_value(&identity),
             "same_daemon": same_daemon,
             "exact_child_identity": exact_child_identity,
+            "observed_child_generation_matches": observed_child_generation_matches,
         }),
     );
     None
@@ -41895,17 +42786,19 @@ fn terminate_agent_daemon_with_info(
         } else if meta_key.as_ref() == Some(key) {
             let child_liveness = agent_meta_child_pid_liveness(meta);
             let surviving_child_pgid = agent_meta_surviving_child_process_group(meta);
-            terminated_child_pid = terminate_agent_meta_child_process(
+            terminated_child_pid = terminate_explicit_agent_meta_child_runtime(
                 meta,
                 key,
                 "terminate_agent_stale_child_cleanup",
             );
+            let child_liveness_after = agent_meta_child_pid_liveness(meta);
+            let surviving_child_pgid_after = agent_meta_surviving_child_process_group(meta);
             let possible_live_daemon = daemon_alive
                 && daemon_identity != Some(AgentDaemonProcessIdentity::Other)
                 && agent_meta_daemon_pid_matches(meta);
             if possible_live_daemon
                 || (terminated_child_pid.is_none()
-                    && (child_liveness.is_some() || surviving_child_pgid.is_some()))
+                    && (child_liveness_after.is_some() || surviving_child_pgid_after.is_some()))
             {
                 skipped_unverified = true;
                 preserve_runtime_files = true;
@@ -41922,6 +42815,8 @@ fn terminate_agent_daemon_with_info(
                         "child_pid": meta.child_pid,
                         "child_liveness": child_liveness.map(|liveness| liveness.label()),
                         "surviving_child_pgid": surviving_child_pgid,
+                        "child_liveness_after": child_liveness_after.map(|liveness| liveness.label()),
+                        "surviving_child_pgid_after": surviving_child_pgid_after,
                     }),
                 );
             }
@@ -41980,12 +42875,12 @@ fn terminate_agent_daemon_with_info(
         );
         false
     } else {
-        let cleanup = if terminated_pid.is_some() {
+        let cleanup = if terminated_pid.is_some() || meta_key.as_ref() == Some(key) {
             observed_endpoint.as_ref().ok().and_then(|endpoint| {
-                remove_terminated_owned_agent_runtime_files_by_stem(
+                remove_verified_inactive_agent_runtime_files_after_refresh(
                     runtime_dir,
                     &stem,
-                    observed_meta.as_deref(),
+                    key,
                     endpoint,
                     "terminate_agent_cleanup",
                 )
@@ -43266,48 +44161,37 @@ fn unix_signal_target_exists(target: i32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn unix_process_group_has_live_member(pgid: i32) -> bool {
-    linux_process_group_has_live_member(pgid)
+    linux_process_group_member_pids_complete(pgid)
+        .map(|pids| !pids.is_empty())
+        .unwrap_or_else(|| unix_signal_target_exists(-pgid))
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_group_has_live_member(pgid: i32) -> bool {
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return unix_signal_target_exists(-pgid);
-    };
-    let mut scan_incomplete = false;
+fn linux_process_group_member_pids_complete(pgid: i32) -> Option<Vec<u32>> {
+    let entries = fs::read_dir("/proc").ok()?;
+    let mut pids = Vec::new();
     for entry_result in entries {
-        let entry = match entry_result {
-            Ok(entry) => entry,
-            Err(_) => {
-                scan_incomplete = true;
-                continue;
-            }
-        };
+        let entry = entry_result.ok()?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.parse::<u32>().is_err() {
+        let Ok(pid) = name.parse::<u32>() else {
             continue;
-        }
+        };
         let stat_path = entry.path().join("stat");
         let stat = match fs::read_to_string(stat_path) {
             Ok(stat) => stat,
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(_) => {
-                scan_incomplete = true;
-                continue;
-            }
+            Err(_) => return None,
         };
-        let Some((candidate_pgid, state)) = linux_process_stat_group_and_state(&stat) else {
-            scan_incomplete = true;
-            continue;
-        };
+        let (candidate_pgid, state) = linux_process_stat_group_and_state(&stat)?;
         if candidate_pgid == pgid && state != 'Z' {
-            return true;
+            pids.push(pid);
         }
     }
-    scan_incomplete && unix_signal_target_exists(-pgid)
+    pids.sort_unstable();
+    Some(pids)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -43322,18 +44206,34 @@ fn linux_process_stat_group_and_state(stat: &str) -> Option<(i32, char)> {
 
 #[cfg(target_os = "macos")]
 fn unix_process_group_has_live_member(pgid: i32) -> bool {
+    macos_process_group_member_pids_complete(pgid)
+        .map(|pids| !pids.is_empty())
+        .unwrap_or_else(|| unix_signal_target_exists(-pgid))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_group_member_pids_complete(pgid: i32) -> Option<Vec<u32>> {
     let mut command = Command::new("ps");
     command
         .args(["-axo", "pid=,pgid=,stat="])
         .env("LC_ALL", "C")
         .stdin(Stdio::null());
-    let Some(output) = process_probe_command_output(command, "macos_process_group_liveness") else {
-        return unix_signal_target_exists(-pgid);
-    };
+    let output = process_probe_command_output(command, "macos_process_group_liveness")?;
     if !output.status.success() {
-        return unix_signal_target_exists(-pgid);
+        return None;
     }
-    parse_ps_process_group_has_live_member(&String::from_utf8_lossy(&output.stdout), pgid)
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let pid = parts.next()?.parse::<u32>().ok()?;
+        let candidate_pgid = parts.next()?.parse::<i32>().ok()?;
+        let stat = parts.next()?;
+        if candidate_pgid == pgid && !stat.starts_with('Z') {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    Some(pids)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -43349,6 +44249,243 @@ fn parse_ps_process_group_has_live_member(raw: &str, pgid: i32) -> bool {
         };
         raw_pgid.parse::<i32>().ok() == Some(pgid) && !stat.starts_with('Z')
     })
+}
+
+#[cfg(target_os = "linux")]
+fn agent_child_runtime_member_pids_complete(child_pid: u32) -> Option<Vec<u32>> {
+    let pgid = i32::try_from(child_pid).ok()?;
+    linux_process_group_member_pids_complete(pgid)
+}
+
+#[cfg(target_os = "macos")]
+fn agent_child_runtime_member_pids_complete(child_pid: u32) -> Option<Vec<u32>> {
+    let pgid = i32::try_from(child_pid).ok()?;
+    macos_process_group_member_pids_complete(pgid)
+}
+
+#[cfg(windows)]
+fn agent_child_runtime_member_pids_complete(child_pid: u32) -> Option<Vec<u32>> {
+    windows_process_tree_pids_complete(child_pid).map(|pids| {
+        pids.into_iter()
+            .filter(|pid| process_is_alive(*pid))
+            .collect()
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn agent_child_runtime_member_pids_complete(_child_pid: u32) -> Option<Vec<u32>> {
+    None
+}
+
+#[derive(Debug)]
+struct AgentChildRuntimeExitObservation {
+    live: bool,
+    witnesses: Vec<AgentChildRuntimeWitness>,
+}
+
+/// The daemon has reaped its exact direct child. Reuse each complete group/tree
+/// observation needed for liveness to capture descendants that may have
+/// appeared between periodic witness scans and the leader's exit, including a
+/// later retry after a transient snapshot failure.
+fn observe_agent_child_runtime_after_leader_exit(
+    child_pid: u32,
+    pty_output_closed: bool,
+    recorded_witnesses: &[AgentChildRuntimeWitness],
+) -> AgentChildRuntimeExitObservation {
+    let member_pids = agent_child_runtime_member_pids_complete(child_pid);
+    let mut live = member_pids
+        .as_ref()
+        .map(|members| !members.is_empty())
+        .unwrap_or_else(|| agent_child_runtime_may_have_live_member(child_pid, pty_output_closed));
+    let mut witnesses = member_pids
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pid| *pid != child_pid && process_is_alive(*pid))
+        .filter_map(|pid| {
+            process_start_ticks(pid)
+                .map(|start_ticks| AgentChildRuntimeWitness { pid, start_ticks })
+        })
+        .collect::<Vec<_>>();
+    // A member PID can exit and be recycled between the group/tree snapshot
+    // and start-token lookup. Reconfirm membership and the exact token before
+    // handing the observation to either Identify or the disk writer. A failed
+    // second snapshot keeps conservative liveness but yields no destructive
+    // continuity evidence.
+    if let Some(revalidated_members) = agent_child_runtime_member_pids_complete(child_pid) {
+        live = !revalidated_members.is_empty();
+        let revalidated_members = revalidated_members.into_iter().collect::<HashSet<_>>();
+        witnesses.retain(|witness| {
+            revalidated_members.contains(&witness.pid)
+                && process_start_token_matches(
+                    witness.start_ticks,
+                    process_start_ticks(witness.pid),
+                ) == Some(true)
+        });
+    } else {
+        witnesses.clear();
+    }
+    #[cfg(windows)]
+    {
+        // When an intermediate Windows parent exits, Toolhelp retains the
+        // child's numeric parent PID but no longer supplies the missing edge
+        // needed to walk from the original root. Previously recorded exact
+        // identities preserve that disconnected part of the managed tree.
+        let mut recorded_possible = recorded_witnesses
+            .iter()
+            .copied()
+            .filter(|witness| {
+                witness.pid != child_pid
+                    && agent_child_runtime_witness_should_be_preserved(*witness)
+            })
+            .collect::<Vec<_>>();
+        recorded_possible.sort_unstable_by_key(|witness| (witness.pid, witness.start_ticks));
+        recorded_possible.dedup();
+        witnesses.sort_unstable_by_key(|witness| (witness.pid, witness.start_ticks));
+        witnesses.dedup();
+        // Previously recorded exact identities come first because they may be
+        // the only remaining evidence for a subtree whose intermediate parent
+        // has disappeared from Toolhelp. Newly visible descendants fill the
+        // remaining bounded slots.
+        witnesses =
+            prioritized_agent_child_runtime_witnesses(&recorded_possible, &witnesses);
+        live |= !witnesses.is_empty();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = recorded_witnesses;
+        #[cfg(unix)]
+        if process_start_ticks(child_pid).is_some() {
+            // try_wait has reaped the exact direct child. A process now
+            // occupying that numeric PID is a reused generation; do not mint a
+            // witness for a group that could have been recreated during the
+            // observation window.
+            witnesses.clear();
+        }
+        witnesses.sort_unstable_by_key(|witness| (witness.pid, witness.start_ticks));
+        witnesses.dedup();
+        witnesses.truncate(AGENT_CHILD_RUNTIME_WITNESS_LIMIT);
+    }
+    AgentChildRuntimeExitObservation { live, witnesses }
+}
+
+fn capture_agent_child_runtime_witnesses(
+    child_pid: u32,
+    child_start_ticks: u64,
+) -> Vec<AgentChildRuntimeWitness> {
+    if process_start_token_matches(child_start_ticks, process_start_ticks(child_pid)) != Some(true)
+    {
+        return Vec::new();
+    }
+    let Some(member_pids) = agent_child_runtime_member_pids_complete(child_pid) else {
+        return Vec::new();
+    };
+    if process_start_token_matches(child_start_ticks, process_start_ticks(child_pid)) != Some(true)
+    {
+        return Vec::new();
+    }
+    let mut witnesses = member_pids
+        .into_iter()
+        .filter(|pid| *pid != child_pid && process_is_alive(*pid))
+        .filter_map(|pid| {
+            process_start_ticks(pid)
+                .map(|start_ticks| AgentChildRuntimeWitness { pid, start_ticks })
+        })
+        .collect::<Vec<_>>();
+    if process_start_token_matches(child_start_ticks, process_start_ticks(child_pid)) != Some(true)
+    {
+        return Vec::new();
+    }
+    #[cfg(windows)]
+    {
+        let Some(revalidated_members) = agent_child_runtime_member_pids_complete(child_pid) else {
+            return Vec::new();
+        };
+        let revalidated_members = revalidated_members.into_iter().collect::<HashSet<_>>();
+        witnesses.retain(|witness| {
+            revalidated_members.contains(&witness.pid)
+                && process_start_token_matches(
+                    witness.start_ticks,
+                    process_start_ticks(witness.pid),
+                ) == Some(true)
+        });
+        if process_start_token_matches(child_start_ticks, process_start_ticks(child_pid))
+            != Some(true)
+        {
+            return Vec::new();
+        }
+    }
+    witnesses.sort_unstable_by_key(|witness| (witness.pid, witness.start_ticks));
+    witnesses.dedup();
+    witnesses.truncate(AGENT_CHILD_RUNTIME_WITNESS_LIMIT);
+    witnesses
+}
+
+#[cfg(not(windows))]
+fn verified_agent_meta_child_runtime_witnesses(
+    meta: &AgentMetaSnapshot,
+) -> Option<Vec<AgentChildRuntimeWitness>> {
+    let child_pid = meta.child_pid.filter(|pid| *pid > 0)?;
+    let members = agent_child_runtime_member_pids_complete(child_pid)?;
+    let member_pids = members.into_iter().collect::<HashSet<_>>();
+    let witnesses = meta
+        .child_runtime_witnesses
+        .iter()
+        .copied()
+        .filter(|witness| witness.pid != child_pid && member_pids.contains(&witness.pid))
+        .filter(|witness| {
+            process_is_alive(witness.pid)
+                && process_start_token_matches(
+                    witness.start_ticks,
+                    process_start_ticks(witness.pid),
+                ) == Some(true)
+        })
+        .collect::<Vec<_>>();
+    (!witnesses.is_empty()).then_some(witnesses)
+}
+
+#[cfg(windows)]
+fn verified_agent_meta_child_runtime_witnesses(
+    meta: &AgentMetaSnapshot,
+) -> Option<Vec<AgentChildRuntimeWitness>> {
+    let child_pid = meta.child_pid.filter(|pid| *pid > 0)?;
+    let witnesses = meta
+        .child_runtime_witnesses
+        .iter()
+        .copied()
+        .filter(|witness| witness.pid != child_pid)
+        .filter(|witness| {
+            process_is_alive(witness.pid)
+                && process_start_token_matches(
+                    witness.start_ticks,
+                    process_start_ticks(witness.pid),
+                ) == Some(true)
+        })
+        .collect::<Vec<_>>();
+    (!witnesses.is_empty()).then_some(witnesses)
+}
+
+#[cfg(any(windows, test))]
+fn child_runtime_witness_identity_may_match(
+    process_alive: bool,
+    start_token_matches: Option<bool>,
+) -> bool {
+    process_alive && start_token_matches != Some(false)
+}
+
+#[cfg(windows)]
+fn agent_meta_child_runtime_witness_may_survive(meta: &AgentMetaSnapshot) -> bool {
+    let Some(child_pid) = meta.child_pid.filter(|pid| *pid > 0) else {
+        return false;
+    };
+    meta.child_runtime_witnesses.iter().any(|witness| {
+        witness.pid != child_pid
+            && agent_child_runtime_witness_should_be_preserved(*witness)
+    })
+}
+
+#[cfg(not(windows))]
+fn agent_meta_child_runtime_witness_may_survive(meta: &AgentMetaSnapshot) -> bool {
+    verified_agent_meta_child_runtime_witnesses(meta).is_some()
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
@@ -43424,6 +44561,29 @@ fn agent_child_runtime_definitively_gone(_pid: u32) -> bool {
     false
 }
 
+/// Prove that the recorded child generation has no remaining managed runtime.
+/// A recycled root PID belongs to another process and must not keep stale
+/// metadata forever; an exact live descendant witness always wins over that
+/// numeric-root conclusion. On Windows, a live witness whose start token is
+/// temporarily unreadable is also unknown rather than gone because exited
+/// ancestors can disappear from Toolhelp's parent chain.
+fn agent_meta_child_runtime_definitively_gone(meta: &AgentMetaSnapshot) -> bool {
+    let Some(child_pid) = meta.child_pid.filter(|pid| *pid > 0) else {
+        return false;
+    };
+    if agent_meta_child_runtime_witness_may_survive(meta) {
+        return false;
+    }
+    if let Some(expected_start_ticks) = meta.child_pid_start_ticks {
+        if process_start_token_matches(expected_start_ticks, process_start_ticks(child_pid))
+            == Some(false)
+        {
+            return true;
+        }
+    }
+    agent_child_runtime_definitively_gone(child_pid)
+}
+
 #[cfg(unix)]
 fn wait_for_unix_process_group_exit(pid: i32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
@@ -43473,17 +44633,46 @@ fn unix_verified_process_group_allows_followup_signal(
 }
 
 #[cfg(unix)]
-fn terminate_verified_unix_process_group_after_leader_exit(pgid: u32, reason: &str) -> bool {
+fn terminate_verified_unix_process_group_after_leader_exit(
+    pgid: u32,
+    witnesses: &[AgentChildRuntimeWitness],
+    reason: &str,
+) -> bool {
     if pgid == 0 || pgid > i32::MAX as u32 || process_is_alive(pgid) {
         return false;
     }
     let pgid_i32 = pgid as i32;
-    if !unix_process_group_has_live_member(pgid_i32) {
+    let Some(member_pids) = agent_child_runtime_member_pids_complete(pgid) else {
+        return false;
+    };
+    if member_pids.is_empty() {
         return true;
     }
-    // The exact leader was supplied by a live daemon identity response. A PGID
-    // cannot be reused while that group still has members, so the surviving
-    // group remains the same target even though the leader has exited.
+    let exact_witness_still_in_group = witnesses.iter().any(|witness| {
+        member_pids.contains(&witness.pid)
+            && process_is_alive(witness.pid)
+            && process_start_token_matches(
+                witness.start_ticks,
+                process_start_ticks(witness.pid),
+            ) == Some(true)
+    });
+    if !exact_witness_still_in_group {
+        debug_log(
+            "process_group_terminate_after_leader_exit_unverified",
+            serde_json::json!({
+                "reason": reason,
+                "pgid": pgid,
+                "recorded_witnesses": witnesses,
+                "member_pids": member_pids,
+                "cause": "exact_witness_missing_before_signal",
+            }),
+        );
+        return false;
+    }
+    // The exact surviving member was recorded while the leader was live and
+    // was revalidated in this group immediately above. A PGID cannot be reused
+    // while that witnessed group still has members, so it remains the same
+    // target even though the leader has exited.
     let result = unsafe { libc::kill(-pgid_i32, libc::SIGKILL) };
     let error = (result != 0).then(|| io::Error::last_os_error().to_string());
     let exited = result == 0
@@ -43953,6 +45142,15 @@ fn terminate_windows_process_group(pid: u32, expected_start_ticks: Option<u64>) 
     let mut exit_code = 0u32;
     let target_alive_after = unsafe { GetExitCodeProcess(target_handle.0, &mut exit_code) } != 0
         && exit_code == STILL_ACTIVE;
+    // Holding target_handle keeps this exact process object (and therefore its
+    // numeric PID) pinned while Toolhelp verifies the remaining visible tree.
+    // taskkill success plus root exit alone is not proof that /T reached every
+    // concurrently created descendant.
+    let descendant_tree_live_after = windows_process_tree_pids_complete(pid).map(|pids| {
+        pids.into_iter()
+            .any(|candidate| candidate != pid && process_is_alive(candidate))
+    });
+    let descendants_confirmed_gone = descendant_tree_live_after == Some(false);
     debug_log(
         "process_group_terminate_done",
         serde_json::json!({
@@ -43963,9 +45161,13 @@ fn terminate_windows_process_group(pid: u32, expected_start_ticks: Option<u64>) 
             "timed_out": timed_out,
             "taskkill_kill_error": taskkill_kill_error,
             "alive_after": target_alive_after,
+            "descendant_tree_live_after": descendant_tree_live_after,
+            "descendants_confirmed_gone": descendants_confirmed_gone,
         }),
     );
-    result.is_ok_and(|status| status.success()) && !target_alive_after
+    result.is_ok_and(|status| status.success())
+        && !target_alive_after
+        && descendants_confirmed_gone
 }
 
 fn wait_for_std_child_exit_bounded(
@@ -44822,6 +46024,7 @@ fn agent_meta_snapshot_from_identity_event(event: AgentDaemonEvent) -> Option<Ag
         daemon_pid_start_ticks,
         child_pid,
         child_pid_start_ticks,
+        child_runtime_witnesses,
         attached,
         attached_client_pid,
         attached_client_instance_id,
@@ -44839,6 +46042,7 @@ fn agent_meta_snapshot_from_identity_event(event: AgentDaemonEvent) -> Option<Ag
         pid_start_ticks: daemon_pid_start_ticks,
         child_pid,
         child_pid_start_ticks,
+        child_runtime_witnesses,
         provider: Some(provider.as_str().to_string()),
         session_id: Some(session_id),
         cwd: Some(cwd),
@@ -57739,6 +58943,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn child_exit_cleanup_preserves_auth_and_history_when_meta_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("agents");
+        let scrollback_dir = runtime_dir.join("scrollback");
+        ensure_private_agent_runtime_dir(&runtime_dir).unwrap();
+        ensure_private_agent_runtime_dir(&scrollback_dir).unwrap();
+        let key = AgentKey::new(&session_info(
+            Provider::Codex,
+            "child-exit-meta-remove-failure",
+            "/repo",
+        ));
+        let stem = agent_file_stem(&key);
+        let socket_path = runtime_dir.join(format!("{stem}.sock"));
+        let meta_path = runtime_dir.join(format!("{stem}.json"));
+        let auth_path = runtime_dir.join(format!("{stem}.auth"));
+        let pty_log_path = scrollback_dir.join(format!("{stem}.ptylog"));
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let (listener, publication) = bind_agent_listener(&key, &socket_path).unwrap();
+        // remove_file cannot remove this path, and the bounded metadata reader
+        // also rejects it as a non-regular file.
+        fs::create_dir(&meta_path).unwrap();
+        fs::write(&auth_path, format!("{token}\n")).unwrap();
+        fs::write(&pty_log_path, b"preserve scrollback\n").unwrap();
+
+        assert!(!cleanup_owned_agent_daemon_runtime_after_child_exit(
+            listener,
+            &publication,
+            &key,
+            &socket_path,
+            &meta_path,
+            &auth_path,
+            &pty_log_path,
+            token,
+            "test_child_exit_meta_remove_failure",
+        ));
+
+        assert!(!socket_path.exists());
+        assert!(meta_path.is_dir());
+        assert_eq!(fs::read(&auth_path).unwrap(), format!("{token}\n").as_bytes());
+        assert_eq!(fs::read(&pty_log_path).unwrap(), b"preserve scrollback\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn late_meta_write_preserves_a_rebound_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_dir = dir.path().join("agents");
@@ -64988,6 +66236,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             pid_start_ticks: None,
             child_pid: Some(456),
             child_pid_start_ticks: Some(789),
+            child_runtime_witnesses: Vec::new(),
             provider: Some(live_key.provider.as_str().into()),
             session_id: Some(live_key.session_id.clone()),
             cwd: Some(canonical.clone()),
@@ -65690,6 +66939,17 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn live_witness_with_unknown_start_token_is_not_proof_of_exit() {
+        assert!(child_runtime_witness_identity_may_match(true, Some(true)));
+        assert!(child_runtime_witness_identity_may_match(true, None));
+        assert!(!child_runtime_witness_identity_may_match(
+            true,
+            Some(false)
+        ));
+        assert!(!child_runtime_witness_identity_may_match(false, None));
+    }
+
+    #[test]
     fn linux_process_stat_group_parser_extracts_state_and_pgid() {
         assert_eq!(
             linux_process_stat_group_and_state("123 (sleep worker) S 1 456 456 0"),
@@ -65890,6 +67150,150 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 .get("pid_start_ticks")
                 .and_then(serde_json::Value::as_u64),
             process_start_ticks(std::process::id())
+        );
+    }
+
+    #[test]
+    fn agent_meta_witness_injection_round_trips_exact_identities() {
+        let witnesses = vec![
+            AgentChildRuntimeWitness {
+                pid: 101,
+                start_ticks: 1_001,
+            },
+            AgentChildRuntimeWitness {
+                pid: 202,
+                start_ticks: 2_002,
+            },
+        ];
+        let contents = agent_meta_contents_with_child_runtime_witnesses(
+            r#"{"pid":3000000000,"provider":"codex","session_id":"witnesses"}"#,
+            &witnesses,
+        );
+        let snapshot: AgentMetaSnapshot = serde_json::from_str(&contents).unwrap();
+
+        assert_eq!(snapshot.child_runtime_witnesses, witnesses);
+    }
+
+    #[test]
+    fn direct_child_exit_witnesses_survive_writer_cache_replacement() {
+        let flags = DaemonRuntimeFileFlags::new();
+        let periodic = AgentChildRuntimeWitness {
+            pid: 101,
+            start_ticks: 1_001,
+        };
+        let at_exit = AgentChildRuntimeWitness {
+            pid: 202,
+            start_ticks: 2_002,
+        };
+
+        flags.publish_child_runtime_witnesses(&[periodic]);
+        flags.record_child_exit_runtime_witnesses(&[at_exit]);
+        flags.publish_child_runtime_witnesses(&[]);
+
+        assert_eq!(flags.child_runtime_witnesses(), vec![at_exit]);
+
+        flags.publish_child_runtime_witnesses(&[periodic]);
+        assert_eq!(
+            flags.child_runtime_witnesses(),
+            vec![periodic, at_exit],
+            "Identify and runtime repair must retain the final exit observation",
+        );
+    }
+
+    #[test]
+    fn newer_child_exit_witness_has_priority_at_metadata_bound() {
+        let flags = DaemonRuntimeFileFlags::new();
+        let older = (0..AGENT_CHILD_RUNTIME_WITNESS_LIMIT)
+            .map(|index| AgentChildRuntimeWitness {
+                pid: 1_000 + index as u32,
+                start_ticks: 10_000 + index as u64,
+            })
+            .collect::<Vec<_>>();
+        let newer = AgentChildRuntimeWitness {
+            pid: 99_999,
+            start_ticks: 999_999,
+        };
+
+        flags.record_child_exit_runtime_witnesses(&older);
+        flags.record_child_exit_runtime_witnesses(&[newer]);
+        let merged = flags.child_runtime_witnesses();
+
+        assert_eq!(merged.len(), AGENT_CHILD_RUNTIME_WITNESS_LIMIT);
+        assert!(merged.contains(&newer));
+        assert!(merged.contains(&older[0]));
+        assert!(
+            !merged.contains(older.last().unwrap()),
+            "the newest exact observation must displace an older bounded entry regardless of PID order",
+        );
+    }
+
+    #[test]
+    fn agent_meta_witness_deserialization_is_bounded() {
+        let witnesses = (0..AGENT_CHILD_RUNTIME_WITNESS_LIMIT + 10)
+            .map(|index| {
+                serde_json::json!({
+                    "pid": 1_000 + index as u32,
+                    "start_ticks": 10_000 + index as u64,
+                })
+            })
+            .collect::<Vec<_>>();
+        let contents = serde_json::json!({
+            "pid": 3_000_000_000_u32,
+            "provider": "codex",
+            "session_id": "bounded-witnesses",
+            "child_runtime_witnesses": witnesses,
+        })
+        .to_string();
+
+        let snapshot: AgentMetaSnapshot = serde_json::from_str(&contents).unwrap();
+
+        assert_eq!(
+            snapshot.child_runtime_witnesses.len(),
+            AGENT_CHILD_RUNTIME_WITNESS_LIMIT,
+        );
+        assert_eq!(snapshot.child_runtime_witnesses[0].pid, 1_000);
+        assert_eq!(
+            snapshot.child_runtime_witnesses.last().unwrap().pid,
+            1_000 + AGENT_CHILD_RUNTIME_WITNESS_LIMIT as u32 - 1,
+        );
+    }
+
+    #[test]
+    fn agent_child_runtime_witness_cache_resets_for_a_new_generation() {
+        let mut generation = Some((10, 100));
+        let mut witnesses = vec![AgentChildRuntimeWitness {
+            pid: 11,
+            start_ticks: 110,
+        }];
+
+        refresh_agent_child_runtime_witness_cache(
+            &mut generation,
+            &mut witnesses,
+            Some(20),
+            Some(200),
+        );
+
+        assert_eq!(generation, Some((20, 200)));
+        assert!(witnesses.is_empty());
+    }
+
+    #[test]
+    fn stable_agent_child_runtime_witness_refresh_backs_off_with_a_cap() {
+        let initial =
+            Duration::from_millis(AGENT_CHILD_RUNTIME_WITNESS_REFRESH_INITIAL_MS);
+        let maximum = Duration::from_millis(AGENT_CHILD_RUNTIME_WITNESS_REFRESH_MAX_MS);
+
+        assert_eq!(
+            next_agent_child_runtime_witness_refresh_interval(initial, true),
+            initial,
+        );
+        assert_eq!(
+            next_agent_child_runtime_witness_refresh_interval(initial, false),
+            initial.saturating_mul(2),
+        );
+        assert_eq!(
+            next_agent_child_runtime_witness_refresh_interval(maximum, false),
+            maximum,
         );
     }
 
@@ -70036,6 +71440,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             pid_start_ticks: None,
             child_pid: None,
             child_pid_start_ticks: None,
+            child_runtime_witnesses: Vec::new(),
             provider: Some("claude".into()),
             session_id: Some("s1".into()),
             cwd: Some("/repo".into()),
@@ -70065,6 +71470,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             pid_start_ticks: None,
             child_pid: None,
             child_pid_start_ticks: None,
+            child_runtime_witnesses: Vec::new(),
             provider: Some("claude".into()),
             session_id: Some("s1".into()),
             cwd: Some("/repo".into()),
@@ -70130,6 +71536,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             pid_start_ticks: None,
             child_pid: None,
             child_pid_start_ticks: None,
+            child_runtime_witnesses: Vec::new(),
             provider: Some("claude".into()),
             session_id: Some("s1".into()),
             cwd: Some("/repo".into()),
@@ -70429,6 +71836,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                     daemon_pid_start_ticks: process_start_ticks(std::process::id()),
                     child_pid: None,
                     child_pid_start_ticks: None,
+                    child_runtime_witnesses: Vec::new(),
                     attached: false,
                     attached_client_pid: None,
                     attached_client_instance_id: None,
@@ -70597,6 +72005,10 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             daemon_pid_start_ticks: Some(456),
             child_pid: Some(789),
             child_pid_start_ticks: Some(987),
+            child_runtime_witnesses: vec![AgentChildRuntimeWitness {
+                pid: 790,
+                start_ticks: 988,
+            }],
             attached: true,
             attached_client_pid: Some(42),
             attached_client_instance_id: Some("client-id".into()),
@@ -70616,6 +72028,13 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
         assert_eq!(meta.pid_start_ticks, Some(456));
         assert_eq!(meta.child_pid, Some(789));
         assert_eq!(meta.child_pid_start_ticks, Some(987));
+        assert_eq!(
+            meta.child_runtime_witnesses,
+            vec![AgentChildRuntimeWitness {
+                pid: 790,
+                start_ticks: 988,
+            }]
+        );
         assert!(meta.attached);
         assert_eq!(meta.attached_client_pid, Some(42));
         assert_eq!(
@@ -70630,6 +72049,29 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 .as_deref(),
             Some("shell @ meta")
         );
+    }
+
+    #[test]
+    fn legacy_daemon_identity_without_runtime_witnesses_remains_readable() {
+        let event: AgentDaemonEvent = serde_json::from_value(serde_json::json!({
+            "type": "identity",
+            "provider": "codex",
+            "session_id": "legacy-identity",
+            "cwd": "/repo/legacy",
+            "source": SHELL_SESSION_SOURCE_MARKER,
+            "command": "zsh",
+            "daemon_pid": 123,
+            "daemon_pid_start_ticks": 456,
+            "child_pid": 789,
+            "child_pid_start_ticks": 987,
+        }))
+        .unwrap();
+
+        let meta = agent_meta_snapshot_from_identity_event(event).unwrap();
+
+        assert!(meta.child_runtime_witnesses.is_empty());
+        assert_eq!(meta.child_pid, Some(789));
+        assert_eq!(meta.child_pid_start_ticks, Some(987));
     }
 
     #[test]
@@ -70761,6 +72203,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 pid_start_ticks: None,
                 child_pid: None,
                 child_pid_start_ticks: None,
+                child_runtime_witnesses: Vec::new(),
                 provider: Some(key.provider.as_str().into()),
                 session_id: Some(key.session_id.clone()),
                 cwd: Some("/repo/sub".into()),
@@ -70793,6 +72236,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 pid_start_ticks: None,
                 child_pid: None,
                 child_pid_start_ticks: None,
+                child_runtime_witnesses: Vec::new(),
                 provider: Some(key.provider.as_str().into()),
                 session_id: Some("different-session".into()),
                 cwd: Some("/repo/sub".into()),
@@ -71355,6 +72799,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             pid_start_ticks: None,
             child_pid: Some(456),
             child_pid_start_ticks: Some(789),
+            child_runtime_witnesses: Vec::new(),
             provider: Some(missing_live_key.provider.as_str().into()),
             session_id: Some(missing_live_key.session_id.clone()),
             cwd: Some("/repo/sub".into()),
@@ -71790,7 +73235,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
 
     #[cfg(unix)]
     #[test]
-    fn stale_agent_meta_lists_surviving_child_process_group_as_lost() {
+    fn stale_agent_meta_lists_surviving_child_group_as_lost_until_explicit_killall() {
         let shell = Path::new("/bin/sh");
         if !shell.is_file() {
             return;
@@ -71834,8 +73279,31 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             let _ = child.wait();
             panic!("descendant did not start");
         }
+        let descendant_pid = fs::read_to_string(&descendant_ready_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let Some(descendant_start_ticks) = process_start_ticks(descendant_pid) else {
+            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            return;
+        };
+        assert!(
+            capture_agent_child_runtime_witnesses(child_pid, child_start_ticks)
+                .iter()
+                .any(|witness| witness.pid == descendant_pid
+                    && witness.start_ticks == descendant_start_ticks),
+            "live daemon metadata must capture an exact descendant witness",
+        );
         fs::write(&leader_exit_path, b"exit").unwrap();
         assert_process_exits(&mut child, "session leader did not exit");
+        let exit_observation =
+            observe_agent_child_runtime_after_leader_exit(child_pid, false, &[]);
+        assert!(exit_observation.live);
+        assert!(exit_observation.witnesses.iter().any(|witness| {
+            witness.pid == descendant_pid && witness.start_ticks == descendant_start_ticks
+        }));
         assert!(
             agent_child_process_group_has_live_member(child_pid),
             "test descendant did not remain in the leader's process group"
@@ -71845,6 +73313,43 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             provider: Provider::Codex,
             session_id: "surviving-child-group-session".into(),
         };
+        let unwitnessed = AgentMetaSnapshot {
+            pid: 3_000_000_000,
+            child_pid: Some(child_pid),
+            child_pid_start_ticks: Some(child_start_ticks),
+            provider: Some(key.provider.as_str().to_string()),
+            session_id: Some(key.session_id.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            agent_meta_surviving_child_process_group(&unwitnessed),
+            Some(child_pid),
+            "an uncertain group remains preservation evidence",
+        );
+        assert_eq!(
+            agent_meta_verified_surviving_child_process_group(&unwitnessed),
+            None,
+            "a numeric group alone must not manufacture a lost label",
+        );
+        assert_eq!(
+            terminate_live_agent_identity_child_process(
+                &unwitnessed,
+                &key,
+                "test_live_unwitnessed_orphaned_group",
+            ),
+            LiveAgentChildTermination::unconfirmed(Some(child_pid)),
+            "a live daemon response must not authorize a potentially reused group by number alone",
+        );
+        assert_eq!(
+            terminate_explicit_agent_meta_child_runtime(
+                &unwitnessed,
+                &key,
+                "test_unwitnessed_orphaned_group",
+            ),
+            None,
+            "legacy metadata without a live identity witness must stay preservation-only",
+        );
+        assert!(agent_child_process_group_has_live_member(child_pid));
         let meta_path = dir.path().join(format!("{}.json", agent_file_stem(&key)));
         let socket_path = agent_runtime_stem_endpoint_path(dir.path(), &agent_file_stem(&key));
         fs::write(
@@ -71860,6 +73365,42 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             .to_string(),
         )
         .unwrap();
+        assert_eq!(
+            read_agent_runtime_state_at_for_key(
+                Some(&key),
+                &meta_path,
+                &socket_path,
+                std::process::id(),
+            ),
+            AgentListState::Idle,
+            "an unwitnessed numeric process group must not be displayed as lost",
+        );
+        assert!(
+            meta_path.exists() && agent_child_process_group_has_live_member(child_pid),
+            "an unwitnessed group must remain preserved for safe manual recovery",
+        );
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "pid": 3_000_000_000_u32,
+                "child_pid": child_pid,
+                "child_pid_start_ticks": child_start_ticks,
+                "child_runtime_witnesses": [{
+                    "pid": descendant_pid,
+                    "start_ticks": descendant_start_ticks,
+                }],
+                "provider": key.provider.as_str(),
+                "session_id": &key.session_id,
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let witnessed_meta = read_agent_meta_snapshot_at(&meta_path).unwrap();
+        assert!(
+            !agent_meta_child_runtime_definitively_gone(&witnessed_meta),
+            "an exact live descendant must prevent a false child-runtime completion"
+        );
 
         let discovered = discover_live_shell_infos_at_with_liveness(dir.path(), |_, _, _| None);
         let state = read_agent_runtime_state_at_for_key(
@@ -71869,12 +73410,9 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             std::process::id(),
         );
         let killall = kill_all_agent_daemons_at(dir.path(), std::process::id());
-        let meta_preserved = meta_path.exists();
-        let group_preserved = agent_child_process_group_has_live_member(child_pid);
-        if !terminate_verified_unix_process_group_after_leader_exit(
-            child_pid,
-            "test_orphaned_group_cleanup",
-        ) {
+        let meta_removed = !meta_path.exists();
+        let group_terminated = !agent_child_process_group_has_live_member(child_pid);
+        if !group_terminated {
             let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
         }
 
@@ -71885,12 +73423,18 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             }
         );
         assert!(
-            meta_preserved,
-            "runtime metadata must remain while a recorded child group survives"
+            meta_removed,
+            "explicit killall must remove metadata after the recorded child group exits"
         );
         assert!(
-            group_preserved && killall.skipped_unverified > 0,
-            "stale metadata alone must not authorize signalling a surviving process group"
+            group_terminated
+                && killall.child_processes_terminated == 1
+                && killall.skipped_unverified == 0,
+            "explicit killall must finish an exactly recorded surviving Unix process group"
+        );
+        assert!(
+            agent_meta_child_runtime_definitively_gone(&witnessed_meta),
+            "the same recorded generation must become definitively gone after its group exits"
         );
         assert!(
             discovered.iter().any(|info| AgentKey::new(info) == key),
@@ -78933,6 +80477,10 @@ IF EXIST "%~dp0\node.exe" (
             "old snapshot".into(),
             Some(11),
             Some(22),
+            vec![AgentChildRuntimeWitness {
+                pid: 33,
+                start_ticks: 44,
+            }],
             Provider::Codex,
             "coalesced-meta",
             None,
@@ -78945,11 +80493,25 @@ IF EXIST "%~dp0\node.exe" (
             "latest snapshot".into(),
             Some(11),
             Some(22),
+            Vec::new(),
             Provider::Codex,
             "coalesced-meta",
             None,
         )
         .unwrap();
+        assert_eq!(
+            pending
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .child_runtime_witness_seeds,
+            vec![AgentChildRuntimeWitness {
+                pid: 33,
+                start_ticks: 44,
+            }],
+            "a newer activity snapshot must not coalesce away an exit witness",
+        );
         drop(tx);
 
         let (completion_tx, completion_rx) = mpsc::channel();
@@ -79149,6 +80711,46 @@ IF EXIST "%~dp0\node.exe" (
         assert_eq!(outcome.pid, None);
         assert!(!meta_path.exists());
         assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn terminate_agent_daemon_removes_definitively_stale_unreachable_endpoint() {
+        let info = session_info(
+            Provider::Codex,
+            &format!("stale-endpoint-cleanup-{}", uuid::Uuid::now_v7()),
+            "/tmp/stale-endpoint-cleanup",
+        );
+        let key = AgentKey::new(&info);
+        let meta_path = agent_meta_path(&key).unwrap();
+        let socket_path = agent_socket_path(&key).unwrap();
+        let pty_log_path = agent_pty_log_path(&key).unwrap();
+        fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(pty_log_path.parent().unwrap()).unwrap();
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "pid": 3_000_000_000u32,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+                "cwd": &info.cwd,
+                "source": info.source.display().to_string(),
+                "updated_at_epoch_s": current_epoch_s(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(&socket_path, b"stale endpoint").unwrap();
+        fs::write(&pty_log_path, b"stale history\n").unwrap();
+
+        let outcome = terminate_agent_daemon(&key).unwrap();
+
+        assert_eq!(outcome.pid, None);
+        assert_eq!(outcome.child_pid, None);
+        assert!(!outcome.skipped_unverified);
+        assert!(outcome.pty_log_deleted);
+        assert!(!meta_path.exists());
+        assert!(!socket_path.exists());
+        assert!(!pty_log_path.exists());
     }
 
     #[test]
@@ -79654,7 +81256,7 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn killall_preserves_stale_runtime_with_unverified_endpoint_generation() {
+    fn killall_removes_definitively_stale_unreachable_endpoint_generation() {
         let dir = tempfile::tempdir().unwrap();
         let scrollback = dir.path().join("scrollback");
         fs::create_dir_all(&scrollback).unwrap();
@@ -79691,13 +81293,13 @@ IF EXIST "%~dp0\node.exe" (
         assert_eq!(report.scanned, 1);
         assert_eq!(report.stale, 1);
         assert_eq!(report.killed, 0);
-        assert_eq!(report.skipped_unverified, 1);
-        assert_eq!(report.pty_logs_deleted, 0);
-        assert_eq!(report.cwd_locks_removed, 0);
-        assert!(meta.exists());
-        assert!(socket.exists());
-        assert!(pty_log.exists());
-        assert!(cwd_lock.exists());
+        assert_eq!(report.skipped_unverified, 0);
+        assert_eq!(report.pty_logs_deleted, 1);
+        assert_eq!(report.cwd_locks_removed, 1);
+        assert!(!meta.exists());
+        assert!(!socket.exists());
+        assert!(!pty_log.exists());
+        assert!(!cwd_lock.exists());
     }
 
     #[test]
@@ -80108,7 +81710,7 @@ IF EXIST "%~dp0\node.exe" (
         let replacement_tmp = dir.path().join("replacement-endpoint.tmp");
         fs::write(&replacement_tmp, b"replacement endpoint generation").unwrap();
         replace_runtime_file_atomically(&replacement_tmp, &endpoint_path).unwrap();
-        let outcome = remove_terminated_owned_agent_runtime_files_by_stem(
+        let outcome = remove_verified_inactive_agent_runtime_files_by_stem(
             dir.path(),
             stem,
             Some(&stale_meta),
@@ -80121,13 +81723,49 @@ IF EXIST "%~dp0\node.exe" (
         assert!(endpoint_path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn terminated_owned_cleanup_accepts_runtime_generation_already_absent() {
+    fn verified_inactive_cleanup_retains_identity_when_endpoint_remove_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let scrollback = dir.path().join("scrollback");
+        fs::create_dir_all(&scrollback).unwrap();
+        let stem = "codex-endpoint-remove-failure";
+        let meta_path = dir.path().join(format!("{stem}.json"));
+        let endpoint_path = agent_runtime_stem_endpoint_path(dir.path(), stem);
+        let auth_path = dir.path().join(format!("{stem}.auth"));
+        let pty_log_path = scrollback.join(format!("{stem}.ptylog"));
+        let stale_meta =
+            br#"{"pid":3000000000,"provider":"codex","session_id":"endpoint-remove-failure"}"#;
+        fs::write(&meta_path, stale_meta).unwrap();
+        // remove_file cannot unlink a directory. Its stable inode is still a
+        // valid endpoint-generation observation for exercising failure order.
+        fs::create_dir(&endpoint_path).unwrap();
+        fs::write(&auth_path, b"preserve bearer").unwrap();
+        fs::write(&pty_log_path, b"preserve history\n").unwrap();
+        let observed_endpoint = observe_agent_runtime_endpoint(dir.path(), stem).unwrap();
+
+        let outcome = remove_verified_inactive_agent_runtime_files_by_stem(
+            dir.path(),
+            stem,
+            Some(stale_meta),
+            &observed_endpoint,
+            "test_endpoint_remove_failure",
+        );
+
+        assert_eq!(outcome, None);
+        assert!(endpoint_path.is_dir());
+        assert_eq!(fs::read(&meta_path).unwrap(), stale_meta);
+        assert_eq!(fs::read(&auth_path).unwrap(), b"preserve bearer");
+        assert_eq!(fs::read(&pty_log_path).unwrap(), b"preserve history\n");
+    }
+
+    #[test]
+    fn verified_inactive_cleanup_accepts_runtime_generation_already_absent() {
         let dir = tempfile::tempdir().unwrap();
         let stale_meta: &[u8] =
             br#"{"pid":3000000000,"provider":"codex","session_id":"already-gone"}"#;
 
-        let outcome = remove_terminated_owned_agent_runtime_files_by_stem(
+        let outcome = remove_verified_inactive_agent_runtime_files_by_stem(
             dir.path(),
             "codex-already-gone",
             Some(stale_meta),
@@ -80136,6 +81774,93 @@ IF EXIST "%~dp0\node.exe" (
         );
 
         assert_eq!(outcome, Some(false));
+    }
+
+    #[test]
+    fn verified_inactive_cleanup_refreshes_meta_after_identity_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(
+            Provider::Codex,
+            "identity-refresh-cleanup",
+            "/repo/identity-refresh-cleanup",
+        );
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let meta_path = dir.path().join(format!("{stem}.json"));
+        let before_identity = serde_json::json!({
+            "pid": 3_000_000_000u32,
+            "provider": info.provider.as_str(),
+            "session_id": &info.session_id,
+            "attached": false,
+        })
+        .to_string();
+        let after_identity = serde_json::json!({
+            "pid": 3_000_000_000u32,
+            "provider": info.provider.as_str(),
+            "session_id": &info.session_id,
+            "attached": true,
+            "updated_at_epoch_s": current_epoch_s(),
+        })
+        .to_string();
+        fs::write(&meta_path, &before_identity).unwrap();
+        let observed_endpoint = observe_agent_runtime_endpoint(dir.path(), &stem).unwrap();
+
+        // A live Identify request writes a fresh snapshot before returning its
+        // exact child identity. Cleanup must observe these final bytes after
+        // termination instead of comparing against the pre-request snapshot.
+        fs::write(&meta_path, &after_identity).unwrap();
+        let outcome = remove_verified_inactive_agent_runtime_files_after_refresh(
+            dir.path(),
+            &stem,
+            &key,
+            &observed_endpoint,
+            "test_identity_refresh_cleanup",
+        );
+
+        assert_ne!(before_identity, after_identity);
+        assert_eq!(outcome, Some(false));
+        assert!(!meta_path.exists());
+    }
+
+    #[test]
+    fn verified_inactive_cleanup_refreshes_endpoint_after_daemon_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = session_info(
+            Provider::Codex,
+            "endpoint-refresh-cleanup",
+            "/repo/endpoint-refresh-cleanup",
+        );
+        let key = AgentKey::new(&info);
+        let stem = agent_file_stem(&key);
+        let meta_path = dir.path().join(format!("{stem}.json"));
+        let endpoint_path = agent_runtime_stem_endpoint_path(dir.path(), &stem);
+        fs::write(
+            &meta_path,
+            serde_json::json!({
+                "pid": 3_000_000_000u32,
+                "provider": info.provider.as_str(),
+                "session_id": &info.session_id,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(&endpoint_path, b"terminating endpoint").unwrap();
+        let observed_endpoint = observe_agent_runtime_endpoint(dir.path(), &stem).unwrap();
+
+        // The daemon can unlink its endpoint before a final metadata cleanup
+        // finishes. The now-absent endpoint is the inactive generation to
+        // revalidate, not an automatic reason to preserve stale metadata.
+        fs::remove_file(&endpoint_path).unwrap();
+        let outcome = remove_verified_inactive_agent_runtime_files_after_refresh(
+            dir.path(),
+            &stem,
+            &key,
+            &observed_endpoint,
+            "test_endpoint_refresh_cleanup",
+        );
+
+        assert_eq!(outcome, Some(false));
+        assert!(!meta_path.exists());
     }
 
     #[test]
