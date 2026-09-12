@@ -55,6 +55,9 @@ tempfile = "3"
 # clear_wide / Screen::text() panics that trigger when a wide character is
 # stranded at the last column after a shrink resize. See vendor/vt100-cokac.
 vt100 = { path = "vendor/vt100-cokac" }
+# Preserve the incremental decoder state in PTY checkpoints (including a
+# partially received UTF-8 character or control sequence).
+vte = { path = "vendor/vte-cokac" }
 
 [profile.release]
 opt-level = 3

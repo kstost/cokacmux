@@ -63,9 +63,9 @@ unsafe extern "system" {
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -93,6 +93,9 @@ use cokacmux::universal::{Provider, UniversalSession};
 use cokacmux::ConvertError;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+#[path = "cokacmux_mouse.rs"]
+mod mouse;
 const PREVIEW_CACHE_LIMIT: usize = 16;
 const AI_TITLE_TIMEOUT_SECS: u64 = 180;
 const AI_TITLE_MAX_CHARS: usize = 120;
@@ -196,7 +199,6 @@ const AGENT_AUX_PANE_TARGET_WIDTH: u16 = 52;
 const AGENT_MAIN_MIN_WIDTH_WITH_AUX: u16 = 36;
 const AGENT_OUTPUT_POLL_LIMIT: usize = 256;
 const AGENT_OUTPUT_DRAIN_BUDGET_MS: u64 = 8;
-const TERMINAL_RESPONSE_SCAN_TAIL_BYTES: usize = 4;
 const AGENT_DAEMON_ARG: &str = "--agent-daemon";
 const AGENT_DAEMON_READY_ENV: &str = "COKACMUX_DAEMON_READY_STDOUT";
 const AGENT_DAEMON_READY_TCP_ENV: &str = "COKACMUX_DAEMON_READY_TCP";
@@ -5595,6 +5597,7 @@ fn agent_daemon_event_debug_value(event: &AgentDaemonEvent) -> serde_json::Value
             last_input_epoch_ms,
             bracketed_paste_mode,
             input_acknowledgements,
+            ..
         } => serde_json::json!({
             "kind": "attached",
             "provider": provider.as_str(),
@@ -5627,9 +5630,14 @@ fn agent_daemon_event_debug_value(event: &AgentDaemonEvent) -> serde_json::Value
             "kind": "output",
             "data": debug_terminal_data_summary(data, 128),
         }),
-        AgentDaemonEvent::Snapshot { data } => serde_json::json!({
+        AgentDaemonEvent::Snapshot { data, state } => serde_json::json!({
             "kind": "snapshot",
             "data": debug_terminal_data_summary(data, 128),
+            "checkpoint": state.as_ref().map(|state| serde_json::json!({
+                "size": state.parser.size(),
+                "estimated_bytes": state.parser.estimated_bytes(),
+                "history_lines": state.history.len(),
+            })),
         }),
         AgentDaemonEvent::Exited { status } => serde_json::json!({
             "kind": "exited",
@@ -5896,6 +5904,22 @@ struct AgentPtyOutputDrain {
     activity_changed: bool,
     has_more: bool,
     output_closed: bool,
+    output_error: Option<String>,
+}
+
+enum AgentPtyOutput {
+    Data(Vec<u8>),
+    Eof,
+    Failed(String),
+}
+
+fn read_pty_retry_interrupted(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -5936,7 +5960,9 @@ struct AgentSession {
     input_sequences_in_flight: HashSet<DaemonPtyInputAcknowledgement>,
     pending_input: VecDeque<DaemonPtyInputJob>,
     pending_input_bytes: usize,
-    output_rx: Receiver<Vec<u8>>,
+    output_rx: Receiver<AgentPtyOutput>,
+    output_read_error: Option<String>,
+    output_eof: bool,
     /// All daemon disk writes (pty log appends, meta snapshots) go through
     /// this bounded queue to a dedicated writer thread, so a disk stall can
     /// never block the output pump that feeds the client's screen. Jobs are
@@ -5961,7 +5987,6 @@ struct AgentSession {
     last_meta_activity_write_epoch_ms: u64,
     last_cwd_refresh_at: Instant,
     debug_drain_logs: u32,
-    terminal_response_scan_tail: Vec<u8>,
     bracketed_paste_mode: bool,
     bracketed_paste_scan_tail: Vec<u8>,
 }
@@ -6502,7 +6527,7 @@ fn run_daemon_disk_writer(
     );
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ScreenHistory {
     lines: VecDeque<String>,
     last_snapshot: Vec<String>,
@@ -7136,7 +7161,7 @@ impl AgentSession {
             }
         };
         let (output_tx, output_rx) =
-            mpsc::sync_channel::<Vec<u8>>(AGENT_PTY_OUTPUT_QUEUE_MAX_CHUNKS);
+            mpsc::sync_channel::<AgentPtyOutput>(AGENT_PTY_OUTPUT_QUEUE_MAX_CHUNKS);
         let reader_provider = info.provider;
         let reader_session_id = info.session_id.clone();
         if let Err(error) = thread::Builder::new()
@@ -7150,8 +7175,9 @@ impl AgentSession {
                 let mut read_count = 0u32;
                 let mut total_bytes = 0usize;
                 loop {
-                    match reader.read(&mut buf) {
+                    match read_pty_retry_interrupted(reader.as_mut(), &mut buf) {
                         Ok(0) => {
+                            let _ = output_tx.send(AgentPtyOutput::Eof);
                             debug_log(
                                 "agent_pty_eof",
                                 serde_json::json!({
@@ -7179,7 +7205,10 @@ impl AgentSession {
                                     }),
                                 );
                             }
-                            if output_tx.send(buf[..n].to_vec()).is_err() {
+                            if output_tx
+                                .send(AgentPtyOutput::Data(buf[..n].to_vec()))
+                                .is_err()
+                            {
                                 debug_log(
                                     "agent_pty_receiver_closed",
                                     serde_json::json!({
@@ -7193,6 +7222,7 @@ impl AgentSession {
                             }
                         }
                         Err(e) => {
+                            let _ = output_tx.send(AgentPtyOutput::Failed(e.to_string()));
                             debug_log(
                                 "agent_pty_read_error",
                                 serde_json::json!({
@@ -7220,7 +7250,8 @@ impl AgentSession {
             return Err(error.into());
         }
 
-        let parser = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
+        let mut parser = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
+        parser.set_collect_responses(true);
         let (disk_tx, disk_rx) = mpsc::sync_channel::<DaemonDiskJob>(DAEMON_DISK_QUEUE_MAX_JOBS);
         let pending_meta_write = Arc::new(Mutex::new(None));
         let writer_pending_meta_write = Arc::clone(&pending_meta_write);
@@ -7353,6 +7384,8 @@ impl AgentSession {
             pending_input: VecDeque::new(),
             pending_input_bytes: 0,
             output_rx,
+            output_read_error: None,
+            output_eof: false,
             disk_tx: disk_thread.is_some().then_some(disk_tx),
             pending_meta_write,
             meta_write_completion_rx,
@@ -7369,7 +7402,6 @@ impl AgentSession {
             last_cwd_refresh_at: Instant::now()
                 - Duration::from_millis(AGENT_STATE_POLL_INTERVAL_MS),
             debug_drain_logs: 0,
-            terminal_response_scan_tail: Vec::new(),
             bracketed_paste_mode: false,
             bracketed_paste_scan_tail: Vec::new(),
         })
@@ -7380,25 +7412,10 @@ impl AgentSession {
         let started = Instant::now();
         while should_continue_agent_output_drain(drain.chunks.len(), started.elapsed()) {
             match self.output_rx.try_recv() {
-                Ok(bytes) => {
+                Ok(AgentPtyOutput::Data(bytes)) => {
                     self.last_output_epoch_ms = current_epoch_ms();
                     drain.activity_changed = true;
                     self.append_pty_log(&bytes);
-                    let bracketed_changed = update_bracketed_paste_mode_from_output(
-                        &mut self.bracketed_paste_mode,
-                        &mut self.bracketed_paste_scan_tail,
-                        &bytes,
-                    );
-                    if bracketed_changed && DEBUG_ENABLED.load(Ordering::Relaxed) {
-                        debug_log(
-                            "daemon_bracketed_paste_mode_changed",
-                            serde_json::json!({
-                                "provider": self.info.provider.as_str(),
-                                "session_id": &self.info.session_id,
-                                "enabled": self.bracketed_paste_mode,
-                            }),
-                        );
-                    }
                     if process_parser_output(
                         &mut self.parser,
                         &bytes,
@@ -7408,21 +7425,9 @@ impl AgentSession {
                         self.last_screen_change_epoch_ms = current_epoch_ms();
                         drain.activity_changed = true;
                     }
-                    let mut terminal_response_scan = self.terminal_response_scan_tail.clone();
-                    let previous_scan_len = terminal_response_scan.len();
-                    terminal_response_scan.extend_from_slice(&bytes);
-                    let terminal_response = terminal_response_for_combined_output(
-                        self.parser.screen(),
-                        &terminal_response_scan,
-                        previous_scan_len,
-                    );
-                    let keep_start = terminal_response_scan
-                        .len()
-                        .saturating_sub(TERMINAL_RESPONSE_SCAN_TAIL_BYTES);
-                    self.terminal_response_scan_tail =
-                        terminal_response_scan[keep_start..].to_vec();
-
-                    if let Some(response) = terminal_response {
+                    self.bracketed_paste_mode = self.parser.screen().bracketed_paste();
+                    let response = self.parser.take_responses();
+                    if !response.is_empty() {
                         match self.write_to_agent(&response, false) {
                             Ok(()) => {
                                 debug_log(
@@ -7449,9 +7454,24 @@ impl AgentSession {
                     }
                     drain.chunks.push(bytes);
                 }
+                Ok(AgentPtyOutput::Eof) => {
+                    self.output_eof = true;
+                    drain.output_closed = true;
+                    break;
+                }
+                Ok(AgentPtyOutput::Failed(error)) => {
+                    self.output_read_error = Some(error.clone());
+                    drain.output_error = Some(error);
+                    break;
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    drain.output_closed = true;
+                    drain.output_closed = self.output_eof;
+                    if !self.output_eof && self.output_read_error.is_none() {
+                        let error = "PTY output reader stopped without EOF".to_string();
+                        self.output_read_error = Some(error.clone());
+                        drain.output_error = Some(error);
+                    }
                     break;
                 }
             }
@@ -7734,6 +7754,8 @@ impl AgentSession {
             &self.info,
             Some(&mut screen_history),
         );
+        // Replayed historical queries are not new requests from the child.
+        parser.set_collect_responses(true);
         self.parser = parser;
         self.screen_history = screen_history;
         self.screen_hash = screen_activity_hash(self.parser.screen());
@@ -7750,7 +7772,7 @@ impl AgentSession {
         );
     }
 
-    fn resize(&mut self, cols: u16, rows: u16) {
+    fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
         let next = agent_pty_size(cols, rows);
         if self.pty_size.rows == next.rows && self.pty_size.cols == next.cols {
             debug_log(
@@ -7765,7 +7787,7 @@ impl AgentSession {
                     "reason": "unchanged",
                 }),
             );
-            return;
+            return Ok(());
         }
         let old_rows = self.pty_size.rows;
         let old_cols = self.pty_size.cols;
@@ -7774,10 +7796,13 @@ impl AgentSession {
         let verbose_debug = TRACE_ENABLED.load(Ordering::Relaxed);
         let state_before = (should_debug && verbose_debug)
             .then(|| debug_agent_session_state_value(self, visible_rows, visible_rows.min(120)));
-        let resize_result = self.master.resize(next);
-        self.parser.screen_mut().set_size(next.rows, next.cols);
-        self.screen_hash = screen_activity_hash(self.parser.screen());
-        self.pty_size = next;
+        let master = &self.master;
+        let resize_result = resize_pty_state(&mut self.parser, &mut self.pty_size, next, |size| {
+            master.resize(size).map_err(io::Error::other)
+        });
+        if resize_result.is_ok() {
+            self.screen_hash = screen_activity_hash(self.parser.screen());
+        }
         if should_debug {
             let state_after = verbose_debug.then(|| {
                 debug_agent_session_state_value(self, visible_rows, visible_rows.min(120))
@@ -7792,12 +7817,13 @@ impl AgentSession {
                     "new_rows": next.rows,
                     "new_cols": next.cols,
                     "pty_resize_ok": resize_result.is_ok(),
-                    "pty_resize_error": resize_result.err().map(|e| e.to_string()),
+                    "pty_resize_error": resize_result.as_ref().err().map(|e| e.to_string()),
                     "state_before": state_before,
                     "state_after": state_after,
                 }),
             );
         }
+        resize_result
     }
 
     fn send_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -8097,6 +8123,25 @@ impl AgentSession {
         }
         snapshot
     }
+
+    fn snapshot_event(&mut self, include_scrollback: bool, checkpoint: bool) -> AgentDaemonEvent {
+        AgentDaemonEvent::Snapshot {
+            // Do not duplicate a large history in two encodings. Negotiate
+            // the additive capability; older clients receive ANSI only.
+            data: if checkpoint {
+                Vec::new()
+            } else {
+                self.screen_snapshot_bytes(include_scrollback)
+            },
+            state: checkpoint.then(|| AgentTerminalSnapshot {
+                // Installing a checkpoint replaces both grids. Unlike a
+                // legacy visible-only refresh, it must not clear history on
+                // resize or after dropped output.
+                parser: self.parser.checkpoint(true),
+                history: self.screen_history.clone(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8138,6 +8183,9 @@ fn parser_snapshot_bytes_with_history(
         }
         if !replay_lines.is_empty() {
             append_plain_terminal_lines(&mut bytes, &replay_lines);
+            // Every replayed history row must leave the visible grid before
+            // ED clears it. A trailing CRLF alone still loses rows - 1 lines.
+            append_snapshot_history_padding(&mut bytes, parser.screen().size().0);
         }
     }
 
@@ -8146,6 +8194,7 @@ fn parser_snapshot_bytes_with_history(
     bytes.extend_from_slice(b"\x1b[2J\x1b[H");
     bytes.extend_from_slice(&screen.contents_formatted());
     bytes.extend_from_slice(&screen.cursor_state_formatted());
+    bytes.extend_from_slice(&screen.input_mode_formatted());
     parser.screen_mut().set_scrollback(original_scrollback);
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         let snapshot_sample_budget = if verbose_debug { 1024 } else { 64 };
@@ -8212,6 +8261,12 @@ fn append_plain_terminal_lines(bytes: &mut Vec<u8>, lines: &[String]) {
     }
 }
 
+fn append_snapshot_history_padding(bytes: &mut Vec<u8>, rows: u16) {
+    for _ in 0..rows {
+        bytes.extend_from_slice(b"\r\n");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotScrollbackSanitize {
     before_scrollback: usize,
@@ -8251,10 +8306,12 @@ fn sanitize_snapshot_visible_screen_duplicates(
         let mut bytes = Vec::new();
         if !scrollback_lines.is_empty() {
             append_plain_terminal_lines(&mut bytes, &scrollback_lines);
+            append_snapshot_history_padding(&mut bytes, rows);
         }
         bytes.extend_from_slice(b"\x1b[2J\x1b[H");
         bytes.extend_from_slice(&screen.contents_formatted());
         bytes.extend_from_slice(&screen.cursor_state_formatted());
+        bytes.extend_from_slice(&screen.input_mode_formatted());
         bytes
     };
 
@@ -8657,6 +8714,10 @@ enum AgentDaemonRequest {
         /// daemon replaces an already attached healthy connection.
         #[serde(default)]
         attach_confirmation: bool,
+        #[serde(default)]
+        input_replay_epochs: bool,
+        #[serde(default)]
+        terminal_checkpoints: bool,
     },
     AttachConfirmed {
         nonce: String,
@@ -8673,6 +8734,8 @@ enum AgentDaemonRequest {
         /// `Attached`. Older daemons ignore this additive field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_replay_epoch: Option<String>,
     },
     Detach,
 }
@@ -8759,6 +8822,10 @@ enum AgentDaemonEvent {
         /// produce.
         #[serde(default)]
         input_acknowledgements: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_replay_epoch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pty_size: Option<(u16, u16)>,
     },
     AttachChallenge {
         provider: Provider,
@@ -8776,6 +8843,9 @@ enum AgentDaemonEvent {
     },
     Snapshot {
         data: Vec<u8>,
+        /// Negotiated capability: old clients receive only the ANSI fallback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<AgentTerminalSnapshot>,
     },
     Exited {
         status: String,
@@ -8783,6 +8853,49 @@ enum AgentDaemonEvent {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentTerminalSnapshot {
+    parser: vt100::ParserCheckpoint,
+    history: ScreenHistory,
+}
+
+struct PreparedAgentSnapshot {
+    parser: vt100::Parser,
+    history: ScreenHistory,
+    estimated_bytes: usize,
+}
+
+impl std::fmt::Debug for PreparedAgentSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedAgentSnapshot")
+            .field("size", &self.parser.screen().size())
+            .field("estimated_bytes", &self.estimated_bytes)
+            .finish()
+    }
+}
+
+impl AgentTerminalSnapshot {
+    fn prepare(self) -> std::result::Result<PreparedAgentSnapshot, String> {
+        if self.history.lines.len() > AGENT_SCROLLBACK_LINES {
+            return Err("terminal checkpoint exceeds screen history limit".into());
+        }
+        let estimated_bytes = self.parser.estimated_bytes()
+            + self.history.lines.iter().map(String::len).sum::<usize>()
+            + self
+                .history
+                .last_snapshot
+                .iter()
+                .map(String::len)
+                .sum::<usize>();
+        let parser = vt100::Parser::from_checkpoint(self.parser).map_err(str::to_string)?;
+        Ok(PreparedAgentSnapshot {
+            parser,
+            history: self.history,
+            estimated_bytes,
+        })
+    }
 }
 
 type AgentAttachAcknowledgement = std::result::Result<AgentDaemonEvent, String>;
@@ -8848,6 +8961,8 @@ fn agent_output_kind_label(kind: AgentOutputKind) -> &'static str {
 struct AgentOutputSegment {
     kind: AgentOutputKind,
     data: Vec<u8>,
+    offset: usize,
+    snapshot: Option<PreparedAgentSnapshot>,
 }
 
 #[derive(Debug)]
@@ -8855,6 +8970,7 @@ struct AgentOutputChunk {
     kind: AgentOutputKind,
     data: Vec<u8>,
     segment_done: bool,
+    snapshot: Option<PreparedAgentSnapshot>,
 }
 
 #[derive(Debug, Default)]
@@ -8940,6 +9056,8 @@ struct AgentClient {
     /// confirm liveness and the UI can reconnect without pruning the agent or
     /// its persisted auxiliary relationship.
     connection_ended: Option<String>,
+    pending_resize: Option<(u16, u16)>,
+    input_replay_epoch: Option<String>,
     input_acknowledgements: bool,
     daemon_pid: u32,
     daemon_pid_start_ticks: Option<u64>,
@@ -8979,6 +9097,7 @@ struct UnacknowledgedAgentInput {
     data: Vec<u8>,
     daemon_pid: u32,
     daemon_pid_start_ticks: Option<u64>,
+    input_replay_epoch: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -9360,6 +9479,8 @@ impl AgentClient {
                 client_debug: Some(DEBUG_ENABLED.load(Ordering::Relaxed)),
                 client_trace: Some(TRACE_ENABLED.load(Ordering::Relaxed)),
                 attach_confirmation: true,
+                input_replay_epochs: true,
+                terminal_checkpoints: true,
             },
             Duration::from_millis(AGENT_ATTACH_WRITE_TIMEOUT_MS),
         )?;
@@ -9590,6 +9711,8 @@ impl AgentClient {
                 pty_size,
                 exited: None,
                 connection_ended: None,
+                pending_resize: None,
+                input_replay_epoch: None,
                 input_acknowledgements: false,
                 daemon_pid: 0,
                 daemon_pid_start_ticks: None,
@@ -9654,6 +9777,8 @@ impl AgentClient {
                 last_input_epoch_ms,
                 bracketed_paste_mode,
                 input_acknowledgements,
+                input_replay_epoch,
+                pty_size,
                 ..
             } => {
                 self.connection_ended = None;
@@ -9662,6 +9787,12 @@ impl AgentClient {
                 self.daemon_pid_start_ticks = daemon_pid_start_ticks;
                 self.bracketed_paste_mode = bracketed_paste_mode;
                 self.input_acknowledgements = input_acknowledgements;
+                self.input_replay_epoch = input_replay_epoch;
+                // New daemons report applied geometry; older ones only
+                // acknowledge the most recently queued resize.
+                if let Some(size) = pty_size.or(self.pending_resize) {
+                    self.apply_acknowledged_pty_size(size);
+                }
                 self.bracketed_paste_scan_tail.clear();
                 let visible_rows = self.pty_size.rows as usize;
                 let verbose_debug = TRACE_ENABLED.load(Ordering::Relaxed);
@@ -9791,7 +9922,14 @@ impl AgentClient {
                     self.process_agent_output(&data, true);
                 }
             }
-            AgentDaemonEvent::Snapshot { data } => {
+            AgentDaemonEvent::Snapshot { data, state } => {
+                if let Some(state) = state {
+                    match state.prepare() {
+                        Ok(snapshot) => self.install_agent_snapshot(snapshot),
+                        Err(error) => self.connection_ended = Some(error),
+                    }
+                    return;
+                }
                 if DEBUG_ENABLED.load(Ordering::Relaxed) {
                     let verbose_debug = TRACE_ENABLED.load(Ordering::Relaxed);
                     let visible_rows = self.pty_size.rows as usize;
@@ -9833,18 +9971,17 @@ impl AgentClient {
                         "message": &message,
                     }),
                 );
-                self.mark_exit_detected();
-                self.exited = Some(message);
+                // A PTY/connection error is not evidence of process exit.
+                self.connection_ended = Some(message);
             }
         }
     }
 
     fn process_agent_output(&mut self, data: &[u8], counts_as_activity: bool) {
-        let bracketed_changed = update_bracketed_paste_mode_from_output(
-            &mut self.bracketed_paste_mode,
-            &mut self.bracketed_paste_scan_tail,
-            data,
-        );
+        let previous_bracketed = self.bracketed_paste_mode;
+        self.process_agent_output_inner(data, counts_as_activity, true);
+        self.bracketed_paste_mode = self.parser.screen().bracketed_paste();
+        let bracketed_changed = previous_bracketed != self.bracketed_paste_mode;
         if bracketed_changed && DEBUG_ENABLED.load(Ordering::Relaxed) {
             debug_log(
                 "agent_client_bracketed_paste_mode_changed",
@@ -9855,7 +9992,6 @@ impl AgentClient {
                 }),
             );
         }
-        self.process_agent_output_inner(data, counts_as_activity, true);
     }
 
     fn process_agent_snapshot_output(&mut self, data: &[u8]) {
@@ -9934,6 +10070,26 @@ impl AgentClient {
         self.finish_agent_snapshot();
     }
 
+    fn install_agent_snapshot(&mut self, snapshot: PreparedAgentSnapshot) {
+        let (rows, cols) = snapshot.parser.screen().size();
+        self.parser = snapshot.parser;
+        self.screen_history = snapshot.history;
+        self.pty_size = agent_pty_size(cols, rows);
+        if self.pending_resize == Some((rows, cols)) {
+            self.pending_resize = None;
+        }
+        self.history_scroll_offset = 0;
+        self.bracketed_paste_mode = self.parser.screen().bracketed_paste();
+        self.bracketed_paste_scan_tail.clear();
+        self.screen_hash = screen_activity_hash(self.parser.screen());
+        self.pending_snapshot_output = false;
+        self.snapshot_parse_in_progress = false;
+        self.codex_transcript_overlay_assumed_open = false;
+        if screen_has_visible_content(self.parser.screen()) {
+            self.startup_spinner_started_at = None;
+        }
+    }
+
     fn begin_agent_snapshot(&mut self, first_chunk: &[u8]) {
         let visible_rows = self.pty_size.rows as usize;
         let should_debug = DEBUG_ENABLED.load(Ordering::Relaxed);
@@ -9957,6 +10113,12 @@ impl AgentClient {
             self.pty_size.cols,
             AGENT_SCROLLBACK_LINES,
         );
+        // Older daemons advertise paste mode in Attached but omit it from
+        // their ANSI snapshot. Seed that mode before replay; explicit modes
+        // in newer snapshots still override it.
+        if self.bracketed_paste_mode {
+            safe_parser_process(&mut self.parser, b"\x1b[?2004h");
+        }
         self.screen_history = ScreenHistory::default();
         self.history_scroll_offset = 0;
         self.codex_transcript_overlay_assumed_open = false;
@@ -10002,10 +10164,16 @@ impl AgentClient {
                 }),
             );
         }
+        self.bracketed_paste_mode = self.parser.screen().bracketed_paste();
+        self.bracketed_paste_scan_tail.clear();
         self.snapshot_parse_in_progress = false;
     }
 
     fn process_agent_snapshot_chunk(&mut self, chunk: AgentOutputChunk) {
+        if let Some(snapshot) = chunk.snapshot {
+            self.install_agent_snapshot(snapshot);
+            return;
+        }
         if !self.snapshot_parse_in_progress {
             self.begin_agent_snapshot(&chunk.data);
         }
@@ -10049,6 +10217,7 @@ impl AgentClient {
                             kind: AgentOutputKind::Snapshot,
                             data: chunk.data,
                             segment_done: chunk.segment_done,
+                            snapshot: None,
                         });
                     } else if !chunk.data.is_empty() {
                         self.process_agent_output(&chunk.data, true);
@@ -10134,7 +10303,11 @@ impl AgentClient {
 
     fn resize(&mut self, cols: u16, rows: u16) {
         let next = agent_pty_size(cols, rows);
-        if self.pty_size.rows == next.rows && self.pty_size.cols == next.cols {
+        if self.pending_resize == Some((next.rows, next.cols))
+            || (self.pending_resize.is_none()
+                && self.pty_size.rows == next.rows
+                && self.pty_size.cols == next.cols)
+        {
             return;
         }
         let old_rows = self.pty_size.rows;
@@ -10144,16 +10317,15 @@ impl AgentClient {
         let verbose_debug = TRACE_ENABLED.load(Ordering::Relaxed);
         let state_before = (should_debug && verbose_debug)
             .then(|| debug_agent_client_state_value(self, visible_rows, visible_rows.min(120)));
-        self.parser.screen_mut().set_size(next.rows, next.cols);
-        self.screen_hash = screen_activity_hash(self.parser.screen());
-        self.pty_size = next;
-        self.history_scroll_offset = self
-            .history_scroll_offset
-            .min(self.screen_history.max_scroll_offset(next.rows as usize));
         let send_result = self.send_request(AgentDaemonRequest::Resize {
             cols: next.cols,
             rows: next.rows,
         });
+        if send_result.is_ok() {
+            self.pending_resize = Some((next.rows, next.cols));
+        } else {
+            self.connection_ended = send_result.as_ref().err().map(|error| error.to_string());
+        }
         if should_debug {
             let state_after = verbose_debug
                 .then(|| debug_agent_client_state_value(self, visible_rows, visible_rows.min(120)));
@@ -10182,6 +10354,21 @@ impl AgentClient {
         } else {
             self.history_scroll_offset
         }
+    }
+
+    fn apply_acknowledged_pty_size(&mut self, (rows, cols): (u16, u16)) {
+        let next = agent_pty_size(cols, rows);
+        if self.parser.screen().size() != (next.rows, next.cols) {
+            self.parser.screen_mut().set_size(next.rows, next.cols);
+        }
+        self.pty_size = next;
+        if self.pending_resize == Some((rows, cols)) {
+            self.pending_resize = None;
+        }
+        self.screen_hash = screen_activity_hash(self.parser.screen());
+        self.history_scroll_offset = self
+            .history_scroll_offset
+            .min(self.screen_history.max_scroll_offset(rows as usize));
     }
 
     fn set_scrollback_offset(&mut self, rows: usize) -> usize {
@@ -10236,7 +10423,9 @@ impl AgentClient {
     }
 
     fn send_key(&mut self, key: KeyEvent) -> io::Result<()> {
-        if let Some(data) = key_event_to_bytes(key) {
+        if let Some(data) =
+            key_event_to_bytes_with_mode(key, self.parser.screen().application_cursor())
+        {
             let scrollback_before = self.scrollback_offset();
             if DEBUG_ENABLED.load(Ordering::Relaxed) {
                 let visible_rows = self.pty_size.rows as usize;
@@ -10297,7 +10486,10 @@ impl AgentClient {
                     "agent": agent_client_io_debug_value(self),
                 }),
             );
-            Ok(())
+            Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "key has no supported terminal encoding",
+            ))
         }
     }
 
@@ -10536,6 +10728,7 @@ impl AgentClient {
                 self.send_request(AgentDaemonRequest::Input {
                     data: chunk.to_vec(),
                     input_seq: None,
+                    input_replay_epoch: None,
                 })?;
             }
             return Ok(());
@@ -10604,6 +10797,7 @@ impl AgentClient {
                 data: chunk.to_vec(),
                 daemon_pid: self.daemon_pid,
                 daemon_pid_start_ticks: self.daemon_pid_start_ticks,
+                input_replay_epoch: self.input_replay_epoch.clone(),
             })
             .collect::<Vec<_>>();
         self.unacknowledged_input_bytes = next_unacknowledged_bytes;
@@ -10613,6 +10807,7 @@ impl AgentClient {
             if let Err(error) = self.send_request(AgentDaemonRequest::Input {
                 data: pending.data,
                 input_seq: Some(pending.input_seq),
+                input_replay_epoch: pending.input_replay_epoch,
             }) {
                 debug_log(
                     "agent_client_input_queue_failed_retained",
@@ -10702,6 +10897,17 @@ impl AgentClient {
                 "retained input daemon generation cannot be verified; new input remains paused",
             ));
         }
+        if self.input_replay_epoch.is_none()
+            || self
+                .unacknowledged_input
+                .iter()
+                .any(|frame| frame.input_replay_epoch != self.input_replay_epoch)
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "retained input replay window cannot be verified or has expired; input remains paused",
+            ));
+        }
         if !self.input_acknowledgements {
             return Err(io::Error::new(
                 ErrorKind::Unsupported,
@@ -10717,6 +10923,7 @@ impl AgentClient {
             self.send_request(AgentDaemonRequest::Input {
                 data: frame.data,
                 input_seq: Some(frame.input_seq),
+                input_replay_epoch: frame.input_replay_epoch,
             })?;
         }
         self.unacknowledged_input_replay_queued = true;
@@ -10842,8 +11049,25 @@ fn queue_agent_output(
     kind: AgentOutputKind,
     data: Vec<u8>,
 ) -> std::result::Result<(), String> {
+    queue_agent_output_with_snapshot(output_buffer, tx, reader_id, kind, data, None)
+}
+
+fn queue_agent_output_with_snapshot(
+    output_buffer: &Arc<Mutex<AgentOutputBuffer>>,
+    tx: &Sender<MainEvent>,
+    reader_id: u64,
+    kind: AgentOutputKind,
+    data: Vec<u8>,
+    snapshot: Option<PreparedAgentSnapshot>,
+) -> std::result::Result<(), String> {
+    if snapshot.is_some() && kind != AgentOutputKind::Snapshot {
+        return Err("terminal checkpoint must be queued as a snapshot".into());
+    }
     let debug_enabled = DEBUG_ENABLED.load(Ordering::Relaxed);
-    let data_len = data.len();
+    let data_len = data.len()
+        + snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.estimated_bytes);
     let data_summary = debug_enabled.then(|| {
         let sample_budget = if TRACE_ENABLED.load(Ordering::Relaxed) {
             512
@@ -10856,10 +11080,9 @@ fn queue_agent_output(
         let mut pending = lock_agent_output_buffer(output_buffer);
         let mut merged = false;
         if kind == AgentOutputKind::Output {
-            let can_merge = pending
-                .segments
-                .back()
-                .is_some_and(|segment| segment.kind == AgentOutputKind::Output);
+            let can_merge = pending.segments.back().is_some_and(|segment| {
+                segment.kind == AgentOutputKind::Output && segment.offset == 0
+            });
             if can_merge {
                 merged = true;
                 pending
@@ -10869,14 +11092,20 @@ fn queue_agent_output(
                     .data
                     .extend_from_slice(&data);
             } else {
-                pending
-                    .segments
-                    .push_back(AgentOutputSegment { kind, data });
+                pending.segments.push_back(AgentOutputSegment {
+                    kind,
+                    data,
+                    offset: 0,
+                    snapshot,
+                });
             }
         } else {
-            pending
-                .segments
-                .push_back(AgentOutputSegment { kind, data });
+            pending.segments.push_back(AgentOutputSegment {
+                kind,
+                data,
+                offset: 0,
+                snapshot,
+            });
         }
         pending.queued_bytes = pending.queued_bytes.saturating_add(data_len);
         let segments_len = pending.segments.len();
@@ -10943,24 +11172,39 @@ fn take_agent_output_chunk(
         return (None, false);
     };
 
-    if front.data.len() <= max_bytes {
+    let remaining = front.data.len() - front.offset;
+    if remaining <= max_bytes {
         let segment = pending.segments.pop_front().expect("front segment exists");
-        pending.queued_bytes = pending.queued_bytes.saturating_sub(segment.data.len());
+        let snapshot_bytes = segment
+            .snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.estimated_bytes);
+        pending.queued_bytes = pending
+            .queued_bytes
+            .saturating_sub(remaining + snapshot_bytes);
         let has_more = !pending.segments.is_empty();
         pending.wake_pending = has_more;
         return (
             Some(AgentOutputChunk {
                 kind: segment.kind,
-                data: segment.data,
+                data: if segment.offset == 0 {
+                    segment.data
+                } else {
+                    segment.data[segment.offset..].to_vec()
+                },
                 segment_done: true,
+                snapshot: segment.snapshot,
             }),
             has_more,
         );
     }
 
     let kind = front.kind;
-    let rest = front.data.split_off(max_bytes);
-    let data = std::mem::replace(&mut front.data, rest);
+    // Copy only the consumed prefix. Repeated split_off copied the entire
+    // remaining tail under this UI/reader mutex, making a drain quadratic.
+    let end = front.offset + max_bytes;
+    let data = front.data[front.offset..end].to_vec();
+    front.offset = end;
     pending.queued_bytes = pending.queued_bytes.saturating_sub(data.len());
     pending.wake_pending = true;
     (
@@ -10968,6 +11212,7 @@ fn take_agent_output_chunk(
             kind,
             data,
             segment_done: false,
+            snapshot: None,
         }),
         true,
     )
@@ -11208,6 +11453,9 @@ struct DaemonConnection {
     out_discarded_frames: u64,
     out_discarded_bytes: u64,
     needs_resync: bool,
+    snapshot_size: Option<(u16, u16)>,
+    input_replay_epoch: Option<String>,
+    terminal_checkpoints: bool,
 }
 
 impl DaemonConnection {
@@ -11242,6 +11490,9 @@ impl DaemonConnection {
             out_discarded_frames: 0,
             out_discarded_bytes: 0,
             needs_resync: false,
+            snapshot_size: None,
+            input_replay_epoch: None,
+            terminal_checkpoints: false,
         })
     }
 
@@ -11310,6 +11561,12 @@ impl DaemonConnection {
         }
         self.out_pending_bytes = projected;
         self.out_frames.push_back(OutboundFrame { kind, bytes });
+        if let AgentDaemonEvent::Snapshot {
+            state: Some(state), ..
+        } = event
+        {
+            self.snapshot_size = Some(state.parser.size());
+        }
         self.flush_outbound()?;
         self.enforce_outbound_budget()
     }
@@ -11388,6 +11645,32 @@ impl DaemonConnection {
             std::mem::take(&mut self.out_discarded_frames),
             std::mem::take(&mut self.out_discarded_bytes),
         )
+    }
+
+    fn send_exit_after_resync(
+        &mut self,
+        status: String,
+        snapshot: impl FnOnce() -> AgentDaemonEvent,
+    ) -> io::Result<()> {
+        let exit = AgentDaemonEvent::Exited { status };
+        // Even the exit control frame itself can cross the discard budget.
+        let exit_bytes = serde_json::to_vec(&exit)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
+            .len()
+            + 1;
+        if self.out_pending_bytes.saturating_add(exit_bytes) > DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES
+        {
+            self.discard_output_backlog_for_resync();
+        }
+        if self.needs_resync {
+            // There will be no more output after this checkpoint. Remove all
+            // superseded whole output frames, retaining any partial frame so
+            // framing survives. Queue the authoritative state before Exited.
+            self.discard_output_backlog_for_resync();
+            self.send_event(&snapshot())?;
+            self.finish_resync();
+        }
+        self.send_event(&exit)
     }
 
     fn read_requests(&mut self) -> io::Result<Vec<AgentDaemonRequest>> {
@@ -12119,6 +12402,11 @@ struct App {
     last_agent_state_poll: Instant,
     last_live_shell_discovery: Instant,
     list_state: ListState,
+    /// Hit targets from the last rendered frame, including exact PTY reader IDs.
+    mouse_wheel_regions: Vec<mouse::MouseWheelRegion>,
+    previous_mouse_wheel_regions: Vec<mouse::MouseWheelRegion>,
+    /// Manual sidebar scrolling never changes the active agent or keyboard focus.
+    agent_sidebar_scroll: Option<mouse::AgentSidebarScroll>,
     session_view: SessionViewMode,
     // Deliberately transient: each process starts with the safe TopLevel view.
     session_scope: SessionScope,
@@ -12311,6 +12599,9 @@ impl App {
             last_live_shell_discovery: Instant::now()
                 - Duration::from_millis(LIVE_SHELL_DISCOVERY_INTERVAL_MS),
             list_state: ListState::default(),
+            mouse_wheel_regions: Vec::new(),
+            previous_mouse_wheel_regions: Vec::new(),
+            agent_sidebar_scroll: None,
             session_view,
             session_scope: SessionScope::TopLevel,
             provider_filter: ProviderFilter::All,
@@ -28241,6 +28532,17 @@ fn setup_terminal() -> Result<Tui> {
             "error": bracketed_paste.err().map(|e| e.to_string()),
         }),
     );
+    let mouse_capture = execute!(stdout, EnableMouseCapture);
+    debug_log(
+        "terminal_mouse_capture_enable",
+        serde_json::json!({
+            "ok": mouse_capture.is_ok(),
+            "error": mouse_capture.as_ref().err().map(|error| error.to_string()),
+        }),
+    );
+    if mouse_capture.is_err() {
+        let _ = execute!(stdout, DisableMouseCapture);
+    }
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -28263,6 +28565,10 @@ fn setup_terminal() -> Result<Tui> {
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     debug_log("terminal_restore_start", serde_json::json!({}));
     let mut first_error = None;
+    record_terminal_restore_error(
+        &mut first_error,
+        execute!(terminal.backend_mut(), DisableMouseCapture),
+    );
     record_terminal_restore_error(
         &mut first_error,
         execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags),
@@ -28301,6 +28607,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 
 fn restore_terminal_without_instance() {
     let mut stdout = io::stdout();
+    let _ = execute!(stdout, DisableMouseCapture);
     let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     let _ = execute!(stdout, DisableBracketedPaste);
     let _ = execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show);
@@ -28947,9 +29254,15 @@ fn handle_main_event(
             handle_actionable_input_event(app, key);
         }
         MainEvent::Input {
+            event: Event::Mouse(event),
+            queued_at_epoch_ms,
+        } => mouse::handle_mouse_input_event(app, event, queued_at_epoch_ms),
+        MainEvent::Input {
             event: Event::Resize(cols, rows),
             ..
         } => {
+            // Coordinates from the previous layout are no longer actionable.
+            app.mouse_wheel_regions.clear();
             let viewports = app
                 .is_agent_view()
                 .then(|| app.sync_agent_viewports(cols, rows));
@@ -29197,6 +29510,11 @@ fn run(terminal: &mut Tui) -> Result<()> {
             match event::poll(Duration::from_secs(60)) {
                 Ok(true) => match event::read() {
                     Ok(ev) => {
+                        // Mouse capture can emit motion at a high rate. Only
+                        // wheels enter the UI queue or ordinary input logging.
+                        if !mouse::should_forward_terminal_input(&ev) {
+                            continue;
+                        }
                         let event_debug = input_event_debug_value(&ev);
                         debug_log(
                             "input_event_read",
@@ -29527,12 +29845,30 @@ fn poll_pending_daemon_attach_confirmation(
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct AcceptedAgentInputSequences {
     by_client: VecDeque<(String, u64)>,
+    epochs: HashMap<String, String>,
 }
 
 impl AcceptedAgentInputSequences {
+    fn prepare_client(&mut self, client_instance_id: &str) -> String {
+        if let Some(epoch) = self.epochs.get(client_instance_id) {
+            return epoch.clone();
+        }
+        if self.by_client.len() >= DAEMON_INPUT_DEDUPE_CLIENTS_MAX {
+            if let Some((expired, _)) = self.by_client.pop_front() {
+                self.epochs.remove(&expired);
+            }
+        }
+        let epoch = uuid::Uuid::new_v4().to_string();
+        self.by_client
+            .push_back((client_instance_id.to_string(), 0));
+        self.epochs
+            .insert(client_instance_id.to_string(), epoch.clone());
+        epoch
+    }
+
     fn already_accepted(&self, client_instance_id: &str, input_seq: u64) -> bool {
         self.by_client
             .iter()
@@ -29554,11 +29890,8 @@ impl AcceptedAgentInputSequences {
                 .push_back((instance_id, previous.max(input_seq)));
             return;
         }
-        if self.by_client.len() >= DAEMON_INPUT_DEDUPE_CLIENTS_MAX {
-            self.by_client.pop_front();
-        }
-        self.by_client
-            .push_back((client_instance_id.to_string(), input_seq));
+        // A late writer completion must not resurrect an evicted replay
+        // window or evict the currently attached client's window.
     }
 }
 
@@ -29767,12 +30100,37 @@ fn handle_daemon_client_request(
             client_debug,
             client_trace,
             attach_confirmation: _,
+            input_replay_epochs,
+            terminal_checkpoints,
         } => {
+            conn.terminal_checkpoints = terminal_checkpoints;
+            if let Some(error) = agent.output_read_error.as_ref() {
+                let _ = conn.send_event(&AgentDaemonEvent::Error {
+                    message: format!("PTY output reader failed; process preserved: {error}"),
+                });
+                return DaemonRequestOutcome::RejectConnection;
+            }
             let previous_client_pid = *attached_client_pid;
             let previous_client_instance_id = attached_client_instance_id.clone();
             let previous_pty_size = agent.pty_size;
+            let previous_screen = agent.parser.screen().clone();
+            let previous_input_sequences = accepted_input_sequences.clone();
+            conn.input_replay_epoch = if input_replay_epochs {
+                let Some(instance_id) = client_instance_id.as_deref() else {
+                    return DaemonRequestOutcome::RejectConnection;
+                };
+                Some(accepted_input_sequences.prepare_client(instance_id))
+            } else {
+                None
+            };
             adopt_client_debug_mode(agent, client_debug, client_trace);
-            agent.resize(cols, rows);
+            if let Err(error) = agent.resize(cols, rows) {
+                *accepted_input_sequences = previous_input_sequences;
+                let _ = conn.send_event(&AgentDaemonEvent::Error {
+                    message: format!("PTY resize failed: {error}"),
+                });
+                return DaemonRequestOutcome::RejectConnection;
+            }
             let client_instance_id_for_log = client_instance_id.clone();
             *attached_client_pid = Some(client_pid);
             *attached_client_instance_id = client_instance_id;
@@ -29802,9 +30160,17 @@ fn handle_daemon_client_request(
             let outcome = if send_ok {
                 DaemonRequestOutcome::Continue
             } else {
+                *accepted_input_sequences = previous_input_sequences;
                 *attached_client_pid = previous_client_pid;
                 *attached_client_instance_id = previous_client_instance_id;
-                agent.resize(previous_pty_size.cols, previous_pty_size.rows);
+                if agent
+                    .resize(previous_pty_size.cols, previous_pty_size.rows)
+                    .is_ok()
+                {
+                    // Growing a shrunken grid cannot recreate truncated cells.
+                    *agent.parser.screen_mut() = previous_screen;
+                    agent.screen_hash = screen_activity_hash(agent.parser.screen());
+                }
                 let _ = write_agent_meta(
                     meta_path,
                     agent,
@@ -29854,8 +30220,14 @@ fn handle_daemon_client_request(
                     "rows": rows,
                 }),
             );
-            agent.resize(cols, rows);
-            let send_result = send_daemon_attached(conn, agent, false, false);
+            let send_result = agent
+                .resize(cols, rows)
+                .and_then(|()| send_daemon_attached(conn, agent, false, false));
+            if let Err(error) = send_result.as_ref() {
+                let _ = conn.send_event(&AgentDaemonEvent::Error {
+                    message: format!("PTY resize failed: {error}"),
+                });
+            }
             let send_ok = send_result.is_ok();
             let send_error = send_result.as_ref().err().map(|e| e.to_string());
             debug_log(
@@ -29878,7 +30250,11 @@ fn handle_daemon_client_request(
                 DaemonRequestOutcome::RejectConnection
             }
         }
-        AgentDaemonRequest::Input { data, input_seq } => {
+        AgentDaemonRequest::Input {
+            data,
+            input_seq,
+            input_replay_epoch,
+        } => {
             let input_client_instance_id =
                 input_seq.and_then(|_| attached_client_instance_id.clone());
             if input_seq.is_some() && input_client_instance_id.is_none() {
@@ -29893,6 +30269,19 @@ fn handle_daemon_client_request(
                     }),
                 );
                 return DaemonRequestOutcome::RejectConnection;
+            }
+            if let Some(instance_id) = input_client_instance_id.as_deref() {
+                let expected = accepted_input_sequences.epochs.get(instance_id);
+                if input_replay_epoch.is_none()
+                    || input_replay_epoch.as_ref() != expected
+                    || input_replay_epoch != conn.input_replay_epoch
+                {
+                    let _ = conn.send_event(&AgentDaemonEvent::Error {
+                        message: "Input replay window expired; retained input was not written"
+                            .into(),
+                    });
+                    return DaemonRequestOutcome::RejectConnection;
+                }
             }
             let already_accepted = input_seq
                 .zip(input_client_instance_id.as_deref())
@@ -31320,13 +31709,13 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                         "reason": if flush_failed { "write_failed" } else { "stalled" },
                     }),
                 );
-            } else if conn.should_resync() {
-                let snapshot = agent.screen_snapshot_bytes(false);
+            } else if conn.should_resync()
+                || conn.snapshot_size != Some((agent.pty_size.rows, agent.pty_size.cols))
+            {
+                let snapshot = agent.snapshot_event(false, conn.terminal_checkpoints);
+                conn.snapshot_size = Some((agent.pty_size.rows, agent.pty_size.cols));
                 let (discarded_frames, discarded_bytes) = conn.finish_resync();
-                if conn
-                    .send_event(&AgentDaemonEvent::Snapshot { data: snapshot })
-                    .is_err()
-                {
+                if conn.send_event(&snapshot).is_err() {
                     client = None;
                     attached_client_pid = None;
                     attached_client_instance_id = None;
@@ -31349,6 +31738,17 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                         }),
                     );
                 }
+            }
+        }
+
+        if let Some(error) = output_drain.output_error.as_ref() {
+            // Deliver already-read bytes and any required resync before the
+            // error. A client may begin reconnecting as soon as it sees it.
+            // The failed reader does not authorize child/runtime cleanup.
+            if let Some(conn) = client.as_mut() {
+                let _ = conn.send_event(&AgentDaemonEvent::Error {
+                    message: format!("PTY output reader failed; process preserved: {error}"),
+                });
             }
         }
 
@@ -31461,8 +31861,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 let group_check_due = last_direct_child_group_check_at.is_none_or(|checked_at| {
                     checked_at.elapsed() >= Duration::from_millis(AGENT_STATE_POLL_INTERVAL_MS)
                 });
-                let recorded_runtime_witnesses =
-                    agent.runtime_file_flags.child_runtime_witnesses();
+                let recorded_runtime_witnesses = agent.runtime_file_flags.child_runtime_witnesses();
                 let mut exit_witnesses = Vec::new();
                 if group_check_due {
                     direct_child_group_live = agent.child_pid.is_some_and(|pid| {
@@ -31677,8 +32076,9 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     );
 
     if let Some(conn) = client.as_mut() {
-        let exit_notice_result = conn.send_event(&AgentDaemonEvent::Exited {
-            status: exit_status.clone(),
+        let checkpoints = conn.terminal_checkpoints;
+        let exit_notice_result = conn.send_exit_after_resync(exit_status.clone(), || {
+            agent.snapshot_event(false, checkpoints)
         });
         // The exit notice (and any final output) may still be queued; give
         // the peer a bounded window to drain before the runtime files go
@@ -31851,10 +32251,9 @@ fn send_daemon_attached(
     include_scrollback: bool,
     require_attached_ack_flush: bool,
 ) -> io::Result<()> {
-    let snapshot = agent.screen_snapshot_bytes(include_scrollback);
+    let snapshot = agent.snapshot_event(include_scrollback, conn.terminal_checkpoints);
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         let verbose_debug = TRACE_ENABLED.load(Ordering::Relaxed);
-        let snapshot_sample_budget = if verbose_debug { 1024 } else { 64 };
         debug_log(
             "daemon_send_attached_snapshot",
             serde_json::json!({
@@ -31864,8 +32263,7 @@ fn send_daemon_attached(
                 "daemon_exe": debug_process_exe(std::process::id()),
                 "daemon_cmdline": debug_process_cmdline(std::process::id()),
                 "child_pid": agent.child_pid,
-                "snapshot_len": snapshot.len(),
-                "snapshot": debug_terminal_data_summary(&snapshot, snapshot_sample_budget),
+                "snapshot": agent_daemon_event_debug_value(&snapshot),
                 "include_scrollback": include_scrollback,
                 "scrollback": agent.parser.screen().scrollback(),
                 "screen_history_lines": agent.screen_history.len(),
@@ -31888,7 +32286,9 @@ fn send_daemon_attached(
         last_output_epoch_ms: agent.last_output_epoch_ms,
         last_input_epoch_ms: agent.last_input_epoch_ms,
         bracketed_paste_mode: agent.bracketed_paste_mode,
-        input_acknowledgements: true,
+        input_acknowledgements: conn.input_replay_epoch.is_some(),
+        input_replay_epoch: conn.input_replay_epoch.clone(),
+        pty_size: Some((agent.pty_size.rows, agent.pty_size.cols)),
     }) {
         debug_log(
             "daemon_send_attached_event_failed",
@@ -31917,7 +32317,7 @@ fn send_daemon_attached(
         );
         return Err(error);
     }
-    if let Err(e) = conn.send_event(&AgentDaemonEvent::Snapshot { data: snapshot }) {
+    if let Err(e) = conn.send_event(&snapshot) {
         debug_log(
             "daemon_send_attached_snapshot_failed",
             serde_json::json!({
@@ -31929,6 +32329,7 @@ fn send_daemon_attached(
         );
         return Err(e);
     }
+    conn.snapshot_size = Some((agent.pty_size.rows, agent.pty_size.cols));
     debug_log(
         "daemon_send_attached_done",
         serde_json::json!({
@@ -38488,46 +38889,19 @@ fn terminal_response_for_output(screen: &vt100::Screen, bytes: &[u8]) -> Option<
     terminal_response_for_combined_output(screen, bytes, 0)
 }
 
+#[cfg(test)]
 fn terminal_response_for_combined_output(
     screen: &vt100::Screen,
     bytes: &[u8],
-    previous_len: usize,
+    _previous_len: usize,
 ) -> Option<Vec<u8>> {
-    let mut response = Vec::new();
-
-    if contains_new_sequence(bytes, previous_len, b"\x1b[5n") {
-        response.extend_from_slice(b"\x1b[0n");
-    }
-
-    if contains_new_sequence(bytes, previous_len, b"\x1b[6n") {
-        let (row, col) = screen.cursor_position();
-        response.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
-    }
-
-    if contains_new_sequence(bytes, previous_len, b"\x1b[?6n") {
-        let (row, col) = screen.cursor_position();
-        response.extend_from_slice(format!("\x1b[?{};{}R", row + 1, col + 1).as_bytes());
-    }
-
+    let (rows, cols) = screen.size();
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    *parser.screen_mut() = screen.clone();
+    parser.set_collect_responses(true);
+    parser.process(bytes);
+    let response = parser.take_responses();
     (!response.is_empty()).then_some(response)
-}
-
-fn contains_new_sequence(bytes: &[u8], previous_len: usize, sequence: &[u8]) -> bool {
-    if sequence.is_empty() || bytes.len() < sequence.len() {
-        return false;
-    }
-
-    let start = previous_len.saturating_sub(sequence.len().saturating_sub(1));
-    let end = bytes.len() - sequence.len();
-    for index in start..=end {
-        if index + sequence.len() <= previous_len {
-            continue;
-        }
-        if &bytes[index..index + sequence.len()] == sequence {
-            return true;
-        }
-    }
-    false
 }
 
 fn debug_log(event: &str, details: serde_json::Value) {
@@ -38764,13 +39138,21 @@ fn run_agent_reader_thread(
                         return reason;
                     }
                 }
-                Ok(AgentDaemonEvent::Snapshot { data }) => {
-                    if let Err(reason) = queue_agent_output(
+                Ok(AgentDaemonEvent::Snapshot { data, state }) => {
+                    // Decode/validate on the socket worker. The UI installs
+                    // the prepared state in order, without replaying ANSI.
+                    let snapshot = match state.map(AgentTerminalSnapshot::prepare).transpose() {
+                        Ok(snapshot) => snapshot,
+                        Err(reason) => return reason,
+                    };
+                    let data = if snapshot.is_some() { Vec::new() } else { data };
+                    if let Err(reason) = queue_agent_output_with_snapshot(
                         &output_buffer,
                         tx,
                         reader_id,
                         AgentOutputKind::Snapshot,
                         data,
+                        snapshot,
                     ) {
                         return reason;
                     }
@@ -39100,6 +39482,7 @@ fn agent_daemon_request_debug_value(request: &AgentDaemonRequest) -> serde_json:
             client_debug,
             client_trace,
             attach_confirmation,
+            ..
         } => serde_json::json!({
             "type": "attach",
             "cols": cols,
@@ -39122,7 +39505,9 @@ fn agent_daemon_request_debug_value(request: &AgentDaemonRequest) -> serde_json:
             "cols": cols,
             "rows": rows,
         }),
-        AgentDaemonRequest::Input { data, input_seq } => serde_json::json!({
+        AgentDaemonRequest::Input {
+            data, input_seq, ..
+        } => serde_json::json!({
             "type": "input",
             "len": data.len(),
             "input_seq": input_seq,
@@ -44478,8 +44863,7 @@ fn agent_meta_child_runtime_witness_may_survive(meta: &AgentMetaSnapshot) -> boo
         return false;
     };
     meta.child_runtime_witnesses.iter().any(|witness| {
-        witness.pid != child_pid
-            && agent_child_runtime_witness_should_be_preserved(*witness)
+        witness.pid != child_pid && agent_child_runtime_witness_should_be_preserved(*witness)
     })
 }
 
@@ -49957,6 +50341,10 @@ fn debug_key_event_value(key: KeyEvent) -> serde_json::Value {
 }
 
 fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    key_event_to_bytes_with_mode(key, false)
+}
+
+fn key_event_to_bytes_with_mode(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let mut bytes = Vec::new();
@@ -49968,6 +50356,7 @@ fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
             }
             let lower = c.to_ascii_lowercase();
             let code = match lower {
+                ' ' | '@' => 0,
                 'a'..='z' => (lower as u8) - b'a' + 1,
                 '[' => 0x1b,
                 '\\' => 0x1c,
@@ -49992,6 +50381,20 @@ fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
             }
             bytes.push(b'\r');
         }
+        KeyCode::BackTab => {
+            let modifiers = key.modifiers | KeyModifiers::SHIFT;
+            if modifiers == KeyModifiers::SHIFT {
+                bytes.extend_from_slice(b"\x1b[Z");
+            } else {
+                bytes.extend_from_slice(&modified_csi_final(b'Z', modifiers));
+            }
+        }
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            return key_event_to_bytes_with_mode(
+                KeyEvent::new(KeyCode::BackTab, key.modifiers),
+                application_cursor,
+            );
+        }
         KeyCode::Tab => {
             if alt {
                 bytes.push(0x1b);
@@ -50010,40 +50413,48 @@ fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
             }
             bytes.push(0x1b);
         }
-        KeyCode::Up => bytes.extend_from_slice(&modified_csi_final(b'A', key.modifiers)),
-        KeyCode::Down => bytes.extend_from_slice(&modified_csi_final(b'B', key.modifiers)),
-        KeyCode::Right => bytes.extend_from_slice(&modified_csi_final(b'C', key.modifiers)),
-        KeyCode::Left => bytes.extend_from_slice(&modified_csi_final(b'D', key.modifiers)),
-        KeyCode::Home => bytes.extend_from_slice(&modified_csi_final(b'H', key.modifiers)),
-        KeyCode::End => bytes.extend_from_slice(&modified_csi_final(b'F', key.modifiers)),
+        KeyCode::Up => {
+            bytes.extend_from_slice(&cursor_key_bytes(b'A', key.modifiers, application_cursor))
+        }
+        KeyCode::Down => {
+            bytes.extend_from_slice(&cursor_key_bytes(b'B', key.modifiers, application_cursor))
+        }
+        KeyCode::Right => {
+            bytes.extend_from_slice(&cursor_key_bytes(b'C', key.modifiers, application_cursor))
+        }
+        KeyCode::Left => {
+            bytes.extend_from_slice(&cursor_key_bytes(b'D', key.modifiers, application_cursor))
+        }
+        KeyCode::Home => {
+            bytes.extend_from_slice(&cursor_key_bytes(b'H', key.modifiers, application_cursor))
+        }
+        KeyCode::End => {
+            bytes.extend_from_slice(&cursor_key_bytes(b'F', key.modifiers, application_cursor))
+        }
         KeyCode::PageUp => bytes.extend_from_slice(&modified_csi_tilde(5, key.modifiers)),
         KeyCode::PageDown => bytes.extend_from_slice(&modified_csi_tilde(6, key.modifiers)),
         KeyCode::Delete => bytes.extend_from_slice(&modified_csi_tilde(3, key.modifiers)),
         KeyCode::Insert => bytes.extend_from_slice(&modified_csi_tilde(2, key.modifiers)),
-        KeyCode::F(n) => {
-            if alt {
-                bytes.push(0x1b);
+        KeyCode::F(n) => match n {
+            1..=4 => bytes.extend_from_slice(&cursor_key_bytes(b'P' + n - 1, key.modifiers, true)),
+            5..=12 => {
+                let code = [15, 17, 18, 19, 20, 21, 23, 24][usize::from(n - 5)];
+                bytes.extend_from_slice(&modified_csi_tilde(code, key.modifiers));
             }
-            match n {
-                1 => bytes.extend_from_slice(b"\x1bOP"),
-                2 => bytes.extend_from_slice(b"\x1bOQ"),
-                3 => bytes.extend_from_slice(b"\x1bOR"),
-                4 => bytes.extend_from_slice(b"\x1bOS"),
-                5 => bytes.extend_from_slice(b"\x1b[15~"),
-                6 => bytes.extend_from_slice(b"\x1b[17~"),
-                7 => bytes.extend_from_slice(b"\x1b[18~"),
-                8 => bytes.extend_from_slice(b"\x1b[19~"),
-                9 => bytes.extend_from_slice(b"\x1b[20~"),
-                10 => bytes.extend_from_slice(b"\x1b[21~"),
-                11 => bytes.extend_from_slice(b"\x1b[23~"),
-                12 => bytes.extend_from_slice(b"\x1b[24~"),
-                _ => return None,
-            }
-        }
+            _ => return None,
+        },
         _ => return None,
     }
 
     Some(bytes)
+}
+
+fn cursor_key_bytes(final_byte: u8, modifiers: KeyModifiers, application: bool) -> Vec<u8> {
+    if application && xterm_modifier_param(modifiers).is_none() {
+        vec![0x1b, b'O', final_byte]
+    } else {
+        modified_csi_final(final_byte, modifiers)
+    }
 }
 
 fn modified_csi_final(final_byte: u8, modifiers: KeyModifiers) -> Vec<u8> {
@@ -50686,6 +51097,7 @@ fn render_agent_kill_replacement_pane(
 }
 
 fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
+    app.begin_mouse_wheel_frame();
     let area = f.area();
     let main_area = Rect::new(
         area.x,
@@ -50775,6 +51187,21 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             None
         };
 
+    if let (Some(agent), Some(outcome)) = (app.active_agent.as_ref(), main_outcome.as_ref()) {
+        let reader_id = agent.reader_id;
+        app.record_mouse_wheel_region(
+            outcome.content_area,
+            mouse::MouseWheelTarget::Agent { reader_id },
+        );
+    }
+    if let (Some(aux), Some(outcome)) = (app.agent_aux.as_ref(), auxiliary_outcome.as_ref()) {
+        let reader_id = aux.agent.reader_id;
+        app.record_mouse_wheel_region(
+            outcome.content_area,
+            mouse::MouseWheelTarget::Agent { reader_id },
+        );
+    }
+
     let focused_cursor = match app.agent_focus {
         AgentFocusPane::Main => main_outcome.as_ref().and_then(|outcome| outcome.cursor),
         AgentFocusPane::Auxiliary => auxiliary_outcome
@@ -50801,13 +51228,14 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         let candidates = app.agent_sidebar_candidates();
         sidebar_candidates_len = Some(candidates.len());
         f.render_widget(Clear, sidebar_area);
+        let sidebar_focused = app.agent_focus == AgentFocusPane::Sidebar;
         draw_agent_sidebar(
             f,
             app,
             sidebar_area,
             &candidates,
             workspace_key,
-            app.agent_focus == AgentFocusPane::Sidebar,
+            sidebar_focused,
         );
     }
 
@@ -50871,6 +51299,9 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             f.set_cursor_position(cursor);
             cursor_set = Some(cursor);
         }
+    }
+    if mouse::input_blocked(app) {
+        app.mouse_wheel_regions.clear();
     }
     debug_log(
         "ui_agent_render_done",
@@ -51876,6 +52307,22 @@ fn agent_pty_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
+fn resize_pty_state(
+    parser: &mut vt100::Parser,
+    current: &mut PtySize,
+    next: PtySize,
+    resize: impl FnOnce(PtySize) -> io::Result<()>,
+) -> io::Result<()> {
+    resize(next)?;
+    parser.screen_mut().set_size(next.rows, next.cols);
+    *current = next;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "cokacmux_pty_tests.rs"]
+mod pty_regression_tests;
+
 // vt100 0.16.2 has an unwrap() in Screen::text() that panics when a wide
 // character is drawn at the last column (col+1 out of bounds). catch_unwind
 // keeps the process alive, but the default panic hook still floods stderr —
@@ -52084,7 +52531,7 @@ fn adjusted_agent_auxiliary_width(
 
 fn draw_agent_sidebar(
     f: &mut ratatui::Frame,
-    app: &App,
+    app: &mut App,
     area: Rect,
     candidates: &[SessionInfo],
     active_key: &AgentKey,
@@ -52160,17 +52607,39 @@ fn draw_agent_sidebar(
         })
         .collect();
 
+    let selected = candidates
+        .iter()
+        .position(|info| AgentKey::new(info) == *active_key);
+    let manual_offset = app
+        .agent_sidebar_scroll
+        .as_ref()
+        .filter(|scroll| scroll.workspace == *active_key)
+        .map(|scroll| {
+            scroll.offset.min(candidates.len().saturating_sub(inner.height as usize))
+        });
     let mut state = ListState::default();
-    state.select(
-        candidates
-            .iter()
-            .position(|info| AgentKey::new(info) == *active_key),
-    );
-    let list = List::new(items)
+    let offset = manual_offset.unwrap_or(0);
+    state.select(selected.and_then(|index| {
+        if manual_offset.is_some() {
+            // Do not make Ratatui auto-scroll back to an off-screen active row.
+            (index >= offset && index < offset + inner.height as usize).then(|| index - offset)
+        } else {
+            Some(index)
+        }
+    }));
+    let list = List::new(items.into_iter().skip(offset).collect::<Vec<_>>())
         .style(theme_base_style())
         .highlight_style(agent_sidebar_highlight_style(focused))
         .highlight_symbol(UI_SELECTED_MARKER);
     f.render_stateful_widget(list, inner, &mut state);
+    app.record_mouse_wheel_region(
+        inner,
+        mouse::MouseWheelTarget::AgentSidebar {
+            workspace: active_key.clone(),
+            offset: offset + state.offset(),
+            total_rows: candidates.len(),
+        },
+    );
 }
 
 fn render_vt100_screen(buf: &mut Buffer, screen: &vt100::Screen, area: Rect, focused: bool) {
@@ -53759,6 +54228,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
 }
 
 fn ui(f: &mut ratatui::Frame, app: &mut App) {
+    app.begin_mouse_wheel_frame();
     let area = f.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -53831,6 +54301,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 draw_session_refresh_pending_overlay(f, area, app);
             }
         }
+    }
+    if mouse::input_blocked(app) {
+        app.mouse_wheel_regions.clear();
     }
 }
 
@@ -56331,6 +56804,10 @@ fn draw_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .style(theme_base_style())
         .highlight_style(theme_selected_style());
     f.render_stateful_widget(list, list_area, &mut app.list_state);
+    app.record_mouse_wheel_region(
+        Rect::new(inner.x, list_area.y, inner.width, list_area.height),
+        mouse::MouseWheelTarget::Sessions,
+    );
     if show_scrollbar {
         let scrollbar_area = Rect::new(
             inner.right().saturating_sub(1),
@@ -56354,6 +56831,12 @@ fn draw_preview(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     app.preview_page_height = inner.height.max(1);
 
     let current = app.current().cloned();
+    if let Some(info) = current.as_ref() {
+        app.record_mouse_wheel_region(
+            inner,
+            mouse::MouseWheelTarget::Preview(PreviewKey::new(info, app.preview_mode)),
+        );
+    }
     let mut lines = Vec::new();
     let mut summary_style_state = PreviewSummaryStyleState::default();
     let mut max_scroll = 0u16;
@@ -58221,6 +58704,7 @@ mod tests {
         let debug = agent_daemon_request_debug_value(&AgentDaemonRequest::Input {
             data: b"secret paste contents".to_vec(),
             input_seq: Some(42),
+            input_replay_epoch: None,
         });
 
         assert_eq!(
@@ -59434,7 +59918,7 @@ mod tests {
         assert!(is_ui_stall_latency_ms(UI_STALL_LOG_THRESHOLD_MS));
     }
 
-    fn session_info(provider: Provider, session_id: &str, cwd: &str) -> SessionInfo {
+    pub(super) fn session_info(provider: Provider, session_id: &str, cwd: &str) -> SessionInfo {
         SessionInfo {
             provider,
             session_id: session_id.to_string(),
@@ -59476,6 +59960,8 @@ mod tests {
             pty_size,
             exited: Some("test".into()),
             connection_ended: None,
+            pending_resize: None,
+            input_replay_epoch: Some("test-replay-epoch".into()),
             input_acknowledgements: false,
             daemon_pid: 0,
             daemon_pid_start_ticks: None,
@@ -60592,9 +61078,12 @@ mod tests {
         let mut conn = DaemonConnection::new(left).unwrap();
         let oversized = vec![255u8; AGENT_CLIENT_FRAME_MAX_BYTES / 3];
         assert_eq!(
-            conn.send_event(&AgentDaemonEvent::Snapshot { data: oversized })
-                .unwrap_err()
-                .kind(),
+            conn.send_event(&AgentDaemonEvent::Snapshot {
+                data: oversized,
+                state: None
+            })
+            .unwrap_err()
+            .kind(),
             ErrorKind::InvalidData
         );
 
@@ -60759,6 +61248,8 @@ mod tests {
                     last_input_epoch_ms: 0,
                     bracketed_paste_mode: false,
                     input_acknowledgements: true,
+                    input_replay_epoch: None,
+                    pty_size: None,
                 },
             )
             .unwrap();
@@ -60874,7 +61365,7 @@ mod tests {
     /// Flush `conn` and read from the peer until the outbound queue is
     /// empty, then pull whatever is left in the kernel buffer.
     #[cfg(unix)]
-    fn drain_daemon_connection_pair(
+    pub(super) fn drain_daemon_connection_pair(
         conn: &mut DaemonConnection,
         right: &mut AgentStream,
         received: &mut Vec<u8>,
@@ -60943,6 +61434,7 @@ mod tests {
         assert!(discarded_bytes > 0);
         conn.send_event(&AgentDaemonEvent::Snapshot {
             data: b"RESYNC".to_vec(),
+            state: None,
         })
         .unwrap();
         drain_daemon_connection_pair(&mut conn, &mut right, &mut received);
@@ -60958,8 +61450,8 @@ mod tests {
             if line.is_empty() {
                 continue;
             }
-            let event: AgentDaemonEvent = serde_json::from_slice(line)
-                .expect("every delivered line must parse after a discard");
+            let event: AgentDaemonEvent =
+                serde_json::from_slice(line).expect("every delivered line must parse after a discard");
             match &event {
                 AgentDaemonEvent::Output { data } => {
                     assert!(!data.is_empty());
@@ -60970,7 +61462,7 @@ mod tests {
                     saw_exited = true;
                     last_event = "exited".into();
                 }
-                AgentDaemonEvent::Snapshot { data } => {
+                AgentDaemonEvent::Snapshot { data, .. } => {
                     assert_eq!(data, b"RESYNC");
                     last_event = "snapshot".into();
                 }
@@ -61071,7 +61563,7 @@ mod tests {
         args
     }
 
-    fn app_for_key_tests() -> App {
+    pub(super) fn app_for_key_tests() -> App {
         let (preview_tx, _preview_request_rx) = mpsc::channel::<PreviewRequest>();
         let (_preview_result_tx, preview_rx) = mpsc::channel::<PreviewResult>();
         let settings = Settings {
@@ -61093,6 +61585,9 @@ mod tests {
             last_live_shell_discovery: Instant::now()
                 - Duration::from_millis(LIVE_SHELL_DISCOVERY_INTERVAL_MS),
             list_state: ListState::default(),
+            mouse_wheel_regions: Vec::new(),
+            previous_mouse_wheel_regions: Vec::new(),
+            agent_sidebar_scroll: None,
             session_view: SessionViewMode::Tree,
             session_scope: SessionScope::TopLevel,
             provider_filter: ProviderFilter::All,
@@ -71082,7 +71577,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     #[test]
     fn agent_sidebar_rendered_cursor_style_reflects_focus() {
         fn marker_cell_style(focused: bool) -> (String, Color, Color, Modifier) {
-            let app = app_for_key_tests();
+            let mut app = app_for_key_tests();
             let info = session_info(Provider::Codex, "sidebar-style-agent", "/repo");
             let active_key = AgentKey::new(&info);
             let candidates = vec![info];
@@ -71092,7 +71587,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 .draw(|f| {
                     draw_agent_sidebar(
                         f,
-                        &app,
+                        &mut app,
                         Rect::new(0, 0, 32, 5),
                         &candidates,
                         &active_key,
@@ -74821,12 +75316,11 @@ IF EXIST "%~dp0\node.exe" (
 
         for chunk in reassembled.chunks(AGENT_INPUT_REQUEST_CHUNK_BYTES) {
             let wire = serde_json::to_vec(&AuthenticatedAgentDaemonRequest {
-                auth: Some(
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-                ),
+                auth: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
                 request: AgentDaemonRequest::Input {
                     data: chunk.to_vec(),
                     input_seq: None,
+                    input_replay_epoch: None,
                 },
             })
             .unwrap();
@@ -74848,6 +75342,7 @@ IF EXIST "%~dp0\node.exe" (
             AgentDaemonRequest::Input {
                 data,
                 input_seq: Some(input_seq),
+                ..
             } => {
                 assert_eq!(data, b"kept-until-ack");
                 input_seq
@@ -74884,9 +75379,9 @@ IF EXIST "%~dp0\node.exe" (
     #[test]
     fn retained_input_replays_same_sequence_for_same_daemon_generation() {
         let session_id = format!("input-replay-{}", uuid::Uuid::now_v7());
-        let (mut first, first_requests) =
-            buffered_output_test_client_with_requests(&session_id, 7203);
+        let (mut first, first_requests) = buffered_output_test_client_with_requests(&session_id, 7203);
         first.input_acknowledgements = true;
+        first.input_replay_epoch = Some("retained-input-test-window".into());
         first.daemon_pid = 321;
         first.daemon_pid_start_ticks = Some(654);
         first.send_input_data(b"replay-me".to_vec()).unwrap();
@@ -74906,6 +75401,7 @@ IF EXIST "%~dp0\node.exe" (
         let (mut second, second_requests) =
             buffered_output_test_client_with_requests(&session_id, 7204);
         second.input_acknowledgements = true;
+        second.input_replay_epoch = Some("retained-input-test-window".into());
         second.daemon_pid = 321;
         second.daemon_pid_start_ticks = Some(654);
         second.unacknowledged_input = recovered;
@@ -74917,6 +75413,7 @@ IF EXIST "%~dp0\node.exe" (
             AgentDaemonRequest::Input {
                 input_seq: Some(input_seq),
                 data,
+                ..
             } => {
                 assert_eq!(data, b"replay-me");
                 input_seq
@@ -74945,6 +75442,7 @@ IF EXIST "%~dp0\node.exe" (
                 data: b"old".to_vec(),
                 daemon_pid: 800,
                 daemon_pid_start_ticks: Some(801),
+                input_replay_epoch: None,
             });
         client.unacknowledged_input_bytes = 3;
 
@@ -74961,6 +75459,7 @@ IF EXIST "%~dp0\node.exe" (
     fn daemon_input_sequence_ledger_deduplicates_replay_per_client_instance() {
         let mut accepted = AcceptedAgentInputSequences::default();
         assert!(!accepted.already_accepted("client-a", 10));
+        accepted.prepare_client("client-a");
         accepted.record("client-a", 10);
         assert!(accepted.already_accepted("client-a", 10));
         assert!(accepted.already_accepted("client-a", 9));
@@ -76131,6 +76630,8 @@ IF EXIST "%~dp0\node.exe" (
             pty_size,
             exited: Some("test".into()),
             connection_ended: None,
+            pending_resize: None,
+            input_replay_epoch: None,
             input_acknowledgements: false,
             daemon_pid: 0,
             daemon_pid_start_ticks: None,
@@ -76184,7 +76685,7 @@ IF EXIST "%~dp0\node.exe" (
         buffered_output_test_client_with_requests(session_id, reader_id).0
     }
 
-    fn buffered_output_test_client_with_requests(
+    pub(super) fn buffered_output_test_client_with_requests(
         session_id: &str,
         reader_id: u64,
     ) -> (AgentClient, Receiver<AgentWriterRequest>) {
@@ -76203,6 +76704,8 @@ IF EXIST "%~dp0\node.exe" (
             pty_size,
             exited: None,
             connection_ended: None,
+            pending_resize: None,
+            input_replay_epoch: None,
             input_acknowledgements: false,
             daemon_pid: 0,
             daemon_pid_start_ticks: None,
@@ -79394,6 +79897,8 @@ IF EXIST "%~dp0\node.exe" (
                 last_input_epoch_ms: 12,
                 bracketed_paste_mode: false,
                 input_acknowledgements: true,
+                input_replay_epoch: None,
+                pty_size: None,
             },
         )
         .unwrap();
@@ -79471,6 +79976,8 @@ IF EXIST "%~dp0\node.exe" (
             pty_size,
             exited: Some("test".into()),
             connection_ended: None,
+            pending_resize: None,
+            input_replay_epoch: None,
             input_acknowledgements: false,
             daemon_pid: 0,
             daemon_pid_start_ticks: None,
@@ -79512,6 +80019,8 @@ IF EXIST "%~dp0\node.exe" (
             last_input_epoch_ms: 0,
             bracketed_paste_mode: false,
             input_acknowledgements: false,
+            input_replay_epoch: None,
+            pty_size: None,
         });
 
         let (tx, _rx) = mpsc::channel::<MainEvent>();
@@ -79745,6 +80254,8 @@ IF EXIST "%~dp0\node.exe" (
             pty_size,
             exited: Some("test".into()),
             connection_ended: None,
+            pending_resize: None,
+            input_replay_epoch: None,
             input_acknowledgements: false,
             daemon_pid: 0,
             daemon_pid_start_ticks: None,
@@ -79827,6 +80338,8 @@ IF EXIST "%~dp0\node.exe" (
             pty_size,
             exited: Some("test".into()),
             connection_ended: None,
+            pending_resize: None,
+            input_replay_epoch: None,
             input_acknowledgements: false,
             daemon_pid: 0,
             daemon_pid_start_ticks: None,
@@ -80066,11 +80579,14 @@ IF EXIST "%~dp0\node.exe" (
         let mut attached_pid = Some(123);
         let mut attached_instance = Some("ack-boundary-client".to_string());
         let mut accepted = AcceptedAgentInputSequences::default();
+        let epoch = accepted.prepare_client("ack-boundary-client");
+        conn.input_replay_epoch = Some(epoch.clone());
 
         let outcome = handle_daemon_client_request(
             AgentDaemonRequest::Input {
                 data: b"queued-not-yet-acknowledged".to_vec(),
                 input_seq: Some(91),
+                input_replay_epoch: Some(epoch),
             },
             &mut conn,
             &mut agent,
@@ -80082,8 +80598,7 @@ IF EXIST "%~dp0\node.exe" (
 
         assert!(matches!(outcome, DaemonRequestOutcome::Continue));
         assert!(!accepted.already_accepted("ack-boundary-client", 91));
-        let early_event =
-            read_agent_daemon_event_with_timeout(&mut peer, Duration::from_millis(20));
+        let early_event = read_agent_daemon_event_with_timeout(&mut peer, Duration::from_millis(20));
         assert!(matches!(
             early_event,
             Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
@@ -80230,6 +80745,8 @@ IF EXIST "%~dp0\node.exe" (
         let mut agent =
             AgentSession::spawn_with_spec(info, spec, 80, 24, AgentLaunchMode::Normal).unwrap();
         let original_size = agent.pty_size;
+        safe_parser_process(&mut agent.parser, b"\x1b[24;60HKEEP-AFTER-FAILED-ATTACH");
+        let original_screen = agent.parser.screen().contents_formatted();
         let meta_path = dir.path().join("candidate.json");
         let (server, peer) = AgentStream::pair().unwrap();
         let mut candidate = DaemonConnection::new(server).unwrap();
@@ -80240,13 +80757,15 @@ IF EXIST "%~dp0\node.exe" (
 
         let outcome = handle_daemon_client_request(
             AgentDaemonRequest::Attach {
-                cols: 120,
-                rows: 40,
+                cols: 40,
+                rows: 6,
                 client_pid: 222,
                 client_instance_id: Some("closed-candidate".to_string()),
                 client_debug: None,
                 client_trace: None,
                 attach_confirmation: false,
+                input_replay_epochs: true,
+                terminal_checkpoints: true,
             },
             &mut candidate,
             &mut agent,
@@ -80264,6 +80783,7 @@ IF EXIST "%~dp0\node.exe" (
         );
         assert_eq!(agent.pty_size.cols, original_size.cols);
         assert_eq!(agent.pty_size.rows, original_size.rows);
+        assert_eq!(agent.parser.screen().contents_formatted(), original_screen);
 
         let (server, peer) = AgentStream::pair().unwrap();
         let mut unconfirmed = PendingDaemonAttachConfirmation {
@@ -80277,6 +80797,8 @@ IF EXIST "%~dp0\node.exe" (
                 client_debug: None,
                 client_trace: None,
                 attach_confirmation: true,
+                input_replay_epochs: true,
+                terminal_checkpoints: true,
             },
             nonce: "unconfirmed-nonce".to_string(),
             client_instance_id: Some("unconfirmed-candidate".to_string()),
@@ -80306,6 +80828,8 @@ IF EXIST "%~dp0\node.exe" (
                 client_debug: None,
                 client_trace: None,
                 attach_confirmation: true,
+                input_replay_epochs: true,
+                terminal_checkpoints: true,
             },
             nonce: "expected-confirmation-nonce".to_string(),
             client_instance_id: Some("confirmed-candidate".to_string()),

@@ -30,6 +30,29 @@ impl PartialEq<Self> for Cell {
 }
 
 impl Cell {
+    pub(crate) fn checkpoint_len(&self) -> u8 {
+        self.len
+    }
+
+    pub(crate) fn from_checkpoint(
+        contents: &str,
+        len: u8,
+        attrs: crate::attrs::Attrs,
+    ) -> Result<Self, &'static str> {
+        if contents.len() > CONTENT_BYTES
+            || contents.len() != usize::from(len & LEN_BITS)
+            || len & !(LEN_BITS | IS_WIDE | IS_WIDE_CONTINUATION) != 0
+            || len & (IS_WIDE | IS_WIDE_CONTINUATION) == (IS_WIDE | IS_WIDE_CONTINUATION)
+        {
+            return Err("invalid terminal checkpoint cell");
+        }
+        let mut cell = Self::new();
+        cell.contents[..contents.len()].copy_from_slice(contents.as_bytes());
+        cell.len = len;
+        cell.attrs = attrs;
+        Ok(cell)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             contents: Default::default(),

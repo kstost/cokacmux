@@ -1,6 +1,6 @@
 use crate::term::BufWrite as _;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Grid {
     size: Size,
     pos: Pos,
@@ -16,6 +16,44 @@ pub struct Grid {
 }
 
 impl Grid {
+    pub(crate) fn checkpoint_is_valid(&self, allow_empty: bool) -> bool {
+        self.size.rows > 0
+            && self.size.cols > 0
+            && (self.rows.len() == usize::from(self.size.rows)
+                || (allow_empty && self.rows.is_empty()))
+            && self.rows.iter().all(|row| row.cols() == self.size.cols)
+            && self.pos.row < self.size.rows
+            && self.pos.col <= self.size.cols
+            && self.saved_pos.row < self.size.rows
+            && self.saved_pos.col <= self.size.cols
+            && self.scroll_top <= self.scroll_bottom
+            && self.scroll_bottom < self.size.rows
+            && self.scrollback.len() <= self.scrollback_len
+            && self.scrollback_offset <= self.scrollback.len()
+    }
+
+    pub(crate) fn clear_checkpoint_history(&mut self) {
+        self.scrollback.clear();
+        self.scrollback_offset = 0;
+    }
+
+    pub(crate) fn checkpoint_bytes(&self) -> usize {
+        self.rows
+            .iter()
+            .chain(&self.scrollback)
+            .map(|row| row.checkpoint_bytes())
+            .sum()
+    }
+
+    pub(crate) fn report_position(&self) -> (u16, u16) {
+        let row = if self.origin_mode {
+            self.pos.row.saturating_sub(self.scroll_top)
+        } else {
+            self.pos.row
+        };
+        (row, self.pos.col.min(self.size.cols - 1))
+    }
+
     pub fn new(size: Size, scrollback_len: usize) -> Self {
         Self {
             size,
@@ -35,10 +73,8 @@ impl Grid {
     pub fn allocate_rows(&mut self) {
         if self.rows.is_empty() {
             self.rows.extend(
-                std::iter::repeat_with(|| {
-                    crate::row::Row::new(self.size.cols)
-                })
-                .take(usize::from(self.size.rows)),
+                std::iter::repeat_with(|| crate::row::Row::new(self.size.cols))
+                    .take(usize::from(self.size.rows)),
             );
         }
     }
@@ -147,9 +183,7 @@ impl Grid {
         self.rows.iter()
     }
 
-    pub fn drawing_rows_mut(
-        &mut self,
-    ) -> impl Iterator<Item = &mut crate::row::Row> {
+    pub fn drawing_rows_mut(&mut self) -> impl Iterator<Item = &mut crate::row::Row> {
         self.rows.iter_mut()
     }
 
@@ -161,10 +195,7 @@ impl Grid {
         self.drawing_rows().nth(usize::from(row))
     }
 
-    pub fn drawing_row_mut(
-        &mut self,
-        row: u16,
-    ) -> Option<&mut crate::row::Row> {
+    pub fn drawing_row_mut(&mut self, row: u16) -> Option<&mut crate::row::Row> {
         self.drawing_rows_mut().nth(usize::from(row))
     }
 
@@ -214,10 +245,7 @@ impl Grid {
         }
     }
 
-    pub fn write_contents_formatted(
-        &self,
-        contents: &mut Vec<u8>,
-    ) -> crate::attrs::Attrs {
+    pub fn write_contents_formatted(&self, contents: &mut Vec<u8>) -> crate::attrs::Attrs {
         crate::term::ClearAttrs.write_buf(contents);
         crate::term::ClearScreen.write_buf(contents);
 
@@ -242,11 +270,7 @@ impl Grid {
             wrapping = row.wrapped();
         }
 
-        self.write_cursor_position_formatted(
-            contents,
-            Some(prev_pos),
-            Some(prev_attrs),
-        );
+        self.write_cursor_position_formatted(contents, Some(prev_pos), Some(prev_attrs));
 
         prev_attrs
     }
@@ -260,9 +284,7 @@ impl Grid {
         let mut prev_pos = prev.pos;
         let mut wrapping = false;
         let mut prev_wrapping = false;
-        for (i, (row, prev_row)) in
-            self.visible_rows().zip(prev.visible_rows()).enumerate()
-        {
+        for (i, (row, prev_row)) in self.visible_rows().zip(prev.visible_rows()).enumerate() {
             // we limit the number of cols to a u16 (see Size), so
             // visible_rows() can never return more rows than will fit
             let i = i.try_into().unwrap();
@@ -283,11 +305,7 @@ impl Grid {
             prev_wrapping = prev_row.wrapped();
         }
 
-        self.write_cursor_position_formatted(
-            contents,
-            Some(prev_pos),
-            Some(prev_attrs),
-        );
+        self.write_cursor_position_formatted(contents, Some(prev_pos), Some(prev_attrs));
 
         prev_attrs
     }
@@ -318,18 +336,16 @@ impl Grid {
             {
                 pos.col = self.size.cols - 2;
             }
-            let cell =
-                // we assume self.pos.row is always valid, and self.size.cols
-                // - 2 must be a valid column because self.size.cols - 1 is
-                // always valid and we just checked that the cell at
-                // self.size.cols - 1 is a wide continuation character, which
-                // means that the first half of the wide character must be
-                // before it
-                self.drawing_cell(pos).unwrap();
+            // we assume self.pos.row is always valid, and self.size.cols
+            // - 2 must be a valid column because self.size.cols - 1 is
+            // always valid and we just checked that the cell at
+            // self.size.cols - 1 is a wide continuation character, which
+            // means that the first half of the wide character must be
+            // before it
+            let cell = self.drawing_cell(pos).unwrap();
             if cell.has_contents() {
                 if let Some(prev_pos) = prev_pos {
-                    crate::term::MoveFromTo::new(prev_pos, pos)
-                        .write_buf(contents);
+                    crate::term::MoveFromTo::new(prev_pos, pos).write_buf(contents);
                 } else {
                     crate::term::MoveTo::new(pos).write_buf(contents);
                 }
@@ -372,37 +388,19 @@ impl Grid {
                         .unwrap();
                     if cell.has_contents() {
                         if let Some(prev_pos) = prev_pos {
-                            if prev_pos.row != i
-                                || prev_pos.col < self.size.cols
-                            {
-                                crate::term::MoveFromTo::new(prev_pos, pos)
-                                    .write_buf(contents);
-                                cell.attrs().write_escape_code_diff(
-                                    contents,
-                                    &prev_attrs,
-                                );
+                            if prev_pos.row != i || prev_pos.col < self.size.cols {
+                                crate::term::MoveFromTo::new(prev_pos, pos).write_buf(contents);
+                                cell.attrs().write_escape_code_diff(contents, &prev_attrs);
                                 contents.extend(cell.contents().as_bytes());
-                                prev_attrs.write_escape_code_diff(
-                                    contents,
-                                    cell.attrs(),
-                                );
+                                prev_attrs.write_escape_code_diff(contents, cell.attrs());
                             }
                         } else {
                             crate::term::MoveTo::new(pos).write_buf(contents);
-                            cell.attrs().write_escape_code_diff(
-                                contents,
-                                &prev_attrs,
-                            );
+                            cell.attrs().write_escape_code_diff(contents, &prev_attrs);
                             contents.extend(cell.contents().as_bytes());
-                            prev_attrs.write_escape_code_diff(
-                                contents,
-                                cell.attrs(),
-                            );
+                            prev_attrs.write_escape_code_diff(contents, cell.attrs());
                         }
-                        contents.extend(
-                            "\n".repeat(usize::from(self.pos.row - i))
-                                .as_bytes(),
-                        );
+                        contents.extend("\n".repeat(usize::from(self.pos.row - i)).as_bytes());
                         found = true;
                         break;
                     }
@@ -420,8 +418,7 @@ impl Grid {
                         col: self.size.cols - 1,
                     };
                     if let Some(prev_pos) = prev_pos {
-                        crate::term::MoveFromTo::new(prev_pos, pos)
-                            .write_buf(contents);
+                        crate::term::MoveFromTo::new(prev_pos, pos).write_buf(contents);
                     } else {
                         crate::term::MoveTo::new(pos).write_buf(contents);
                     }
@@ -440,13 +437,11 @@ impl Grid {
                     crate::term::Backspace.write_buf(contents);
                     crate::term::EraseChar::new(1).write_buf(contents);
                     crate::term::RestoreCursor.write_buf(contents);
-                    prev_attrs
-                        .write_escape_code_diff(contents, end_cell.attrs());
+                    prev_attrs.write_escape_code_diff(contents, end_cell.attrs());
                 }
             }
         } else if let Some(prev_pos) = prev_pos {
-            crate::term::MoveFromTo::new(prev_pos, self.pos)
-                .write_buf(contents);
+            crate::term::MoveFromTo::new(prev_pos, self.pos).write_buf(contents);
         } else {
             crate::term::MoveTo::new(self.pos).write_buf(contents);
         }
@@ -729,13 +724,13 @@ impl Grid {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Size {
     pub rows: u16,
     pub cols: u16,
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Pos {
     pub row: u16,
     pub col: u16,

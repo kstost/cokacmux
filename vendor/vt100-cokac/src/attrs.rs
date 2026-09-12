@@ -1,7 +1,7 @@
 use crate::term::BufWrite as _;
 
 /// Represents a foreground or background color for cells.
-#[derive(Eq, PartialEq, Debug, Copy, Clone, Default)]
+#[derive(Eq, PartialEq, Debug, Copy, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub enum Color {
     /// The default terminal color.
     #[default]
@@ -21,7 +21,7 @@ const TEXT_MODE_ITALIC: u8 = 0b0000_0100;
 const TEXT_MODE_UNDERLINE: u8 = 0b0000_1000;
 const TEXT_MODE_INVERSE: u8 = 0b0001_0000;
 
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Attrs {
     pub fgcolor: Color,
     pub bgcolor: Color,
@@ -91,11 +91,7 @@ impl Attrs {
         }
     }
 
-    pub fn write_escape_code_diff(
-        &self,
-        contents: &mut Vec<u8>,
-        other: &Self,
-    ) {
+    pub fn write_escape_code_diff(&self, contents: &mut Vec<u8>, other: &Self) {
         if self != other && self == &Self::default() {
             crate::term::ClearAttrs.write_buf(contents);
             return;
