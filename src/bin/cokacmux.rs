@@ -9064,6 +9064,8 @@ struct AgentClient {
     unacknowledged_input: VecDeque<UnacknowledgedAgentInput>,
     unacknowledged_input_bytes: usize,
     unacknowledged_input_replay_queued: bool,
+    /// Original press for detach cleanup, or a release that must precede later input.
+    pending_mouse_release: Option<mouse::MouseButtonCapture>,
     screen_hash: u64,
     last_screen_change_epoch_ms: u64,
     last_output_epoch_ms: u64,
@@ -9240,6 +9242,7 @@ enum AgentScrollAction {
 
 impl Drop for AgentClient {
     fn drop(&mut self) {
+        mouse::release_before_detach(self);
         let mut detach_queued = false;
         if self.exited.is_none() {
             preserve_unacknowledged_agent_input(
@@ -9719,6 +9722,7 @@ impl AgentClient {
                 unacknowledged_input: recovered_input,
                 unacknowledged_input_bytes: recovered_input_bytes,
                 unacknowledged_input_replay_queued: false,
+                pending_mouse_release: None,
                 screen_hash,
                 last_screen_change_epoch_ms: 0,
                 last_output_epoch_ms: 0,
@@ -10709,6 +10713,11 @@ impl AgentClient {
     }
 
     fn send_input_data(&mut self, data: Vec<u8>) -> io::Result<()> {
+        mouse::flush_pending_release(self)?;
+        self.send_input_data_inner(data)
+    }
+
+    fn send_input_data_inner(&mut self, data: Vec<u8>) -> io::Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -12405,6 +12414,7 @@ struct App {
     /// Hit targets from the last rendered frame, including exact PTY reader IDs.
     mouse_wheel_regions: Vec<mouse::MouseWheelRegion>,
     previous_mouse_wheel_regions: Vec<mouse::MouseWheelRegion>,
+    mouse_button_capture: Option<mouse::MouseButtonCapture>,
     /// Manual sidebar scrolling never changes the active agent or keyboard focus.
     agent_sidebar_scroll: Option<mouse::AgentSidebarScroll>,
     session_view: SessionViewMode,
@@ -12601,6 +12611,7 @@ impl App {
             list_state: ListState::default(),
             mouse_wheel_regions: Vec::new(),
             previous_mouse_wheel_regions: Vec::new(),
+            mouse_button_capture: None,
             agent_sidebar_scroll: None,
             session_view,
             session_scope: SessionScope::TopLevel,
@@ -28532,7 +28543,11 @@ fn setup_terminal() -> Result<Tui> {
             "error": bracketed_paste.err().map(|e| e.to_string()),
         }),
     );
-    let mouse_capture = execute!(stdout, EnableMouseCapture);
+    let mouse_capture = execute!(
+        stdout,
+        EnableMouseCapture,
+        crossterm::event::EnableFocusChange
+    );
     debug_log(
         "terminal_mouse_capture_enable",
         serde_json::json!({
@@ -28542,6 +28557,7 @@ fn setup_terminal() -> Result<Tui> {
     );
     if mouse_capture.is_err() {
         let _ = execute!(stdout, DisableMouseCapture);
+        let _ = execute!(stdout, crossterm::event::DisableFocusChange);
     }
     let _ = execute!(
         stdout,
@@ -28565,6 +28581,10 @@ fn setup_terminal() -> Result<Tui> {
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     debug_log("terminal_restore_start", serde_json::json!({}));
     let mut first_error = None;
+    record_terminal_restore_error(
+        &mut first_error,
+        execute!(terminal.backend_mut(), crossterm::event::DisableFocusChange),
+    );
     record_terminal_restore_error(
         &mut first_error,
         execute!(terminal.backend_mut(), DisableMouseCapture),
@@ -28607,6 +28627,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 
 fn restore_terminal_without_instance() {
     let mut stdout = io::stdout();
+    let _ = execute!(stdout, crossterm::event::DisableFocusChange);
     let _ = execute!(stdout, DisableMouseCapture);
     let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     let _ = execute!(stdout, DisableBracketedPaste);
@@ -29258,10 +29279,15 @@ fn handle_main_event(
             queued_at_epoch_ms,
         } => mouse::handle_mouse_input_event(app, event, queued_at_epoch_ms),
         MainEvent::Input {
+            event: Event::FocusLost,
+            ..
+        } => mouse::cancel_mouse_capture(app),
+        MainEvent::Input {
             event: Event::Resize(cols, rows),
             ..
         } => {
             // Coordinates from the previous layout are no longer actionable.
+            mouse::cancel_mouse_capture(app);
             app.mouse_wheel_regions.clear();
             let viewports = app
                 .is_agent_view()
@@ -29510,8 +29536,8 @@ fn run(terminal: &mut Tui) -> Result<()> {
             match event::poll(Duration::from_secs(60)) {
                 Ok(true) => match event::read() {
                     Ok(ev) => {
-                        // Mouse capture can emit motion at a high rate. Only
-                        // wheels enter the UI queue or ordinary input logging.
+                        // Ignore hover motion. Preserve press/drag/release order
+                        // for children that requested native mouse input.
                         if !mouse::should_forward_terminal_input(&ev) {
                             continue;
                         }
@@ -29725,6 +29751,8 @@ fn run(terminal: &mut Tui) -> Result<()> {
         draw_app_frame(terminal, &mut app, "main_loop")?;
         record_main_loop_heartbeat();
     }
+    mouse::cancel_mouse_capture(&mut app);
+    mouse::finish_mouse_frame(&mut app);
     let registry_saved = flush_persisted_agent_auxiliary_registry_writer(Duration::from_secs(1));
     if !registry_saved {
         debug_log(
@@ -51303,6 +51331,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     if mouse::input_blocked(app) {
         app.mouse_wheel_regions.clear();
     }
+    mouse::finish_mouse_frame(app);
     debug_log(
         "ui_agent_render_done",
         serde_json::json!({
@@ -54305,6 +54334,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     if mouse::input_blocked(app) {
         app.mouse_wheel_regions.clear();
     }
+    mouse::finish_mouse_frame(app);
 }
 
 fn draw_delete_confirm_modal(
@@ -59968,6 +59998,7 @@ mod tests {
             unacknowledged_input: VecDeque::new(),
             unacknowledged_input_bytes: 0,
             unacknowledged_input_replay_queued: false,
+            pending_mouse_release: None,
             screen_hash: 0,
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
@@ -61588,6 +61619,7 @@ mod tests {
             mouse_wheel_regions: Vec::new(),
             previous_mouse_wheel_regions: Vec::new(),
             agent_sidebar_scroll: None,
+            mouse_button_capture: None,
             session_view: SessionViewMode::Tree,
             session_scope: SessionScope::TopLevel,
             provider_filter: ProviderFilter::All,
@@ -76638,6 +76670,7 @@ IF EXIST "%~dp0\node.exe" (
             unacknowledged_input: VecDeque::new(),
             unacknowledged_input_bytes: 0,
             unacknowledged_input_replay_queued: false,
+            pending_mouse_release: None,
             screen_hash: 0,
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
@@ -76712,6 +76745,7 @@ IF EXIST "%~dp0\node.exe" (
             unacknowledged_input: VecDeque::new(),
             unacknowledged_input_bytes: 0,
             unacknowledged_input_replay_queued: false,
+            pending_mouse_release: None,
             screen_hash: 0,
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
@@ -79984,6 +80018,7 @@ IF EXIST "%~dp0\node.exe" (
             unacknowledged_input: VecDeque::new(),
             unacknowledged_input_bytes: 0,
             unacknowledged_input_replay_queued: false,
+            pending_mouse_release: None,
             screen_hash: 0,
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
@@ -80262,6 +80297,7 @@ IF EXIST "%~dp0\node.exe" (
             unacknowledged_input: VecDeque::new(),
             unacknowledged_input_bytes: 0,
             unacknowledged_input_replay_queued: false,
+            pending_mouse_release: None,
             screen_hash: 0,
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,
@@ -80346,6 +80382,7 @@ IF EXIST "%~dp0\node.exe" (
             unacknowledged_input: VecDeque::new(),
             unacknowledged_input_bytes: 0,
             unacknowledged_input_replay_queued: false,
+            pending_mouse_release: None,
             screen_hash: 0,
             last_screen_change_epoch_ms: 0,
             last_output_epoch_ms: 0,

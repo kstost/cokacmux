@@ -1,10 +1,24 @@
-//! Wheel-only mouse support. Hit testing uses the last rendered content
+//! Mouse support. Hit testing uses the last rendered content
 //! rectangles, never a guessed terminal size or the keyboard focus.
 
 use super::*;
-use crossterm::event::{MouseEvent, MouseEventKind};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 const WHEEL_LINES: i32 = 3;
+
+#[derive(Debug, Clone)]
+pub(super) struct MouseButtonCapture {
+    reader_id: u64,
+    area: Rect,
+    button: MouseButton,
+    pressed_at: u64,
+    press_position: (u16, u16),
+    last_position: (u16, u16),
+    modifiers: KeyModifiers,
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+    release_pending: bool,
+}
 
 #[derive(Debug, Clone)]
 pub(super) enum MouseWheelTarget {
@@ -84,7 +98,7 @@ fn wheel_direction(kind: MouseEventKind) -> Option<i32> {
 
 pub(super) fn should_forward_terminal_input(event: &Event) -> bool {
     match event {
-        Event::Mouse(mouse) => wheel_direction(mouse.kind).is_some(),
+        Event::Mouse(mouse) => mouse.kind != MouseEventKind::Moved,
         _ => true,
     }
 }
@@ -113,6 +127,46 @@ fn contains_mouse(area: Rect, mouse: MouseEvent) -> bool {
 }
 
 pub(super) fn handle_mouse_input_event(app: &mut App, mouse: MouseEvent, queued_at_epoch_ms: u64) {
+    if matches!(
+        mouse.kind,
+        MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::Up(_)
+    ) {
+        handle_button_input(app, mouse, queued_at_epoch_ms);
+        return;
+    }
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+    ) {
+        if input_blocked(app) || !app.is_agent_view() {
+            return;
+        }
+        let region = app
+            .mouse_wheel_regions
+            .iter()
+            .find(|region| {
+                contains_mouse(region.area, mouse)
+                    && queued_at_epoch_ms > region.valid_since_epoch_ms
+            })
+            .cloned();
+        if let Some(MouseWheelRegion {
+            area,
+            target: MouseWheelTarget::Agent { reader_id },
+            ..
+        }) = region
+        {
+            if let Some(agent) = mouse_agent(app, reader_id) {
+                if agent_accepts_mouse(agent) {
+                    if let Some(data) = encode_mouse_event(agent.parser.screen(), mouse, area) {
+                        if let Err(error) = send_wheel_input(agent, data) {
+                            app.status = format!("mouse input not sent: {error}");
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
     let Some(direction) = wheel_direction(mouse.kind) else {
         return;
     };
@@ -196,7 +250,11 @@ pub(super) fn handle_mouse_input_event(app: &mut App, mouse: MouseEvent, queued_
 /// are pane-relative and one-based, not the enclosing cokacmux coordinates.
 /// https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Mouse-Tracking
 fn encode_mouse_wheel(screen: &vt100::Screen, mouse: MouseEvent, area: Rect) -> Option<Vec<u8>> {
-    let direction = wheel_direction(mouse.kind)?;
+    wheel_direction(mouse.kind)?;
+    encode_mouse_event(screen, mouse, area)
+}
+
+fn encode_mouse_event(screen: &vt100::Screen, mouse: MouseEvent, area: Rect) -> Option<Vec<u8>> {
     if screen.mouse_protocol_mode() == vt100::MouseProtocolMode::None
         || !contains_mouse(area, mouse)
     {
@@ -210,7 +268,36 @@ fn encode_mouse_wheel(screen: &vt100::Screen, mouse: MouseEvent, area: Rect) -> 
     }
     let x = u32::from(col) + 1;
     let y = u32::from(row) + 1;
-    let mut button = if direction > 0 { 64u32 } else { 65u32 };
+    let button_code = |button| match button {
+        MouseButton::Left => 0u32,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    let mode = screen.mouse_protocol_mode();
+    let release = matches!(mouse.kind, MouseEventKind::Up(_));
+    let mut button = match mouse.kind {
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
+        MouseEventKind::Down(button) => button_code(button),
+        MouseEventKind::Up(button) if mode != vt100::MouseProtocolMode::Press => {
+            if screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr {
+                button_code(button)
+            } else {
+                3
+            }
+        }
+        MouseEventKind::Drag(button)
+            if matches!(
+                mode,
+                vt100::MouseProtocolMode::ButtonMotion | vt100::MouseProtocolMode::AnyMotion
+            ) =>
+        {
+            button_code(button) | 32
+        }
+        _ => return None,
+    };
     // X10 press-only tracking does not encode modifier keys.
     if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::Press {
         if mouse.modifiers.contains(KeyModifiers::SHIFT) {
@@ -224,7 +311,10 @@ fn encode_mouse_wheel(screen: &vt100::Screen, mouse: MouseEvent, area: Rect) -> 
         }
     }
     match screen.mouse_protocol_encoding() {
-        vt100::MouseProtocolEncoding::Sgr => Some(format!("\x1b[<{button};{x};{y}M").into_bytes()),
+        vt100::MouseProtocolEncoding::Sgr => {
+            let suffix = if release { 'm' } else { 'M' };
+            Some(format!("\x1b[<{button};{x};{y}{suffix}").into_bytes())
+        }
         vt100::MouseProtocolEncoding::Default => {
             if x > 223 || y > 223 {
                 return None;
@@ -252,6 +342,283 @@ fn encode_mouse_wheel(screen: &vt100::Screen, mouse: MouseEvent, area: Rect) -> 
             Some(bytes)
         }
     }
+}
+
+fn mouse_agent(app: &mut App, reader_id: u64) -> Option<&mut AgentClient> {
+    if app
+        .active_agent
+        .as_ref()
+        .is_some_and(|agent| agent.reader_id == reader_id)
+    {
+        app.active_agent.as_mut()
+    } else {
+        app.agent_aux
+            .as_mut()
+            .filter(|aux| aux.agent.reader_id == reader_id)
+            .map(|aux| &mut aux.agent)
+    }
+}
+
+fn agent_accepts_mouse(agent: &AgentClient) -> bool {
+    agent.exited.is_none()
+        && agent.connection_ended.is_none()
+        && !agent.pending_snapshot_output
+        && !agent.snapshot_parse_in_progress
+        && agent.pending_resize.is_none()
+        && agent.scrollback_offset() == 0
+}
+
+fn captured_event(
+    capture: &MouseButtonCapture,
+    kind: MouseEventKind,
+    modifiers: KeyModifiers,
+    screen: &vt100::Screen,
+) -> MouseEvent {
+    let protocol_limit = match capture.encoding {
+        vt100::MouseProtocolEncoding::Default => 223,
+        vt100::MouseProtocolEncoding::Utf8 => 2015,
+        vt100::MouseProtocolEncoding::Sgr => u16::MAX,
+    };
+    let (rows, columns) = screen.size();
+    let width = capture.area.width.min(columns).min(protocol_limit).max(1);
+    let height = capture.area.height.min(rows).min(protocol_limit).max(1);
+    MouseEvent {
+        kind,
+        modifiers,
+        column: capture
+            .last_position
+            .0
+            .clamp(capture.area.x, capture.area.x.saturating_add(width - 1)),
+        row: capture
+            .last_position
+            .1
+            .clamp(capture.area.y, capture.area.y.saturating_add(height - 1)),
+    }
+}
+
+/// Keep rejected releases on their original connection, ahead of later input.
+/// The writer's acknowledgement queue owns already admitted bytes, including
+/// bytes retained after a writer failure; those must never be submitted twice.
+pub(super) fn cancel_mouse_capture(app: &mut App) {
+    let Some(mut capture) = app.mouse_button_capture.take() else {
+        return;
+    };
+    // End a cancelled gesture at its origin so losing focus or resizing does
+    // not accidentally commit a cross-panel drop in the child.
+    capture.last_position = capture.press_position;
+    release_mouse_capture(app, capture);
+}
+
+fn release_mouse_capture(app: &mut App, mut capture: MouseButtonCapture) {
+    capture.release_pending = true;
+    let Some(agent) = mouse_agent(app, capture.reader_id) else {
+        return;
+    };
+    agent.pending_mouse_release = Some(capture);
+    if let Err(error) = flush_pending_release(agent) {
+        app.status = format!("mouse release waiting: {error}");
+    }
+}
+
+pub(super) fn flush_pending_release(agent: &mut AgentClient) -> io::Result<()> {
+    if agent
+        .pending_mouse_release
+        .as_ref()
+        .is_some_and(|capture| !capture.release_pending)
+    {
+        return Ok(());
+    }
+    let Some(capture) = agent.pending_mouse_release.take() else {
+        return Ok(());
+    };
+    if capture.reader_id != agent.reader_id
+        || agent.exited.is_some()
+        || agent.connection_ended.is_some()
+    {
+        return Ok(());
+    }
+    if agent.pending_snapshot_output
+        || agent.snapshot_parse_in_progress
+        || agent.pending_resize.is_some()
+    {
+        agent.pending_mouse_release = Some(capture);
+        return Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "mouse release is waiting for the child's current screen",
+        ));
+    }
+    if agent.parser.screen().mouse_protocol_mode() != capture.mode
+        || agent.parser.screen().mouse_protocol_encoding() != capture.encoding
+    {
+        return Ok(());
+    }
+    let event = captured_event(
+        &capture,
+        MouseEventKind::Up(capture.button),
+        capture.modifiers,
+        agent.parser.screen(),
+    );
+    if let Some(data) = encode_mouse_event(agent.parser.screen(), event, capture.area) {
+        if let Err(error) = send_admitted_mouse_input(agent, data) {
+            agent.pending_mouse_release = Some(capture);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// AgentClient::drop still owns the original writer, so release before detach.
+pub(super) fn release_before_detach(agent: &mut AgentClient) {
+    if let Some(capture) = agent.pending_mouse_release.as_mut() {
+        if !capture.release_pending {
+            capture.last_position = capture.press_position;
+            capture.release_pending = true;
+        }
+    }
+    let _ = flush_pending_release(agent);
+}
+
+fn send_admitted_mouse_input(agent: &mut AgentClient, data: Vec<u8>) -> io::Result<()> {
+    let retained_before = agent.unacknowledged_input.len();
+    let result = agent.send_input_data_inner(data);
+    if result.is_err() && agent.unacknowledged_input.len() == retained_before {
+        return result;
+    }
+    record_mouse_input(agent);
+    Ok(())
+}
+
+fn send_button_input(agent: &mut AgentClient, data: Vec<u8>) -> io::Result<()> {
+    flush_pending_release(agent)?;
+    send_admitted_mouse_input(agent, data)
+}
+
+pub(super) fn finish_mouse_frame(app: &mut App) {
+    let cancel = app.mouse_button_capture.as_ref().is_some_and(|capture|
+        input_blocked(app) || !app.is_agent_view() || !app.mouse_wheel_regions.iter().any(|region|
+            region.area == capture.area && matches!(region.target, MouseWheelTarget::Agent { reader_id } if reader_id == capture.reader_id)));
+    if cancel {
+        cancel_mouse_capture(app);
+    }
+    for agent in app
+        .active_agent
+        .iter_mut()
+        .chain(app.agent_aux.iter_mut().map(|aux| &mut aux.agent))
+    {
+        if let Err(error) = flush_pending_release(agent) {
+            app.status = format!("mouse release waiting: {error}");
+        }
+    }
+}
+
+fn handle_button_input(app: &mut App, mouse: MouseEvent, queued_at: u64) {
+    if input_blocked(app) || !app.is_agent_view() {
+        cancel_mouse_capture(app);
+        return;
+    }
+    if let MouseEventKind::Down(button) = mouse.kind {
+        cancel_mouse_capture(app);
+        let region = app
+            .mouse_wheel_regions
+            .iter()
+            .find(|region| {
+                contains_mouse(region.area, mouse) && queued_at > region.valid_since_epoch_ms
+            })
+            .cloned();
+        let Some(MouseWheelRegion {
+            area,
+            target: MouseWheelTarget::Agent { reader_id },
+            ..
+        }) = region
+        else {
+            return;
+        };
+        let Some(agent) = mouse_agent(app, reader_id) else {
+            return;
+        };
+        if !agent_accepts_mouse(agent) {
+            return;
+        }
+        let Some(data) = encode_mouse_event(agent.parser.screen(), mouse, area) else {
+            return;
+        };
+        let mode = agent.parser.screen().mouse_protocol_mode();
+        let encoding = agent.parser.screen().mouse_protocol_encoding();
+        if let Err(error) = send_button_input(agent, data) {
+            app.status = format!("mouse press not sent: {error}");
+            return;
+        }
+        let capture = (mode != vt100::MouseProtocolMode::Press).then_some(MouseButtonCapture {
+            reader_id,
+            area,
+            button,
+            pressed_at: queued_at,
+            press_position: (mouse.column, mouse.row),
+            last_position: (mouse.column, mouse.row),
+            mode,
+            encoding,
+            modifiers: mouse.modifiers,
+            release_pending: false,
+        });
+        agent.pending_mouse_release = capture.clone();
+        app.agent_focus = if app
+            .active_agent
+            .as_ref()
+            .is_some_and(|agent| agent.reader_id == reader_id)
+        {
+            AgentFocusPane::Main
+        } else {
+            AgentFocusPane::Auxiliary
+        };
+        app.mouse_button_capture = capture;
+        return;
+    }
+    let Some(mut capture) = app.mouse_button_capture.take() else {
+        return;
+    };
+    let button = match mouse.kind {
+        MouseEventKind::Drag(button) | MouseEventKind::Up(button) => button,
+        _ => return,
+    };
+    if button != capture.button || queued_at < capture.pressed_at {
+        app.mouse_button_capture = Some(capture);
+        return;
+    }
+    let current_region = app.mouse_wheel_regions.iter().any(|region|
+        region.area == capture.area && matches!(region.target, MouseWheelTarget::Agent { reader_id } if reader_id == capture.reader_id));
+    if !current_region {
+        app.mouse_button_capture = Some(capture);
+        cancel_mouse_capture(app);
+        return;
+    }
+    capture.last_position = (mouse.column, mouse.row);
+    capture.modifiers = mouse.modifiers;
+    if matches!(mouse.kind, MouseEventKind::Up(_)) {
+        release_mouse_capture(app, capture);
+        return;
+    }
+    let Some(agent) = mouse_agent(app, capture.reader_id) else {
+        return;
+    };
+    if !agent_accepts_mouse(agent) {
+        app.mouse_button_capture = Some(capture);
+        cancel_mouse_capture(app);
+        return;
+    }
+    if agent.parser.screen().mouse_protocol_mode() != capture.mode
+        || agent.parser.screen().mouse_protocol_encoding() != capture.encoding
+    {
+        return;
+    }
+    let event = captured_event(&capture, mouse.kind, mouse.modifiers, agent.parser.screen());
+    if let Some(data) = encode_mouse_event(agent.parser.screen(), event, capture.area) {
+        if let Err(error) = send_button_input(agent, data) {
+            app.status = format!("mouse input not sent: {error}");
+            app.mouse_button_capture = Some(capture);
+            return;
+        }
+    }
+    app.mouse_button_capture = Some(capture);
 }
 
 fn wheel_fallback_keys(
@@ -351,11 +718,15 @@ fn send_wheel_input(agent: &mut AgentClient, data: Vec<u8>) -> io::Result<()> {
     if agent.scrollback_offset() > 0 {
         agent.set_scrollback_offset(0);
     }
+    record_mouse_input(agent);
+    Ok(())
+}
+
+fn record_mouse_input(agent: &mut AgentClient) {
     agent.last_input_epoch_ms = current_epoch_ms();
     agent.pending_input_since_epoch_ms = Some(agent.last_input_epoch_ms);
-    agent.pending_input_key = Some("mouse wheel".into());
+    agent.pending_input_key = Some("mouse".into());
     agent.pending_input_count = agent.pending_input_count.saturating_add(1);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -391,16 +762,20 @@ mod tests {
     }
 
     #[test]
-    fn mouse_motion_clicks_and_horizontal_wheels_do_not_enter_ui_queue() {
-        for kind in [
+    fn hover_is_filtered_but_buttons_drags_releases_and_wheels_are_preserved() {
+        assert!(!should_forward_terminal_input(&Event::Mouse(wheel(
             MouseEventKind::Moved,
+            1,
+            1
+        ))));
+        for kind in [
             MouseEventKind::Down(MouseButton::Left),
             MouseEventKind::Up(MouseButton::Left),
             MouseEventKind::Drag(MouseButton::Left),
             MouseEventKind::ScrollLeft,
             MouseEventKind::ScrollRight,
         ] {
-            assert!(!should_forward_terminal_input(&Event::Mouse(wheel(
+            assert!(should_forward_terminal_input(&Event::Mouse(wheel(
                 kind, 1, 1
             ))));
         }
@@ -436,6 +811,264 @@ mod tests {
             Rect::new(10, 4, 0, 0),
             wheel(MouseEventKind::ScrollUp, 10, 4)
         ));
+    }
+
+    #[test]
+    fn native_buttons_use_child_modes_and_sgr_release_suffix() {
+        let mut parser = vt100::Parser::new(8, 80, 0);
+        let area = Rect::new(20, 7, 80, 8);
+        let down = wheel(MouseEventKind::Down(MouseButton::Left), 23, 9);
+        let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 24, 10);
+        let up = wheel(MouseEventKind::Up(MouseButton::Left), 24, 10);
+        assert!(encode_mouse_event(parser.screen(), down, area).is_none());
+        parser.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            encode_mouse_event(parser.screen(), down, area).unwrap(),
+            b"\x1b[<0;4;3M"
+        );
+        assert!(encode_mouse_event(parser.screen(), drag, area).is_none());
+        assert_eq!(
+            encode_mouse_event(parser.screen(), up, area).unwrap(),
+            b"\x1b[<0;5;4m"
+        );
+        parser.process(b"\x1b[?1002h");
+        assert_eq!(
+            encode_mouse_event(parser.screen(), drag, area).unwrap(),
+            b"\x1b[<32;5;4M"
+        );
+        parser.process(b"\x1b[?1006l");
+        assert_eq!(
+            encode_mouse_event(parser.screen(), up, area).unwrap(),
+            vec![27, b'[', b'M', 35, 37, 36]
+        );
+        parser.process(b"\x1b[?9h");
+        assert!(encode_mouse_event(parser.screen(), up, area).is_none());
+        assert!(encode_mouse_event(parser.screen(), drag, area).is_none());
+    }
+
+    #[test]
+    fn drag_and_release_stay_with_pressed_reader_when_pointer_crosses_panes() {
+        let mut app = app_for_key_tests();
+        let (mut main, main_requests) =
+            buffered_output_test_client_with_requests("mouse-main", 9941);
+        let (mut auxiliary, aux_requests) =
+            buffered_output_test_client_with_requests("mouse-aux", 9942);
+        main.parser.process(b"\x1b[?1002h\x1b[?1006h");
+        auxiliary.parser.process(b"\x1b[?1002h\x1b[?1006h");
+        let parent = AgentKey::new(&main.info);
+        app.active_agent = Some(main);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: auxiliary,
+        });
+        app.show_sessions_view = false;
+        app.record_mouse_wheel_region(
+            Rect::new(0, 0, 40, 8),
+            MouseWheelTarget::Agent { reader_id: 9941 },
+        );
+        app.record_mouse_wheel_region(
+            Rect::new(40, 0, 40, 8),
+            MouseWheelTarget::Agent { reader_id: 9942 },
+        );
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Down(MouseButton::Left), 2, 2),
+        );
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Drag(MouseButton::Left), 42, 3),
+        );
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Up(MouseButton::Left), 42, 3),
+        );
+        assert_eq!(
+            request_bytes(&main_requests),
+            [
+                b"\x1b[<0;3;3M".to_vec(),
+                b"\x1b[<32;40;4M".to_vec(),
+                b"\x1b[<0;40;4m".to_vec(),
+            ]
+        );
+        assert!(aux_requests.try_recv().is_err());
+        assert!(app.mouse_button_capture.is_none());
+        assert_eq!(app.agent_focus, AgentFocusPane::Main);
+        app.active_agent.as_mut().unwrap().exited = Some("test cleanup".into());
+        app.agent_aux.as_mut().unwrap().agent.exited = Some("test cleanup".into());
+    }
+
+    #[test]
+    fn replaced_reader_never_receives_an_old_drag_or_release() {
+        let mut app = app_for_key_tests();
+        let (mut main, requests) =
+            buffered_output_test_client_with_requests("mouse-replaced", 9943);
+        main.parser.process(b"\x1b[?1002h\x1b[?1006h");
+        app.active_agent = Some(main);
+        app.show_sessions_view = false;
+        app.record_mouse_wheel_region(
+            Rect::new(0, 0, 40, 8),
+            MouseWheelTarget::Agent { reader_id: 9943 },
+        );
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Down(MouseButton::Left), 2, 2),
+        );
+        assert_eq!(request_bytes(&requests).len(), 1);
+        app.active_agent.as_mut().unwrap().reader_id = 9944;
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Drag(MouseButton::Left), 4, 2),
+        );
+        dispatch(&mut app, wheel(MouseEventKind::Up(MouseButton::Left), 4, 2));
+        assert!(requests.try_recv().is_err());
+        assert!(app.mouse_button_capture.is_none());
+        app.active_agent.as_mut().unwrap().exited = Some("test cleanup".into());
+    }
+
+    #[test]
+    fn release_waits_for_screen_and_precedes_the_next_key_with_its_modifiers() {
+        let mut app = app_for_key_tests();
+        let (mut main, requests) = buffered_output_test_client_with_requests("mouse-release", 9945);
+        main.parser.process(b"\x1b[?1002h\x1b[?1006h");
+        app.active_agent = Some(main);
+        app.show_sessions_view = false;
+        app.record_mouse_wheel_region(
+            Rect::new(0, 0, 40, 8),
+            MouseWheelTarget::Agent { reader_id: 9945 },
+        );
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Down(MouseButton::Left), 2, 2),
+        );
+        assert_eq!(request_bytes(&requests).len(), 1);
+        app.active_agent.as_mut().unwrap().pending_snapshot_output = true;
+        let mut release = wheel(MouseEventKind::Up(MouseButton::Left), 12, 3);
+        release.modifiers = KeyModifiers::SHIFT;
+        dispatch(&mut app, release);
+        let main = app.active_agent.as_mut().unwrap();
+        assert!(main.pending_mouse_release.is_some());
+        assert!(main.send_input_data(b"x".to_vec()).is_err());
+        assert!(requests.try_recv().is_err());
+        main.pending_snapshot_output = false;
+        main.send_input_data(b"x".to_vec()).unwrap();
+        assert_eq!(
+            request_bytes(&requests),
+            [b"\x1b[<4;13;4m".to_vec(), b"x".to_vec()]
+        );
+        assert!(main.pending_mouse_release.is_none());
+        finish_mouse_frame(&mut app);
+        assert!(requests.try_recv().is_err());
+        app.active_agent.as_mut().unwrap().exited = Some("test cleanup".into());
+    }
+
+    #[test]
+    fn release_retained_after_writer_failure_is_not_submitted_twice() {
+        let mut app = app_for_key_tests();
+        let (mut main, requests) =
+            buffered_output_test_client_with_requests("mouse-retained", 9946);
+        main.parser.process(b"\x1b[?1002h\x1b[?1006h");
+        app.active_agent = Some(main);
+        app.show_sessions_view = false;
+        app.record_mouse_wheel_region(
+            Rect::new(0, 0, 40, 8),
+            MouseWheelTarget::Agent { reader_id: 9946 },
+        );
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Down(MouseButton::Left), 2, 2),
+        );
+        assert_eq!(request_bytes(&requests).len(), 1);
+        app.active_agent.as_mut().unwrap().input_acknowledgements = true;
+        drop(requests);
+        dispatch(&mut app, wheel(MouseEventKind::Up(MouseButton::Left), 4, 3));
+        let main = app.active_agent.as_mut().unwrap();
+        assert!(main.pending_mouse_release.is_none());
+        assert_eq!(main.unacknowledged_input.len(), 1);
+        assert_eq!(
+            main.unacknowledged_input.front().unwrap().data,
+            b"\x1b[<0;5;4m"
+        );
+        flush_pending_release(main).unwrap();
+        assert_eq!(main.unacknowledged_input.len(), 1);
+        assert!(main.send_input_data(b"x".to_vec()).is_err());
+        main.exited = Some("test cleanup".into());
+    }
+
+    #[test]
+    fn cancellation_releases_at_origin_and_ignores_a_late_physical_release() {
+        let mut app = app_for_key_tests();
+        let (mut main, requests) = buffered_output_test_client_with_requests("mouse-cancel", 9947);
+        main.parser.process(b"\x1b[?1002h\x1b[?1006h");
+        app.active_agent = Some(main);
+        app.show_sessions_view = false;
+        app.record_mouse_wheel_region(
+            Rect::new(0, 0, 40, 8),
+            MouseWheelTarget::Agent { reader_id: 9947 },
+        );
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Down(MouseButton::Left), 2, 2),
+        );
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Drag(MouseButton::Left), 30, 3),
+        );
+        assert_eq!(request_bytes(&requests).len(), 2);
+        cancel_mouse_capture(&mut app);
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Up(MouseButton::Left), 30, 3),
+        );
+        assert_eq!(request_bytes(&requests), [b"\x1b[<0;3;3m".to_vec()]);
+        app.active_agent.as_mut().unwrap().exited = Some("test cleanup".into());
+    }
+
+    #[test]
+    fn detaching_a_pressed_reader_sends_its_release_before_detach() {
+        let mut app = app_for_key_tests();
+        let (mut main, requests) = buffered_output_test_client_with_requests("mouse-detach", 9948);
+        main.parser.process(b"\x1b[?1002h\x1b[?1006h");
+        app.active_agent = Some(main);
+        app.show_sessions_view = false;
+        app.record_mouse_wheel_region(
+            Rect::new(0, 0, 40, 8),
+            MouseWheelTarget::Agent { reader_id: 9948 },
+        );
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Down(MouseButton::Left), 2, 2),
+        );
+        assert_eq!(request_bytes(&requests).len(), 1);
+        drop(app.active_agent.take());
+        let release = requests.try_recv().unwrap();
+        assert!(
+            matches!(release.request, AgentDaemonRequest::Input { data, .. } if data == b"\x1b[<0;3;3m")
+        );
+        dispatch(&mut app, wheel(MouseEventKind::Up(MouseButton::Left), 4, 3));
+        assert!(app.mouse_button_capture.is_none());
+    }
+
+    #[test]
+    fn switching_to_sessions_blocks_buttons_before_the_next_redraw() {
+        let mut app = app_for_key_tests();
+        let (mut main, requests) = buffered_output_test_client_with_requests("mouse-hidden", 9949);
+        main.parser.process(b"\x1b[?1002h\x1b[?1006h");
+        app.active_agent = Some(main);
+        app.show_sessions_view = false;
+        app.record_mouse_wheel_region(
+            Rect::new(0, 0, 40, 8),
+            MouseWheelTarget::Agent { reader_id: 9949 },
+        );
+        app.show_sessions_view = true;
+        dispatch(
+            &mut app,
+            wheel(MouseEventKind::Down(MouseButton::Left), 2, 2),
+        );
+        dispatch(&mut app, wheel(MouseEventKind::ScrollRight, 2, 2));
+        assert!(requests.try_recv().is_err());
+        assert!(app.mouse_button_capture.is_none());
+        app.active_agent.as_mut().unwrap().exited = Some("test cleanup".into());
     }
 
     #[test]
