@@ -100,5 +100,5 @@ responsiveness (5); never risk a live agent (1) to clean up the display (3).
 
 - Version is defined in `Cargo.toml` (line 3: `version = "x.x.x"`)
 - All version displays use `env!("CARGO_PKG_VERSION")` macro to read from Cargo.toml
-- To update version: only modify `Cargo.toml`, all other locations reflect automatically
+- To update version: modify `Cargo.toml` and the matching `cokacmux` package version in `Cargo.lock` together; builds use `--locked`. Version displays reflect `Cargo.toml` automatically.
 - Never hardcode version strings in source code

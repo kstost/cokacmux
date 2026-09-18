@@ -1,11 +1,14 @@
+import io
 import os
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from builder.executor import BuildExecutor, BuildResult, run_build
+from builder.logger import Logger
 from builder.targets import Target
 
 
@@ -54,6 +57,34 @@ class _IsolatedEnvironmentTestCase(unittest.TestCase):
 
 
 class ExecutorSafetyTests(_IsolatedEnvironmentTestCase):
+    def test_build_failure_diagnostics_are_visible_without_verbose(self):
+        diagnostic = "error: cannot update Cargo.lock because --locked was passed"
+        cases = [
+            ("", "\n".join(["   Compiling dependency"] * 25 + [diagnostic]), diagnostic),
+            (diagnostic, "", diagnostic),
+            ("", "", "exited with status 101 without diagnostics"),
+        ]
+        for stdout, stderr, expected in cases:
+            with (
+                self.subTest(stderr=bool(stderr), stdout=bool(stdout)),
+                tempfile.TemporaryDirectory() as root,
+            ):
+                config = _Config(host_os="macos", release=False)
+                executor = _executor(root, config)
+                executor.logger = Logger(use_color=False, verbose=False)
+                target = Target(
+                    "x86_64-apple-darwin", "macos-x86_64", "macos", "x86_64", is_native=True
+                )
+                output = io.StringIO()
+                with redirect_stdout(output), patch(
+                    "builder.executor.subprocess.run",
+                    return_value=MagicMock(returncode=101, stdout=stdout, stderr=stderr),
+                ):
+                    result = executor.build_target(target)
+                self.assertFalse(result.success)
+                self.assertIn(expected, output.getvalue())
+                self.assertIn(expected, result.error_message)
+
     def test_every_build_variant_runs_cargo_through_verified_pinned_rustup(self):
         cases = [
             (

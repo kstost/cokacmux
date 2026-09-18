@@ -96,6 +96,8 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 #[path = "cokacmux_mouse.rs"]
 mod mouse;
+#[path = "cokacmux_selection.rs"]
+mod selection;
 const PREVIEW_CACHE_LIMIT: usize = 16;
 const AI_TITLE_TIMEOUT_SECS: u64 = 180;
 const AI_TITLE_MAX_CHARS: usize = 120;
@@ -187,7 +189,8 @@ const AI_SEARCH_OUTPUT_SCHEMA: &str = r#"{
 }"#;
 const DEFAULT_SESSIONS_PANE_PERCENT: u16 = 45;
 const PANE_RESIZE_STEP_COLUMNS: u16 = 2;
-const AGENT_SCROLLBACK_LINES: usize = 10_000;
+// vt100 allocates scrollback as output arrives; this imposes no retention limit.
+const AGENT_SCROLLBACK_LINES: usize = usize::MAX;
 const AGENT_STATUS_HEIGHT: u16 = 1;
 const AGENT_SIDEBAR_WIDTH: u16 = 30;
 const DEFAULT_AGENT_SIDEBAR_WIDTH: u16 = AGENT_SIDEBAR_WIDTH;
@@ -768,6 +771,8 @@ struct CokacmuxSettings {
     agent_sidebar_width: u16,
     #[serde(default)]
     agent_aux_width: Option<u16>,
+    #[serde(default, deserialize_with = "deserialize_agent_scrollback_lines")]
+    scrollback_lines: Option<usize>,
     /// Whether the left "agents N" sidebar is currently visible in the
     /// agents view. Toggled by Ctrl+B. The configured width is preserved
     /// regardless; hiding/showing just collapses the column to 0.
@@ -794,6 +799,7 @@ impl Default for CokacmuxSettings {
             sessions_pane_width: None,
             agent_sidebar_width: DEFAULT_AGENT_SIDEBAR_WIDTH,
             agent_aux_width: None,
+            scrollback_lines: None,
             agent_sidebar_visible: default_agent_sidebar_visible(),
             session_view: default_session_view(),
             agent_programs: AgentProgramSettings::default(),
@@ -922,6 +928,35 @@ fn default_sessions_pane_percent() -> u16 {
 
 fn default_agent_sidebar_width() -> u16 {
     DEFAULT_AGENT_SIDEBAR_WIDTH
+}
+
+fn default_agent_scrollback_lines() -> usize {
+    AGENT_SCROLLBACK_LINES
+}
+
+fn legacy_screen_history_limit() -> usize {
+    // Checkpoints without a limit field came from daemons with a fixed buffer.
+    10_000
+}
+
+fn deserialize_agent_scrollback_lines<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_u64().and_then(|lines| usize::try_from(lines).ok()))
+}
+
+fn parse_agent_scrollback_lines(
+    value: &str,
+) -> std::result::Result<Option<usize>, std::num::ParseIntError> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("unlimited") {
+        return Ok(None);
+    }
+    value.parse::<usize>().map(Some)
 }
 
 fn default_session_view() -> SessionViewMode {
@@ -2998,6 +3033,9 @@ impl SettingsState {
 
     fn selected_text_field(&self) -> Option<SettingsTextField> {
         match (self.section, self.selected) {
+            (SettingsSection::General, SETTINGS_GENERAL_SCROLLBACK_LINES) => {
+                Some(SettingsTextField::ScrollbackLines)
+            }
             (SettingsSection::Agents, SETTINGS_AGENTS_CODEX) => {
                 Some(SettingsTextField::AgentProgram(Provider::Codex))
             }
@@ -3029,7 +3067,8 @@ impl SettingsState {
             (SettingsSection::Ai, _) if self.selected < SETTINGS_AI_ROW_COUNT => {
                 SettingsRowKind::Select
             }
-            (SettingsSection::Agents, SETTINGS_AGENTS_CODEX)
+            (SettingsSection::General, SETTINGS_GENERAL_SCROLLBACK_LINES)
+            | (SettingsSection::Agents, SETTINGS_AGENTS_CODEX)
             | (SettingsSection::Agents, SETTINGS_AGENTS_CLAUDE)
             | (SettingsSection::Agents, SETTINGS_AGENTS_OPENCODE)
             | (SettingsSection::Agents, SETTINGS_AGENTS_PI)
@@ -3135,6 +3174,7 @@ struct SettingsDraft {
     sessions_pane_width: Option<u16>,
     sessions_pane_percent: u16,
     agent_sidebar_width: u16,
+    scrollback_lines: String,
     agent_programs: AgentProgramSettings,
     cokacdir_program: String,
 }
@@ -3148,6 +3188,10 @@ impl SettingsDraft {
             sessions_pane_width: settings.sessions_pane_width,
             sessions_pane_percent: settings.sessions_pane_percent,
             agent_sidebar_width: settings.agent_sidebar_width,
+            scrollback_lines: settings
+                .scrollback_lines
+                .map(|lines| lines.to_string())
+                .unwrap_or_default(),
             agent_programs: settings.agent_programs.clone(),
             cokacdir_program: settings.cokacdir_program.clone().unwrap_or_default(),
         }
@@ -3155,6 +3199,7 @@ impl SettingsDraft {
 
     fn text_field_value(&self, field: SettingsTextField) -> &str {
         match field {
+            SettingsTextField::ScrollbackLines => &self.scrollback_lines,
             SettingsTextField::AgentProgram(Provider::Codex) => {
                 self.agent_programs.codex.as_deref().unwrap_or("")
             }
@@ -3176,6 +3221,7 @@ impl SettingsDraft {
 
     fn text_field_value_mut(&mut self, field: SettingsTextField) -> &mut String {
         match field {
+            SettingsTextField::ScrollbackLines => &mut self.scrollback_lines,
             SettingsTextField::AgentProgram(Provider::Codex) => {
                 self.agent_programs.codex.get_or_insert_with(String::new)
             }
@@ -3205,8 +3251,18 @@ struct SettingsEdit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SettingsTextField {
+    ScrollbackLines,
     AgentProgram(Provider),
     CokacdirProgram,
+}
+
+impl SettingsTextField {
+    fn edit_label(self) -> &'static str {
+        match self {
+            Self::ScrollbackLines => "scrollback lines",
+            Self::AgentProgram(_) | Self::CokacdirProgram => "path",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3219,7 +3275,8 @@ enum SettingsRowKind {
 
 const SETTINGS_GENERAL_SESSION_VIEW: usize = 0;
 const SETTINGS_GENERAL_AGENT_SIDEBAR_VISIBLE: usize = 1;
-const SETTINGS_GENERAL_ROW_COUNT: usize = 2;
+const SETTINGS_GENERAL_SCROLLBACK_LINES: usize = 2;
+const SETTINGS_GENERAL_ROW_COUNT: usize = 3;
 
 const SETTINGS_AI_NONE: usize = 0;
 const SETTINGS_AI_CLAUDE: usize = 1;
@@ -6527,14 +6584,33 @@ fn run_daemon_disk_writer(
     );
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScreenHistory {
     lines: VecDeque<String>,
     last_snapshot: Vec<String>,
+    #[serde(default = "legacy_screen_history_limit")]
+    max_lines: usize,
+}
+
+impl Default for ScreenHistory {
+    fn default() -> Self {
+        Self::new(default_agent_scrollback_lines())
+    }
 }
 
 impl ScreenHistory {
+    fn new(max_lines: usize) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            last_snapshot: Vec::new(),
+            max_lines,
+        }
+    }
+
     fn capture(&mut self, parser: &mut vt100::Parser) {
+        if self.max_lines == 0 {
+            return;
+        }
         let lines = parser_visible_plain_lines(parser, 0)
             .into_iter()
             .map(|line| line.trim_end_matches(' ').to_string())
@@ -6543,6 +6619,9 @@ impl ScreenHistory {
     }
 
     fn capture_lines(&mut self, lines: Vec<String>) {
+        if self.max_lines == 0 {
+            return;
+        }
         if lines.is_empty() || lines.iter().all(|line| line.trim().is_empty()) {
             return;
         }
@@ -6601,7 +6680,7 @@ impl ScreenHistory {
     }
 
     fn truncate_to_limit(&mut self) {
-        while self.lines.len() > AGENT_SCROLLBACK_LINES {
+        while self.lines.len() > self.max_lines {
             self.lines.pop_front();
         }
     }
@@ -6978,6 +7057,10 @@ impl AgentSession {
             launch_mode,
             auth_token,
             Some(runtime_endpoint),
+            settings
+                .cokacmux
+                .scrollback_lines
+                .unwrap_or(AGENT_SCROLLBACK_LINES),
         )
     }
 
@@ -6997,9 +7080,11 @@ impl AgentSession {
             launch_mode,
             new_agent_auth_token(),
             None,
+            default_agent_scrollback_lines(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_with_spec_and_auth(
         info: SessionInfo,
         spec: AgentLaunchSpec,
@@ -7008,6 +7093,7 @@ impl AgentSession {
         launch_mode: AgentLaunchMode,
         auth_token: String,
         runtime_endpoint: Option<(PathBuf, AgentEndpointPublication)>,
+        scrollback_lines: usize,
     ) -> Result<Self> {
         if let Some(cwd) = &spec.cwd {
             validate_agent_launch_cwd(cwd)?;
@@ -7250,7 +7336,7 @@ impl AgentSession {
             return Err(error.into());
         }
 
-        let mut parser = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
+        let mut parser = vt100::Parser::new(pty_size.rows, pty_size.cols, scrollback_lines);
         parser.set_collect_responses(true);
         let (disk_tx, disk_rx) = mpsc::sync_channel::<DaemonDiskJob>(DAEMON_DISK_QUEUE_MAX_JOBS);
         let pending_meta_write = Arc::new(Mutex::new(None));
@@ -7360,7 +7446,7 @@ impl AgentSession {
         drop(pair.slave);
 
         let pty_log_enabled = pty_log_enabled && disk_thread.is_some();
-        let screen_history = ScreenHistory::default();
+        let screen_history = ScreenHistory::new(scrollback_lines);
         let screen_hash = screen_activity_hash(parser.screen());
         let now_ms = current_epoch_ms();
 
@@ -7745,9 +7831,9 @@ impl AgentSession {
         let mut parser = vt100::Parser::new(
             self.pty_size.rows,
             self.pty_size.cols,
-            AGENT_SCROLLBACK_LINES,
+            self.parser.screen().scrollback_capacity(),
         );
-        let mut screen_history = ScreenHistory::default();
+        let mut screen_history = ScreenHistory::new(self.screen_history.max_lines);
         replay_agent_pty_log_with_history(
             &mut parser,
             &path,
@@ -8315,7 +8401,8 @@ fn sanitize_snapshot_visible_screen_duplicates(
         bytes
     };
 
-    *parser = vt100::Parser::new(rows, cols, AGENT_SCROLLBACK_LINES);
+    let scrollback_lines = parser.screen().scrollback_capacity();
+    *parser = vt100::Parser::new(rows, cols, scrollback_lines);
     safe_parser_process(parser, &rebuild_bytes);
     parser.screen_mut().set_scrollback(0);
     let after_scrollback = parser_max_scrollback(parser);
@@ -8339,7 +8426,10 @@ fn compact_frame_scrollback_lines(
     }
 
     let leading_lines = scrollback_lines.len() % visible_rows;
-    let mut history = ScreenHistory::default();
+    // This temporary compaction history includes the current screen as well.
+    // Do not silently truncate a configured larger buffer to the default limit.
+    let mut history =
+        ScreenHistory::new(scrollback_lines.len().saturating_add(visible_lines.len()));
     if leading_lines > 0 {
         history.append_lines(&scrollback_lines[..leading_lines]);
     }
@@ -8878,7 +8968,7 @@ impl std::fmt::Debug for PreparedAgentSnapshot {
 
 impl AgentTerminalSnapshot {
     fn prepare(self) -> std::result::Result<PreparedAgentSnapshot, String> {
-        if self.history.lines.len() > AGENT_SCROLLBACK_LINES {
+        if self.history.lines.len() > self.history.max_lines {
             return Err("terminal checkpoint exceeds screen history limit".into());
         }
         let estimated_bytes = self.parser.estimated_bytes()
@@ -9589,7 +9679,12 @@ impl AgentClient {
             AGENT_STREAM_WRITE_STALL_TIMEOUT_MS,
         )))?;
         let pty_size = agent_pty_size(cols, rows);
-        let parser = vt100::Parser::new(pty_size.rows, pty_size.cols, AGENT_SCROLLBACK_LINES);
+        let settings = Settings::load();
+        let scrollback_lines = settings
+            .cokacmux
+            .scrollback_lines
+            .unwrap_or(AGENT_SCROLLBACK_LINES);
+        let parser = vt100::Parser::new(pty_size.rows, pty_size.cols, scrollback_lines);
         let screen_hash = screen_activity_hash(parser.screen());
 
         // The token is published before the daemon readiness handshake. Keep
@@ -9689,7 +9784,6 @@ impl AgentClient {
             }
         };
 
-        let settings = Settings::load();
         let command_line =
             agent_launch_spec_with_settings(&info, launch_mode, &settings).command_line();
         // Take recovery state only after every fallible setup step. From this
@@ -9706,7 +9800,7 @@ impl AgentClient {
                 command_line,
                 info,
                 parser,
-                screen_history: ScreenHistory::default(),
+                screen_history: ScreenHistory::new(scrollback_lines),
                 history_scroll_offset: 0,
                 output_buffer,
                 request_tx,
@@ -10115,7 +10209,7 @@ impl AgentClient {
         self.parser = vt100::Parser::new(
             self.pty_size.rows,
             self.pty_size.cols,
-            AGENT_SCROLLBACK_LINES,
+            self.parser.screen().scrollback_capacity(),
         );
         // Older daemons advertise paste mode in Attached but omit it from
         // their ANSI snapshot. Seed that mode before replay; explicit modes
@@ -10123,7 +10217,7 @@ impl AgentClient {
         if self.bracketed_paste_mode {
             safe_parser_process(&mut self.parser, b"\x1b[?2004h");
         }
-        self.screen_history = ScreenHistory::default();
+        self.screen_history = ScreenHistory::new(self.screen_history.max_lines);
         self.history_scroll_offset = 0;
         self.codex_transcript_overlay_assumed_open = false;
         self.screen_hash = screen_activity_hash(self.parser.screen());
@@ -12415,6 +12509,7 @@ struct App {
     mouse_wheel_regions: Vec<mouse::MouseWheelRegion>,
     previous_mouse_wheel_regions: Vec<mouse::MouseWheelRegion>,
     mouse_button_capture: Option<mouse::MouseButtonCapture>,
+    text_selection: selection::TextSelection,
     /// Manual sidebar scrolling never changes the active agent or keyboard focus.
     agent_sidebar_scroll: Option<mouse::AgentSidebarScroll>,
     session_view: SessionViewMode,
@@ -12612,6 +12707,7 @@ impl App {
             mouse_wheel_regions: Vec::new(),
             previous_mouse_wheel_regions: Vec::new(),
             mouse_button_capture: None,
+            text_selection: selection::TextSelection::default(),
             agent_sidebar_scroll: None,
             session_view,
             session_scope: SessionScope::TopLevel,
@@ -12816,6 +12912,16 @@ impl App {
     }
 
     fn save_settings_draft(&mut self, draft: SettingsDraft) -> bool {
+        let Ok(scrollback_lines) = parse_agent_scrollback_lines(&draft.scrollback_lines) else {
+            self.status = "scrollback lines must be a non-negative whole number or unlimited.".into();
+            if let InputMode::Settings { state, .. } = &mut self.input_mode {
+                state.section = SettingsSection::General;
+                state.selected = SETTINGS_GENERAL_SCROLLBACK_LINES;
+                state.editing = None;
+                state.edit_finished = false;
+            }
+            return false;
+        };
         let previous_settings = self.settings.clone();
         let previous_session_view = self.session_view;
         let selected_key = self.current().map(AgentKey::new);
@@ -12825,6 +12931,7 @@ impl App {
         self.settings.cokacmux.sessions_pane_width = draft.sessions_pane_width;
         self.settings.cokacmux.sessions_pane_percent = draft.sessions_pane_percent.min(100);
         self.settings.cokacmux.agent_sidebar_width = draft.agent_sidebar_width;
+        self.settings.cokacmux.scrollback_lines = scrollback_lines;
         self.settings.cokacmux.agent_programs = draft.agent_programs;
         self.settings.cokacmux.cokacdir_program = Some(draft.cokacdir_program);
         self.settings
@@ -12848,13 +12955,18 @@ impl App {
                     self.preview_scroll = 0;
                     self.focus = FocusPane::Sessions;
                 }
-                self.status = "settings saved.".into();
+                self.status = if previous_settings.cokacmux.scrollback_lines != scrollback_lines {
+                    "settings saved; scrollback lines apply to newly started agents.".into()
+                } else {
+                    "settings saved.".into()
+                };
                 debug_log(
                     "settings_saved",
                     serde_json::json!({
                         "provider": ai_title_provider_label(self.settings.cokacmux.ai.provider),
                         "session_view": self.session_view.label(),
                         "agent_sidebar_visible": self.settings.cokacmux.agent_sidebar_visible,
+                        "scrollback_lines": scrollback_lines,
                     }),
                 );
                 true
@@ -28942,6 +29054,9 @@ fn spawn_ui_stall_watchdog() -> io::Result<JoinHandle<()>> {
 
 fn handle_actionable_input_event(app: &mut App, key: KeyEvent) {
     let started = Instant::now();
+    if selection::handle_key(app, key) {
+        return;
+    }
     if handle_pending_termination_key(app, key) {
         debug_log(
             "input_key_termination_pending",
@@ -29021,6 +29136,7 @@ fn handle_pending_termination_key(app: &mut App, key: KeyEvent) -> bool {
 
 fn handle_paste_input_event(app: &mut App, text: String) {
     let started = Instant::now();
+    selection::clear(app);
     if app.agent_kill_pending.is_some() || app.killall_pending.is_some() {
         app.status = "agent termination is in progress; paste ignored".into();
         return;
@@ -29281,12 +29397,16 @@ fn handle_main_event(
         MainEvent::Input {
             event: Event::FocusLost,
             ..
-        } => mouse::cancel_mouse_capture(app),
+        } => {
+            selection::clear(app);
+            mouse::cancel_mouse_capture(app);
+        }
         MainEvent::Input {
             event: Event::Resize(cols, rows),
             ..
         } => {
             // Coordinates from the previous layout are no longer actionable.
+            selection::clear(app);
             mouse::cancel_mouse_capture(app);
             app.mouse_wheel_regions.clear();
             let viewports = app
@@ -29441,6 +29561,7 @@ fn handle_main_event(
 
 fn draw_app_frame(terminal: &mut Tui, app: &mut App, reason: &'static str) -> Result<()> {
     let started = Instant::now();
+    selection::flush_clipboard(app, &mut io::stdout());
     let draw_area = terminal.size().ok();
     debug_log(
         "main_draw_start",
@@ -51221,6 +51342,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             outcome.content_area,
             mouse::MouseWheelTarget::Agent { reader_id },
         );
+        selection::record_frame(app, f.buffer_mut(), reader_id, outcome.content_area);
     }
     if let (Some(aux), Some(outcome)) = (app.agent_aux.as_ref(), auxiliary_outcome.as_ref()) {
         let reader_id = aux.agent.reader_id;
@@ -51228,6 +51350,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             outcome.content_area,
             mouse::MouseWheelTarget::Agent { reader_id },
         );
+        selection::record_frame(app, f.buffer_mut(), reader_id, outcome.content_area);
     }
 
     let focused_cursor = match app.agent_focus {
@@ -51322,6 +51445,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         && !agent_exit_overlay_drawn
         && !runtime_refresh_overlay_drawn
         && !session_refresh_overlay_drawn
+        && !selection::is_active(app)
     {
         if let Some(cursor) = focused_cursor {
             f.set_cursor_position(cursor);
@@ -51332,6 +51456,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         app.mouse_wheel_regions.clear();
     }
     mouse::finish_mouse_frame(app);
+    selection::finish_frame(app, f.buffer_mut(), Some(status_area));
     debug_log(
         "ui_agent_render_done",
         serde_json::json!({
@@ -52351,6 +52476,10 @@ fn resize_pty_state(
 #[cfg(test)]
 #[path = "cokacmux_pty_tests.rs"]
 mod pty_regression_tests;
+
+#[cfg(test)]
+#[path = "cokacmux_scrollback_tests.rs"]
+mod scrollback_tests;
 
 // vt100 0.16.2 has an unwrap() in Screen::text() that panics when a wide
 // character is drawn at the last column (col+1 out of bounds). catch_unwind
@@ -53481,14 +53610,17 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
     if let InputMode::Settings { state, return_to } = &mut app.input_mode {
         let mut next_mode: Option<InputMode> = None;
         let mut save_request: Option<(SettingsDraft, AiTitleSettingsReturn)> = None;
+        let edit_label = state
+            .selected_text_field()
+            .map_or("path", SettingsTextField::edit_label);
         if let Some(mut edit) = state.editing.take() {
             if keybindings.matches(KeyAction::AiTitleSettingsCancel, key) {
                 state.cancel_editing_selected_text(edit);
-                app.status = "path edit cancelled.".into();
+                app.status = format!("{} edit cancelled.", edit_label);
                 debug_log_key_event(key, "settings_path_edit_cancel");
             } else if keybindings.matches(KeyAction::AiTitleSettingsSave, key) {
                 state.finish_editing_selected_text();
-                app.status = "path edit done; Enter saves settings.".into();
+                app.status = format!("{} edit done; Enter saves settings.", edit_label);
                 debug_log_key_event(key, "settings_path_edit_done");
             } else {
                 {
@@ -53539,7 +53671,10 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         } else if keybindings.matches(KeyAction::AiTitleSettingsSave, key) {
             if state.selected_text_field().is_some() && !state.edit_finished {
                 state.begin_editing_selected_text();
-                app.status = "editing path; Enter finishes edit, Esc cancels edit.".into();
+                app.status = format!(
+                    "editing {}; Enter finishes edit, Esc cancels edit.",
+                    edit_label
+                );
                 debug_log_key_event(key, "settings_path_edit_begin");
             } else {
                 save_request = Some((state.draft.clone(), return_to.clone()));
@@ -53565,6 +53700,17 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         } else if keybindings.matches(KeyAction::AiTitleSettingsPrev, key) {
             state.move_row(-1);
             debug_log_key_event(key, "settings_row_prev");
+        } else if state.selected_text_field() == Some(SettingsTextField::ScrollbackLines)
+            && matches!(key.code, KeyCode::Char(c) if c.is_ascii_digit())
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            // Numeric input takes precedence over the AI provider shortcuts.
+            if let KeyCode::Char(c) = key.code {
+                state.insert_char_in_selected_text(c);
+            }
+            app.status = "editing scrollback lines; Enter finishes edit, Esc cancels edit.".into();
+            debug_log_key_event(key, "settings_scrollback_edit_begin_insert");
         } else if keybindings.matches(KeyAction::AiTitleSettingsNone, key) {
             state.section = SettingsSection::Ai;
             state.selected = SETTINGS_AI_NONE;
@@ -53603,7 +53749,10 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 && !key.modifiers.contains(KeyModifiers::ALT)
                 && state.insert_char_in_selected_text(c)
             {
-                app.status = "editing path; Enter finishes edit, Esc cancels edit.".into();
+                app.status = format!(
+                    "editing {}; Enter finishes edit, Esc cancels edit.",
+                    edit_label
+                );
                 debug_log_key_event(key, "settings_path_edit_begin_insert");
             } else {
                 debug_log_key_event(key, "settings_ignored");
@@ -54335,6 +54484,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         app.mouse_wheel_regions.clear();
     }
     mouse::finish_mouse_frame(app);
+    selection::finish_frame(app, f.buffer_mut(), None);
 }
 
 fn draw_delete_confirm_modal(
@@ -55191,7 +55341,9 @@ fn settings_modal_lines(
     ];
     let mut cursor = None;
     match state.section {
-        SettingsSection::General => settings_general_lines(state, inner_width, &mut lines),
+        SettingsSection::General => {
+            cursor = settings_general_lines(state, inner_width, &mut lines);
+        }
         SettingsSection::Ai => settings_ai_lines(state, inner_width, &mut lines),
         SettingsSection::Agents => {
             cursor = settings_agents_lines(state, inner_width, &mut lines);
@@ -55236,7 +55388,7 @@ fn settings_general_lines(
     state: &SettingsState,
     inner_width: usize,
     lines: &mut Vec<Line<'static>>,
-) {
+) -> Option<(usize, usize)> {
     let draft = &state.draft;
     lines.push(settings_row_line(
         state.selected == SETTINGS_GENERAL_SESSION_VIEW,
@@ -55256,6 +55408,27 @@ fn settings_general_lines(
         },
         inner_width,
     ));
+    let field = SettingsTextField::ScrollbackLines;
+    let line_index = lines.len();
+    let (line, cursor) = settings_text_row_line(
+        state,
+        SETTINGS_GENERAL_SCROLLBACK_LINES,
+        "Scrollback lines",
+        field,
+        state.text_status(field),
+        inner_width,
+    );
+    lines.push(line);
+    lines.push(Line::from(""));
+    lines.push(settings_heading_line(
+        "Empty / unlimited = no limit (default); 0 = off",
+        inner_width,
+    ));
+    lines.push(settings_heading_line(
+        "Applies to newly started agents.",
+        inner_width,
+    ));
+    cursor.map(|col| (line_index, col))
 }
 
 fn settings_ai_lines(state: &SettingsState, inner_width: usize, lines: &mut Vec<Line<'static>>) {
@@ -55482,16 +55655,21 @@ fn settings_text_row_line(
 fn settings_text_display_value(draft: &SettingsDraft, field: SettingsTextField) -> String {
     let value = draft.text_field_value(field).trim();
     if value.is_empty() {
-        format!("(default: {})", settings_text_default_program(field))
+        if field == SettingsTextField::ScrollbackLines {
+            settings_text_default_value(field)
+        } else {
+            format!("(default: {})", settings_text_default_value(field))
+        }
     } else {
         value.to_string()
     }
 }
 
-fn settings_text_default_program(field: SettingsTextField) -> &'static str {
+fn settings_text_default_value(field: SettingsTextField) -> String {
     match field {
-        SettingsTextField::AgentProgram(provider) => default_agent_program(provider),
-        SettingsTextField::CokacdirProgram => COKACDIR_PROGRAM_NAME,
+        SettingsTextField::ScrollbackLines => "unlimited".to_string(),
+        SettingsTextField::AgentProgram(provider) => default_agent_program(provider).to_string(),
+        SettingsTextField::CokacdirProgram => COKACDIR_PROGRAM_NAME.to_string(),
     }
 }
 
@@ -55533,6 +55711,14 @@ impl SettingsTextStatus {
 
 fn settings_text_status(draft: &SettingsDraft, field: SettingsTextField) -> SettingsTextStatus {
     match field {
+        SettingsTextField::ScrollbackLines => {
+            match parse_agent_scrollback_lines(&draft.scrollback_lines) {
+                Ok(None) => SettingsTextStatus::ok("unlimited"),
+                Ok(Some(0)) => SettingsTextStatus::ok("off"),
+                Ok(Some(_)) => SettingsTextStatus::ok("lines"),
+                Err(_) => SettingsTextStatus::error("enter 0 or more / unlimited"),
+            }
+        }
         SettingsTextField::AgentProgram(provider) => {
             match resolve_agent_program_for_provider(provider, &draft.agent_programs) {
                 Some(path) => SettingsTextStatus::ok(format!("ok: {}", display_cwd_path(&path))),
@@ -55556,9 +55742,16 @@ fn settings_text_status(draft: &SettingsDraft, field: SettingsTextField) -> Sett
 }
 
 fn settings_help_items(state: &SettingsState, keybindings: &KeyBindings) -> Vec<HelpItem> {
-    if state.editing.is_some() {
+    if let Some(edit) = &state.editing {
         return vec![
-            direct_help_item("type", "path"),
+            direct_help_item(
+                "type",
+                if edit.field == SettingsTextField::ScrollbackLines {
+                    "number"
+                } else {
+                    "path"
+                },
+            ),
             direct_help_item("←/→", "cursor"),
             help_item(
                 keybindings,
@@ -55600,7 +55793,11 @@ fn settings_help_items(state: &SettingsState, keybindings: &KeyBindings) -> Vec<
                 keybindings,
                 KeyAction::AiTitleSettingsSave,
                 "Enter",
-                "edit path",
+                if state.selected_text_field() == Some(SettingsTextField::ScrollbackLines) {
+                    "edit number"
+                } else {
+                    "edit path"
+                },
             ));
         }
         SettingsRowKind::ReadOnly => {
@@ -61620,6 +61817,7 @@ mod tests {
             previous_mouse_wheel_regions: Vec::new(),
             agent_sidebar_scroll: None,
             mouse_button_capture: None,
+            text_selection: selection::TextSelection::default(),
             session_view: SessionViewMode::Tree,
             session_scope: SessionScope::TopLevel,
             provider_filter: ProviderFilter::All,

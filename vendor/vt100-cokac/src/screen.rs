@@ -147,6 +147,13 @@ impl Screen {
         self.grid().scrollback()
     }
 
+    /// Returns the configured scrollback capacity of the normal screen.
+    /// This remains available while the alternate screen is active.
+    #[must_use]
+    pub fn scrollback_capacity(&self) -> usize {
+        self.grid.scrollback_len()
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain

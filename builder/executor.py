@@ -446,16 +446,20 @@ class BuildExecutor:
                 )
             else:
                 self.logger.error(f"Build failed for {target.friendly_name}")
-                # Print stderr for debugging
-                if result.stderr:
-                    for line in result.stderr.split("\n")[:20]:
-                        if line.strip():
-                            self.logger.debug(f"  {line}")
+                # Cargo diagnostics belong in normal output, including errors
+                # after a long list of dependency compilation messages.
+                diagnostics = result.stderr.strip() or result.stdout.strip()
+                if not diagnostics:
+                    diagnostics = (
+                        f"Build command exited with status {result.returncode} "
+                        "without diagnostics"
+                    )
+                self.logger.error(diagnostics)
 
                 return BuildResult(
                     target=target,
                     success=False,
-                    error_message=result.stderr,
+                    error_message=diagnostics,
                 )
 
         except Exception as e:

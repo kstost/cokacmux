@@ -38,7 +38,7 @@ pub(super) enum MouseWheelTarget {
 pub(super) struct MouseWheelRegion {
     pub(super) area: Rect,
     pub(super) target: MouseWheelTarget,
-    valid_since_epoch_ms: u64,
+    pub(super) valid_since_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +49,7 @@ pub(super) struct AgentSidebarScroll {
 
 impl App {
     pub(super) fn begin_mouse_wheel_frame(&mut self) {
+        selection::begin_frame(self);
         self.previous_mouse_wheel_regions = std::mem::take(&mut self.mouse_wheel_regions);
     }
 
@@ -127,6 +128,9 @@ fn contains_mouse(area: Rect, mouse: MouseEvent) -> bool {
 }
 
 pub(super) fn handle_mouse_input_event(app: &mut App, mouse: MouseEvent, queued_at_epoch_ms: u64) {
+    if selection::handle_mouse(app, mouse, queued_at_epoch_ms) {
+        return;
+    }
     if matches!(
         mouse.kind,
         MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::Up(_)
