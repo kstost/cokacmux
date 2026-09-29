@@ -33,6 +33,18 @@ impl ParserCheckpoint {
     pub fn estimated_bytes(&self) -> usize {
         self.screen.checkpoint_bytes()
     }
+
+    /// Scrollback rows retained by both grids.
+    pub fn scrollback_rows(&self) -> usize {
+        self.screen.checkpoint_scrollback_rows()
+    }
+
+    /// Drop up to `rows` of the oldest scrollback rows and return how many
+    /// were dropped, so an oversized checkpoint can fit a bounded transport
+    /// frame. The live parser it was taken from is unaffected.
+    pub fn drop_oldest_scrollback(&mut self, rows: usize) -> usize {
+        self.screen.drop_oldest_checkpoint_scrollback(rows)
+    }
 }
 
 impl Parser {

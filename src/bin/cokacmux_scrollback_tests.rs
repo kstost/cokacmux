@@ -336,3 +336,43 @@ fn client_reconnect_and_legacy_snapshot_keep_daemon_capacity() {
         assert!(client.parser.screen().contents().contains("ALT"));
     }
 }
+
+#[test]
+fn only_terminals_keep_a_cokacmux_scrollback() {
+    let limited = CokacmuxSettings {
+        scrollback_lines: Some(5_000),
+        ..Default::default()
+    };
+    let unlimited = CokacmuxSettings::default();
+    let cwd = "/tmp/project".to_string();
+    let terminals = [
+        shell_session_info_for_cwd(cwd.clone()),
+        cli_command_session_info("web".into(), cwd.clone(), vec!["npm".into(), "run".into()])
+            .unwrap(),
+    ];
+    for info in &terminals {
+        assert_eq!(agent_scrollback_lines_for(info, &limited), 5_000);
+        assert_eq!(
+            agent_scrollback_lines_for(info, &unlimited),
+            AGENT_SCROLLBACK_LINES
+        );
+    }
+    let stored_session = SessionInfo {
+        provider: Provider::Codex,
+        session_id: "stored".into(),
+        cwd: cwd.clone(),
+        source: PathBuf::from("/tmp/project/rollout.jsonl"),
+        updated_at_epoch_s: 0,
+        title: None,
+        relation: None,
+    };
+    let others = [
+        cokacdir_session_info_for_cwd(cwd.clone()),
+        new_agent_session_info(Provider::Claude, cwd.clone()),
+        stored_session,
+    ];
+    for info in &others {
+        assert_eq!(agent_scrollback_lines_for(info, &limited), 0);
+        assert_eq!(agent_scrollback_lines_for(info, &unlimited), 0);
+    }
+}

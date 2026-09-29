@@ -88,6 +88,15 @@ impl Screen {
         self.grid.checkpoint_bytes() + self.alternate_grid.checkpoint_bytes()
     }
 
+    pub(crate) fn checkpoint_scrollback_rows(&self) -> usize {
+        self.grid.scrollback_rows() + self.alternate_grid.scrollback_rows()
+    }
+
+    pub(crate) fn drop_oldest_checkpoint_scrollback(&mut self, rows: usize) -> usize {
+        let dropped = self.grid.drop_oldest_scrollback(rows);
+        dropped + self.alternate_grid.drop_oldest_scrollback(rows - dropped)
+    }
+
     pub(crate) fn report_position(&self) -> (u16, u16) {
         self.grid().report_position()
     }

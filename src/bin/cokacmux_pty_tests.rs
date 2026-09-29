@@ -376,3 +376,133 @@ fn expired_replay_window_keeps_input_without_replaying_or_accepting_new_input() 
     );
     client.exited = Some("test cleanup".into());
 }
+
+#[test]
+fn snapshot_history_copy_skips_only_lines_that_can_never_fit() {
+    let mut history = ScreenHistory::new(AGENT_SCROLLBACK_LINES);
+    history.append_lines(&["a".repeat(10), "b".repeat(10), "c".repeat(10)]);
+    // Each 10-byte line costs at least 13 encoded bytes.
+    assert_eq!(
+        history.clone_newest_within(39).all_lines(),
+        history.all_lines()
+    );
+    assert_eq!(
+        history.clone_newest_within(38).all_lines(),
+        ["bbbbbbbbbb", "cccccccccc"]
+    );
+    assert!(history.clone_newest_within(12).all_lines().is_empty());
+}
+
+#[test]
+fn oversized_checkpoint_snapshot_keeps_the_newest_history_that_fits() {
+    let line = |index: usize| format!("{index:04}{}", "x".repeat(96));
+    let total = 400;
+    let mut history = ScreenHistory::new(AGENT_SCROLLBACK_LINES);
+    for index in 0..total {
+        history.append_lines(&[line(index)]);
+    }
+    let parser = vt100::Parser::new(5, 20, AGENT_SCROLLBACK_LINES);
+    let max_bytes = 16 * 1024;
+    let frame = encode_agent_snapshot_frame_within(
+        AgentDaemonEvent::Snapshot {
+            data: Vec::new(),
+            state: Some(AgentTerminalSnapshot {
+                parser: parser.checkpoint(true),
+                history,
+            }),
+        },
+        max_bytes,
+    )
+    .unwrap();
+    assert!(frame.len() <= max_bytes);
+    let Ok(AgentDaemonEvent::Snapshot {
+        state: Some(state), ..
+    }) = serde_json::from_slice::<AgentDaemonEvent>(&frame[..frame.len() - 1])
+    else {
+        panic!("a trimmed frame must stay a terminal checkpoint");
+    };
+    let kept = state.history.all_lines();
+    assert!(!kept.is_empty() && kept.len() < total);
+    // Oldest lines go first: what remains is the contiguous newest suffix.
+    let expected = (total - kept.len()..total).map(line).collect::<Vec<_>>();
+    assert_eq!(kept, expected);
+    assert!(state.prepare().is_ok());
+}
+
+#[test]
+fn oversized_checkpoint_without_history_keeps_the_newest_scrollback_that_fits() {
+    let mut daemon = vt100::Parser::new(5, 20, AGENT_SCROLLBACK_LINES);
+    for index in 0..600 {
+        daemon.process(format!("ROW{index:04}\r\n").as_bytes());
+    }
+    let original = parser_scrollback_plain_lines(&mut daemon);
+    let max_bytes = 32 * 1024;
+    let frame = encode_agent_snapshot_frame_within(
+        AgentDaemonEvent::Snapshot {
+            data: Vec::new(),
+            state: Some(AgentTerminalSnapshot {
+                parser: daemon.checkpoint(true),
+                history: ScreenHistory::new(AGENT_SCROLLBACK_LINES),
+            }),
+        },
+        max_bytes,
+    )
+    .unwrap();
+    assert!(frame.len() <= max_bytes);
+    let Ok(AgentDaemonEvent::Snapshot {
+        state: Some(state), ..
+    }) = serde_json::from_slice::<AgentDaemonEvent>(&frame[..frame.len() - 1])
+    else {
+        panic!("a trimmed frame must stay a terminal checkpoint");
+    };
+    let mut client = state.prepare().unwrap().parser;
+    let kept = parser_scrollback_plain_lines(&mut client);
+    assert!(!kept.is_empty() && kept.len() < original.len());
+    assert_eq!(kept[..], original[original.len() - kept.len()..]);
+    assert_eq!(client.screen().contents(), daemon.screen().contents());
+}
+
+#[cfg(unix)]
+#[test]
+fn output_behind_a_large_snapshot_is_kept_without_another_resync() {
+    let (left, _right) = AgentStream::pair().unwrap();
+    let mut conn = DaemonConnection::new(left).unwrap();
+    // The peer never reads, so more than the whole output budget of this
+    // snapshot stays queued.
+    conn.send_snapshot_event(AgentDaemonEvent::Snapshot {
+        data: vec![b'x'; 2 * DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES],
+        state: None,
+    })
+    .unwrap();
+    assert!(conn.out_pending_snapshot_bytes > DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES);
+
+    // An idle full-screen app still emits a few bytes on every redraw.
+    for _ in 0..16 {
+        conn.send_event(&AgentDaemonEvent::Output {
+            data: b"\x1b[0m\x1b[?25l".to_vec(),
+        })
+        .unwrap();
+    }
+    assert!(!conn.needs_resync);
+    assert_eq!(conn.out_discarded_frames, 0);
+    assert_eq!(
+        conn.out_frames
+            .iter()
+            .filter(|frame| frame.kind == OutboundFrameKind::Output)
+            .count(),
+        16
+    );
+
+    // Output volume behind the snapshot still has its own budget.
+    for _ in 0..200 {
+        conn.send_event(&AgentDaemonEvent::Output {
+            data: vec![b'y'; 16 * 1024],
+        })
+        .unwrap();
+        if conn.needs_resync {
+            break;
+        }
+    }
+    assert!(conn.needs_resync);
+    assert!(conn.output_backlog_bytes() <= DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES);
+}

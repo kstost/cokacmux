@@ -37,6 +37,17 @@ impl Grid {
         self.scrollback_offset = 0;
     }
 
+    pub(crate) fn scrollback_rows(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    pub(crate) fn drop_oldest_scrollback(&mut self, rows: usize) -> usize {
+        let rows = rows.min(self.scrollback.len());
+        self.scrollback.drain(..rows);
+        self.scrollback_offset = self.scrollback_offset.min(self.scrollback.len());
+        rows
+    }
+
     pub(crate) fn checkpoint_bytes(&self) -> usize {
         self.rows
             .iter()

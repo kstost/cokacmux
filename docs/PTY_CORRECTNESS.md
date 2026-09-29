@@ -15,6 +15,13 @@ the prepared state without replaying a large ANSI history. Resize and
 backpressure checkpoints also preserve history instead of replacing it with
 an empty history.
 
+A checkpoint that would not fit in one snapshot frame
+(DAEMON_SNAPSHOT_FRAME_MAX_BYTES) is sent with its oldest screen history,
+then its oldest parser scrollback, trimmed until it fits. Only the
+transmitted copy is trimmed; the daemon keeps its full state. Before this, an
+oversized checkpoint failed every attach and resync, and the client
+reconnected in a loop without ever showing the agent.
+
 Clients which do not advertise this capability receive the existing ANSI
 snapshot instead. The history replay explicitly scrolls every history row
 off the visible grid before clearing it. New clients can also consume legacy
@@ -24,6 +31,12 @@ lossless decoder checkpoint.
 Checkpoint queues account for decoded state memory, not only ANSI byte
 length. Partially consumed byte segments use an offset and do not repeatedly
 copy their remaining tail.
+
+The output discard budget excludes unsent snapshot bytes. Output queued
+behind a large checkpoint stays in order and is delivered after it; only the
+output volume itself can force a resync. Counting the snapshot made even an
+idle app's periodic redraw bytes trigger another full checkpoint each time
+the previous one drained, indefinitely.
 
 When output was discarded under backpressure, the shutdown path queues an
 authoritative final snapshot before Exited. This includes the case where
@@ -64,7 +77,8 @@ Focused tests are in src/bin/cokacmux_pty_tests.rs, with additional existing
 PTY integration cases in src/bin/cokacmux.rs. They cover checkpoint continuation
 at every byte boundary, full history preservation, device-report ordering,
 key encodings, read interruption, resize failure, expired replay windows,
-output-buffer allocation, and final snapshot/exit ordering.
+output-buffer allocation, final snapshot/exit ordering, oldest-first
+trimming of oversized checkpoints, and output kept behind a large snapshot.
 
 Rust builds and tests require explicit user approval and isolated test
 storage as specified by CLAUDE.md and PROJECT_POLICY.md. Formatting and

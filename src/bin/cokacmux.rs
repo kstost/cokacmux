@@ -383,11 +383,11 @@ const AGENT_PTY_OUTPUT_QUEUE_MAX_CHUNKS: usize = 128;
 /// gone or wedged, and blocking the pump on it would freeze the agent pane.
 const AGENT_STREAM_WRITE_STALL_TIMEOUT_MS: u64 = 10_000;
 /// Upper bound on the daemon→client outbound queue (serialized event
-/// bytes). A client that lets this much pile up has its queued output
-/// frames discarded — with accounting — and is resynced from the live
-/// screen snapshot once it drains; the daemon loop itself never sleeps on
-/// a slow peer. Control frames (attach handshake, exit notices, snapshots)
-/// are never discarded.
+/// bytes), not counting unsent snapshots. A client that lets this much pile
+/// up has its queued output frames discarded — with accounting — and is
+/// resynced from the live screen snapshot once it drains; the daemon loop
+/// itself never sleeps on a slow peer. Control frames (attach handshake,
+/// exit notices, snapshots) are never discarded.
 const DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES: usize = 512 * 1024;
 /// After a discard, the resync snapshot is queued once the outbound queue
 /// has drained below this, so it reaches the client promptly instead of
@@ -397,6 +397,11 @@ const DAEMON_CLIENT_OUTBOUND_RESYNC_BYTES: usize = 16 * 1024;
 /// exit ordering. Drop the connection once one full maximum-sized frame plus
 /// one in-flight replacement can no longer fit in a fixed memory budget.
 const DAEMON_CLIENT_OUTBOUND_HARD_BYTES: usize = 2 * AGENT_CLIENT_FRAME_MAX_BYTES;
+/// Largest snapshot frame the daemon queues; a larger terminal checkpoint is
+/// sent with its oldest history trimmed. A partially sent snapshot, its
+/// replacement and a full output backlog then always fit under the hard cap.
+const DAEMON_SNAPSHOT_FRAME_MAX_BYTES: usize =
+    AGENT_CLIENT_FRAME_MAX_BYTES - DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES;
 /// After waitpid reports the child dead, wait for the dedicated PTY reader to
 /// observe EOF and drain every queued chunk. The timeout is only a bound for a
 /// broken platform reader; ordinary completion is driven by channel closure.
@@ -932,6 +937,18 @@ fn default_agent_sidebar_width() -> u16 {
 
 fn default_agent_scrollback_lines() -> usize {
     AGENT_SCROLLBACK_LINES
+}
+
+/// Output scrollback cokacmux keeps for a session. Only terminals (a shell
+/// or a `cokacmux start` command) keep one. Coding agents scroll their own
+/// transcript, and cokacdir's full-screen redraws would only fill the buffer
+/// with near-identical frames.
+fn agent_scrollback_lines_for(info: &SessionInfo, settings: &CokacmuxSettings) -> usize {
+    if is_shell_session_info(info) || is_cli_command_session_info(info) {
+        settings.scrollback_lines.unwrap_or(AGENT_SCROLLBACK_LINES)
+    } else {
+        0
+    }
 }
 
 fn legacy_screen_history_limit() -> usize {
@@ -6685,6 +6702,50 @@ impl ScreenHistory {
         }
     }
 
+    /// Copy holding only the newest lines that could still fit in a frame of
+    /// `max_bytes`. Every encoded line costs at least its UTF-8 length plus
+    /// quotes and a separator, so older lines could never be transmitted.
+    fn clone_newest_within(&self, max_bytes: usize) -> Self {
+        let mut remaining = max_bytes;
+        let mut keep = 0usize;
+        for line in self.lines.iter().rev() {
+            let cost = line.len().saturating_add(3);
+            if cost > remaining {
+                break;
+            }
+            remaining -= cost;
+            keep += 1;
+        }
+        Self {
+            lines: self
+                .lines
+                .iter()
+                .skip(self.lines.len() - keep)
+                .cloned()
+                .collect(),
+            last_snapshot: self.last_snapshot.clone(),
+            max_lines: self.max_lines,
+        }
+    }
+
+    /// Drop the oldest lines until their encoding frees at least `bytes`.
+    /// Returns how many lines were dropped (at least one while any remain).
+    fn drop_oldest_encoded_bytes(&mut self, bytes: usize) -> usize {
+        let mut freed = 0usize;
+        let mut dropped = 0usize;
+        while freed < bytes || dropped == 0 {
+            let Some(line) = self.lines.pop_front() else {
+                break;
+            };
+            // The encoded string plus its array separator.
+            let encoded = serde_json::to_string(&line)
+                .map_or(line.len().saturating_add(3), |json| json.len() + 1);
+            freed = freed.saturating_add(encoded);
+            dropped += 1;
+        }
+        dropped
+    }
+
     fn len(&self) -> usize {
         self.lines.len()
     }
@@ -7049,6 +7110,7 @@ impl AgentSession {
         settings: &Settings,
     ) -> Result<Self> {
         let spec = agent_launch_spec_with_settings(&info, launch_mode, settings);
+        let scrollback_lines = agent_scrollback_lines_for(&info, &settings.cokacmux);
         Self::spawn_with_spec_and_auth(
             info,
             spec,
@@ -7057,10 +7119,7 @@ impl AgentSession {
             launch_mode,
             auth_token,
             Some(runtime_endpoint),
-            settings
-                .cokacmux
-                .scrollback_lines
-                .unwrap_or(AGENT_SCROLLBACK_LINES),
+            scrollback_lines,
         )
     }
 
@@ -8224,7 +8283,11 @@ impl AgentSession {
                 // legacy visible-only refresh, it must not clear history on
                 // resize or after dropped output.
                 parser: self.parser.checkpoint(true),
-                history: self.screen_history.clone(),
+                // Lines that could never fit in one frame are not copied or
+                // encoded; the sender trims the rest to the exact limit.
+                history: self
+                    .screen_history
+                    .clone_newest_within(DAEMON_SNAPSHOT_FRAME_MAX_BYTES),
             }),
         }
     }
@@ -9680,10 +9743,7 @@ impl AgentClient {
         )))?;
         let pty_size = agent_pty_size(cols, rows);
         let settings = Settings::load();
-        let scrollback_lines = settings
-            .cokacmux
-            .scrollback_lines
-            .unwrap_or(AGENT_SCROLLBACK_LINES);
+        let scrollback_lines = agent_scrollback_lines_for(&info, &settings.cokacmux);
         let parser = vt100::Parser::new(pty_size.rows, pty_size.cols, scrollback_lines);
         let screen_hash = screen_activity_hash(parser.screen());
 
@@ -11370,12 +11430,15 @@ struct OutboundFrame {
 /// Write as much queued data as the stream accepts without blocking.
 /// `front_written` tracks how much of the front frame already went out so a
 /// frame interrupted by `WouldBlock` resumes mid-frame and line framing is
-/// preserved. Returns true when at least one byte was written.
+/// preserved. `pending_snapshot_bytes` is the unsent part of queued snapshot
+/// frames within `pending_bytes`. Returns true when at least one byte was
+/// written.
 fn flush_outbound_frames<W: Write>(
     stream: &mut W,
     frames: &mut VecDeque<OutboundFrame>,
     front_written: &mut usize,
     pending_bytes: &mut usize,
+    pending_snapshot_bytes: &mut usize,
 ) -> io::Result<bool> {
     let mut progress = false;
     while let Some(front) = frames.front() {
@@ -11390,6 +11453,9 @@ fn flush_outbound_frames<W: Write>(
             Ok(n) => {
                 progress = true;
                 *pending_bytes = pending_bytes.saturating_sub(n);
+                if front.kind == OutboundFrameKind::Snapshot {
+                    *pending_snapshot_bytes = pending_snapshot_bytes.saturating_sub(n);
+                }
                 *front_written += n;
                 if *front_written >= front.bytes.len() {
                     frames.pop_front();
@@ -11451,6 +11517,93 @@ fn discard_queued_snapshot_frames(
     });
     *pending_bytes = pending_bytes.saturating_sub(dropped_bytes as usize);
     (dropped_frames, dropped_bytes)
+}
+
+/// Encode one event as a newline-terminated line, without the frame limit.
+fn encode_agent_daemon_event_line(event: &AgentDaemonEvent) -> io::Result<Vec<u8>> {
+    let mut bytes =
+        serde_json::to_vec(event).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn agent_daemon_event_frame_too_large(max_bytes: usize) -> io::Error {
+    io::Error::new(
+        ErrorKind::InvalidData,
+        format!("agent daemon event frame exceeds {} bytes", max_bytes),
+    )
+}
+
+/// Screen geometry carried by a terminal checkpoint snapshot, if any.
+fn agent_snapshot_checkpoint_size(event: &AgentDaemonEvent) -> Option<(u16, u16)> {
+    match event {
+        AgentDaemonEvent::Snapshot {
+            state: Some(state), ..
+        } => Some(state.parser.size()),
+        _ => None,
+    }
+}
+
+/// Encode a snapshot as one frame. A terminal checkpoint larger than
+/// `DAEMON_SNAPSHOT_FRAME_MAX_BYTES` loses its oldest history first (screen
+/// history, then parser scrollback) until it fits, so the client shows the
+/// newest history it can receive instead of every attach and resync failing
+/// and reconnecting forever. Only this transmitted copy is trimmed; the
+/// daemon keeps its full history.
+fn encode_agent_snapshot_frame(event: AgentDaemonEvent) -> io::Result<Vec<u8>> {
+    encode_agent_snapshot_frame_within(event, DAEMON_SNAPSHOT_FRAME_MAX_BYTES)
+}
+
+fn encode_agent_snapshot_frame_within(
+    mut event: AgentDaemonEvent,
+    max_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    let mut trimmed_history_lines = 0usize;
+    let mut trimmed_scrollback_rows = 0usize;
+    loop {
+        let bytes = encode_agent_daemon_event_line(&event)?;
+        if bytes.len() <= max_bytes {
+            if trimmed_history_lines > 0 || trimmed_scrollback_rows > 0 {
+                debug_log(
+                    "daemon_snapshot_trimmed_to_frame",
+                    serde_json::json!({
+                        "trimmed_history_lines": trimmed_history_lines,
+                        "trimmed_scrollback_rows": trimmed_scrollback_rows,
+                        "frame_bytes": bytes.len(),
+                        "limit": max_bytes,
+                    }),
+                );
+            }
+            return Ok(bytes);
+        }
+        let overflow = bytes.len() - max_bytes;
+        let AgentDaemonEvent::Snapshot {
+            state: Some(state), ..
+        } = &mut event
+        else {
+            return Err(agent_daemon_event_frame_too_large(max_bytes));
+        };
+        if !state.history.lines.is_empty() {
+            let dropped = state.history.drop_oldest_encoded_bytes(overflow);
+            trimmed_history_lines = trimmed_history_lines.saturating_add(dropped);
+            continue;
+        }
+        let scrollback_rows = state.parser.scrollback_rows();
+        if scrollback_rows == 0 {
+            return Err(agent_daemon_event_frame_too_large(max_bytes));
+        }
+        // Rows cannot be measured one by one here. Drop by the average row
+        // size of the remaining payload (scrollback, both visible grids and
+        // the history snapshot), with slack so a skewed tail rarely needs
+        // another encoding pass.
+        let (rows, _) = state.parser.size();
+        let payload_rows = scrollback_rows.saturating_add(usize::from(rows).saturating_mul(3));
+        let average_row_bytes = (bytes.len() / payload_rows.max(1)).max(1);
+        let needed = overflow.div_ceil(average_row_bytes);
+        let slack = needed / 8 + 1;
+        let dropped = state.parser.drop_oldest_scrollback(needed.saturating_add(slack));
+        trimmed_scrollback_rows = trimmed_scrollback_rows.saturating_add(dropped);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -11552,6 +11705,9 @@ struct DaemonConnection {
     out_frames: VecDeque<OutboundFrame>,
     out_front_written: usize,
     out_pending_bytes: usize,
+    /// Unsent snapshot bytes within `out_pending_bytes`. They are excluded
+    /// from the output discard budget; see `output_backlog_bytes`.
+    out_pending_snapshot_bytes: usize,
     out_last_progress_at: Instant,
     out_discarded_frames: u64,
     out_discarded_bytes: u64,
@@ -11589,6 +11745,7 @@ impl DaemonConnection {
             out_frames: VecDeque::new(),
             out_front_written: 0,
             out_pending_bytes: 0,
+            out_pending_snapshot_bytes: 0,
             out_last_progress_at: Instant::now(),
             out_discarded_frames: 0,
             out_discarded_bytes: 0,
@@ -11616,40 +11773,55 @@ impl DaemonConnection {
             self.out_discarded_frames += 1;
             return Ok(());
         }
-        let mut bytes =
-            serde_json::to_vec(event).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-        bytes.push(b'\n');
+        let bytes = encode_agent_daemon_event_line(event)?;
         if bytes.len() > AGENT_CLIENT_FRAME_MAX_BYTES {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "agent daemon event frame exceeds {} bytes",
-                    AGENT_CLIENT_FRAME_MAX_BYTES
-                ),
-            ));
+            return Err(agent_daemon_event_frame_too_large(AGENT_CLIENT_FRAME_MAX_BYTES));
         }
+        self.queue_outbound_frame(kind, bytes, agent_snapshot_checkpoint_size(event))
+    }
+
+    /// Queue a snapshot built for this connection. Owning it lets a terminal
+    /// checkpoint that cannot fit in one frame be sent with its oldest
+    /// history trimmed instead of failing every attach and resync.
+    fn send_snapshot_event(&mut self, event: AgentDaemonEvent) -> io::Result<()> {
+        let snapshot_size = agent_snapshot_checkpoint_size(&event);
+        let bytes = encode_agent_snapshot_frame(event)?;
+        self.queue_outbound_frame(OutboundFrameKind::Snapshot, bytes, snapshot_size)
+    }
+
+    fn queue_outbound_frame(
+        &mut self,
+        kind: OutboundFrameKind,
+        bytes: Vec<u8>,
+        snapshot_size: Option<(u16, u16)>,
+    ) -> io::Result<()> {
         if kind == OutboundFrameKind::Snapshot {
-            let (frames, bytes) = discard_queued_snapshot_frames(
+            let (dropped_frames, dropped_bytes) = discard_queued_snapshot_frames(
                 &mut self.out_frames,
                 self.out_front_written,
                 &mut self.out_pending_bytes,
             );
-            if frames > 0 {
+            // Superseded snapshots were wholly unsent.
+            self.out_pending_snapshot_bytes = self
+                .out_pending_snapshot_bytes
+                .saturating_sub(dropped_bytes as usize);
+            if dropped_frames > 0 {
                 debug_log(
                     "daemon_client_snapshot_coalesced",
                     serde_json::json!({
-                        "dropped_frames": frames,
-                        "dropped_bytes": bytes,
+                        "dropped_frames": dropped_frames,
+                        "dropped_bytes": dropped_bytes,
                         "pending_bytes": self.out_pending_bytes,
                     }),
                 );
             }
         }
-        let projected = self
-            .out_pending_bytes
-            .checked_add(bytes.len())
-            .ok_or_else(|| io::Error::other("agent client outbound byte count overflow"))?;
-        if projected > DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES {
+        let added_backlog = if kind == OutboundFrameKind::Snapshot {
+            0
+        } else {
+            bytes.len()
+        };
+        if self.output_discard_needed(added_backlog, bytes.len()) {
             self.discard_output_backlog_for_resync();
         }
         let projected = self
@@ -11663,12 +11835,13 @@ impl DaemonConnection {
             )));
         }
         self.out_pending_bytes = projected;
+        if kind == OutboundFrameKind::Snapshot {
+            self.out_pending_snapshot_bytes =
+                self.out_pending_snapshot_bytes.saturating_add(bytes.len());
+        }
         self.out_frames.push_back(OutboundFrame { kind, bytes });
-        if let AgentDaemonEvent::Snapshot {
-            state: Some(state), ..
-        } = event
-        {
-            self.snapshot_size = Some(state.parser.size());
+        if snapshot_size.is_some() {
+            self.snapshot_size = snapshot_size;
         }
         self.flush_outbound()?;
         self.enforce_outbound_budget()
@@ -11680,6 +11853,7 @@ impl DaemonConnection {
             &mut self.out_frames,
             &mut self.out_front_written,
             &mut self.out_pending_bytes,
+            &mut self.out_pending_snapshot_bytes,
         )?;
         if progress || self.out_pending_bytes == 0 {
             self.out_last_progress_at = Instant::now();
@@ -11687,8 +11861,27 @@ impl DaemonConnection {
         Ok(())
     }
 
+    /// Queued bytes the output discard budget applies to. An unsent snapshot
+    /// is excluded: it is already the newest full screen (older unsent ones
+    /// are coalesced away), and output queued behind it stays in order.
+    /// Counting it made any output behind a snapshot larger than the budget
+    /// discard that output and schedule yet another full snapshot, so an
+    /// agent that redraws while idle kept the client resyncing forever.
+    fn output_backlog_bytes(&self) -> usize {
+        self.out_pending_bytes.saturating_sub(self.out_pending_snapshot_bytes)
+    }
+
+    /// Output is discarded once the non-snapshot backlog would exceed its
+    /// budget, and before the whole queue would exceed the hard cap.
+    fn output_discard_needed(&self, added_backlog: usize, added_total: usize) -> bool {
+        self.output_backlog_bytes().saturating_add(added_backlog)
+            > DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES
+            || self.out_pending_bytes.saturating_add(added_total)
+                > DAEMON_CLIENT_OUTBOUND_HARD_BYTES
+    }
+
     fn enforce_outbound_budget(&mut self) -> io::Result<()> {
-        if self.out_pending_bytes > DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES {
+        if self.output_discard_needed(0, 0) {
             self.discard_output_backlog_for_resync();
         }
         if self.out_pending_bytes > DAEMON_CLIENT_OUTBOUND_HARD_BYTES {
@@ -11761,8 +11954,7 @@ impl DaemonConnection {
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
             .len()
             + 1;
-        if self.out_pending_bytes.saturating_add(exit_bytes) > DAEMON_CLIENT_OUTBOUND_DISCARD_BYTES
-        {
+        if self.output_discard_needed(exit_bytes, exit_bytes) {
             self.discard_output_backlog_for_resync();
         }
         if self.needs_resync {
@@ -11770,7 +11962,7 @@ impl DaemonConnection {
             // superseded whole output frames, retaining any partial frame so
             // framing survives. Queue the authoritative state before Exited.
             self.discard_output_backlog_for_resync();
-            self.send_event(&snapshot())?;
+            self.send_snapshot_event(snapshot())?;
             self.finish_resync();
         }
         self.send_event(&exit)
@@ -12956,7 +13148,7 @@ impl App {
                     self.focus = FocusPane::Sessions;
                 }
                 self.status = if previous_settings.cokacmux.scrollback_lines != scrollback_lines {
-                    "settings saved; scrollback lines apply to newly started agents.".into()
+                    "settings saved; scrollback lines apply to newly started terminals.".into()
                 } else {
                     "settings saved.".into()
                 };
@@ -31864,7 +32056,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 let snapshot = agent.snapshot_event(false, conn.terminal_checkpoints);
                 conn.snapshot_size = Some((agent.pty_size.rows, agent.pty_size.cols));
                 let (discarded_frames, discarded_bytes) = conn.finish_resync();
-                if conn.send_event(&snapshot).is_err() {
+                if conn.send_snapshot_event(snapshot).is_err() {
                     client = None;
                     attached_client_pid = None;
                     attached_client_instance_id = None;
@@ -32466,7 +32658,7 @@ fn send_daemon_attached(
         );
         return Err(error);
     }
-    if let Err(e) = conn.send_event(&snapshot) {
+    if let Err(e) = conn.send_snapshot_event(snapshot) {
         debug_log(
             "daemon_send_attached_snapshot_failed",
             serde_json::json!({
@@ -39211,6 +39403,10 @@ fn run_agent_reader_thread(
 ) -> String {
     let mut attach_ack = PendingAgentAttachAcknowledgement::new(attach_ack_tx);
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    // Prefix of `buf` already searched for a frame delimiter. A multi-MB
+    // snapshot frame arrives in 8 KiB reads; rescanning it from the start
+    // after every read made one frame cost O(n^2) on this thread.
+    let mut scanned = 0usize;
     let mut tmp = [0u8; 8192];
     loop {
         if !wait_for_agent_output_capacity(&output_buffer, reader_id) {
@@ -39263,13 +39459,16 @@ fn run_agent_reader_thread(
             }
         }
         // Drain whatever complete lines accumulated.
-        while let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
+        while let Some(offset) = buf[scanned..].iter().position(|byte| *byte == b'\n') {
+            let pos = scanned + offset;
             if pos > AGENT_CLIENT_FRAME_MAX_BYTES {
                 return format!(
                     "agent event frame exceeds {} bytes",
                     AGENT_CLIENT_FRAME_MAX_BYTES
                 );
             }
+            // Bytes after this delimiter have not been searched yet.
+            scanned = 0;
             let line: Vec<u8> = buf.drain(..=pos).collect();
             let line = &line[..line.len().saturating_sub(1)];
             if line.is_empty() {
@@ -39356,6 +39555,7 @@ fn run_agent_reader_thread(
                 }
             }
         }
+        scanned = buf.len();
         if buf.len() > AGENT_CLIENT_FRAME_MAX_BYTES {
             return format!(
                 "incomplete agent event frame exceeds {} bytes",
@@ -55425,7 +55625,7 @@ fn settings_general_lines(
         inner_width,
     ));
     lines.push(settings_heading_line(
-        "Applies to newly started agents.",
+        "Applies to newly started terminals.",
         inner_width,
     ));
     cursor.map(|col| (line_index, col))
@@ -61210,14 +61410,20 @@ mod tests {
         ]);
         let mut front_written = 0usize;
         let mut pending = 15usize;
+        let mut pending_snapshot = 0usize;
 
         let mut writer = LimitedWriter {
             accepted: Vec::new(),
             budget: 12,
         };
-        let progress =
-            flush_outbound_frames(&mut writer, &mut frames, &mut front_written, &mut pending)
-                .unwrap();
+        let progress = flush_outbound_frames(
+            &mut writer,
+            &mut frames,
+            &mut front_written,
+            &mut pending,
+            &mut pending_snapshot,
+        )
+        .unwrap();
         assert!(progress);
         assert_eq!(pending, 3);
         assert_eq!(frames.len(), 1);
@@ -61227,9 +61433,14 @@ mod tests {
             accepted: Vec::new(),
             budget: 0,
         };
-        let progress =
-            flush_outbound_frames(&mut blocked, &mut frames, &mut front_written, &mut pending)
-                .unwrap();
+        let progress = flush_outbound_frames(
+            &mut blocked,
+            &mut frames,
+            &mut front_written,
+            &mut pending,
+            &mut pending_snapshot,
+        )
+        .unwrap();
         assert!(!progress);
         assert_eq!(pending, 3);
         assert_eq!(front_written, 2);
@@ -61238,14 +61449,62 @@ mod tests {
             accepted: Vec::new(),
             budget: 64,
         };
-        let progress =
-            flush_outbound_frames(&mut writer, &mut frames, &mut front_written, &mut pending)
-                .unwrap();
+        let progress = flush_outbound_frames(
+            &mut writer,
+            &mut frames,
+            &mut front_written,
+            &mut pending,
+            &mut pending_snapshot,
+        )
+        .unwrap();
         assert!(progress);
         assert_eq!(pending, 0);
+        assert_eq!(pending_snapshot, 0);
         assert!(frames.is_empty());
         assert_eq!(front_written, 0);
         assert_eq!(writer.accepted, vec![b'b'; 3]);
+    }
+
+    #[test]
+    fn flush_outbound_frames_counts_down_only_snapshot_bytes() {
+        let mut frames: VecDeque<OutboundFrame> = VecDeque::from([
+            outbound_frame(OutboundFrameKind::Snapshot, 10, b'a'),
+            outbound_frame(OutboundFrameKind::Output, 5, b'b'),
+        ]);
+        let mut front_written = 0usize;
+        let mut pending = 15usize;
+        let mut pending_snapshot = 10usize;
+
+        let mut writer = LimitedWriter {
+            accepted: Vec::new(),
+            budget: 4,
+        };
+        flush_outbound_frames(
+            &mut writer,
+            &mut frames,
+            &mut front_written,
+            &mut pending,
+            &mut pending_snapshot,
+        )
+        .unwrap();
+        assert_eq!(pending, 11);
+        assert_eq!(pending_snapshot, 6);
+
+        let mut writer = LimitedWriter {
+            accepted: Vec::new(),
+            budget: 64,
+        };
+        flush_outbound_frames(
+            &mut writer,
+            &mut frames,
+            &mut front_written,
+            &mut pending,
+            &mut pending_snapshot,
+        )
+        .unwrap();
+        assert_eq!(pending, 0);
+        assert_eq!(pending_snapshot, 0);
+        assert!(frames.is_empty());
     }
 
     #[test]
