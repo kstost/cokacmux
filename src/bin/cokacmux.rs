@@ -192,6 +192,8 @@ const PANE_RESIZE_STEP_COLUMNS: u16 = 2;
 // vt100 allocates scrollback as output arrives; this imposes no retention limit.
 const AGENT_SCROLLBACK_LINES: usize = usize::MAX;
 const AGENT_STATUS_HEIGHT: u16 = 1;
+/// How long a new status message replaces the key help in the agent footer.
+const AGENT_FOOTER_STATUS_MS: u64 = 4_000;
 const AGENT_SIDEBAR_WIDTH: u16 = 30;
 const DEFAULT_AGENT_SIDEBAR_WIDTH: u16 = AGENT_SIDEBAR_WIDTH;
 const AGENT_SIDEBAR_RESIZE_STEP: u16 = PANE_RESIZE_STEP_COLUMNS;
@@ -1892,6 +1894,13 @@ fn key_binding_control_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<V
         return None;
     }
     Some(bytes)
+}
+
+/// Ctrl+F and Ctrl+T belong to cokacmux (the right-panel toggles by
+/// default). They are never forwarded to a child app, in any pane, even when
+/// a custom keymap moved the toggles to other keys.
+fn is_cokacmux_reserved_agent_key(key: KeyEvent) -> bool {
+    key_event_control_bytes(key).is_some_and(|bytes| bytes == [0x06] || bytes == [0x14])
 }
 
 fn key_event_control_bytes(key: KeyEvent) -> Option<Vec<u8>> {
@@ -6625,7 +6634,11 @@ impl ScreenHistory {
     }
 
     fn capture(&mut self, parser: &mut vt100::Parser) {
-        if self.max_lines == 0 {
+        // A full-screen app on the alternate screen redraws in place. Its
+        // frames are not scrollback (terminals and tmux do not keep them
+        // either); capturing them filled the history with a near-identical
+        // copy of the whole screen on every keystroke.
+        if self.max_lines == 0 || parser.screen().alternate_screen() {
             return;
         }
         let lines = parser_visible_plain_lines(parser, 0)
@@ -10581,6 +10594,18 @@ impl AgentClient {
     }
 
     fn send_key(&mut self, key: KeyEvent) -> io::Result<()> {
+        if is_cokacmux_reserved_agent_key(key) {
+            debug_log(
+                "agent_client_reserved_key_not_forwarded",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "code": key_code_label(key),
+                    "modifiers": format!("{:?}", key.modifiers),
+                }),
+            );
+            return Ok(());
+        }
         if let Some(data) =
             key_event_to_bytes_with_mode(key, self.parser.screen().application_cursor())
         {
@@ -12722,6 +12747,10 @@ struct App {
     data_task: Option<DataTaskPending>,
     input_mode: InputMode,
     notice_overlay: Option<NoticeDialog>,
+    /// The status last seen by the agent view footer, and until when it is
+    /// shown there instead of the key help.
+    agent_footer_status_seen: String,
+    agent_footer_status_until: Option<Instant>,
     preview_cache: HashMap<PreviewKey, PreviewEntry>,
     preview_cache_order: VecDeque<PreviewKey>,
     preview_requested: Option<(PreviewKey, u64)>,
@@ -12918,6 +12947,8 @@ impl App {
             data_task: None,
             input_mode: InputMode::Normal,
             notice_overlay: None,
+            agent_footer_status_seen: String::new(),
+            agent_footer_status_until: None,
             preview_cache: HashMap::new(),
             preview_cache_order: VecDeque::new(),
             preview_requested: None,
@@ -13631,12 +13662,6 @@ impl App {
             AgentFocusPane::Main => self.focus_main_agent(),
             AgentFocusPane::Auxiliary => self.focus_auxiliary_agent(),
         }
-    }
-
-    fn active_main_agent_is_coding(&self) -> bool {
-        self.active_agent
-            .as_ref()
-            .is_some_and(|agent| is_coding_agent_session_info(&agent.info))
     }
 
     fn focused_agent_info(&self) -> Option<&SessionInfo> {
@@ -14769,6 +14794,15 @@ impl App {
         entry: &PersistedAgentAuxiliaryEntry,
         info: &SessionInfo,
     ) -> bool {
+        // Provider-and-folder matching exists for coding agents whose session
+        // id changes after launch. Terminal and cokacdir panes carry an
+        // arbitrary provider, so a panel of either one matches only by its
+        // exact key; otherwise it could attach to a new agent in the same
+        // folder, or the other way around.
+        if !is_coding_agent_session_info(info) || persisted_auxiliary_parent_is_plain_pty_tool(entry)
+        {
+            return false;
+        }
         entry.parent_source == NEW_AGENT_SESSION_SOURCE_MARKER
             || entry
                 .parent
@@ -15362,7 +15396,7 @@ impl App {
         terminal_rows: u16,
         reason: &'static str,
     ) -> bool {
-        if self.agent_aux.is_some() || !self.active_main_agent_is_coding() {
+        if self.agent_aux.is_some() {
             return false;
         }
         let Some(active_info) = self.active_agent.as_ref().map(|agent| agent.info.clone()) else {
@@ -15622,21 +15656,6 @@ impl App {
                 "snapshot": app_runtime_snapshot_debug_value(self, false),
             }),
         );
-        if !self.active_main_agent_is_coding() {
-            self.status = format!(
-                "right {} panel is available from Codex, Claude, or OpenCode.",
-                kind.label()
-            );
-            debug_log(
-                "agent_auxiliary_toggle_skipped",
-                serde_json::json!({
-                    "kind": kind.label(),
-                    "reason": "active_main_agent_not_coding",
-                    "snapshot": app_runtime_snapshot_debug_value(self, false),
-                }),
-            );
-            return;
-        }
         let Some(active_info) = self.active_agent.as_ref().map(|agent| agent.info.clone()) else {
             self.status = format!("no active agent for right {} panel.", kind.label());
             debug_log(
@@ -17370,6 +17389,25 @@ impl App {
         self.input_mode = InputMode::Notice { title, message };
     }
 
+    /// A status set since the agent view last drew is shown in its footer
+    /// for a few seconds instead of the key help, so an action that reports
+    /// only through the status (a refused or hidden panel) is not silent.
+    fn agent_footer_status(&mut self) -> Option<String> {
+        let now = Instant::now();
+        if self.status != self.agent_footer_status_seen {
+            self.agent_footer_status_seen.clone_from(&self.status);
+            let message = self.status.trim();
+            let routine = message.is_empty()
+                || message == "loading…"
+                || is_plain_session_count_status(message);
+            self.agent_footer_status_until =
+                (!routine).then(|| now + Duration::from_millis(AGENT_FOOTER_STATUS_MS));
+        }
+        self.agent_footer_status_until
+            .is_some_and(|until| now < until)
+            .then(|| self.status.trim().to_string())
+    }
+
     fn status_is_covered_by_session_overlay(&self) -> bool {
         self.data_task.is_some()
             || self.new_session_launch.is_some()
@@ -18985,9 +19023,7 @@ impl App {
                             .active_agent
                             .as_ref()
                             .map(|agent| AgentKey::new(&agent.info));
-                        if active_parent.as_ref() == Some(&parent)
-                            && self.active_main_agent_is_coding()
-                        {
+                        if active_parent.as_ref() == Some(&parent) {
                             self.set_auxiliary_agent(kind, parent, agent);
                             if ctx.focus_auxiliary_on_ready {
                                 self.set_agent_focus(AgentFocusPane::Auxiliary);
@@ -47354,6 +47390,18 @@ fn is_plain_pty_tool_session_info(info: &SessionInfo) -> bool {
         || is_cokacdir_session_info(info)
 }
 
+/// Whether a persisted panel's parent is a terminal or cokacdir pane. The
+/// recorded source decides; the synthetic session-id prefixes cover entries
+/// saved while the parent's source was not known.
+fn persisted_auxiliary_parent_is_plain_pty_tool(entry: &PersistedAgentAuxiliaryEntry) -> bool {
+    entry.parent_source == SHELL_SESSION_SOURCE_MARKER
+        || entry.parent_source == COKACDIR_SESSION_SOURCE_MARKER
+        || is_cli_command_session_source(Path::new(&entry.parent_source))
+        || ["shell-", "command-", "cokacdir-"]
+            .iter()
+            .any(|prefix| entry.parent.session_id.starts_with(prefix))
+}
+
 fn auxiliary_kind_for_session_info(info: &SessionInfo) -> Option<AgentAuxKind> {
     if is_shell_session_info(info) || is_cli_command_session_info(info) {
         Some(AgentAuxKind::Terminal)
@@ -51563,15 +51611,25 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
 
     let buf = f.buffer_mut();
     fill_area(buf, status_area, theme_status_style());
-    let agent_help_items = agent_help_items(&app.keybindings);
-    f.render_widget(
-        help_line_from_items_with_bg(
-            &agent_help_items,
-            status_area.width as usize,
-            THEME_STATUS_BG,
-        ),
-        status_area,
-    );
+    if let Some(status) = app.agent_footer_status() {
+        f.render_widget(
+            Line::from(Span::styled(
+                truncate_width(&status, status_area.width as usize),
+                theme_status_style(),
+            )),
+            status_area,
+        );
+    } else {
+        let agent_help_items = agent_help_items(&app.keybindings);
+        f.render_widget(
+            help_line_from_items_with_bg(
+                &agent_help_items,
+                status_area.width as usize,
+                THEME_STATUS_BG,
+            ),
+            status_area,
+        );
+    }
 
     app.poll_agent_runtime_states();
     let mut sidebar_candidates_len = None;
@@ -62094,6 +62152,8 @@ mod tests {
             data_task: None,
             input_mode: InputMode::Normal,
             notice_overlay: None,
+            agent_footer_status_seen: String::new(),
+            agent_footer_status_until: None,
             preview_cache: HashMap::new(),
             preview_cache_order: VecDeque::new(),
             preview_requested: None,
@@ -77535,6 +77595,124 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
+    fn terminal_main_can_toggle_its_right_panel() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let mut main = buffered_output_test_client("terminal-main", 171);
+        main.info = shell_session_info_for_cwd("/repo".into());
+        app.set_active_agent(main);
+        let parent = AgentKey::new(&app.active_agent.as_ref().unwrap().info);
+        let (aux, _aux_rx) = buffered_output_test_client_with_requests("terminal-main-aux", 172);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Cokacdir,
+            parent: parent.clone(),
+            agent: aux,
+        });
+        app.agent_focus = AgentFocusPane::Main;
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+
+        handle_agent_key(&mut app, ctrl_f, 120, 30);
+        assert!(app.agent_aux.is_none());
+        assert_eq!(app.hidden_agent_aux.len(), 1);
+        assert_eq!(app.hidden_agent_aux[0].parent, parent);
+
+        handle_agent_key(&mut app, ctrl_f, 120, 30);
+        let restored = app
+            .agent_aux
+            .as_ref()
+            .expect("a terminal main should show its cokacdir panel again");
+        assert_eq!(restored.kind, AgentAuxKind::Cokacdir);
+        assert_eq!(restored.agent.reader_id, 172);
+    }
+
+    #[test]
+    fn terminal_panels_never_match_a_new_agent_parent_by_folder() {
+        let app = app_for_key_tests();
+        let shell = shell_session_info_for_cwd("/repo".into());
+        let new_claude = new_agent_session_info(Provider::Claude, "/repo".into());
+        let entry_for = |parent: &SessionInfo| PersistedAgentAuxiliaryEntry {
+            agent: AgentKey {
+                provider: Provider::Claude,
+                session_id: "shell-aux".into(),
+            },
+            kind: AgentAuxKind::Terminal,
+            parent: AgentKey::new(parent),
+            parent_provider: parent.provider,
+            parent_cwd: parent.cwd.clone(),
+            parent_source: parent.source.display().to_string(),
+            visible: true,
+            updated_at_epoch_s: 0,
+        };
+        // Terminal panes carry an arbitrary provider (Claude): neither side
+        // may claim the other's panel just because the folder matches.
+        assert!(!app.persisted_auxiliary_matches_active(&entry_for(&shell), &new_claude));
+        assert!(!app.persisted_auxiliary_matches_active(&entry_for(&new_claude), &shell));
+        assert!(app.persisted_auxiliary_matches_active(&entry_for(&shell), &shell));
+        assert!(app.persisted_auxiliary_matches_active(&entry_for(&new_claude), &new_claude));
+    }
+
+    #[test]
+    fn agent_footer_shows_a_new_status_briefly_then_the_key_help() {
+        let mut app = app_for_key_tests();
+        app.status = "12 sessions".into();
+        assert_eq!(app.agent_footer_status(), None, "session counts are routine");
+
+        app.status = "terminal is too narrow for a right panel.".into();
+        assert_eq!(
+            app.agent_footer_status().as_deref(),
+            Some("terminal is too narrow for a right panel.")
+        );
+        assert!(app.agent_footer_status().is_some(), "shown until it expires");
+
+        app.agent_footer_status_until = Instant::now().checked_sub(Duration::from_millis(1));
+        assert_eq!(app.agent_footer_status(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_view_footer_renders_a_fresh_status() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        app.set_active_agent(buffered_output_test_client("footer-status", 173));
+        app.status = "right terminal hidden".into();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui_agent(frame, &mut app)).unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("right terminal hidden"), "{rendered}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_f_and_ctrl_t_are_never_forwarded_to_a_child() {
+        let (mut client, requests) =
+            buffered_output_test_client_with_requests("reserved-keys", 174);
+        for key in [
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::CONTROL),
+        ] {
+            client.send_key(key).unwrap();
+        }
+        assert!(
+            requests.try_recv().is_err(),
+            "reserved keys must not reach the child"
+        );
+
+        client
+            .send_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(
+            requests.try_recv().is_ok(),
+            "other control keys still reach the child"
+        );
+        client.exited = Some("test cleanup".into());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn auxiliary_toggle_hides_and_restores_existing_cokacdir() {
         let mut app = app_for_key_tests();
         app.show_sessions_view = false;
@@ -80565,14 +80743,14 @@ IF EXIST "%~dp0\node.exe" (
         let mut source = vt100::Parser::new(5, 30, AGENT_SCROLLBACK_LINES);
         let mut history = ScreenHistory::default();
         for frame in 1..=8 {
-            let bytes = format!("\x1b[?1049h\x1b[H\x1b[2JFRAME{:03}\r\n", frame);
+            let bytes = format!("\x1b[H\x1b[2JFRAME{:03}\r\n", frame);
             safe_parser_process(&mut source, bytes.as_bytes());
             history.capture(&mut source);
         }
         assert_eq!(
             parser_max_scrollback(&mut source),
             0,
-            "alternate-screen redraws should not create vt100 scrollback"
+            "in-place redraws should not create vt100 scrollback"
         );
         assert!(
             history.max_scroll_offset(5) > 0,
@@ -80597,9 +80775,7 @@ IF EXIST "%~dp0\node.exe" (
         let mut screen_hash = screen_activity_hash(source.screen());
         let mut bytes = Vec::new();
         for frame in 1..=8 {
-            bytes.extend_from_slice(
-                format!("\x1b[?1049h\x1b[H\x1b[2JFRAME{frame:03}\r\n").as_bytes(),
-            );
+            bytes.extend_from_slice(format!("\x1b[H\x1b[2JFRAME{frame:03}\r\n").as_bytes());
         }
 
         assert!(process_parser_output(
@@ -80629,7 +80805,7 @@ IF EXIST "%~dp0\node.exe" (
         let mut history = ScreenHistory::default();
         for frame in 1..=4 {
             let bytes = format!(
-                "\x1b[?1049h\x1b[H\x1b[2JFRAME{frame:03}\r\nROW{frame:03}A\r\nROW{frame:03}B\r\nROW{frame:03}C"
+                "\x1b[H\x1b[2JFRAME{frame:03}\r\nROW{frame:03}A\r\nROW{frame:03}B\r\nROW{frame:03}C"
             );
             safe_parser_process(&mut source, bytes.as_bytes());
             history.capture(&mut source);
@@ -80651,7 +80827,7 @@ IF EXIST "%~dp0\node.exe" (
 
         safe_parser_process(
             &mut source,
-            b"\x1b[?1049h\x1b[H\x1b[2JHEADER\r\nSTABLE1\r\nSTABLE2\r\nWORK old\r\nSTATUS old",
+            b"\x1b[H\x1b[2JHEADER\r\nSTABLE1\r\nSTABLE2\r\nWORK old\r\nSTATUS old",
         );
         history.capture(&mut source);
         safe_parser_process(
@@ -80676,7 +80852,7 @@ IF EXIST "%~dp0\node.exe" (
         let mut source = vt100::Parser::new(4, 40, AGENT_SCROLLBACK_LINES);
         let mut history = ScreenHistory::default();
 
-        safe_parser_process(&mut source, b"\x1b[?1049h\x1b[H\x1b[2JA\r\nB\r\nC\r\nD");
+        safe_parser_process(&mut source, b"\x1b[H\x1b[2JA\r\nB\r\nC\r\nD");
         history.capture(&mut source);
         safe_parser_process(&mut source, b"\x1b[H\x1b[2JB\r\nC\r\nD\r\nE");
         history.capture(&mut source);
@@ -80708,7 +80884,7 @@ IF EXIST "%~dp0\node.exe" (
         let mut history = ScreenHistory::default();
         let mut screen_hash = screen_activity_hash(source.screen());
         for frame in 1..=3 {
-            let bytes = format!("\x1b[?1049h\x1b[H\x1b[2JFRAME{frame:03}\r\n");
+            let bytes = format!("\x1b[H\x1b[2JFRAME{frame:03}\r\n");
             let _ = process_parser_output(
                 &mut source,
                 bytes.as_bytes(),
@@ -80778,7 +80954,7 @@ IF EXIST "%~dp0\node.exe" (
         client.screen_hash = screen_activity_hash(client.parser.screen());
 
         for frame in 1..=8 {
-            let bytes = format!("\x1b[?1049h\x1b[H\x1b[2JFRAME{:03}\r\n", frame);
+            let bytes = format!("\x1b[H\x1b[2JFRAME{:03}\r\n", frame);
             client.process_agent_output(bytes.as_bytes(), true);
         }
 
@@ -81366,7 +81542,7 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
-    fn live_pty_fullscreen_redraws_scroll_through_screen_history() {
+    fn live_pty_fullscreen_redraws_stay_out_of_screen_history() {
         let shell = PathBuf::from("/bin/sh");
         if !shell.is_file() {
             return;
@@ -81393,7 +81569,14 @@ IF EXIST "%~dp0\node.exe" (
             AgentSession::spawn_with_spec(info.clone(), spec, 40, 6, AgentLaunchMode::Normal)
                 .unwrap();
         agent.send_bytes(b"printf '\\033[?1049h'\n").unwrap();
-        let _ = drain_agent_until(&mut agent, Duration::from_secs(2), |_| false);
+        assert!(
+            drain_agent_until(&mut agent, Duration::from_secs(2), |agent| {
+                agent.parser.screen().alternate_screen()
+            }),
+            "the shell did not enter the alternate screen"
+        );
+        let _ = drain_agent_until(&mut agent, Duration::from_millis(300), |_| false);
+        let history_before = agent.screen_history.all_lines();
 
         for frame in 1..=12 {
             let command = format!("printf '\\033[H\\033[2JFRAME{frame:03}\\nROW{frame:03}\\n'\n");
@@ -81406,34 +81589,24 @@ IF EXIST "%~dp0\node.exe" (
             );
         }
 
+        assert!(agent.parser.screen().alternate_screen());
         assert_eq!(
-            parser_max_scrollback(&mut agent.parser),
-            0,
-            "fullscreen redraws should leave vt100 scrollback empty"
-        );
-        assert!(
-            agent
-                .screen_history
-                .max_scroll_offset(agent.pty_size.rows as usize)
-                > 0,
-            "screen history should provide a fallback scroll range"
+            agent.screen_history.all_lines(),
+            history_before,
+            "alternate-screen frames must not be captured into screen history"
         );
 
-        let snapshot = agent.screen_snapshot_bytes(true);
-        let mut restored = vt100::Parser::new(
-            agent.pty_size.rows,
-            agent.pty_size.cols,
-            AGENT_SCROLLBACK_LINES,
-        );
-        safe_parser_process(&mut restored, &snapshot);
-        let restored_text = parser_snapshot_text(&mut restored);
+        // Capture resumes once the app returns to the normal screen.
+        agent.send_bytes(b"printf '\\033[?1049l'; echo BACK-ON-MAIN\n").unwrap();
         assert!(
-            restored_text.contains("FRAME001") && restored_text.contains("FRAME012"),
-            "snapshot event did not transfer fullscreen screen history: {:?}",
-            restored_text
+            drain_agent_until(&mut agent, Duration::from_secs(2), |agent| {
+                agent.screen_history.all_lines().iter().any(|line| line.contains("BACK-ON-MAIN"))
+            }),
+            "normal-screen output after the app should be captured again"
         );
+        assert!(!agent.screen_history.all_lines().iter().any(|line| line.contains("FRAME")));
 
-        agent.send_bytes(b"printf '\\033[?1049l'; exit\n").unwrap();
+        agent.send_bytes(b"exit\n").unwrap();
         let _ = drain_agent_until(&mut agent, Duration::from_millis(500), |_| false);
         let _ = agent.child.kill();
         let _ = agent.child.wait();

@@ -376,3 +376,29 @@ fn only_terminals_keep_a_cokacmux_scrollback() {
         assert_eq!(agent_scrollback_lines_for(info, &unlimited), 0);
     }
 }
+
+#[test]
+fn alternate_screen_frames_stay_out_of_history_until_the_app_exits() {
+    fn feed(parser: &mut vt100::Parser, hash: &mut u64, history: &mut ScreenHistory, bytes: &[u8]) {
+        process_parser_output(parser, bytes, hash, Some(history));
+    }
+    let mut parser = vt100::Parser::new(5, 30, AGENT_SCROLLBACK_LINES);
+    let mut history = ScreenHistory::new(AGENT_SCROLLBACK_LINES);
+    let mut hash = screen_activity_hash(parser.screen());
+    feed(&mut parser, &mut hash, &mut history, b"$ ls\r\nfile\r\n$ cokacdir");
+    let before = history.all_lines();
+    assert!(before.iter().any(|line| line == "file"));
+
+    // A full-screen editor redraws its status line on every key.
+    feed(&mut parser, &mut hash, &mut history, b"\x1b[?1049h");
+    for col in 1..=50 {
+        let frame = format!("\x1b[H\x1b[2Jf1.txt Ln 1, Col {col}\r\nbody\r\nmore");
+        feed(&mut parser, &mut hash, &mut history, frame.as_bytes());
+    }
+    assert_eq!(history.all_lines(), before);
+
+    feed(&mut parser, &mut hash, &mut history, b"\x1b[?1049l\r\n$ done");
+    let after = history.all_lines();
+    assert!(after.iter().any(|line| line == "$ done"));
+    assert!(!after.iter().any(|line| line.contains("Col")));
+}

@@ -338,7 +338,7 @@ cokacmux start web --cwd C:\work\app -- npm run dev
 
 ### 코딩 도구 화면에서 쓰는 키
 
-코딩 도구 화면은 Claude Code, Codex, OpenCode, Pi, GJC, 일반 명령창, `cokacdir`가 실제로 떠 있는 화면입니다. 보통 키 입력은 현재 포커스가 있는 창으로 그대로 전달됩니다. 아래 키들은 `cokacmux`가 먼저 잡아 처리합니다.
+코딩 도구 화면은 Claude Code, Codex, OpenCode, Pi, GJC, 일반 명령창, `cokacdir`가 실제로 떠 있는 화면입니다. 보통 키 입력은 현재 포커스가 있는 창으로 그대로 전달됩니다. 아래 키들은 `cokacmux`가 먼저 잡아 처리합니다. 맨 아래 줄에는 단축키 안내가 보이며, 패널을 열 수 없는 이유 같은 상태 메시지가 생기면 몇 초간 안내 대신 표시됩니다.
 
 | 키 | 언제 쓰나요 | 무엇을 하나요 |
 |---|---|---|
@@ -499,7 +499,7 @@ cokacmux start web --cwd C:\work\app -- npm run dev
 
 스크롤 버퍼 크기는 **General → Scrollback lines**에서 바꿉니다. `Enter`로 편집을 시작하고 값을 입력한 뒤, `Enter`로 편집을 끝내고 다시 `Enter`를 눌러 저장합니다. 기본값은 **무제한(`unlimited`)**이며 입력 가능한 줄 수에 별도 상한을 두지 않습니다. 빈 값이나 `unlimited`는 무제한, 양의 정수는 지정한 줄 수만 보관, `0`은 기록 보관 끄기입니다. 변경값은 **새로 시작하는 터미널부터** 적용됩니다. 실행 중인 터미널은 다시 연결해도 시작 당시의 설정을 유지합니다.
 
-이 값은 cokacmux가 터미널(명령창과 `cokacmux start`로 띄운 terminal)마다 보관하는 출력 스크롤 버퍼의 한도입니다. 코딩 도구와 `cokacdir`에는 cokacmux 출력 스크롤 버퍼를 두지 않습니다. Codex·Claude Code 등은 자체 대화 기록과 내부 스크롤을 해당 도구가 관리합니다. [설정 파일 예시](docs/KEYBINDINGS.md#스크롤-버퍼-크기)도 참고하세요.
+이 값은 cokacmux가 터미널(명령창과 `cokacmux start`로 띄운 terminal)마다 보관하는 출력 스크롤 버퍼의 한도입니다. 코딩 도구와 `cokacdir`에는 cokacmux 출력 스크롤 버퍼를 두지 않습니다. 터미널 안에서 vim·less·htop·`cokacdir` 같은 전체 화면 앱이 떠 있는 동안의 화면은 기록하지 않으며, 앱을 종료하면 그 전의 출력은 그대로 스크롤할 수 있습니다. Codex·Claude Code 등은 자체 대화 기록과 내부 스크롤을 해당 도구가 관리합니다. [설정 파일 예시](docs/KEYBINDINGS.md#스크롤-버퍼-크기)도 참고하세요.
 
 | 키 | 언제 쓰나요 | 무엇을 하나요 |
 |---|---|---|

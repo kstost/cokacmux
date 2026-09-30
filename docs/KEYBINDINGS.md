@@ -86,7 +86,7 @@ cokacmux는 config 디렉터리의 `keybinding.json`을 읽어 단축키를 설�
 
 ### 스크롤 버퍼 크기
 
-세션 목록에서 `,` → **General → Scrollback lines**로 이동해 cokacmux가 터미널(명령창과 `cokacmux start`로 띄운 terminal)마다 보관하는 스크롤 버퍼의 최대 줄 수를 변경합니다. 코딩 도구와 `cokacdir`에는 cokacmux 스크롤 버퍼를 두지 않습니다. `Enter`로 편집을 시작하고 값을 입력한 뒤, `Enter`로 편집을 끝내고 다시 `Enter`로 저장합니다. 기본값은 **무제한(`unlimited`)**이며 입력 가능한 줄 수에 별도 상한을 두지 않습니다. 빈 값이나 `unlimited`는 무제한, 양의 정수는 지정한 줄 수만 보관, `0`은 기록 보관 끄기입니다. 음수·소수·잘못된 입력은 저장할 수 없습니다.
+세션 목록에서 `,` → **General → Scrollback lines**로 이동해 cokacmux가 터미널(명령창과 `cokacmux start`로 띄운 terminal)마다 보관하는 스크롤 버퍼의 최대 줄 수를 변경합니다. 코딩 도구와 `cokacdir`에는 cokacmux 스크롤 버퍼를 두지 않습니다. 터미널 안에서 vim·less·htop·`cokacdir` 같은 전체 화면 앱이 떠 있는 동안의 화면은 기록하지 않으며, 앱을 종료하면 그 전의 출력은 그대로 스크롤할 수 있습니다. `Enter`로 편집을 시작하고 값을 입력한 뒤, `Enter`로 편집을 끝내고 다시 `Enter`로 저장합니다. 기본값은 **무제한(`unlimited`)**이며 입력 가능한 줄 수에 별도 상한을 두지 않습니다. 빈 값이나 `unlimited`는 무제한, 양의 정수는 지정한 줄 수만 보관, `0`은 기록 보관 끄기입니다. 음수·소수·잘못된 입력은 저장할 수 없습니다.
 
 설정은 `~/.cokacmux/settings.json`의 `cokacmux.scrollback_lines`에 저장합니다. `COKACMUX_CONFIG_DIR`을 지정했다면 해당 디렉터리의 `settings.json`을 사용합니다. 무제한은 `null`로 저장합니다. 기존 파일의 다른 항목을 유지하면서 다음 값을 넣습니다.
 
@@ -263,8 +263,8 @@ Codex가 만든 non-root 세션은 기본 `top-level` 범위에서 숨겨집니�
 | `agent.kill` | `ctrl+k` | 현재 코딩 agent/일반 터미널 종료. `cokacdir` 화면에서는 자식 앱에 전달 |
 | `agent.new_shell` | `ctrl+n` | 현재 agent cwd를 기본값으로 새 세션 모달 열기 |
 | `agent.toggle_sidebar` | `ctrl+b` | agents 사이드바 표시/숨김 |
-| `agent.toggle_cokacdir_panel` | `ctrl+f` | 현재 코딩 에이전트의 cwd로 오른쪽 cokacdir 패널 표시/숨김. 숨김 중에도 자식 앱은 계속 실행 |
-| `agent.toggle_terminal_panel` | `ctrl+t` | 현재 코딩 에이전트의 cwd로 오른쪽 terminal 패널 표시/숨김. 숨김 중에도 자식 앱은 계속 실행 |
+| `agent.toggle_cokacdir_panel` | `ctrl+f` | 현재 main pane(코딩 에이전트·터미널·`cokacdir`)의 작업 폴더로 오른쪽 cokacdir 패널 표시/숨김. 숨김 중에도 자식 앱은 계속 실행 |
+| `agent.toggle_terminal_panel` | `ctrl+t` | 현재 main pane(코딩 에이전트·터미널·`cokacdir`)의 작업 폴더로 오른쪽 terminal 패널 표시/숨김. 숨김 중에도 자식 앱은 계속 실행 |
 | `agent.focus_sidebar` | `ctrl+1` | 왼쪽 agents 패널로 포커스 이동. 숨겨져 있으면 표시 |
 | `agent.focus_main` | `ctrl+2` | 중앙 agent 패널로 포커스 이동 |
 | `agent.focus_auxiliary` | `ctrl+3` | 오른쪽 보조 패널로 포커스 이동 |
@@ -280,6 +280,8 @@ Codex가 만든 non-root 세션은 기본 `top-level` 범위에서 숨겨집니�
 | `agent.sidebar_next` | `alt+down`, `ctrl+shift+down` | agents 사이드바 선택 아래로 이동 |
 | `agent.switch_prev` | `ctrl+pageup` | 이전 live agent로 전환 |
 | `agent.switch_next` | `ctrl+pagedown` | 다음 live agent로 전환 |
+
+`Ctrl+F`와 `Ctrl+T`는 cokacmux가 항상 먼저 처리하며 어떤 pane에서도 자식 앱에 전달하지 않습니다. 위 두 토글 액션을 다른 키로 바꿔도 `Ctrl+F`와 `Ctrl+T`는 자식 앱으로 가지 않습니다.
 
 ### delete_confirm
 
