@@ -12747,9 +12747,10 @@ struct App {
     data_task: Option<DataTaskPending>,
     input_mode: InputMode,
     notice_overlay: Option<NoticeDialog>,
-    /// The status last seen by the agent view footer, and until when it is
-    /// shown there instead of the key help.
-    agent_footer_status_seen: String,
+    /// The status last seen by the agent view footer (None: the next draw
+    /// treats the current status as new), and until when it is shown there
+    /// instead of the key help.
+    agent_footer_status_seen: Option<String>,
     agent_footer_status_until: Option<Instant>,
     preview_cache: HashMap<PreviewKey, PreviewEntry>,
     preview_cache_order: VecDeque<PreviewKey>,
@@ -12947,7 +12948,7 @@ impl App {
             data_task: None,
             input_mode: InputMode::Normal,
             notice_overlay: None,
-            agent_footer_status_seen: String::new(),
+            agent_footer_status_seen: None,
             agent_footer_status_until: None,
             preview_cache: HashMap::new(),
             preview_cache_order: VecDeque::new(),
@@ -13609,6 +13610,70 @@ impl App {
             self.status = "focus: agents sidebar".into();
         }
         self.set_agent_focus(AgentFocusPane::Sidebar);
+    }
+
+    /// A left click on the agents sidebar. The sidebar takes keyboard focus;
+    /// a click on the row of another attachable agent also switches to it,
+    /// as selecting that row with the keyboard would. `row` is the clicked
+    /// index in the list that was drawn with `listed_rows` entries, or None
+    /// for a click on the border or below the last entry.
+    fn click_agent_sidebar(&mut self, row: Option<usize>, listed_rows: usize) {
+        self.set_agent_focus(AgentFocusPane::Sidebar);
+        let Some(index) = row else {
+            return;
+        };
+        let candidates = self.agent_sidebar_candidates();
+        // If the list changed since it was drawn, the row no longer names
+        // the agent the user saw there.
+        if candidates.len() != listed_rows {
+            return;
+        }
+        let Some(target) = candidates.get(index) else {
+            return;
+        };
+        let target_key = AgentKey::new(target);
+        let Some(anchor_key) = self.pending_main_attach_key().or_else(|| {
+            self.active_agent
+                .as_ref()
+                .map(|agent| AgentKey::new(&agent.info))
+        }) else {
+            return;
+        };
+        if target_key == anchor_key {
+            return;
+        }
+        // Step through the same candidates the keyboard switch uses, so a
+        // listed but unattachable entry (owned by another window) is refused.
+        let switchable = self.live_agent_switch_candidates();
+        let position = |key: &AgentKey| {
+            switchable
+                .iter()
+                .position(|info| AgentKey::new(info) == *key)
+        };
+        let (Some(current), Some(next)) = (position(&anchor_key), position(&target_key)) else {
+            self.status = format!(
+                "{} cannot be attached from here.",
+                live_agent_status_label(target)
+            );
+            return;
+        };
+        let delta = next as i32 - current as i32;
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let viewport = agent_viewports_for_terminal(
+            cols,
+            rows,
+            self.agent_sidebar_config_width(),
+            false,
+            self.agent_aux_width,
+        )
+        .main;
+        self.switch_active_agent_with_focus(
+            delta,
+            false,
+            viewport.pty_cols,
+            viewport.pty_rows,
+            Some(AgentFocusPane::Sidebar),
+        );
     }
 
     fn focus_main_agent(&mut self) {
@@ -15641,6 +15706,26 @@ impl App {
         );
     }
 
+    /// Whether a right panel of this kind is already being opened or restored
+    /// for this parent. Toggling again before that attach lands would start a
+    /// second process of the same kind.
+    fn auxiliary_attach_pending(&self, kind: AgentAuxKind, parent: &AgentKey) -> bool {
+        let pending = |target: &AttachTarget| match target {
+            AttachTarget::Auxiliary {
+                kind: pending_kind,
+                parent: pending_parent,
+            } => *pending_kind == kind && self.agent_aux_parent_matches(pending_parent, parent),
+            AttachTarget::MainAgent => false,
+        };
+        self.attach_in_flight
+            .as_ref()
+            .is_some_and(|attach| pending(&attach.target))
+            || self
+                .queued_attach
+                .as_ref()
+                .is_some_and(|job| pending(&job.ctx.target))
+    }
+
     fn toggle_auxiliary_agent_panel(
         &mut self,
         kind: AgentAuxKind,
@@ -15682,6 +15767,19 @@ impl App {
                 }),
             );
             let _ = self.hide_auxiliary_agent("toggle", false);
+            return;
+        }
+        if self.auxiliary_attach_pending(kind, &parent) {
+            self.status = format!("right {} is still opening...", kind.label());
+            debug_log(
+                "agent_auxiliary_toggle_skipped",
+                serde_json::json!({
+                    "kind": kind.label(),
+                    "reason": "attach_pending",
+                    "parent": agent_key_debug_value(&parent),
+                    "snapshot": app_runtime_snapshot_debug_value(self, false),
+                }),
+            );
             return;
         }
 
@@ -17394,8 +17492,8 @@ impl App {
     /// only through the status (a refused or hidden panel) is not silent.
     fn agent_footer_status(&mut self) -> Option<String> {
         let now = Instant::now();
-        if self.status != self.agent_footer_status_seen {
-            self.agent_footer_status_seen.clone_from(&self.status);
+        if self.agent_footer_status_seen.as_deref() != Some(self.status.as_str()) {
+            self.agent_footer_status_seen = Some(self.status.clone());
             let message = self.status.trim();
             let routine = message.is_empty()
                 || message == "loading…"
@@ -17406,6 +17504,17 @@ impl App {
         self.agent_footer_status_until
             .is_some_and(|until| now < until)
             .then(|| self.status.trim().to_string())
+    }
+
+    /// Called after a key, mouse or paste handler with the status buffer it
+    /// started with. Assigning a status builds the new string while the old
+    /// one is still alive, so a different buffer means the handler set the
+    /// status, possibly to the same text. The footer then shows it again, so
+    /// an action refused twice in a row is not silent the second time.
+    fn note_input_status_write(&mut self, status_before: *const u8) {
+        if !std::ptr::eq(self.status.as_ptr(), status_before) {
+            self.agent_footer_status_seen = None;
+        }
     }
 
     fn status_is_covered_by_session_overlay(&self) -> bool {
@@ -18543,7 +18652,29 @@ impl App {
         // worker result, never this UI result handler. Conservatively retain
         // uncertain relationships until such a result arrives.
         let normalized_auxiliaries = 0usize;
-        let orphaned_auxiliaries = 0usize;
+        // This is such a result for terminal and cokacdir parents: they have
+        // no stored session to reopen, so once the discovery worker's complete
+        // scan proves one gone, its right panels would stay registered to it,
+        // hidden from the sidebar while still running. Release them as
+        // standalone live processes; nothing is terminated.
+        let orphaned_auxiliaries = if scan_complete {
+            let gone_parents = self
+                .persisted_agent_aux
+                .values()
+                .filter(|entry| persisted_auxiliary_parent_is_plain_pty_tool(entry))
+                .map(|entry| entry.parent.clone())
+                .filter(|parent| {
+                    !next_keys.contains(parent)
+                        && !uncertain_stems.contains(&agent_file_stem(parent))
+                })
+                .collect::<HashSet<_>>();
+            gone_parents
+                .iter()
+                .map(|parent| self.release_auxiliaries_for_parent(parent, "plain_parent_gone"))
+                .sum::<usize>()
+        } else {
+            0
+        };
 
         debug_log(
             "live_shell_discovery_applied",
@@ -29604,6 +29735,15 @@ fn handle_main_event(
             }),
         );
     }
+    // Compared after the handler: did this user input set the status?
+    let input_status_before = matches!(
+        &event,
+        MainEvent::Input {
+            event: Event::Key(_) | Event::Mouse(_) | Event::Paste(_),
+            ..
+        }
+    )
+    .then(|| app.status.as_ptr());
     let started = Instant::now();
     match event {
         MainEvent::Input {
@@ -29747,6 +29887,9 @@ fn handle_main_event(
         MainEvent::PreviewReady { .. } => {
             app.poll_preview_results();
         }
+    }
+    if let Some(status_before) = input_status_before {
+        app.note_input_status_write(status_before);
     }
     app.prepare_sessions_view_after_transition(previous_is_agent_view, reason);
     let elapsed_ms = started.elapsed().as_millis();
@@ -62152,7 +62295,7 @@ mod tests {
             data_task: None,
             input_mode: InputMode::Normal,
             notice_overlay: None,
-            agent_footer_status_seen: String::new(),
+            agent_footer_status_seen: None,
             agent_footer_status_until: None,
             preview_cache: HashMap::new(),
             preview_cache_order: VecDeque::new(),
@@ -77652,6 +77795,114 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
+    fn toggling_a_right_panel_that_is_still_opening_starts_nothing() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let active_info = shell_session_info_for_cwd("/repo".into());
+        let active_key = AgentKey::new(&active_info);
+        app.set_active_agent(inert_agent_client_for_tests(active_info, 1));
+        let opening = cokacdir_session_info_for_cwd("/repo".into());
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 1,
+            key: AgentKey::new(&opening),
+            target: AttachTarget::Auxiliary {
+                kind: AgentAuxKind::Cokacdir,
+                parent: active_key.clone(),
+            },
+            started_at: Instant::now(),
+        });
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        handle_agent_key(&mut app, ctrl_f, 160, 30);
+        assert!(
+            app.queued_attach.is_none(),
+            "a second Ctrl+F must not start another cokacdir"
+        );
+        assert_eq!(app.status, "right cokacdir is still opening...");
+
+        // The other panel kind is a different process and may still open.
+        handle_agent_key(&mut app, ctrl_t, 160, 30);
+        let queued = app
+            .queued_attach
+            .as_ref()
+            .expect("Ctrl+T should queue a terminal panel");
+        assert!(matches!(
+            queued.ctx.target,
+            AttachTarget::Auxiliary {
+                kind: AgentAuxKind::Terminal,
+                ..
+            }
+        ));
+
+        handle_agent_key(&mut app, ctrl_t, 160, 30);
+        assert_eq!(app.status, "right terminal is still opening...");
+    }
+
+    #[test]
+    fn panels_of_a_gone_terminal_parent_are_released_not_lost() {
+        let mut app = app_for_key_tests();
+        let parent = shell_session_info_for_cwd("/repo/gone-parent".into());
+        let parent_key = AgentKey::new(&parent);
+        let panel = shell_session_info_for_cwd("/repo/gone-parent".into());
+        let panel_key = AgentKey::new(&panel);
+        let live = AgentListState::Live {
+            activity: AgentActivity::Quiet,
+        };
+        app.live_shells = vec![parent.clone(), panel.clone()];
+        app.agent_states.insert(parent_key.clone(), live);
+        app.agent_states.insert(panel_key.clone(), live);
+        app.persisted_agent_aux.insert(
+            panel_key.clone(),
+            PersistedAgentAuxiliaryEntry {
+                agent: panel_key.clone(),
+                kind: AgentAuxKind::Terminal,
+                parent: parent_key.clone(),
+                parent_provider: parent.provider,
+                parent_cwd: parent.cwd.clone(),
+                parent_source: parent.source.display().to_string(),
+                visible: false,
+                updated_at_epoch_s: 0,
+            },
+        );
+        assert!(app.is_auxiliary_agent_key(&panel_key));
+
+        // Each scan finds the panel alive and the parent's runtime files gone.
+        let scan = |app: &mut App, seq: u64, scan_complete: bool| {
+            app.live_shell_discovery_seq = seq;
+            app.live_shell_discovery_pending = true;
+            app.on_live_shell_discovery_result(LiveShellDiscoveryResult {
+                seq,
+                baseline_keys: HashSet::from([parent_key.clone(), panel_key.clone()]),
+                live_shells: vec![panel.clone()],
+                scan_complete,
+                uncertain_stems: HashSet::new(),
+                started_at_epoch_ms: current_epoch_ms(),
+                queued_at_epoch_ms: current_epoch_ms(),
+                elapsed_ms: 1,
+            });
+        };
+
+        // An incomplete scan proves nothing, so the relationship is kept.
+        scan(&mut app, 21, false);
+        assert!(app.persisted_agent_aux.contains_key(&panel_key));
+
+        // A complete scan without the parent releases the panel: it stays
+        // live and is no longer hidden from the sidebar behind a dead parent.
+        scan(&mut app, 22, true);
+        assert!(!app.persisted_agent_aux.contains_key(&panel_key));
+        assert!(!app.is_auxiliary_agent_key(&panel_key));
+        assert!(app
+            .live_shells
+            .iter()
+            .any(|info| AgentKey::new(info) == panel_key));
+        assert!(!app
+            .live_shells
+            .iter()
+            .any(|info| AgentKey::new(info) == parent_key));
+    }
+
+    #[test]
     fn agent_footer_shows_a_new_status_briefly_then_the_key_help() {
         let mut app = app_for_key_tests();
         app.status = "12 sessions".into();
@@ -77666,6 +77917,60 @@ IF EXIST "%~dp0\node.exe" (
 
         app.agent_footer_status_until = Instant::now().checked_sub(Duration::from_millis(1));
         assert_eq!(app.agent_footer_status(), None);
+    }
+
+    #[test]
+    fn agent_footer_shows_a_repeated_refusal_again() {
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let active_info = shell_session_info_for_cwd("/repo".into());
+        let active_key = AgentKey::new(&active_info);
+        app.set_active_agent(inert_agent_client_for_tests(active_info, 1));
+        let opening = cokacdir_session_info_for_cwd("/repo".into());
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 1,
+            key: AgentKey::new(&opening),
+            target: AttachTarget::Auxiliary {
+                kind: AgentAuxKind::Cokacdir,
+                parent: active_key,
+            },
+            started_at: Instant::now(),
+        });
+        let mut previous_is_agent_view = true;
+        let mut input = |app: &mut App, event: Event| {
+            handle_main_event(
+                app,
+                MainEvent::Input {
+                    event,
+                    queued_at_epoch_ms: current_epoch_ms(),
+                },
+                &mut previous_is_agent_view,
+                "test",
+            );
+        };
+        let ctrl_f = Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        let still_opening = Some("right cokacdir is still opening...");
+
+        input(&mut app, ctrl_f.clone());
+        assert_eq!(app.agent_footer_status().as_deref(), still_opening);
+        app.agent_footer_status_until = Instant::now().checked_sub(Duration::from_millis(1));
+        assert_eq!(app.agent_footer_status(), None);
+
+        // Input that leaves the status alone keeps the key help.
+        input(
+            &mut app,
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert_eq!(app.agent_footer_status(), None);
+
+        // The same refusal a second time is reported again.
+        input(&mut app, ctrl_f);
+        assert_eq!(app.agent_footer_status().as_deref(), still_opening);
     }
 
     #[cfg(unix)]

@@ -127,6 +127,41 @@ fn contains_mouse(area: Rect, mouse: MouseEvent) -> bool {
         && mouse.row < area.bottom()
 }
 
+/// The agents sidebar under a click: the clicked list index when the click
+/// landed on a listed row, and the number of rows that list was drawn with.
+/// The recorded region is the list inside the sidebar border, so a click on
+/// the border or title still belongs to the sidebar but to no row.
+fn sidebar_click(app: &App, mouse: MouseEvent, queued_at: u64) -> Option<(Option<usize>, usize)> {
+    let workspace = app.agent_workspace_info().map(AgentKey::new)?;
+    app.mouse_wheel_regions.iter().find_map(|region| {
+        let MouseWheelTarget::AgentSidebar {
+            workspace: drawn_for,
+            offset,
+            total_rows,
+        } = &region.target
+        else {
+            return None;
+        };
+        if *drawn_for != workspace || queued_at <= region.valid_since_epoch_ms {
+            return None;
+        }
+        let area = region.area;
+        if contains_mouse(area, mouse) {
+            let index = offset + usize::from(mouse.row - area.y);
+            return Some(((index < *total_rows).then_some(index), *total_rows));
+        }
+        let left = area.x.saturating_sub(1);
+        let top = area.y.saturating_sub(1);
+        let bordered = Rect::new(
+            left,
+            top,
+            area.right().saturating_add(1) - left,
+            area.bottom().saturating_add(1) - top,
+        );
+        contains_mouse(bordered, mouse).then_some((None, *total_rows))
+    })
+}
+
 pub(super) fn handle_mouse_input_event(app: &mut App, mouse: MouseEvent, queued_at_epoch_ms: u64) {
     if selection::handle_mouse(app, mouse, queued_at_epoch_ms) {
         return;
@@ -522,6 +557,12 @@ fn handle_button_input(app: &mut App, mouse: MouseEvent, queued_at: u64) {
     }
     if let MouseEventKind::Down(button) = mouse.kind {
         cancel_mouse_capture(app);
+        if button == MouseButton::Left {
+            if let Some((row, listed_rows)) = sidebar_click(app, mouse, queued_at) {
+                app.click_agent_sidebar(row, listed_rows);
+                return;
+            }
+        }
         let region = app
             .mouse_wheel_regions
             .iter()
@@ -1399,6 +1440,75 @@ mod tests {
             dispatch(&mut app, wheel(MouseEventKind::ScrollDown, 4, 2));
         }
         assert_eq!(app.agent_sidebar_scroll.as_ref().unwrap().offset, 11);
+        app.active_agent.as_mut().unwrap().exited = Some("test cleanup".into());
+    }
+
+    #[test]
+    fn sidebar_click_focuses_the_sidebar_and_switches_to_a_clicked_agent() {
+        let mut app = app_for_key_tests();
+        let (tx, _rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
+        let (main, requests) =
+            buffered_output_test_client_with_requests("sidebar-click-main", 9950);
+        let main_key = AgentKey::new(&main.info);
+        app.active_agent = Some(main);
+        app.show_sessions_view = false;
+        let other = shell_session_info_for_cwd("/repo".into());
+        let other_key = AgentKey::new(&other);
+        app.live_shells.push(other);
+        app.agent_states.insert(
+            other_key.clone(),
+            AgentListState::Live {
+                activity: AgentActivity::Quiet,
+            },
+        );
+
+        let candidates = app.agent_sidebar_candidates();
+        assert_eq!(candidates.len(), 2);
+        let other_row = candidates
+            .iter()
+            .position(|info| AgentKey::new(info) == other_key)
+            .unwrap() as u16;
+        let backend = ratatui::backend::TestBackend::new(32, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_agent_sidebar(
+                    frame,
+                    &mut app,
+                    Rect::new(0, 0, 32, 6),
+                    &candidates,
+                    &main_key,
+                    false,
+                )
+            })
+            .unwrap();
+
+        // The border and the rows below the list only take focus.
+        for (column, row) in [(0, 0), (4, 4)] {
+            app.agent_focus = AgentFocusPane::Main;
+            let click = wheel(MouseEventKind::Down(MouseButton::Left), column, row);
+            dispatch(&mut app, click);
+            assert_eq!(app.agent_focus, AgentFocusPane::Sidebar);
+            assert!(app.attach_in_flight.is_none());
+            assert!(app.queued_attach.is_none());
+        }
+
+        // A listed agent is switched to, as with the keyboard.
+        app.agent_focus = AgentFocusPane::Main;
+        let click = wheel(MouseEventKind::Down(MouseButton::Left), 4, 1 + other_row);
+        dispatch(&mut app, click);
+        assert_eq!(app.agent_focus, AgentFocusPane::Sidebar);
+        assert_eq!(
+            app.attach_in_flight
+                .as_ref()
+                .map(|attach| attach.key.clone()),
+            Some(other_key)
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "a sidebar click is never sent to the child"
+        );
         app.active_agent.as_mut().unwrap().exited = Some("test cleanup".into());
     }
 

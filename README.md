@@ -356,6 +356,7 @@ cokacmux start web --cwd C:\work\app -- npm run dev
 | `Ctrl+←`, `Ctrl+.`, `Shift+←` | 포커스를 왼쪽 방향으로 옮기고 싶을 때 | sidebar, main, right pane 사이에서 이전 pane으로 이동합니다. sidebar가 숨겨져 있으면 sidebar는 건너뜁니다. |
 | `Ctrl+→`, `Ctrl+/`, `Ctrl+_`, `Shift+→` | 포커스를 오른쪽 방향으로 옮기고 싶을 때 | sidebar, main, right pane 사이에서 다음 pane으로 이동합니다. |
 | sidebar 포커스에서 `↑`, `↓` | 실행 중인 agent 목록을 고르고 싶을 때 | agents sidebar 안에서 위아래 항목으로 이동합니다. |
+| sidebar 항목을 마우스로 클릭 | 목록에서 다른 작업으로 바로 가고 싶을 때 | 클릭한 agent로 전환하고 sidebar에 포커스를 둡니다. 빈 영역이나 테두리를 클릭하면 포커스만 옮깁니다. |
 | `Alt+↑`, `Ctrl+Shift+↑` | 다른 실행 작업으로 빠르게 바꾸고 싶을 때 | 이전 agent로 전환합니다. |
 | `Alt+↓`, `Ctrl+Shift+↓` | 다른 실행 작업으로 빠르게 바꾸고 싶을 때 | 다음 agent로 전환합니다. |
 | `Ctrl+PageUp` | 여러 agent 사이를 순서대로 오갈 때 | 이전 실행 화면으로 전환합니다. |
