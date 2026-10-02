@@ -400,6 +400,7 @@ fn mouse_agent(app: &mut App, reader_id: u64) -> Option<&mut AgentClient> {
 
 fn agent_accepts_mouse(agent: &AgentClient) -> bool {
     agent.exited.is_none()
+        && agent.held_exit.is_none()
         && agent.connection_ended.is_none()
         && !agent.pending_snapshot_output
         && !agent.snapshot_parse_in_progress
@@ -472,6 +473,7 @@ pub(super) fn flush_pending_release(agent: &mut AgentClient) -> io::Result<()> {
     };
     if capture.reader_id != agent.reader_id
         || agent.exited.is_some()
+        || agent.held_exit.is_some()
         || agent.connection_ended.is_some()
     {
         return Ok(());
@@ -714,7 +716,10 @@ fn scroll_agent_with_wheel(
         // into a partially installed snapshot or an unacknowledged resize.
         return Ok(());
     }
-    let connected = agent.exited.is_none() && agent.connection_ended.is_none();
+    // A held terminal's command exited: the wheel scrolls its retained
+    // history locally instead of sending input nobody will read.
+    let connected =
+        agent.exited.is_none() && agent.held_exit.is_none() && agent.connection_ended.is_none();
     if connected && agent.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None {
         let data = encode_mouse_wheel(agent.parser.screen(), mouse, area).ok_or_else(|| {
             io::Error::new(

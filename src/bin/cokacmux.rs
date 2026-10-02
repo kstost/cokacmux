@@ -209,52 +209,115 @@ const AGENT_DAEMON_READY_ENV: &str = "COKACMUX_DAEMON_READY_STDOUT";
 const AGENT_DAEMON_READY_TCP_ENV: &str = "COKACMUX_DAEMON_READY_TCP";
 const AGENT_DAEMON_READY_KIND: &str = "cokacmux_agent_daemon_ready";
 const CLI_AFTER_LONG_HELP: &str = "\
-CONFIG:
-  ~/.cokacmux/settings.json
-  ~/.cokacmux/keybinding.json
+EXAMPLES:
+  cokacmux                               Open the TUI
+  cokacmux --check                       Check that sessions can be found
+  cokacmux start web -- npm run dev      Run a dev server in the background
+  cokacmux start test --keep -- npm test Keep its final screen after it exits
+  cokacmux killall                       Stop all agents and terminals
+  cokacmux help start                    Show help for one command
 
-INTERACTIVE KEYS:
-  Esc/q/Ctrl+q quit
-  Up/Down      navigate
-  Alt+Up/Down or Ctrl+Shift+Up/Down select from sidebar/list
-  Alt+Left/Right or Ctrl+Shift+Left/Right resize focused side pane
-  Agent: Shift+Up/Down child transcript line, Shift+Alt+Up/Down page, Shift/Alt+Home/End top/bottom
-  PgUp / PgDn  jump 10
-  g/Home / G/End top / bottom
-  Tab          switch focus between session list and preview
-  Ctrl+F       open search mode chooser
-  v            toggle session list/tree view
-  u            toggle top-level/all sessions for this run (starts top-level)
-  t            edit selected session title
-  ,            configure AI agent; title edit Ctrl+T generates AI title
-  r            refresh from disk
-  c            clone selected session
-  e / Enter    switch to live selected agent, or choose launch mode to start it
-  Ctrl+] / Ctrl+[ switch between sessions and active agent
-  Ctrl+K       kill selected/current agent
-  Ctrl+PgUp/PgDn switch live agent from agent screen
-  Delete / d   delete selected session (confirm)
-  Space        refresh preview";
+FILES:
+  ~/.cokacmux/settings.json        Settings (settings screen: ,)
+  ~/.cokacmux/keybinding.json      Key bindings; the keys below are defaults
+  ~/.cokacmux/titles.json          Session titles you edited
+  ~/.cokacmux/agents/              Runtime files of live agents and terminals
+  ~/.cokacmux/debug/cokacmux.log   Log written with --debug or --trace
+
+ENVIRONMENT:
+  COKACMUX_HOME         Home folder used to find sessions and ~/.cokacmux
+  COKACMUX_CONFIG_DIR   Folder for settings, key bindings, runtime and debug
+                        files instead of ~/.cokacmux (titles and clone links
+                        stay in ~/.cokacmux)
+
+INTERACTIVE KEYS - session list:
+  Up/Down               Move
+  PgUp/PgDn             Jump 10 (scroll a page in the preview)
+  g/Home, G/End         Top, bottom
+  Tab                   Switch focus between list and preview
+  e/Enter               Switch to the live agent, or choose how to launch it
+  Ctrl+N                New terminal, cokacdir, or coding agent
+  Ctrl+F                Search (text or AI); Esc clears the results
+  v                     Toggle list/tree view
+  u                     Toggle top-level/all sessions (starts top-level)
+  t                     Edit title
+  ,                     Settings (AI agent for search and titles)
+  c                     Clone session
+  Delete/d              Delete session (asks first)
+  r                     Reload sessions from disk
+  Space                 Refresh preview
+  Alt+Up/Down           Select from the sidebar/list
+  Alt+Left/Right        Resize the focused side pane
+  Ctrl+]/Ctrl+[         Switch between the list and the active agent
+  Ctrl+K                Kill the selected live agent
+  Ctrl+Shift+K/Shift+K  Kill all live agents and terminals (asks first)
+  q/Esc/Ctrl+Q          Quit; live agents and terminals keep running
+
+INTERACTIVE KEYS - agent screen:
+  Ctrl+]/Ctrl+[         Back to the list; the agent keeps running
+  Ctrl+K                Kill the current agent or terminal
+  Ctrl+Shift+K          Kill all live agents and terminals (asks first)
+  Ctrl+N                New terminal, cokacdir, or coding agent
+  Ctrl+PgUp/PgDn        Switch to the previous/next live agent
+  Ctrl+B                Toggle the agent sidebar
+  Ctrl+F / Ctrl+T       Toggle the cokacdir / terminal right panel
+  Ctrl+1/2/3            Focus sidebar / agent / right panel
+  Ctrl+Left/Right       Move focus between panes (also Shift+Left/Right)
+  Shift+Up/Down         Scroll one line
+  Shift+Alt+Up/Down     Scroll one page (also Alt+PgUp/PgDn)
+  Shift+Home/End        Scroll to top/bottom (also Alt+Home/End)
+  Alt+Up/Down           Select from the sidebar
+  Alt+Left/Right        Resize the focused side pane
+  Ctrl+Q                Quit; agents and terminals keep running";
+const CLI_START_AFTER_LONG_HELP: &str = "\
+EXAMPLES:
+  cokacmux start web -- npm run dev
+  cokacmux start api --cwd ~/work/app -- node server.js
+  cokacmux start worker -- bash -lc 'source .env && npm run worker'
+  cokacmux start test --keep -- npm test
+  cokacmux start web -- powershell.exe -NoProfile -Command \"npm run dev\"
+
+NOTES:
+  The command runs in its own terminal; its output is not printed here.
+  Run `cokacmux` and pick the name in the live list to see it.
+
+  Without --keep, the terminal leaves the list when the command exits. A
+  command that finishes before startup is confirmed (e.g. `ls`) is reported
+  as already exited.
+
+  Shell syntax (pipes, &&, cd, source, variables) needs a shell:
+  `-- bash -lc '...'`, or `-- cmd.exe /C ...` / `-- powershell.exe -Command
+  ...` on Windows.
+
+  Stop one terminal with Ctrl+K in the TUI, or all with `cokacmux killall`.";
 const AGENT_DAEMON_START_LOCK_VERSION: u32 = 1;
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
     name = "cokacmux",
     version,
-    about = "TUI session browser for local coding agents",
-    long_about = "cokacmux - TUI session browser for local coding agents",
+    about = "Session browser and multiplexer for local coding agents",
+    long_about = "\
+cokacmux - session browser and multiplexer for local coding agents
+
+Browse, search, resume, clone and delete the sessions of Claude Code, Codex,
+OpenCode, Pi and GJC, and keep agents and terminals running in the background
+while you switch between them. Run without arguments to open the TUI.",
     after_long_help = CLI_AFTER_LONG_HELP
 )]
 struct CokacmuxCli {
-    /// Enable debug logs.
+    /// Write debug logs to ~/.cokacmux/debug/cokacmux.log.
     #[arg(long, global = true)]
     debug: bool,
 
-    /// Enable high-volume trace logs.
+    /// Also log high-volume traces such as screen dumps (implies --debug).
+    /// Use only while diagnosing a problem.
     #[arg(long, global = true)]
     trace: bool,
 
-    /// Headless sanity check without entering the TUI.
+    /// Find the sessions of every coding agent without opening the TUI,
+    /// print how many were found, and exit non-zero if any agent's sessions
+    /// cannot be read. Cannot be combined with a subcommand.
     #[arg(long)]
     check: bool,
 
@@ -264,24 +327,47 @@ struct CokacmuxCli {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum CliCommand {
-    /// Start a managed terminal command in the background.
+    /// Run a command in a background terminal you can open from the TUI.
+    ///
+    /// The command starts in a terminal managed by cokacmux and keeps running
+    /// after this command returns. It appears as `terminal` in the live list
+    /// of the TUI, where you can open it, read its output, and type into it.
+    #[command(after_long_help = CLI_START_AFTER_LONG_HELP)]
     Start {
-        /// Stable label shown in the live terminal list.
+        /// Name shown in the live list, e.g. web, api, worker.
         name: String,
 
-        /// Working directory for the command.
+        /// Folder to run the command in. It must already exist.
         #[arg(long, value_name = "PATH", default_value = ".")]
         cwd: PathBuf,
 
-        /// Command and arguments to run. Put these after `--`.
+        /// Keep the terminal listed after the command exits so its final
+        /// screen stays readable (read-only, shown as `exit`). Remove it with
+        /// Ctrl+K in the TUI or `cokacmux killall`.
+        #[arg(long)]
+        keep: bool,
+
+        /// Program and arguments to run. Put them after `--`.
         #[arg(value_name = "COMMAND", required = true, num_args = 1.., last = true)]
         command: Vec<String>,
     },
 
-    /// Terminate cokacmux processes and remove ~/.cokacmux/{agents,debug}.
+    /// Stop all agents and terminals and remove runtime and debug files.
+    ///
+    /// Terminates every cokacmux background process (running coding agents
+    /// and terminals, including their commands) and other open cokacmux
+    /// windows, then removes ~/.cokacmux/agents and ~/.cokacmux/debug.
+    /// Settings, key bindings, titles and the agents' own session history
+    /// are kept. If a process cannot be verified or stopped, its files are
+    /// preserved and the command exits non-zero.
     Killall,
 
-    /// Terminate cokacmux processes and remove ~/.cokacmux.
+    /// Stop everything like killall, then delete the whole ~/.cokacmux folder.
+    ///
+    /// Also removes settings, key bindings, edited titles and clone links.
+    /// The coding agents' own session history is not touched. If a process
+    /// may still be running, nothing is deleted and the command exits
+    /// non-zero.
     Reset,
 
     /// Manage cokacmux agent processes.
@@ -293,7 +379,7 @@ enum CliCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum AgentsCliCommand {
-    /// Terminate cokacmux agent processes and remove runtime/debug files.
+    /// Same as `cokacmux killall`.
     Killall,
 }
 
@@ -313,6 +399,11 @@ const AGENT_ATTACH_ACK_TIMEOUT_MS: u64 = 3_000;
 /// timeout for non-responsive or older daemons, not a startup race delay: a
 /// timeout preserves the runtime files instead of declaring the process dead.
 const AGENT_IDENTITY_QUERY_TIMEOUT_MS: u64 = 1_000;
+/// After `cokacmux start` fails its identify round trip, wait this long for
+/// the exact daemon Child to report an exit status. A short command can finish
+/// and its daemon exit before identify; only an observed ExitStatus proves
+/// that, and a timeout keeps the original identify error.
+const CLI_START_EXIT_OBSERVE_TIMEOUT_MS: u64 = 5_000;
 /// Accepted daemon connections wait this long for an attach request before
 /// being dropped. Liveness probes connect and close without attaching.
 const DAEMON_PENDING_ATTACH_TIMEOUT_MS: u64 = 3_000;
@@ -4277,6 +4368,9 @@ enum AgentListState {
     OrphanedGroup {
         child_pgid: u32,
     },
+    /// A `start --keep` terminal whose command exited. Its verified daemon
+    /// is alive and holds the final screen read-only until Ctrl+K/killall.
+    Exited,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4322,6 +4416,7 @@ impl AgentListState {
             } => activity.label(),
             AgentListState::Attached { mine: false, .. } => "other",
             AgentListState::Orphaned { .. } | AgentListState::OrphanedGroup { .. } => "lost",
+            AgentListState::Exited => "exit",
         }
     }
 
@@ -4336,6 +4431,9 @@ impl AgentListState {
                     .fg(THEME_WARNING)
                     .add_modifier(Modifier::BOLD)
             }
+            AgentListState::Exited => Style::default()
+                .fg(THEME_FG_DIM)
+                .add_modifier(Modifier::BOLD),
         }
     }
 
@@ -4345,15 +4443,18 @@ impl AgentListState {
             AgentListState::Live { activity } | AgentListState::Attached { activity, .. } => {
                 activity
             }
-            AgentListState::Orphaned { .. } | AgentListState::OrphanedGroup { .. } => {
-                AgentActivity::Quiet
-            }
+            AgentListState::Orphaned { .. }
+            | AgentListState::OrphanedGroup { .. }
+            | AgentListState::Exited => AgentActivity::Quiet,
         }
     }
 
     fn attached_mine(self) -> Self {
         match self {
-            AgentListState::Orphaned { .. } | AgentListState::OrphanedGroup { .. } => self,
+            // Viewing a held terminal does not make its exited command live.
+            AgentListState::Orphaned { .. }
+            | AgentListState::OrphanedGroup { .. }
+            | AgentListState::Exited => self,
             _ => AgentListState::Attached {
                 mine: true,
                 activity: self.activity(),
@@ -4365,7 +4466,9 @@ impl AgentListState {
 fn is_switchable_agent_state(state: AgentListState) -> bool {
     matches!(
         state,
-        AgentListState::Live { .. } | AgentListState::Attached { mine: true, .. }
+        AgentListState::Live { .. }
+            | AgentListState::Attached { mine: true, .. }
+            | AgentListState::Exited
     )
 }
 
@@ -4444,6 +4547,12 @@ fn agent_list_state_debug_value(state: AgentListState) -> serde_json::Value {
             "mine": serde_json::Value::Null,
             "label": "lost",
             "child_pgid": child_pgid,
+        }),
+        AgentListState::Exited => serde_json::json!({
+            "state": "exited",
+            "activity": serde_json::Value::Null,
+            "mine": serde_json::Value::Null,
+            "label": "exit",
         }),
     }
 }
@@ -5647,6 +5756,7 @@ fn agent_daemon_event_debug_value(event: &AgentDaemonEvent) -> serde_json::Value
             last_output_epoch_ms,
             last_input_epoch_ms,
             updated_at_epoch_s,
+            held_exit,
         } => serde_json::json!({
             "kind": "identity",
             "provider": provider.as_str(),
@@ -5666,6 +5776,7 @@ fn agent_daemon_event_debug_value(event: &AgentDaemonEvent) -> serde_json::Value
             "last_output_epoch_ms": last_output_epoch_ms,
             "last_input_epoch_ms": last_input_epoch_ms,
             "updated_at_epoch_s": updated_at_epoch_s,
+            "held_exit": held_exit.as_deref(),
         }),
         AgentDaemonEvent::Attached {
             provider,
@@ -5680,6 +5791,7 @@ fn agent_daemon_event_debug_value(event: &AgentDaemonEvent) -> serde_json::Value
             last_input_epoch_ms,
             bracketed_paste_mode,
             input_acknowledgements,
+            held_exit,
             ..
         } => serde_json::json!({
             "kind": "attached",
@@ -5695,6 +5807,7 @@ fn agent_daemon_event_debug_value(event: &AgentDaemonEvent) -> serde_json::Value
             "last_input_epoch_ms": last_input_epoch_ms,
             "bracketed_paste_mode": bracketed_paste_mode,
             "input_acknowledgements": input_acknowledgements,
+            "held_exit": held_exit.as_deref(),
         }),
         AgentDaemonEvent::InputAccepted { input_seq } => serde_json::json!({
             "kind": "input_accepted",
@@ -5722,9 +5835,10 @@ fn agent_daemon_event_debug_value(event: &AgentDaemonEvent) -> serde_json::Value
                 "history_lines": state.history.len(),
             })),
         }),
-        AgentDaemonEvent::Exited { status } => serde_json::json!({
+        AgentDaemonEvent::Exited { status, held } => serde_json::json!({
             "kind": "exited",
             "status": status,
+            "held": held,
         }),
         AgentDaemonEvent::Error { message } => serde_json::json!({
             "kind": "error",
@@ -6072,6 +6186,11 @@ struct AgentSession {
     debug_drain_logs: u32,
     bracketed_paste_mode: bool,
     bracketed_paste_scan_tail: Vec<u8>,
+    /// Set once a `start --keep` command has exited: the short exit label
+    /// shown to clients. The daemon then stays alive serving the final
+    /// screen read-only, keeps the original child identity so Ctrl+K and
+    /// killall can verify and terminate it, and ignores input.
+    held_exit: Option<String>,
 }
 
 enum DaemonDiskJob {
@@ -7562,6 +7681,7 @@ impl AgentSession {
             debug_drain_logs: 0,
             bracketed_paste_mode: false,
             bracketed_paste_scan_tail: Vec::new(),
+            held_exit: None,
         })
     }
 
@@ -7955,7 +8075,14 @@ impl AgentSession {
         let state_before = (should_debug && verbose_debug)
             .then(|| debug_agent_session_state_value(self, visible_rows, visible_rows.min(120)));
         let master = &self.master;
+        let held = self.held_exit.is_some();
         let resize_result = resize_pty_state(&mut self.parser, &mut self.pty_size, next, |size| {
+            if held {
+                // The command is gone; only the retained screen follows the
+                // client. A PTY resize could fail after exit (e.g. ConPTY)
+                // and must not reject attaches to a held terminal.
+                return Ok(());
+            }
             master.resize(size).map_err(io::Error::other)
         });
         if resize_result.is_ok() {
@@ -8211,7 +8338,9 @@ impl AgentSession {
     /// platforms without `/proc/<pid>/cwd`.
     /// Returns true when the tool's cwd changed.
     fn refresh_shell_cwd_from_kernel(&mut self) -> bool {
-        if !is_plain_pty_tool_session_info(&self.info) {
+        // A held terminal's child PID is reaped and may be reused by an
+        // unrelated process; its last known cwd is final.
+        if !is_plain_pty_tool_session_info(&self.info) || self.held_exit.is_some() {
             return false;
         }
         if self.last_cwd_refresh_at.elapsed() < Duration::from_millis(AGENT_STATE_POLL_INTERVAL_MS)
@@ -8962,6 +9091,9 @@ enum AgentDaemonEvent {
         last_input_epoch_ms: u64,
         #[serde(default)]
         updated_at_epoch_s: u64,
+        /// Exit label of a held `start --keep` command; None while it runs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held_exit: Option<String>,
     },
     Attached {
         provider: Provider,
@@ -8992,6 +9124,10 @@ enum AgentDaemonEvent {
         input_replay_epoch: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pty_size: Option<(u16, u16)>,
+        /// Set when attaching to a held `start --keep` terminal whose
+        /// command already exited: the pane is read-only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held_exit: Option<String>,
     },
     AttachChallenge {
         provider: Provider,
@@ -9015,6 +9151,11 @@ enum AgentDaemonEvent {
     },
     Exited {
         status: String,
+        /// The command exited but a `start --keep` daemon stays alive holding
+        /// the final screen. Older clients ignore this and treat it as a
+        /// normal exit; new clients keep the pane open read-only.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        held: bool,
     },
     Error {
         message: String,
@@ -9222,6 +9363,10 @@ struct AgentClient {
     /// confirm liveness and the UI can reconnect without pruning the agent or
     /// its persisted auxiliary relationship.
     connection_ended: Option<String>,
+    /// Exit label of a held `start --keep` terminal. The connection and
+    /// daemon stay live, but the command exited: the pane is read-only and
+    /// is neither reaped nor auto-switched away like `exited`.
+    held_exit: Option<String>,
     pending_resize: Option<(u16, u16)>,
     input_replay_epoch: Option<String>,
     input_acknowledgements: bool,
@@ -9881,6 +10026,7 @@ impl AgentClient {
                 pty_size,
                 exited: None,
                 connection_ended: None,
+                held_exit: None,
                 pending_resize: None,
                 input_replay_epoch: None,
                 input_acknowledgements: false,
@@ -9950,6 +10096,7 @@ impl AgentClient {
                 input_acknowledgements,
                 input_replay_epoch,
                 pty_size,
+                held_exit,
                 ..
             } => {
                 self.connection_ended = None;
@@ -9993,6 +10140,9 @@ impl AgentClient {
                     }),
                 );
                 self.pending_snapshot_output = !snapshot_event;
+                if let Some(status) = held_exit {
+                    self.enter_held_exit(status, "attached");
+                }
                 self.last_screen_change_epoch_ms = self
                     .last_screen_change_epoch_ms
                     .max(last_screen_change_epoch_ms);
@@ -10121,17 +10271,22 @@ impl AgentClient {
                 self.pending_snapshot_output = false;
                 self.process_agent_snapshot(&data);
             }
-            AgentDaemonEvent::Exited { status } => {
+            AgentDaemonEvent::Exited { status, held } => {
                 debug_log(
                     "agent_client_event_exited",
                     serde_json::json!({
                         "provider": self.info.provider.as_str(),
                         "session_id": &self.info.session_id,
                         "status": &status,
+                        "held": held,
                     }),
                 );
-                self.mark_exit_detected();
-                self.exited = Some(status);
+                if held {
+                    self.enter_held_exit(status, "exited_event");
+                } else {
+                    self.mark_exit_detected();
+                    self.exited = Some(status);
+                }
             }
             AgentDaemonEvent::Error { message } => {
                 debug_log(
@@ -10676,6 +10831,46 @@ impl AgentClient {
         }
     }
 
+    /// The daemon reports that a `start --keep` command exited and its final
+    /// screen is now held read-only. The connection stays attached and the
+    /// pane stays open; input that never reached the PTY can no longer be
+    /// delivered, so it is released with accounting instead of replayed.
+    fn enter_held_exit(&mut self, status: String, reason: &'static str) {
+        if self
+            .exit_request
+            .as_ref()
+            .is_some_and(|request| request.kind != AgentExitRequestKind::ForcedKill)
+        {
+            self.exit_request = None;
+        }
+        self.pending_input_since_epoch_ms = None;
+        self.pending_input_key = None;
+        self.startup_spinner_started_at = None;
+        let discarded_frames = self.unacknowledged_input.len();
+        let discarded_bytes = self.unacknowledged_input_bytes;
+        if discarded_frames > 0 {
+            self.unacknowledged_input.clear();
+            self.unacknowledged_input_bytes = 0;
+            self.unacknowledged_input_replay_queued = false;
+            release_unacknowledged_agent_input(discarded_bytes, discarded_frames);
+        }
+        if self.held_exit.is_none() || discarded_frames > 0 {
+            debug_log(
+                "agent_client_held_exit",
+                serde_json::json!({
+                    "provider": self.info.provider.as_str(),
+                    "session_id": &self.info.session_id,
+                    "reader_id": self.reader_id,
+                    "reason": reason,
+                    "status": &status,
+                    "discarded_input_frames": discarded_frames,
+                    "discarded_input_bytes": discarded_bytes,
+                }),
+            );
+        }
+        self.held_exit = Some(status);
+    }
+
     fn mark_exit_detected(&mut self) {
         if let Some(request) = self.exit_request.as_mut() {
             request.phase = AgentExitRequestPhase::Detected;
@@ -10872,6 +11067,7 @@ impl AgentClient {
     fn startup_spinner_started_at(&self) -> Option<Instant> {
         if self.startup_spinner_started_at.is_some()
             && self.exited.is_none()
+            && self.held_exit.is_none()
             && self.connection_ended.is_none()
             && !screen_has_visible_content(self.parser.screen())
         {
@@ -10899,6 +11095,14 @@ impl AgentClient {
     fn send_input_data_inner(&mut self, data: Vec<u8>) -> io::Result<()> {
         if data.is_empty() {
             return Ok(());
+        }
+        if let Some(status) = self.held_exit.as_deref() {
+            // Keys, paste and mouse reports all pass here. Nothing is sent to
+            // a held terminal; the caller reports the refusal in the status.
+            return Err(io::Error::new(
+                ErrorKind::Unsupported,
+                format!("command exited ({status}); this terminal is read-only"),
+            ));
         }
 
         if !self.unacknowledged_input.is_empty() && !self.unacknowledged_input_replay_queued {
@@ -11971,9 +12175,10 @@ impl DaemonConnection {
     fn send_exit_after_resync(
         &mut self,
         status: String,
+        held: bool,
         snapshot: impl FnOnce() -> AgentDaemonEvent,
     ) -> io::Result<()> {
-        let exit = AgentDaemonEvent::Exited { status };
+        let exit = AgentDaemonEvent::Exited { status, held };
         // Even the exit control frame itself can cross the discard budget.
         let exit_bytes = serde_json::to_vec(&exit)
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
@@ -17765,6 +17970,9 @@ impl App {
         let key = AgentKey::new(info);
         let trace_enabled = TRACE_ENABLED.load(Ordering::Relaxed);
         if let Some(agent) = self.active_agent.as_ref() {
+            if AgentKey::new(&agent.info) == key && agent.held_exit.is_some() {
+                return AgentListState::Exited;
+            }
             if AgentKey::new(&agent.info) == key {
                 let cached_state = self.agent_states.get(&key).copied();
                 let client_activity = agent.activity();
@@ -19810,17 +20018,32 @@ impl App {
             .as_ref()
             .into_iter()
             .chain(self.agent_aux.as_ref().map(|aux| &aux.agent))
-            .map(|agent| (AgentKey::new(&agent.info), agent.activity()))
+            .map(|agent| {
+                (
+                    AgentKey::new(&agent.info),
+                    agent.activity(),
+                    agent.held_exit.is_some(),
+                )
+            })
             .collect::<Vec<_>>();
-        for (key, client_activity) in overlays {
+        let mut runtime_held_keys = Vec::new();
+        for (key, client_activity, held) in overlays {
             let previous_state = self.agent_states.get(&key).copied();
             let activity = previous_state
                 .map(|state| state.activity())
                 .unwrap_or(AgentActivity::Quiet)
                 .combine(client_activity);
-            let overlay_state = AgentListState::Attached {
-                mine: true,
-                activity,
+            let runtime_held = previous_state == Some(AgentListState::Exited);
+            if runtime_held && !held {
+                runtime_held_keys.push(key.clone());
+            }
+            let overlay_state = if held || runtime_held {
+                AgentListState::Exited
+            } else {
+                AgentListState::Attached {
+                    mine: true,
+                    activity,
+                }
             };
             self.agent_states.insert(key.clone(), overlay_state);
             if TRACE_ENABLED.load(Ordering::Relaxed) {
@@ -19833,6 +20056,20 @@ impl App {
                         "overlay_state": agent_list_state_debug_value(overlay_state),
                     }),
                 );
+            }
+        }
+        // The held notice can race the attach handoff and be dropped as a
+        // stale reader event. Runtime state comes from the daemon's own meta
+        // or identity, so adopt it: the pane must not keep accepting input.
+        for key in runtime_held_keys {
+            for agent in self
+                .active_agent
+                .iter_mut()
+                .chain(self.agent_aux.as_mut().map(|aux| &mut aux.agent))
+            {
+                if agent.held_exit.is_none() && AgentKey::new(&agent.info) == key {
+                    agent.enter_held_exit("?".to_string(), "runtime_state");
+                }
             }
         }
     }
@@ -19854,15 +20091,31 @@ impl App {
         }
     }
 
+    /// Whether `key` is a held `start --keep` terminal as far as this client
+    /// knows: one of its attached panes was told the command exited, or the
+    /// runtime state already reads Exited. A held daemon never becomes live
+    /// again, so local attach/detach bookkeeping must not resurrect it.
+    fn agent_key_is_held_locally(&self, key: &AgentKey) -> bool {
+        self.agent_states.get(key) == Some(&AgentListState::Exited)
+            || self
+                .active_agent
+                .iter()
+                .chain(self.agent_aux.as_ref().map(|aux| &aux.agent))
+                .chain(self.hidden_agent_aux.iter().map(|aux| &aux.agent))
+                .any(|agent| agent.held_exit.is_some() && AgentKey::new(&agent.info) == *key)
+    }
+
     fn mark_agent_attached_locally(&mut self, key: AgentKey) {
         let debug_key = key.clone();
-        let previous_state = self.agent_states.insert(
-            key,
+        let next_state = if self.agent_key_is_held_locally(&key) {
+            AgentListState::Exited
+        } else {
             AgentListState::Attached {
                 mine: true,
                 activity: AgentActivity::Quiet,
-            },
-        );
+            }
+        };
+        let previous_state = self.agent_states.insert(key, next_state);
         if DEBUG_ENABLED.load(Ordering::Relaxed) {
             debug_log(
                 "agent_state_mark_attached_locally",
@@ -19877,9 +20130,12 @@ impl App {
 
     fn mark_agent_live_locally(&mut self, key: AgentKey, activity: AgentActivity) {
         let debug_key = key.clone();
-        let previous_state = self
-            .agent_states
-            .insert(key, AgentListState::Live { activity });
+        let next_state = if self.agent_key_is_held_locally(&key) {
+            AgentListState::Exited
+        } else {
+            AgentListState::Live { activity }
+        };
+        let previous_state = self.agent_states.insert(key, next_state);
         if DEBUG_ENABLED.load(Ordering::Relaxed) {
             debug_log(
                 "agent_state_mark_live_locally",
@@ -22185,6 +22441,12 @@ impl App {
                 self.attach_existing_live_agent(runtime_info, cols, rows, "agent_launch_live");
                 return;
             }
+            AgentListState::Exited => {
+                // A held terminal's daemon is live; attaching shows the final
+                // screen read-only.
+                self.attach_existing_live_agent(runtime_info, cols, rows, "agent_launch_exited");
+                return;
+            }
             AgentListState::Attached { mine: false, .. } => {
                 self.status = format!(
                     "{} is already attached in another cokacmux process.",
@@ -23913,7 +24175,12 @@ impl App {
         for offset in 1..candidates.len() {
             let next_index = (current_index + offset) % candidates.len();
             let next_info = candidates[next_index].clone();
-            if AgentKey::new(&next_info) != current_key {
+            let next_key = AgentKey::new(&next_info);
+            // Auto-switch lands on running work only; a held terminal's final
+            // screen is opened deliberately from the list.
+            if next_key != current_key
+                && self.agent_states.get(&next_key) != Some(&AgentListState::Exited)
+            {
                 return Some(next_info);
             }
         }
@@ -28790,7 +29057,12 @@ fn run_check_cli() -> Result<()> {
 
 fn run_cli_command(command: &CliCommand) -> Result<()> {
     match command {
-        CliCommand::Start { name, cwd, command } => run_start_cli(name, cwd, command),
+        CliCommand::Start {
+            name,
+            cwd,
+            keep,
+            command,
+        } => run_start_cli(name, cwd, *keep, command),
         CliCommand::Killall => run_killall_cli(),
         CliCommand::Reset => run_reset_cli(),
         CliCommand::Agents {
@@ -28799,34 +29071,92 @@ fn run_cli_command(command: &CliCommand) -> Result<()> {
     }
 }
 
-fn run_start_cli(name: &str, cwd: &Path, command: &[String]) -> Result<()> {
+fn run_start_cli(name: &str, cwd: &Path, keep: bool, command: &[String]) -> Result<()> {
     let name = validate_cli_terminal_name(name)?;
     let cwd = normalize_cli_start_cwd(cwd)?;
     let command = validate_cli_terminal_command_at(command, Path::new(&cwd))?;
-    let info = cli_command_session_info(name.clone(), cwd, command)?;
+    let info = cli_command_session_info(name.clone(), cwd, command, keep)?;
     let key = AgentKey::new(&info);
     let command_line = cli_command_launch_spec(&info).command_line();
     let started = start_agent_daemon_with_origin(&info, AgentLaunchMode::Normal)?;
     let spawned = started.spawned;
     let identity = match identify_started_cli_terminal(started.stream, &key) {
-        Ok(identity) => identity,
-        Err(error) => {
+        Ok(identity) => {
             if let Some(spawned) = spawned {
-                // Identify is an I/O operation, not a liveness oracle. The
-                // daemon already completed its readiness handshake and may
-                // simply be slow under load. Preserve it (and its PTY child)
-                // so runtime discovery or a later invocation can reconnect.
+                register_spawned_agent_daemon_reaper(spawned.child, &key, "started");
+            }
+            identity
+        }
+        Err(error) => {
+            let Some(mut spawned) = spawned else {
+                return Err(error);
+            };
+            // Identify is an I/O operation, not a liveness oracle. Only an
+            // ExitStatus observed on the exact Child handle proves the daemon
+            // exited; anything else preserves it (and its PTY child) so
+            // runtime discovery or a later invocation can reconnect.
+            let exit_status = observe_spawned_agent_daemon_exit(
+                &mut spawned.child,
+                Duration::from_millis(CLI_START_EXIT_OBSERVE_TIMEOUT_MS),
+            );
+            let Some(status) = exit_status else {
                 debug_log(
                     "cli_start_identify_failure_daemon_preserved",
                     serde_json::json!({
                         "key": agent_key_debug_value(&key),
-                        "spawned_pid": spawned.pid,
-                        "spawned_pid_start_ticks": spawned.pid_start_ticks,
+                        "spawned_pid": spawned.identity.pid,
+                        "spawned_pid_start_ticks": spawned.identity.pid_start_ticks,
                         "error": error.to_string(),
                     }),
                 );
+                register_spawned_agent_daemon_reaper(
+                    spawned.child,
+                    &key,
+                    "cli_start_identify_failed",
+                );
+                return Err(error);
+            };
+            debug_log(
+                "cli_start_daemon_exited_before_identify",
+                serde_json::json!({
+                    "key": agent_key_debug_value(&key),
+                    "spawned_pid": spawned.identity.pid,
+                    "spawned_pid_start_ticks": spawned.identity.pid_start_ticks,
+                    "status": status.to_string(),
+                    "error": error.to_string(),
+                }),
+            );
+            if let (Ok(meta_path), Ok(socket_path)) =
+                (agent_meta_path(&key), agent_socket_path(&key))
+            {
+                cleanup_exited_spawned_agent_daemon_runtime(
+                    spawned.identity,
+                    &key,
+                    &info,
+                    &meta_path,
+                    &socket_path,
+                    "cli_start_identify_failed",
+                    &status,
+                );
             }
-            return Err(error);
+            // The daemon exits successfully only after its command exits, so
+            // a short command such as `ls` simply finished before identify.
+            if status.success() {
+                println!(
+                    "started terminal {}, but it has already exited: session={} cwd={} command={}; its output is not kept",
+                    name,
+                    info.session_id,
+                    display_cwd_str(&info.cwd),
+                    command_line
+                );
+                return Ok(());
+            }
+            anyhow::bail!(
+                "terminal {} daemon exited during startup ({}): {}",
+                name,
+                status,
+                error
+            );
         }
     };
     if identity.provider != key.provider || identity.session_id != key.session_id {
@@ -28839,7 +29169,33 @@ fn run_start_cli(name: &str, cwd: &Path, command: &[String]) -> Result<()> {
         display_cwd_str(&info.cwd),
         command_line
     );
+    if let Some(held_exit) = identity.held_exit {
+        println!(
+            "terminal {} already exited ({}); kept in the live list until Ctrl+K or killall",
+            name, held_exit
+        );
+    }
     Ok(())
+}
+
+/// Poll the exact daemon Child for an exit status until `timeout`. `None`
+/// means still running or unknown; a failed query is never proof of death.
+fn observe_spawned_agent_daemon_exit(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn spawned_agent_daemon_meta_matches(
@@ -28856,6 +29212,7 @@ fn spawned_agent_daemon_meta_matches(
 struct StartedCliTerminalIdentity {
     provider: Provider,
     session_id: String,
+    held_exit: Option<String>,
 }
 
 fn identify_started_cli_terminal(
@@ -28877,11 +29234,13 @@ fn identify_started_cli_terminal(
         AgentDaemonEvent::Identity {
             provider,
             session_id,
+            held_exit,
             ..
         } => {
             let identity = StartedCliTerminalIdentity {
                 provider,
                 session_id,
+                held_exit,
             };
             if identity.provider == key.provider && identity.session_id == key.session_id {
                 Ok(identity)
@@ -30624,7 +30983,13 @@ fn handle_daemon_client_request(
             terminal_checkpoints,
         } => {
             conn.terminal_checkpoints = terminal_checkpoints;
-            if let Some(error) = agent.output_read_error.as_ref() {
+            // A held terminal's PTY reader may have ended in an error at
+            // exit; its retained screen is still the truth to show.
+            if let Some(error) = agent
+                .output_read_error
+                .as_ref()
+                .filter(|_| agent.held_exit.is_none())
+            {
                 let _ = conn.send_event(&AgentDaemonEvent::Error {
                     message: format!("PTY output reader failed; process preserved: {error}"),
                 });
@@ -30775,6 +31140,23 @@ fn handle_daemon_client_request(
             input_seq,
             input_replay_epoch,
         } => {
+            if agent.held_exit.is_some() {
+                // The command has exited and its input writer is shut down.
+                // Input sent before the client learned of the exit is
+                // dropped, never acknowledged, and must not reject the
+                // connection that is viewing the retained screen.
+                debug_log(
+                    "daemon_input_request_dropped_held",
+                    serde_json::json!({
+                        "provider": agent.info.provider.as_str(),
+                        "session_id": &agent.info.session_id,
+                        "client_pid": *attached_client_pid,
+                        "input_seq": input_seq,
+                        "len": data.len(),
+                    }),
+                );
+                return DaemonRequestOutcome::Continue;
+            }
             let input_client_instance_id =
                 input_seq.and_then(|_| attached_client_instance_id.clone());
             if input_seq.is_some() && input_client_instance_id.is_none() {
@@ -31403,6 +31785,8 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     #[cfg(windows)]
     let mut last_windows_ctrl_event_count = windows_console_ctrl_event_snapshot().0;
     let mut direct_child_exit_status: Option<String> = None;
+    let mut direct_child_exit_label: Option<String> = None;
+    let keep_after_exit = cli_command_session_keeps_exited(&agent.info);
     let mut direct_child_group_live = false;
     let mut last_direct_child_group_check_at: Option<Instant> = None;
     let mut pty_output_closed = false;
@@ -31587,15 +31971,24 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                 }),
             );
         }
-        apply_daemon_pty_input_completions(
-            &mut agent,
-            &mut client,
-            &mut attached_client_pid,
-            &mut attached_client_instance_id,
-            &mut accepted_input_sequences,
-            &meta_path,
-        );
-        if let Err(error) = agent.flush_pending_input() {
+        // A held terminal's input writer is already shut down and resolved;
+        // flushing would report a broken writer and detach its viewer.
+        if agent.held_exit.is_none() {
+            apply_daemon_pty_input_completions(
+                &mut agent,
+                &mut client,
+                &mut attached_client_pid,
+                &mut attached_client_instance_id,
+                &mut accepted_input_sequences,
+                &meta_path,
+            );
+        }
+        let flush_result = if agent.held_exit.is_none() {
+            agent.flush_pending_input()
+        } else {
+            Ok(())
+        };
+        if let Err(error) = flush_result {
             if client.take().is_some() {
                 let disconnected_client_pid = attached_client_pid.take();
                 let disconnected_client_instance_id = attached_client_instance_id.take();
@@ -31674,7 +32067,10 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                         agent.child_pid_start_ticks,
                     ) {
                         Ok(contents) => Some(agent_meta_contents_with_child_runtime_witnesses(
-                            &contents,
+                            &agent_meta_contents_with_held_exit(
+                                contents,
+                                agent.held_exit.as_deref(),
+                            ),
                             &agent.runtime_file_flags.child_runtime_witnesses(),
                         )),
                         Err(error) => {
@@ -32358,9 +32754,15 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
             }
         }
 
-        match agent.child.try_wait() {
-            Ok(Some(status)) => {
-                let status = status.to_string();
+        // A held terminal already observed and reaped its command.
+        let child_wait = if agent.held_exit.is_some() {
+            Ok(None)
+        } else {
+            agent.child.try_wait()
+        };
+        match child_wait {
+            Ok(Some(exit)) => {
+                let status = exit.to_string();
                 let first_direct_child_exit_observation = direct_child_exit_status.is_none();
                 if first_direct_child_exit_observation {
                     debug_log(
@@ -32374,6 +32776,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                         }),
                     );
                     direct_child_exit_status = Some(status.clone());
+                    direct_child_exit_label = Some(agent_child_exit_label(&exit));
                 }
                 // A surviving member of the exact Unix process group or Windows
                 // descendant tree remains managed even if the direct child
@@ -32439,12 +32842,68 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
                             }),
                         );
                     }
+                } else if keep_after_exit {
+                    let label = direct_child_exit_label
+                        .clone()
+                        .unwrap_or_else(|| status.clone());
+                    // `start --keep`: hold the final screen instead of exiting.
+                    // PTY input is resolved exactly as on exit: jobs that
+                    // crossed the write boundary are acknowledged, pending-only
+                    // jobs are dropped unacknowledged.
+                    let input_writer_stopped = agent.shutdown_input_writer();
+                    apply_daemon_pty_input_completions(
+                        &mut agent,
+                        &mut client,
+                        &mut attached_client_pid,
+                        &mut attached_client_instance_id,
+                        &mut accepted_input_sequences,
+                        &meta_path,
+                    );
+                    let dropped_input_jobs = agent.pending_input.len();
+                    agent.pending_input.clear();
+                    agent.pending_input_bytes = 0;
+                    agent.held_exit = Some(label.clone());
+                    let meta_write = write_agent_meta(
+                        &meta_path,
+                        &mut agent,
+                        attached_client_pid.is_some(),
+                        attached_client_pid,
+                        attached_client_instance_id.as_deref(),
+                    );
+                    let notice_result = client.as_mut().map(|conn| {
+                        let checkpoints = conn.terminal_checkpoints;
+                        conn.send_exit_after_resync(label.clone(), true, || {
+                            agent.snapshot_event(false, checkpoints)
+                        })
+                    });
+                    debug_log(
+                        "daemon_child_exit_held",
+                        serde_json::json!({
+                            "provider": agent.info.provider.as_str(),
+                            "session_id": &agent.info.session_id,
+                            "child_pid": agent.child_pid,
+                            "status": &status,
+                            "held_exit": &label,
+                            "input_writer_stopped": input_writer_stopped,
+                            "dropped_input_jobs": dropped_input_jobs,
+                            "meta_write_ok": meta_write.is_ok(),
+                            "attached_client_pid": attached_client_pid,
+                            "notice_ok": notice_result.as_ref().map(Result::is_ok),
+                        }),
+                    );
+                    if matches!(notice_result, Some(Err(_))) {
+                        client = None;
+                        attached_client_pid = None;
+                        attached_client_instance_id = None;
+                        let _ = write_agent_meta(&meta_path, &mut agent, false, None, None);
+                    }
                 } else {
                     break direct_child_exit_status.clone().unwrap_or(status);
                 }
             }
             Ok(None) => {
-                if agent.last_output_epoch_ms == 0
+                if agent.held_exit.is_none()
+                    && agent.last_output_epoch_ms == 0
                     && last_no_output_log_at.elapsed() >= Duration::from_secs(5)
                 {
                     last_no_output_log_at = Instant::now();
@@ -32597,7 +33056,7 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
 
     if let Some(conn) = client.as_mut() {
         let checkpoints = conn.terminal_checkpoints;
-        let exit_notice_result = conn.send_exit_after_resync(exit_status.clone(), || {
+        let exit_notice_result = conn.send_exit_after_resync(exit_status.clone(), false, || {
             agent.snapshot_event(false, checkpoints)
         });
         // The exit notice (and any final output) may still be queued; give
@@ -32736,6 +33195,15 @@ fn run_agent_daemon(info: SessionInfo, launch_mode: AgentLaunchMode) -> Result<(
     Ok(())
 }
 
+/// Short exit label shown for a held terminal: the exit code, or the signal
+/// name when the command was terminated by one.
+fn agent_child_exit_label(status: &portable_pty::ExitStatus) -> String {
+    status
+        .signal()
+        .map(str::to_string)
+        .unwrap_or_else(|| status.exit_code().to_string())
+}
+
 fn send_daemon_identity(
     conn: &mut DaemonConnection,
     agent: &AgentSession,
@@ -32762,6 +33230,7 @@ fn send_daemon_identity(
         last_output_epoch_ms: agent.last_output_epoch_ms,
         last_input_epoch_ms: agent.last_input_epoch_ms,
         updated_at_epoch_s: current_epoch_s(),
+        held_exit: agent.held_exit.clone(),
     })
 }
 
@@ -32809,6 +33278,7 @@ fn send_daemon_attached(
         input_acknowledgements: conn.input_replay_epoch.is_some(),
         input_replay_epoch: conn.input_replay_epoch.clone(),
         pty_size: Some((agent.pty_size.rows, agent.pty_size.cols)),
+        held_exit: agent.held_exit.clone(),
     }) {
         debug_log(
             "daemon_send_attached_event_failed",
@@ -32911,11 +33381,45 @@ fn write_agent_meta_with_child_runtime_witnesses(
         agent.daemon_pid_start_ticks,
         agent.child_pid_start_ticks,
     )?;
+    let contents = agent_meta_contents_with_held_exit(contents, agent.held_exit.as_deref());
     agent.queue_meta_write_with_child_runtime_witnesses(
         meta_path,
         contents,
         child_runtime_witnesses.to_vec(),
     )
+}
+
+/// Record a held `start --keep` terminal's exit label in its meta so every
+/// list reader shows it as exited instead of live. A no-op while running.
+fn agent_meta_contents_with_held_exit(contents: String, held_exit: Option<&str>) -> String {
+    let Some(held_exit) = held_exit else {
+        return contents;
+    };
+    let mut value = match serde_json::from_str::<serde_json::Value>(&contents) {
+        Ok(serde_json::Value::Object(value)) => value,
+        Ok(_) => return contents,
+        Err(error) => {
+            debug_log(
+                "agent_meta_held_exit_injection_parse_failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            return contents;
+        }
+    };
+    value.insert(
+        "held_exit".to_string(),
+        serde_json::Value::String(held_exit.to_string()),
+    );
+    match serde_json::to_string(&serde_json::Value::Object(value)) {
+        Ok(rendered) => format!("{rendered}\n"),
+        Err(error) => {
+            debug_log(
+                "agent_meta_held_exit_injection_render_failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            contents
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -34569,6 +35073,10 @@ struct AgentMetaSnapshot {
     last_input_epoch_ms: u64,
     #[serde(default)]
     updated_at_epoch_s: u64,
+    /// Present while a `start --keep` daemon holds its exited command's final
+    /// screen. The daemon itself is live; only the command has exited.
+    #[serde(default)]
+    held_exit: Option<String>,
 }
 
 fn deserialize_agent_child_runtime_witnesses<'de, D>(
@@ -37171,6 +37679,12 @@ impl AgentMetaSnapshot {
         current_client_instance_id: Option<&str>,
         now_epoch_ms: u64,
     ) -> AgentListState {
+        // Callers derive state only from a verified live daemon's meta or
+        // identity, so a held exit here means the daemon is alive while its
+        // command is not: never busy/quiet.
+        if self.held_exit.is_some() {
+            return AgentListState::Exited;
+        }
         let activity = agent_activity_from_meta(self, now_epoch_ms);
         if self.attached {
             let Some(attached_client_pid) = self.attached_client_pid else {
@@ -39696,7 +40210,10 @@ fn run_agent_reader_thread(
                     // Attached event on the same channel.
                     attach_ack.notify(event);
                 }
-                Ok(AgentDaemonEvent::Exited { status }) if attach_ack.is_pending() => {
+                Ok(AgentDaemonEvent::Exited {
+                    status,
+                    held: false,
+                }) if attach_ack.is_pending() => {
                     attach_ack.fail(format!(
                         "daemon exited before Attached acknowledgement: {}",
                         status
@@ -40760,11 +41277,23 @@ fn register_spawned_agent_daemon_reaper(
 
 struct StartedAgentDaemon {
     stream: AgentStream,
-    spawned: Option<SpawnedAgentDaemonIdentity>,
+    spawned: Option<SpawnedAgentDaemon>,
+}
+
+/// A daemon this process spawned. The caller owns the exact Child handle and
+/// must either observe its exit or hand it to the reaper; dropping it would
+/// leave an unreaped Unix zombie.
+struct SpawnedAgentDaemon {
+    identity: SpawnedAgentDaemonIdentity,
+    child: std::process::Child,
 }
 
 fn start_agent_daemon(info: &SessionInfo, launch_mode: AgentLaunchMode) -> Result<AgentStream> {
-    start_agent_daemon_with_origin(info, launch_mode).map(|started| started.stream)
+    let started = start_agent_daemon_with_origin(info, launch_mode)?;
+    if let Some(spawned) = started.spawned {
+        register_spawned_agent_daemon_reaper(spawned.child, &AgentKey::new(info), "started");
+    }
+    Ok(started.stream)
 }
 
 fn start_agent_daemon_with_origin(
@@ -41113,13 +41642,13 @@ fn start_agent_daemon_with_origin(
         return Err(error);
     }
     match connect_agent_daemon(&key) {
-        Ok(stream) => {
-            register_spawned_agent_daemon_reaper(child, &key, "started");
-            Ok(StartedAgentDaemon {
-                stream,
-                spawned: Some(spawned),
-            })
-        }
+        Ok(stream) => Ok(StartedAgentDaemon {
+            stream,
+            spawned: Some(SpawnedAgentDaemon {
+                identity: spawned,
+                child,
+            }),
+        }),
         Err(error) => {
             finish_spawned_agent_daemon_after_start_error(
                 child,
@@ -46944,6 +47473,7 @@ fn agent_meta_snapshot_from_identity_event(event: AgentDaemonEvent) -> Option<Ag
         last_output_epoch_ms,
         last_input_epoch_ms,
         updated_at_epoch_s,
+        held_exit,
         ..
     } = event
     else {
@@ -46966,6 +47496,7 @@ fn agent_meta_snapshot_from_identity_event(event: AgentDaemonEvent) -> Option<Ag
         last_output_epoch_ms,
         last_input_epoch_ms,
         updated_at_epoch_s,
+        held_exit,
     })
 }
 
@@ -47477,6 +48008,11 @@ struct CliCommandSessionSource {
     argv: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    /// `cokacmux start --keep`: the daemon stays alive after the command
+    /// exits so the final screen remains viewable until Ctrl+K/killall.
+    /// Older encodings omit it and decode as false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    keep: bool,
 }
 
 fn is_shell_session_info(info: &SessionInfo) -> bool {
@@ -47494,10 +48030,11 @@ fn is_cli_command_session_info(info: &SessionInfo) -> bool {
     is_cli_command_session_source(&info.source)
 }
 
-fn cli_command_session_source_for(name: &str, argv: &[String]) -> Result<PathBuf> {
+fn cli_command_session_source_for(name: &str, argv: &[String], keep: bool) -> Result<PathBuf> {
     let payload = CliCommandSessionSource {
         argv: argv.to_vec(),
         name: Some(name.to_string()),
+        keep,
     };
     let encoded = serde_json::to_string(&payload)?;
     let source = format!("{CLI_COMMAND_SESSION_SOURCE_PREFIX}{encoded}");
@@ -47520,6 +48057,11 @@ fn cli_command_session_source(info: &SessionInfo) -> Option<CliCommandSessionSou
 fn cli_command_session_argv(info: &SessionInfo) -> Option<Vec<String>> {
     let source = cli_command_session_source(info)?;
     validate_cli_terminal_command(&source.argv).ok()
+}
+
+/// Whether the daemon should hold the terminal after its command exits.
+fn cli_command_session_keeps_exited(info: &SessionInfo) -> bool {
+    cli_command_session_source(info).is_some_and(|source| source.keep)
 }
 
 fn shell_line_is_exit_command(line: &str) -> bool {
@@ -47584,7 +48126,12 @@ fn shell_session_info_for_cwd(cwd: String) -> SessionInfo {
     }
 }
 
-fn cli_command_session_info(name: String, cwd: String, argv: Vec<String>) -> Result<SessionInfo> {
+fn cli_command_session_info(
+    name: String,
+    cwd: String,
+    argv: Vec<String>,
+    keep: bool,
+) -> Result<SessionInfo> {
     let title = cli_command_terminal_title(&name, &argv);
     Ok(SessionInfo {
         // Provider is arbitrary for synthetic terminal panes; AgentKey uses it
@@ -47593,7 +48140,7 @@ fn cli_command_session_info(name: String, cwd: String, argv: Vec<String>) -> Res
         provider: Provider::Claude,
         session_id: format!("command-{}", uuid::Uuid::now_v7()),
         cwd,
-        source: cli_command_session_source_for(&name, &argv)?,
+        source: cli_command_session_source_for(&name, &argv, keep)?,
         updated_at_epoch_s: chrono::Utc::now().timestamp().max(0) as u64,
         title: Some(title),
         relation: None,
@@ -51763,7 +52310,21 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
             status_area,
         );
     } else {
-        let agent_help_items = agent_help_items(&app.keybindings);
+        let focused_held_exit = match app.agent_focus {
+            AgentFocusPane::Main => app
+                .active_agent
+                .as_ref()
+                .and_then(|agent| agent.held_exit.clone()),
+            AgentFocusPane::Auxiliary => app
+                .agent_aux
+                .as_ref()
+                .and_then(|aux| aux.agent.held_exit.clone()),
+            AgentFocusPane::Sidebar => None,
+        };
+        let agent_help_items = match focused_held_exit.as_deref() {
+            Some(held_exit) => held_agent_help_items(&app.keybindings, held_exit),
+            None => agent_help_items(&app.keybindings),
+        };
         f.render_widget(
             help_line_from_items_with_bg(
                 &agent_help_items,
@@ -58389,6 +58950,29 @@ fn agent_help_text(keybindings: &KeyBindings) -> String {
     help_text_from_items(&agent_help_items(keybindings))
 }
 
+/// Footer for a focused held `start --keep` terminal: its exit status and
+/// the keys that still act on a read-only pane.
+fn held_agent_help_items(keybindings: &KeyBindings, held_exit: &str) -> Vec<HelpItem> {
+    vec![
+        direct_help_item(format!("[exited: {held_exit}]"), "read-only"),
+        help_item(keybindings, KeyAction::AgentKill, "Ctrl+K", "remove"),
+        help_item(
+            keybindings,
+            KeyAction::AgentToggleSessions,
+            "Ctrl+]",
+            "sessions",
+        ),
+        help_pair_item(
+            keybindings,
+            KeyAction::AgentScrollPageUp,
+            KeyAction::AgentScrollPageDown,
+            "Shift+Alt+↑",
+            "Shift+Alt+↓",
+            "scroll",
+        ),
+    ]
+}
+
 fn agent_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
     vec![
         help_item(
@@ -59751,6 +60335,7 @@ mod tests {
             Some(CliCommand::Start {
                 name: "web".into(),
                 cwd: PathBuf::from("/repo"),
+                keep: false,
                 command: vec![
                     "node".into(),
                     "server.js".into(),
@@ -59780,6 +60365,122 @@ mod tests {
     #[test]
     fn cli_start_requires_command_separator() {
         assert!(CokacmuxCli::try_parse_from(["cokacmux", "start", "web", "node"]).is_err());
+    }
+
+    #[test]
+    fn cli_start_parses_keep_flag_before_separator() {
+        let cli = CokacmuxCli::try_parse_from([
+            "cokacmux", "start", "test", "--keep", "--", "npm", "test",
+        ])
+        .expect("start --keep should parse");
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Start {
+                name: "test".into(),
+                cwd: PathBuf::from("."),
+                keep: true,
+                command: vec!["npm".into(), "test".into()],
+            })
+        );
+
+        let cli = CokacmuxCli::try_parse_from(["cokacmux", "start", "web", "--", "ls", "--keep"])
+            .expect("--keep after the separator belongs to the command");
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Start {
+                keep: false,
+                ref command,
+                ..
+            }) if command == &vec!["ls".to_string(), "--keep".to_string()]
+        ));
+    }
+
+    #[test]
+    fn held_exit_meta_reads_as_exited_list_state() {
+        let rendered = "{\"pid\":1,\"provider\":\"claude\",\"session_id\":\"command-held\",\
+                        \"attached\":true,\"attached_client_pid\":7}\n"
+            .to_string();
+        assert_eq!(
+            agent_meta_contents_with_held_exit(rendered.clone(), None),
+            rendered
+        );
+        let running: AgentMetaSnapshot = serde_json::from_str(&rendered).unwrap();
+        assert!(matches!(
+            running.list_state(7, current_epoch_ms()),
+            AgentListState::Attached { mine: true, .. }
+        ));
+
+        let held: AgentMetaSnapshot = serde_json::from_str(&agent_meta_contents_with_held_exit(
+            rendered,
+            Some("Killed"),
+        ))
+        .unwrap();
+        assert_eq!(held.held_exit.as_deref(), Some("Killed"));
+        let state = held.list_state(7, current_epoch_ms());
+        assert_eq!(state, AgentListState::Exited);
+        assert_eq!(state.label(), "exit");
+        assert_eq!(state.attached_mine(), AgentListState::Exited);
+        assert!(is_switchable_agent_state(state));
+        assert!(is_listed_agent_state(state));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_exit_event_keeps_terminal_open_read_only() {
+        let reader_id = 23;
+        let mut app = app_for_key_tests();
+        app.active_agent = Some(buffered_output_test_client("held-exit", reader_id));
+        let info = app.active_agent.as_ref().unwrap().info.clone();
+        let key = AgentKey::new(&info);
+
+        app.on_agent_event(
+            reader_id,
+            AgentDaemonEvent::Exited {
+                status: "0".into(),
+                held: true,
+            },
+        );
+        app.poll_agent_sessions();
+
+        let agent = app
+            .active_agent
+            .as_mut()
+            .expect("a held terminal stays attached");
+        assert!(agent.exited.is_none());
+        assert_eq!(agent.held_exit.as_deref(), Some("0"));
+        let error = agent
+            .send_input_data(b"ls\r".to_vec())
+            .expect_err("a held terminal is read-only");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(app.agent_state_for(&info), AgentListState::Exited);
+
+        app.mark_agent_live_locally(key.clone(), AgentActivity::Busy);
+        assert_eq!(app.agent_states.get(&key), Some(&AgentListState::Exited));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_start_reports_exit_only_from_observed_child_status() {
+        let mut exited = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn short-lived child");
+        let status = observe_spawned_agent_daemon_exit(&mut exited, Duration::from_secs(5))
+            .expect("short-lived child exit should be observed");
+        assert!(status.success());
+
+        let mut running = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn long-lived child");
+        let status = observe_spawned_agent_daemon_exit(&mut running, Duration::from_millis(100));
+        let _ = running.kill();
+        let _ = running.wait();
+        assert!(
+            status.is_none(),
+            "a running daemon must not be reported as exited"
+        );
     }
 
     #[test]
@@ -60213,7 +60914,7 @@ mod tests {
     fn cli_command_terminal_source_round_trips() {
         let program = std::env::current_exe().unwrap().display().to_string();
         let argv = vec![program.clone(), "--version".to_string()];
-        let info = cli_command_session_info("web".into(), "/repo".into(), argv.clone())
+        let info = cli_command_session_info("web".into(), "/repo".into(), argv.clone(), false)
             .expect("command session info should encode source");
 
         assert!(is_cli_command_session_info(&info));
@@ -60228,6 +60929,20 @@ mod tests {
         let source = cli_command_session_source(&info).expect("source should decode");
         assert_eq!(source.name.as_deref(), Some("web"));
         assert_eq!(source.argv, argv);
+        assert!(!source.keep);
+        assert!(!cli_command_session_keeps_exited(&info));
+        assert!(
+            !info.source.display().to_string().contains("\"keep\""),
+            "keep=false must keep the historical source encoding"
+        );
+
+        let kept = cli_command_session_info("web".into(), "/repo".into(), argv.clone(), true)
+            .expect("kept command session info should encode source");
+        assert!(cli_command_session_keeps_exited(&kept));
+        assert_eq!(
+            cli_command_session_source(&kept).map(|source| source.argv),
+            Some(argv.clone())
+        );
 
         let spec = cli_command_launch_spec(&info);
         assert_eq!(spec.program, program);
@@ -60268,7 +60983,7 @@ mod tests {
     #[test]
     fn cli_command_terminal_meta_restores_terminal_kind() {
         let program = std::env::current_exe().unwrap().display().to_string();
-        let info = cli_command_session_info("web".into(), "/repo".into(), vec![program])
+        let info = cli_command_session_info("web".into(), "/repo".into(), vec![program], false)
             .expect("command session info should encode source");
         let meta = AgentMetaSnapshot {
             provider: Some(info.provider.as_str().to_string()),
@@ -60302,7 +61017,7 @@ mod tests {
         app.mark_agent_attached_locally(active_key.clone());
 
         let program = std::env::current_exe().unwrap().display().to_string();
-        let terminal = cli_command_session_info("web".into(), "/repo".into(), vec![program])
+        let terminal = cli_command_session_info("web".into(), "/repo".into(), vec![program], false)
             .expect("command session info should encode source");
         let terminal_key = AgentKey::new(&terminal);
         app.live_shells.push(terminal);
@@ -60347,6 +61062,13 @@ mod tests {
         assert!(rendered.contains("Commands:"));
         assert!(rendered.contains("INTERACTIVE KEYS"));
         assert!(rendered.contains("Ctrl+K"));
+
+        let start_help = CokacmuxCli::try_parse_from(["cokacmux", "start", "--help"])
+            .expect_err("help exits early")
+            .to_string();
+        assert!(start_help.contains("--keep"));
+        assert!(start_help.contains("--cwd"));
+        assert!(start_help.contains("EXAMPLES:"));
     }
 
     #[test]
@@ -60588,6 +61310,7 @@ mod tests {
             pty_size,
             exited: Some("test".into()),
             connection_ended: None,
+            held_exit: None,
             pending_resize: None,
             input_replay_epoch: Some("test-replay-epoch".into()),
             input_acknowledgements: false,
@@ -61938,6 +62661,7 @@ mod tests {
                     input_acknowledgements: true,
                     input_replay_epoch: None,
                     pty_size: None,
+                    held_exit: None,
                 },
             )
             .unwrap();
@@ -62110,6 +62834,7 @@ mod tests {
         // A control event queued during the backpressure window survives.
         conn.send_event(&AgentDaemonEvent::Exited {
             status: "exit status: 0".into(),
+            held: false,
         })
         .unwrap();
 
@@ -62184,6 +62909,7 @@ mod tests {
         // Control events keep flowing while the resync is pending.
         conn.send_event(&AgentDaemonEvent::Exited {
             status: "exit status: 0".into(),
+            held: false,
         })
         .unwrap();
 
@@ -67435,6 +68161,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
             updated_at_epoch_s: current_epoch_s(),
+            held_exit: None,
         };
 
         let conflict = app
@@ -72639,6 +73366,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
             updated_at_epoch_s: 0,
+            held_exit: None,
         };
 
         assert_eq!(
@@ -72669,6 +73397,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
             updated_at_epoch_s: 0,
+            held_exit: None,
         };
 
         assert_eq!(
@@ -72735,6 +73464,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
             updated_at_epoch_s: 0,
+            held_exit: None,
         };
 
         let state = meta.list_state_with_client_identity(
@@ -73031,6 +73761,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                     last_output_epoch_ms: 22,
                     last_input_epoch_ms: 33,
                     updated_at_epoch_s,
+                    held_exit: None,
                 },
             )
             .unwrap();
@@ -73203,6 +73934,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             last_output_epoch_ms: 2,
             last_input_epoch_ms: 3,
             updated_at_epoch_s: 4,
+            held_exit: None,
         };
 
         let meta = agent_meta_snapshot_from_identity_event(event).unwrap();
@@ -73402,6 +74134,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 last_output_epoch_ms: 0,
                 last_input_epoch_ms: 0,
                 updated_at_epoch_s: 456,
+                held_exit: None,
             })
         });
 
@@ -73435,6 +74168,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 last_output_epoch_ms: 0,
                 last_input_epoch_ms: 0,
                 updated_at_epoch_s: 456,
+                held_exit: None,
             })
         });
 
@@ -73998,6 +74732,7 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             last_output_epoch_ms: 0,
             last_input_epoch_ms: 0,
             updated_at_epoch_s: 456,
+            held_exit: None,
         };
 
         app.on_live_shell_discovery_result_with_meta(
@@ -76302,6 +77037,7 @@ IF EXIST "%~dp0\node.exe" (
             273,
             AgentDaemonEvent::Exited {
                 status: "exit status: 0".into(),
+                held: false,
             },
         );
 
@@ -77322,6 +78058,7 @@ IF EXIST "%~dp0\node.exe" (
             pty_size,
             exited: Some("test".into()),
             connection_ended: None,
+            held_exit: None,
             pending_resize: None,
             input_replay_epoch: None,
             input_acknowledgements: false,
@@ -77397,6 +78134,7 @@ IF EXIST "%~dp0\node.exe" (
             pty_size,
             exited: None,
             connection_ended: None,
+            held_exit: None,
             pending_resize: None,
             input_replay_epoch: None,
             input_acknowledgements: false,
@@ -78124,6 +78862,7 @@ IF EXIST "%~dp0\node.exe" (
             177,
             AgentDaemonEvent::Exited {
                 status: "exit status: 0".into(),
+                held: false,
             },
         );
         app.poll_agent_sessions();
@@ -80695,6 +81434,7 @@ IF EXIST "%~dp0\node.exe" (
             reader_id,
             AgentDaemonEvent::Exited {
                 status: "done".into(),
+                held: false,
             },
         );
 
@@ -80873,6 +81613,7 @@ IF EXIST "%~dp0\node.exe" (
                 input_acknowledgements: true,
                 input_replay_epoch: None,
                 pty_size: None,
+                held_exit: None,
             },
         )
         .unwrap();
@@ -80950,6 +81691,7 @@ IF EXIST "%~dp0\node.exe" (
             pty_size,
             exited: Some("test".into()),
             connection_ended: None,
+            held_exit: None,
             pending_resize: None,
             input_replay_epoch: None,
             input_acknowledgements: false,
@@ -80996,6 +81738,7 @@ IF EXIST "%~dp0\node.exe" (
             input_acknowledgements: false,
             input_replay_epoch: None,
             pty_size: None,
+            held_exit: None,
         });
 
         let (tx, _rx) = mpsc::channel::<MainEvent>();
@@ -81227,6 +81970,7 @@ IF EXIST "%~dp0\node.exe" (
             pty_size,
             exited: Some("test".into()),
             connection_ended: None,
+            held_exit: None,
             pending_resize: None,
             input_replay_epoch: None,
             input_acknowledgements: false,
@@ -81312,6 +82056,7 @@ IF EXIST "%~dp0\node.exe" (
             pty_size,
             exited: Some("test".into()),
             connection_ended: None,
+            held_exit: None,
             pending_resize: None,
             input_replay_epoch: None,
             input_acknowledgements: false,

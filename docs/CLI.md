@@ -7,6 +7,7 @@
 | 명령 | 용도 |
 |---|---|
 | `cokacmux` | TUI를 엽니다. |
+| `cokacmux --help` | 전체 도움말을 봅니다. 예시, 설정 파일 위치, 기본 키 목록이 포함됩니다. `cokacmux start --help`처럼 명령마다 따로 볼 수도 있습니다. |
 | `cokacmux --check` | 세션 탐색이 되는지 headless로 확인합니다. |
 | `cokacmux killall` | 실행 중인 cokacmux daemon과 runtime 파일을 정리합니다. |
 | `cokacmux agents killall` | `killall`과 같은 agent runtime 정리 명령입니다. |
@@ -40,13 +41,14 @@ cokacmux start web --cwd /path/to/project -- node server.js
 형식은 다음과 같습니다.
 
 ```text
-cokacmux start [--cwd <PATH>] <NAME> -- <COMMAND> [ARGS...]
+cokacmux start [--cwd <PATH>] [--keep] <NAME> -- <COMMAND> [ARGS...]
 ```
 
 | 항목 | 설명 |
 |---|---|
 | `<NAME>` | agents 목록에 표시할 terminal 이름입니다. 예: `web`, `api`, `vite` |
 | `--cwd <PATH>` | 명령을 실행할 폴더입니다. 생략하면 현재 폴더입니다. |
+| `--keep` | 명령이 끝난 뒤에도 terminal을 목록에 남겨 마지막 출력을 볼 수 있게 합니다. 아래 [`--keep`](#--keep으로-종료-후에도-남기기)을 보세요. |
 | `--` | cokacmux 옵션과 실행할 명령을 나누는 구분자입니다. 필수입니다. |
 | `<COMMAND> [ARGS...]` | 실제 실행할 프로그램과 인자입니다. |
 
@@ -130,6 +132,42 @@ started terminal web: session=... cwd=... command=...
 
 이 줄이 보이면 terminal daemon이 준비되었다는 뜻입니다. 명령 출력은 이 shell에 계속 찍히지 않고, TUI로 다시 붙었을 때 볼 수 있습니다.
 
+`ls -al`처럼 명령이 너무 빨리 끝나서 시작 확인 전에 terminal이 이미 종료되었다면, 오류 대신 다음 줄을 출력하고 정상 종료합니다.
+
+```text
+started terminal web, but it has already exited: session=... cwd=... command=...; its output is not kept
+```
+
+이 경우 명령은 실행되었지만 terminal은 이미 정리되었으므로 TUI에서 다시 붙을 수 없고, 출력도 남지 않습니다. 출력을 보고 싶다면 `--keep`을 붙이세요.
+
+## `--keep`으로 종료 후에도 남기기
+
+기본적으로 명령이 끝나면 terminal은 목록에서 사라집니다. `--keep`을 주면 명령이 끝난 뒤에도 terminal이 목록에 남아 마지막 화면과 스크롤백을 볼 수 있습니다.
+
+```bash
+cokacmux start test --keep -- npm test
+cokacmux start build --keep --cwd ~/work/app -- cargo build
+```
+
+명령이 끝나면 다음처럼 동작합니다.
+
+| 항목 | 동작 |
+|---|---|
+| 목록 상태 | `exit`로 표시됩니다. |
+| 들어가기 | 목록에서 고르면 마지막 화면을 읽기 전용으로 엽니다. 아래 줄에 `[exited: 0]`처럼 종료 코드가 보이고, signal로 끝났다면 signal 이름이 보입니다. |
+| 키 입력 | 명령에 전달되지 않습니다. 입력하면 상태 줄에 읽기 전용이라고 표시됩니다. |
+| 스크롤 | 휠과 스크롤 키로 지난 출력을 볼 수 있습니다. |
+| 제거 | 그 화면에서 `Ctrl+K`를 누르거나 `cokacmux killall`로 정리합니다. 직접 지우기 전까지는 남아 있습니다. |
+| 자동 전환 | 다른 화면이 끝나거나 꺼질 때 다음 화면으로 자동 전환하는 대상에서는 빠집니다. 목록에서 직접 고르면 열립니다. |
+
+명령이 `start`가 끝나기 전에 이미 종료되었다면 `start`가 다음 줄을 함께 출력합니다.
+
+```text
+terminal test already exited (0); kept in the live list until Ctrl+K or killall
+```
+
+남아 있는 동안에는 작은 cokacmux daemon 프로세스가 마지막 화면을 메모리에 들고 있습니다. 다 본 terminal은 `Ctrl+K`로 정리하세요.
+
 ## 안전 규칙
 
 `start`는 실행 전에 아래를 확인합니다.
@@ -169,7 +207,7 @@ started terminal web: session=... cwd=... command=...
 
 | 용도 | 이유 |
 |---|---|
-| 짧은 일회성 명령 | 실행 직후 daemon이 종료되어 TUI에서 붙을 시간이 거의 없습니다. |
+| 짧은 일회성 명령 | 실행 직후 daemon이 종료되어 TUI에서 붙을 시간이 거의 없습니다. 결과를 나중에 보려면 `--keep`을 쓰세요. |
 | 출력만 보고 끝나는 명령 | 일반 shell에서 직접 실행하는 편이 단순합니다. |
 | shell builtin 직접 실행 | `cd`, `source` 같은 builtin은 `bash -lc '...'` 형태로 감싸야 합니다. |
 
