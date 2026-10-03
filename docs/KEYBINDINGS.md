@@ -6,33 +6,36 @@ cokacmux는 config 디렉터리의 `keybinding.json`을 읽어 단축키를 설�
 
 ## 설정 방식
 
-cokacmux가 처리하는 모든 키보드 단축키는 이 파일에서 변경하거나 해제할 수 있습니다. 원하는 액션만 JSON에 적어도 됩니다. 파일에 없는 액션은 메모리에서 기본값으로 적용하며, 기존 파일은 읽기만 합니다. 따라서 재로드가 사용자 편집 내용이나 서식을 덮어쓰지 않습니다. `[]`와 `null`로 해제한 키도 자동으로 복구하지 않습니다.
+cokacmux가 처리하는 모든 키보드 단축키는 이 파일에서 변경하거나 해제할 수 있습니다. 각 액션의 배열에 `key`와 `enabled`를 지정합니다. `enabled: true`는 사용, `enabled: false`는 미사용입니다. 키 조합마다 개별 설정하므로 같은 액션의 다른 키는 그대로 사용할 수 있습니다. `false`인 키도 파일에 남아 있어 나중에 `true`로 바꾸면 다시 사용할 수 있습니다.
+
+예를 들어 다음 설정은 `Shift+←` 포커스 이동만 끄고 `Ctrl+←`, `Ctrl+.`는 유지합니다.
 
 ```json
 {
-  "sessions": {
-    "launch_agent": ["x"],
-    "quit": ["q", "ctrl+q"]
-  },
   "agent": {
-    "scroll_page_up": ["shift+alt+up", "shift+alt+pageup", "alt+pageup"],
-    "scroll_page_down": ["shift+alt+down", "shift+alt+pagedown", "alt+pagedown"],
-    "switch_prev": ["ctrl+,"],
-    "switch_next": ["ctrl+."]
-  },
-  "new_session": {
-    "next": ["down", "tab"],
-    "prev": ["up", "backtab"]
+    "focus_prev": [
+      { "key": "ctrl+left", "enabled": true },
+      { "key": "ctrl+dot", "enabled": true },
+      { "key": "shift+left", "enabled": false }
+    ]
   }
 }
 ```
+
+`enabled`를 생략하면 `true`로 처리하며 저장 시 명시적으로 추가합니다. 값은 JSON 불리언이어야 합니다. `"false"`, `0`, `null` 등은 오류입니다. 꺼진 항목도 `key` 문자열은 필요하지만, 키 이름의 유효성은 켤 때 검사합니다.
+
+앱 시작 시와 실행 중 재로드 시, 기존 파일에도 빠진 액션과 cokacdir 옵션을 기본값으로 자동 추가합니다. 기본 단축키는 모두 `enabled: true`로 생성하며, 기본 키가 없는 액션은 `[]`입니다. 구버전 문자열과 문자열 배열은 키와 순서를 유지한 채 `key`/`enabled` 형식으로 자동 변환합니다. 사용자 지정 키, `false` 값, 알 수 없는 항목, `[]`와 `null`로 해제한 액션은 유지합니다. 보완하거나 변환할 때 JSON 서식은 정리되며, 이미 완전한 파일은 다시 쓰지 않습니다.
+
+보완 저장은 같은 디렉터리의 임시 파일을 작성한 뒤 교체합니다. 여러 cokacmux 사이의 저장을 잠금으로 조정하고, 저장 직전 원문이 달라졌으면 다음 감시 주기에 다시 읽습니다. JSON 문법이나 단축키 설정이 잘못되었거나 최상위 값이 객체가 아니면 파일을 변경하지 않습니다. 읽기 전용 파일은 그대로 두고 메모리에서 설정을 적용합니다. 특정 동작을 해제하려면 액션 항목을 삭제하는 대신 모든 키를 `enabled: false`로 바꾸거나 `[]` 또는 `null`을 지정하세요.
 
 각 액션 값은 다음 형태를 지원합니다.
 
 | 값 | 의미 |
 |---|---|
-| `"x"` | 단일 키로 지정 |
-| `["x", "ctrl+x"]` | 여러 키 중 하나로 지정 |
+| `[{"key":"x","enabled":true},{"key":"ctrl+x","enabled":false}]` | `x`는 사용, `Ctrl+X`는 미사용 |
+| `{"key":"x","enabled":false}` | 단일 키를 미사용으로 지정. 저장 시 배열로 변환 |
+| `"x"` | 구버전 단일 키. `enabled: true`인 배열 항목으로 변환 |
+| `["x", "ctrl+x"]` | 구버전 여러 키. 각각 `enabled: true`인 항목으로 변환 |
 | `[]` | 해당 액션 비활성화 |
 | `null` | 해당 액션 비활성화 |
 
@@ -40,30 +43,39 @@ cokacmux가 처리하는 모든 키보드 단축키는 이 파일에서 변경�
 
 현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.toggle_focus`는 `["tab"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다. Agent 화면에서는 `agent.toggle_cokacdir_panel`이 `["ctrl+f"]`, `agent.toggle_terminal_panel`이 `["ctrl+t"]`, `agent.focus_sidebar`/`agent.focus_main`/`agent.focus_auxiliary`가 각각 `["ctrl+1"]`/`["ctrl+2"]`/`["ctrl+3"]`입니다.
 
-구버전 기본값과 같은 값도 사용자 지정값으로 취급하여 그대로 유지합니다. 예를 들어 `agent.focus_auxiliary: []`, `sessions.filter: ["/"]`, `agent.scroll_page_up: ["shift+pageup"]`를 저장해도 재로드 시 다른 키로 덮어쓰지 않습니다. 화면의 키 안내는 변경한 값을 표시하고, 해제된 동작은 `unbound`로 표시합니다.
+위 기본값 설명은 키 이름만 간략히 표기한 것입니다. 구버전 기본값과 같은 키도 사용자 지정값으로 취급하여 유지합니다. 예를 들어 `agent.focus_auxiliary: []`, `sessions.filter: ["/"]`, `agent.scroll_page_up: ["shift+pageup"]`를 저장해도 재로드 시 다른 키로 덮어쓰지 않습니다. 화면의 키 안내는 켜진 키만 표시하며, 모두 꺼진 동작은 `unbound`로 표시합니다.
 
 기본 키를 바꾸면 이전 키는 더 이상 해당 동작에 쓰이지 않습니다. 에이전트 화면에서 다른 cokacmux 액션과도 일치하지 않는 키는 포커스된 자식 앱에 전달됩니다. 패널 포커스 이동과 `Ctrl+F`/`Ctrl+T`에도 고정 예약키는 없습니다. 같은 화면의 여러 액션에 같은 키를 지정하면 먼저 처리되는 액션이 실행되므로 서로 다른 키를 지정하세요. 텍스트 선택, 작업 진행 잠금, 대화상자 등의 현재 입력 문맥이 일반 화면보다 우선합니다.
 
-예를 들어 Shift 좌우를 자식 앱에 넘기고 패널 토글을 바꾸려면 다음과 같이 지정합니다.
+예를 들어 Shift 좌우를 자식 앱에 넘기고 패널 토글을 바꾸려면 다음과 같이 지정합니다. 다른 액션에 같은 키가 켜져 있으면 그 액션에서 처리할 수 있습니다.
 
 ```json
 {
   "agent": {
-    "focus_prev": ["ctrl+left", "ctrl+dot"],
-    "focus_next": ["ctrl+right", "ctrl+slash", "ctrl+_"],
-    "toggle_cokacdir_panel": ["alt+f"],
-    "toggle_terminal_panel": ["alt+t"]
+    "focus_prev": [
+      { "key": "ctrl+left", "enabled": true },
+      { "key": "ctrl+dot", "enabled": true },
+      { "key": "shift+left", "enabled": false }
+    ],
+    "focus_next": [
+      { "key": "ctrl+right", "enabled": true },
+      { "key": "ctrl+slash", "enabled": true },
+      { "key": "ctrl+_", "enabled": true },
+      { "key": "shift+right", "enabled": false }
+    ],
+    "toggle_cokacdir_panel": [{ "key": "alt+f", "enabled": true }],
+    "toggle_terminal_panel": [{ "key": "alt+t", "enabled": true }]
   },
   "selection": {
-    "copy": ["alt+c"],
-    "clear": ["esc"]
+    "copy": [{ "key": "alt+c", "enabled": true }],
+    "clear": [{ "key": "esc", "enabled": true }]
   }
 }
 ```
 
 ### cokacdir 입력 우선권
 
-기존 동작을 유지하기 위해 아래 옵션은 기본적으로 `true`입니다. 단축키 배열과 달리 이 두 옵션은 JSON 불리언을 사용합니다. 변경 시 재시작 없이 적용됩니다.
+기존 동작을 유지하기 위해 아래 옵션은 기본적으로 `true`입니다. 이 두 옵션은 `key`/`enabled` 객체로 감싸지 않고 JSON 불리언을 직접 지정합니다. 변경 시 재시작 없이 적용됩니다.
 
 ```json
 {
@@ -82,8 +94,8 @@ cokacmux가 처리하는 모든 키보드 단축키는 이 파일에서 변경�
 
 ```json
 {
-  "sessions.launch_agent": ["x"],
-  "agent.scroll_page_down": ["alt+d"]
+  "sessions.launch_agent": [{ "key": "x", "enabled": true }],
+  "agent.scroll_page_down": [{ "key": "alt+d", "enabled": true }]
 }
 ```
 

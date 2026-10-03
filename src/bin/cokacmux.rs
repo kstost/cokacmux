@@ -2157,37 +2157,47 @@ impl KeyBindings {
         path: Option<&Path>,
     ) -> std::result::Result<(Self, Option<SystemTime>), String> {
         let modified = Self::ensure_file_or_mtime(path)?;
-        let keybindings = Self::read_for_observed_mtime(path, modified)?;
-        Ok((keybindings, modified))
+        Self::read_for_observed_mtime(path, modified)
     }
 
     fn read_for_observed_mtime(
         path: Option<&Path>,
         modified: Option<SystemTime>,
-    ) -> std::result::Result<Self, String> {
+    ) -> std::result::Result<(Self, Option<SystemTime>), String> {
         let mut keybindings = Self::default();
         let Some(path) = path else {
-            return Ok(keybindings);
+            return Ok((keybindings, modified));
         };
         if modified.is_none() {
-            return Ok(keybindings);
+            return Ok((keybindings, modified));
         };
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(keybindings),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok((keybindings, None)),
             Err(e) => {
                 return Err(format!("read {} failed: {}", path.display(), e));
             }
         };
-        match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(value) => {
-                // Fill missing actions from Self::default() in memory only.
-                // Writing this snapshot back could erase a concurrent edit.
-                keybindings.apply_json(&value);
+        let mut value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("parse {} failed: {}", path.display(), e))?;
+        let completed = complete_keybinding_config(&mut value)?;
+        keybindings.apply_json(&value);
+        let modified = if completed {
+            match persist_completed_keybindings(path, &content, &value) {
+                Ok(modified) => modified,
+                Err(error) => {
+                    // A read-only config must still supply the user's bindings.
+                    debug_log(
+                        "keybindings_completion_failed",
+                        serde_json::json!({ "path": path.display().to_string(), "error": error.to_string() }),
+                    );
+                    modified
+                }
             }
-            Err(e) => return Err(format!("parse {} failed: {}", path.display(), e)),
-        }
-        Ok(keybindings)
+        } else {
+            modified
+        };
+        Ok((keybindings, modified))
     }
 
     fn file_mtime(path: Option<&Path>) -> std::result::Result<Option<SystemTime>, String> {
@@ -2246,7 +2256,7 @@ impl KeyBindings {
             let value = serde_json::Value::Array(
                 defaults
                     .iter()
-                    .map(|binding| serde_json::Value::String((*binding).to_string()))
+                    .map(|binding| serde_json::json!({ "key": binding, "enabled": true }))
                     .collect(),
             );
             let Some((group, action)) = path.split_once('.') else {
@@ -2340,6 +2350,98 @@ impl KeyBindings {
     }
 }
 
+/// Add missing actions and explicit per-key flags without changing enabled keys.
+fn complete_keybinding_config(value: &mut serde_json::Value) -> std::result::Result<bool, String> {
+    if !value.is_object() {
+        return Err("keybinding config must be a JSON object".into());
+    }
+    let defaults = KeyBindings::default_config_json();
+    let mut changed = false;
+    for (path, _, _) in DEFAULT_KEYBINDINGS {
+        if let Some(bindings) = keybinding_json_value_mut(value, path) {
+            changed |= normalize_keybinding_json_list(bindings)
+                .map_err(|error| format!("invalid {path}: {error}"))?;
+        }
+    }
+    for (group, actions) in defaults.as_object().unwrap() {
+        for (action, default) in actions.as_object().unwrap() {
+            let path = format!("{group}.{action}");
+            if keybinding_json_value(value, &path).is_some() {
+                continue;
+            }
+            let root = value.as_object_mut().unwrap();
+            let group_value = root
+                .entry(group.clone())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(group_map) = group_value.as_object_mut() {
+                group_map.insert(action.clone(), default.clone());
+            } else {
+                // Preserve an unrecognized group value rather than replacing it.
+                root.insert(path, default.clone());
+            }
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Return the staged file's mtime, or None to retry after a competing edit/lock.
+fn persist_completed_keybindings(
+    path: &Path,
+    original: &str,
+    completed: &serde_json::Value,
+) -> io::Result<Option<SystemTime>> {
+    let target = fs::canonicalize(path)?;
+    // Keep the lock on a stable sidecar because the config inode is replaced.
+    let _guard = match runtime_path_mutation_guard(&target) {
+        Ok(guard) => guard,
+        Err(error)
+            if error.kind() == ErrorKind::WouldBlock
+                || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if fs::read_to_string(&target)? != original {
+        return Ok(None);
+    }
+    let permissions = fs::metadata(&target)?.permissions();
+    if permissions.readonly() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "keybinding config is read-only",
+        ));
+    }
+    let content = serde_json::to_string_pretty(completed).map_err(io::Error::other)? + "\n";
+    let temp = target.with_file_name(format!(".keybinding.json.tmp-{}", uuid::Uuid::now_v7()));
+    let result = (|| -> io::Result<Option<SystemTime>> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp)?;
+        file.set_permissions(permissions)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        let modified = file.metadata()?.modified()?;
+        drop(file);
+        // Check again after staging: serialization and disk sync may be slow.
+        // Also preserve the user's symlink if its target changed while staging.
+        if fs::canonicalize(path)? != target || fs::read_to_string(&target)? != original {
+            return Ok(None);
+        }
+        fs::rename(&temp, &target)?;
+        if let Some(parent) = target.parent() {
+            let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        }
+        // Do not stat `path` here: it could already contain a newer user edit.
+        Ok(Some(modified))
+    })();
+    let _ = fs::remove_file(&temp);
+    result
+}
+
 fn keybinding_json_value<'a>(
     root: &'a serde_json::Value,
     path: &str,
@@ -2354,20 +2456,96 @@ fn keybinding_json_value<'a>(
     Some(current)
 }
 
+fn keybinding_json_value_mut<'a>(
+    root: &'a mut serde_json::Value,
+    path: &str,
+) -> Option<&'a mut serde_json::Value> {
+    if root.get(path).is_some() {
+        return root.get_mut(path);
+    }
+    let mut current = root;
+    for part in path.split('.') {
+        current = current.get_mut(part)?;
+    }
+    Some(current)
+}
+
+fn keybinding_entry_enabled(value: &serde_json::Value) -> std::result::Result<bool, String> {
+    match value.get("enabled") {
+        None => Ok(true),
+        Some(serde_json::Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => Err("enabled must be a JSON boolean (true or false)".into()),
+    }
+}
+
+fn parse_keybinding_json_entry(
+    value: &serde_json::Value,
+) -> std::result::Result<Option<KeyBinding>, String> {
+    let (key, enabled) = match value {
+        serde_json::Value::String(key) => (key.as_str(), true),
+        serde_json::Value::Object(_) => {
+            let key = value
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "key must be a string".to_string())?;
+            (key, keybinding_entry_enabled(value)?)
+        }
+        _ => return Err("expected a key string or { key, enabled } object".into()),
+    };
+    if !enabled {
+        return Ok(None);
+    }
+    KeyBinding::parse(key).map(Some)
+}
+
+fn normalize_keybinding_json_list(
+    value: &mut serde_json::Value,
+) -> std::result::Result<bool, String> {
+    // Validate before modifying: malformed flags must not silently enable a key.
+    parse_keybinding_json_list(value)?;
+    if value.is_null() {
+        return Ok(false);
+    }
+    let mut changed = false;
+    if !value.is_array() {
+        *value = serde_json::Value::Array(vec![value.take()]);
+        changed = true;
+    }
+    for binding in value.as_array_mut().unwrap() {
+        if let serde_json::Value::String(key) = binding {
+            *binding = serde_json::json!({ "key": key, "enabled": true });
+            changed = true;
+        } else if binding.get("enabled").is_none() {
+            binding
+                .as_object_mut()
+                .unwrap()
+                .insert("enabled".into(), true.into());
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 fn parse_keybinding_json_list(
     value: &serde_json::Value,
 ) -> std::result::Result<Vec<KeyBinding>, String> {
     match value {
         serde_json::Value::Null => Ok(Vec::new()),
-        serde_json::Value::String(binding) => Ok(vec![KeyBinding::parse(binding)?]),
+        serde_json::Value::String(_) | serde_json::Value::Object(_) => {
+            Ok(parse_keybinding_json_entry(value)?.into_iter().collect())
+        }
         serde_json::Value::Array(bindings) => bindings
             .iter()
-            .map(|binding| match binding {
-                serde_json::Value::String(value) => KeyBinding::parse(value),
-                other => Err(format!("expected string key binding, got {}", other)),
+            .filter_map(|binding| match parse_keybinding_json_entry(binding) {
+                Ok(Some(key)) => Some(Ok(key)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
             })
             .collect(),
-        other => Err(format!("expected string, array, or null, got {}", other)),
+        other => Err(format!(
+            "expected key string, object, array, or null, got {}",
+            other
+        )),
     }
 }
 
@@ -29480,7 +29658,8 @@ fn check_keybindings_reload(
     }
     *known_mtime = current_mtime;
     let reload = match KeyBindings::read_for_observed_mtime(path, current_mtime) {
-        Ok(keybindings) => {
+        Ok((keybindings, observed_mtime)) => {
+            *known_mtime = observed_mtime;
             debug_log(
                 "keybindings_reloaded",
                 serde_json::json!({
@@ -63044,6 +63223,7 @@ mod tests {
 
     #[test]
     fn missing_keybinding_file_is_created_with_defaults() {
+        use super::keybinding_tests::enabled_keys_json;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keybinding.json");
 
@@ -63099,37 +63279,37 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             value["sessions"]["launch_agent"],
-            serde_json::json!(["e", "enter"])
+            enabled_keys_json(&["e", "enter"])
         );
         assert_eq!(
             value["clone_options"]["context_mode"],
-            serde_json::json!(["m"])
+            enabled_keys_json(&["m"])
         );
         assert_eq!(
             value["sessions"]["delete"],
-            serde_json::json!(["delete", "d"])
+            enabled_keys_json(&["delete", "d"])
         );
-        assert_eq!(value["sessions"]["filter"], serde_json::json!(["ctrl+f"]));
-        assert_eq!(value["sessions"]["ai_search"], serde_json::json!([]));
+        assert_eq!(value["sessions"]["filter"], enabled_keys_json(&["ctrl+f"]));
+        assert_eq!(value["sessions"]["ai_search"], enabled_keys_json(&[]));
         assert_eq!(
             value["sessions"]["ai_title_settings"],
-            serde_json::json!(["comma"])
+            enabled_keys_json(&["comma"])
         );
         assert!(value["ai_title_settings"].get("gjc").is_none());
         assert_eq!(
             value["sessions"]["toggle_focus"],
-            serde_json::json!(["tab"])
+            enabled_keys_json(&["tab"])
         );
         assert_eq!(
             value["sessions"]["kill_all"],
-            serde_json::json!(["ctrl+shift+k", "shift+k"])
+            enabled_keys_json(&["ctrl+shift+k", "shift+k"])
         );
-        assert_eq!(value["sessions"]["move_next"], serde_json::json!(["down"]));
-        assert_eq!(value["sessions"]["move_prev"], serde_json::json!(["up"]));
-        assert_eq!(value["search"]["next"], serde_json::json!(["down", "tab"]));
+        assert_eq!(value["sessions"]["move_next"], enabled_keys_json(&["down"]));
+        assert_eq!(value["sessions"]["move_prev"], enabled_keys_json(&["up"]));
+        assert_eq!(value["search"]["next"], enabled_keys_json(&["down", "tab"]));
         assert_eq!(
             value["search"]["prev"],
-            serde_json::json!(["up", "backtab"])
+            enabled_keys_json(&["up", "backtab"])
         );
         for section in [
             "delete_confirm",
@@ -63139,72 +63319,72 @@ mod tests {
         ] {
             assert_eq!(
                 value[section]["next"],
-                serde_json::json!(["right", "down", "tab"])
+                enabled_keys_json(&["right", "down", "tab"])
             );
             assert_eq!(
                 value[section]["prev"],
-                serde_json::json!(["left", "up", "backtab"])
+                enabled_keys_json(&["left", "up", "backtab"])
             );
         }
         assert_eq!(
             value["clone_options"]["next"],
-            serde_json::json!(["right", "down"])
+            enabled_keys_json(&["right", "down"])
         );
         assert_eq!(
             value["clone_options"]["prev"],
-            serde_json::json!(["left", "up"])
+            enabled_keys_json(&["left", "up"])
         );
-        assert_eq!(value["agent_launch"]["next"], serde_json::json!(["down"]));
-        assert_eq!(value["agent_launch"]["prev"], serde_json::json!(["up"]));
+        assert_eq!(value["agent_launch"]["next"], enabled_keys_json(&["down"]));
+        assert_eq!(value["agent_launch"]["prev"], enabled_keys_json(&["up"]));
         assert_eq!(
             value["new_session"]["next"],
-            serde_json::json!(["down", "tab"])
+            enabled_keys_json(&["down", "tab"])
         );
         assert_eq!(
             value["new_session"]["prev"],
-            serde_json::json!(["up", "backtab"])
+            enabled_keys_json(&["up", "backtab"])
         );
         assert_eq!(
             value["new_session"]["choice_next"],
-            serde_json::json!(["right", "space"])
+            enabled_keys_json(&["right", "space"])
         );
         assert_eq!(
             value["new_session"]["choice_prev"],
-            serde_json::json!(["left"])
+            enabled_keys_json(&["left"])
         );
-        assert_eq!(value["sessions"]["toggle_preview"], serde_json::json!([]));
+        assert_eq!(value["sessions"]["toggle_preview"], enabled_keys_json(&[]));
         assert!(!keybindings.matches(
             KeyAction::SessionTogglePreview,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
         ));
         assert_eq!(
             value["agent"]["scroll_page_up"],
-            serde_json::json!(["shift+alt+up", "shift+alt+pageup", "alt+pageup"])
+            enabled_keys_json(&["shift+alt+up", "shift+alt+pageup", "alt+pageup"])
         );
         assert_eq!(
             value["agent"]["scroll_page_down"],
-            serde_json::json!(["shift+alt+down", "shift+alt+pagedown", "alt+pagedown"])
+            enabled_keys_json(&["shift+alt+down", "shift+alt+pagedown", "alt+pagedown"])
         );
         assert_eq!(
             value["agent"]["toggle_cokacdir_panel"],
-            serde_json::json!(["ctrl+f"])
+            enabled_keys_json(&["ctrl+f"])
         );
         assert_eq!(
             value["agent"]["toggle_terminal_panel"],
-            serde_json::json!(["ctrl+t"])
+            enabled_keys_json(&["ctrl+t"])
         );
         assert_eq!(
             value["agent"]["kill_all"],
-            serde_json::json!(["ctrl+shift+k"])
+            enabled_keys_json(&["ctrl+shift+k"])
         );
         assert_eq!(
             value["agent"]["focus_sidebar"],
-            serde_json::json!(["ctrl+1"])
+            enabled_keys_json(&["ctrl+1"])
         );
-        assert_eq!(value["agent"]["focus_main"], serde_json::json!(["ctrl+2"]));
+        assert_eq!(value["agent"]["focus_main"], enabled_keys_json(&["ctrl+2"]));
         assert_eq!(
             value["agent"]["focus_auxiliary"],
-            serde_json::json!(["ctrl+3"])
+            enabled_keys_json(&["ctrl+3"])
         );
         assert!(keybindings.matches(
             KeyAction::AgentToggleCokacdirPanel,
@@ -63230,6 +63410,7 @@ mod tests {
 
     #[test]
     fn custom_agent_scroll_page_bindings_are_not_migrated() {
+        use super::keybinding_tests::enabled_keys_json;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keybinding.json");
         fs::write(
@@ -63270,7 +63451,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             value["agent"]["scroll_page_up"],
-            serde_json::json!(["shift+pageup", "alt+k"])
+            enabled_keys_json(&["shift+pageup", "alt+k"])
         );
     }
 

@@ -7,8 +7,253 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+pub(super) fn enabled_keys_json(keys: &[&str]) -> serde_json::Value {
+    serde_json::Value::Array(
+        keys.iter()
+            .map(|key| serde_json::json!({ "key": key, "enabled": true }))
+            .collect(),
+    )
+}
+
+fn assert_complete_config(value: &serde_json::Value) {
+    for (path, _, _) in DEFAULT_KEYBINDINGS {
+        assert!(
+            keybinding_json_value(value, path).is_some(),
+            "missing {path}"
+        );
+    }
+    for path in ["cokacdir.passthrough_shift", "cokacdir.passthrough_kill"] {
+        assert!(
+            keybinding_json_value(value, path).is_some(),
+            "missing {path}"
+        );
+    }
+}
+
 #[test]
-fn loading_fills_defaults_in_memory_without_rewriting_user_file() {
+fn every_default_key_has_a_boolean_and_can_be_disabled() {
+    let mut config = KeyBindings::default_config_json();
+    let defaults = KeyBindings::default();
+    let mut loaded = KeyBindings::default();
+    loaded.apply_json(&config);
+    for (path, action, keys) in DEFAULT_KEYBINDINGS {
+        let entries = keybinding_json_value_mut(&mut config, path)
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        assert_eq!(entries.len(), keys.len(), "{path}");
+        assert_eq!(
+            loaded.labels(*action, usize::MAX),
+            defaults.labels(*action, usize::MAX),
+            "{path}"
+        );
+        for (entry, key) in entries.iter_mut().zip(keys.iter()) {
+            assert_eq!(entry["key"], *key, "{path}");
+            assert_eq!(entry["enabled"], true, "{path}");
+            entry["enabled"] = false.into();
+        }
+    }
+    loaded.apply_json(&config);
+    for (_, action, _) in DEFAULT_KEYBINDINGS {
+        assert!(loaded.bindings[action].is_empty(), "{action:?}");
+        assert_eq!(loaded.help(*action, "default"), "unbound");
+    }
+    assert!(!complete_keybinding_config(&mut config).unwrap());
+}
+
+#[test]
+fn per_key_flags_preserve_other_keys_and_hide_disabled_help() {
+    let mut bindings = KeyBindings::default();
+    bindings.apply_json(&serde_json::json!({ "agent.focus_prev": [
+        { "key": "shift+left", "enabled": false },
+        { "key": "ctrl+left", "enabled": true },
+        { "key": "ctrl+dot" }
+    ] }));
+    assert!(!bindings.matches(
+        KeyAction::AgentFocusPrev,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)
+    ));
+    assert!(bindings.matches(
+        KeyAction::AgentFocusPrev,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)
+    ));
+    assert!(bindings.matches(
+        KeyAction::AgentFocusPrev,
+        KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL)
+    ));
+    assert_eq!(
+        bindings.help(KeyAction::AgentFocusPrev, "default"),
+        "Ctrl+←/Ctrl+."
+    );
+}
+
+#[test]
+fn legacy_and_boolean_entries_roundtrip_without_losing_user_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keybinding.json");
+    let original = serde_json::json!({
+        "sessions.quit": "f8",
+        "agent": {
+            "focus_prev": [
+                "ctrl+left",
+                { "key": "ctrl+dot", "note": "preserve me" },
+                { "key": "shift+left", "enabled": false }
+            ],
+            "focus_next": { "key": "f9", "enabled": false, "note": "later" },
+            "focus_main": null,
+            "focus_auxiliary": []
+        }
+    });
+    fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+    let (bindings, observed) = KeyBindings::read_from_path(Some(&path)).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_complete_config(&saved);
+    assert_eq!(saved["sessions.quit"], enabled_keys_json(&["f8"]));
+    assert_eq!(
+        saved["agent"]["focus_prev"],
+        serde_json::json!([
+            { "key": "ctrl+left", "enabled": true },
+            { "key": "ctrl+dot", "enabled": true, "note": "preserve me" },
+            { "key": "shift+left", "enabled": false }
+        ])
+    );
+    assert_eq!(
+        saved["agent"]["focus_next"],
+        serde_json::json!([
+            { "key": "f9", "enabled": false, "note": "later" }
+        ])
+    );
+    assert!(saved["agent"]["focus_main"].is_null());
+    assert_eq!(saved["agent"]["focus_auxiliary"], serde_json::json!([]));
+    assert!(bindings.matches(KeyAction::SessionQuit, key(KeyCode::F(8))));
+    assert!(bindings.bindings[&KeyAction::AgentFocusNext].is_empty());
+    KeyBindings::read_from_path(Some(&path)).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(KeyBindings::file_mtime(Some(&path)).unwrap(), observed);
+}
+
+#[test]
+fn malformed_enabled_flags_do_not_replace_active_bindings_or_rewrite_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keybinding.json");
+    let mut app = app_for_key_tests();
+    app.keybindings
+        .apply_json(&serde_json::json!({ "agent.focus_prev": ["f8"] }));
+    for invalid in [
+        serde_json::json!("false"),
+        serde_json::json!(0),
+        serde_json::Value::Null,
+        serde_json::json!([]),
+    ] {
+        let content = serde_json::to_vec(&serde_json::json!({ "agent.focus_prev": [
+            { "key": "f9", "enabled": invalid }
+        ] }))
+        .unwrap();
+        fs::write(&path, &content).unwrap();
+        let mut observed = None;
+        let reload = check_keybindings_reload(Some(&path), &mut observed).unwrap();
+        assert!(reload.keybindings.is_none());
+        assert!(
+            reload.status.contains("enabled must be a JSON boolean"),
+            "{}",
+            reload.status
+        );
+        app.on_keybindings_reloaded(reload);
+        assert!(app
+            .keybindings
+            .matches(KeyAction::AgentFocusPrev, key(KeyCode::F(8))));
+        assert!(!app
+            .keybindings
+            .matches(KeyAction::AgentFocusPrev, key(KeyCode::F(9))));
+        assert_eq!(fs::read(&path).unwrap(), content);
+    }
+    assert!(parse_keybinding_json_list(&serde_json::json!([
+        { "key": "not-a-valid-key", "enabled": false }
+    ]))
+    .unwrap()
+    .is_empty());
+    assert!(parse_keybinding_json_list(&serde_json::json!([
+        { "key": "not-a-valid-key", "enabled": true }
+    ]))
+    .is_err());
+    for entry in [
+        serde_json::json!({ "enabled": false }),
+        serde_json::json!({ "key": 12, "enabled": false }),
+    ] {
+        assert!(parse_keybinding_json_list(&entry).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn boolean_reload_releases_shift_left_to_child_and_can_restore_it() {
+    use super::tests::buffered_output_test_client_with_requests;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keybinding.json");
+    let mut app = app_for_key_tests();
+    let (client, requests) = buffered_output_test_client_with_requests("keybinding-enabled", 922);
+    app.set_active_agent(client);
+    app.show_sessions_view = false;
+    app.settings.cokacmux.agent_sidebar_visible = true;
+    for enabled in [false, true, false] {
+        let config = serde_json::json!({ "agent.focus_prev": [
+            { "key": "ctrl+left", "enabled": true },
+            { "key": "shift+left", "enabled": enabled }
+        ] });
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let mut observed = None;
+        app.on_keybindings_reloaded(check_keybindings_reload(Some(&path), &mut observed).unwrap());
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["agent.focus_prev"], config["agent.focus_prev"]);
+        assert!(check_keybindings_reload(Some(&path), &mut observed).is_none());
+        app.agent_focus = AgentFocusPane::Main;
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+            120,
+            30,
+        );
+        assert_eq!(
+            app.agent_focus,
+            if enabled {
+                AgentFocusPane::Sidebar
+            } else {
+                AgentFocusPane::Main
+            }
+        );
+        let inputs: Vec<Vec<u8>> = requests
+            .try_iter()
+            .filter_map(|request| match request.request {
+                AgentDaemonRequest::Input { data, .. } => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inputs,
+            if enabled {
+                vec![]
+            } else {
+                vec![b"\x1b[1;2D".to_vec()]
+            }
+        );
+        app.agent_focus = AgentFocusPane::Main;
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            120,
+            30,
+        );
+        assert_eq!(app.agent_focus, AgentFocusPane::Sidebar);
+        assert!(!requests
+            .try_iter()
+            .any(|request| matches!(request.request, AgentDaemonRequest::Input { .. })));
+    }
+    app.active_agent.as_mut().unwrap().exited = Some("test cleanup".into());
+}
+
+#[test]
+fn loading_completes_file_without_changing_user_values() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keybinding.json");
     let original = serde_json::json!({
@@ -19,43 +264,175 @@ fn loading_fills_defaults_in_memory_without_rewriting_user_file() {
         "custom_notes": "keep me"
     });
     fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
-    let before = fs::read(&path).unwrap();
-    let modified = fs::metadata(&path).unwrap().modified().unwrap();
-    let (bindings, _) = KeyBindings::read_from_path(Some(&path)).unwrap();
-    assert_eq!(fs::read(&path).unwrap(), before);
-    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+    let (bindings, observed) = KeyBindings::read_from_path(Some(&path)).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_complete_config(&saved);
+    for (action, expected) in [
+        ("sessions.filter", enabled_keys_json(&["/"])),
+        ("sessions.toggle_focus", enabled_keys_json(&["tab", "esc"])),
+        ("sessions.move_next", enabled_keys_json(&["down", "j"])),
+        ("agent.focus_auxiliary", serde_json::json!([])),
+        (
+            "agent.scroll_page_up",
+            enabled_keys_json(&["shift+pageup", "alt+pageup"]),
+        ),
+        ("agent.focus_prev", serde_json::Value::Null),
+        ("cokacdir.passthrough_shift", serde_json::json!(false)),
+    ] {
+        assert_eq!(keybinding_json_value(&saved, action), Some(&expected));
+    }
+    assert_eq!(saved["custom_notes"], "keep me");
+    assert!(
+        saved["agent"].get("focus_prev").is_none(),
+        "flat override must not be duplicated"
+    );
     assert!(bindings.matches(KeyAction::NewSessionComplete, key(KeyCode::Tab)));
     assert!(!bindings.cokacdir_passthrough_shift);
     assert!(bindings.bindings[&KeyAction::AgentFocusAuxiliary].is_empty());
     assert!(bindings.bindings[&KeyAction::AgentFocusPrev].is_empty());
     assert!(bindings.matches(KeyAction::SessionFilter, key(KeyCode::Char('/'))));
+    assert_eq!(observed, KeyBindings::file_mtime(Some(&path)).unwrap());
     KeyBindings::read_from_path(Some(&path)).unwrap();
     assert_eq!(
         fs::read(&path).unwrap(),
-        before,
-        "second load must not rewrite the file"
+        bytes,
+        "complete file must not be rewritten"
     );
+    assert_eq!(observed, KeyBindings::file_mtime(Some(&path)).unwrap());
 }
 
 #[test]
-fn partial_config_reload_does_not_overwrite_edits_or_trigger_another_reload() {
+fn partial_config_reload_completes_file_without_another_reload() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keybinding.json");
     for content in [
-        "{\n  \"agent.focus_prev\": [\"f8\"]\n}\n",
-        "{\n  \"agent.focus_prev\": [], \"notes\": \"new edit\"\n}\n",
+        r#"{"agent.focus_prev": ["f8"]}"#,
+        r#"{"agent.focus_prev": [], "notes": "new edit"}"#,
     ] {
         fs::write(&path, content).unwrap();
         let mut observed = None;
         let reload = check_keybindings_reload(Some(&path), &mut observed).unwrap();
         let bindings = reload.keybindings.unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_complete_config(&saved);
+        let original: serde_json::Value = serde_json::from_str(content).unwrap();
+        for (name, value) in original.as_object().unwrap() {
+            if name == "agent.focus_prev" && content.contains("f8") {
+                assert_eq!(saved[name], enabled_keys_json(&["f8"]));
+            } else {
+                assert_eq!(&saved[name], value);
+            }
+        }
         assert_eq!(
             bindings.matches(KeyAction::AgentFocusPrev, key(KeyCode::F(8))),
             content.contains("f8")
         );
         assert!(check_keybindings_reload(Some(&path), &mut observed).is_none());
     }
+}
+
+#[test]
+fn complete_config_keeps_its_existing_format_and_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keybinding.json");
+    let original = serde_json::to_string(&KeyBindings::default_config_json()).unwrap() + "\n\n";
+    fs::write(&path, &original).unwrap();
+    let before = KeyBindings::file_mtime(Some(&path)).unwrap();
+    KeyBindings::read_from_path(Some(&path)).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    assert_eq!(KeyBindings::file_mtime(Some(&path)).unwrap(), before);
+}
+
+#[test]
+fn completion_rejects_stale_snapshot_and_reloads_latest_user_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keybinding.json");
+    let original = r#"{"agent.focus_prev":["f8"]}"#;
+    let newest = r#"{"agent.focus_prev":["f9"],"notes":"newest"}"#;
+    let mut completed: serde_json::Value = serde_json::from_str(original).unwrap();
+    complete_keybinding_config(&mut completed).unwrap();
+    fs::write(&path, newest).unwrap();
+    assert_eq!(
+        persist_completed_keybindings(&path, original, &completed).unwrap(),
+        None
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), newest);
+    let (bindings, _) = KeyBindings::read_from_path(Some(&path)).unwrap();
+    assert!(bindings.matches(KeyAction::AgentFocusPrev, key(KeyCode::F(9))));
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_complete_config(&saved);
+    assert_eq!(saved["notes"], "newest");
+}
+
+#[test]
+fn completion_retries_after_another_instance_releases_its_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keybinding.json");
+    let original = r#"{"agent.focus_prev":["f8"]}"#;
+    fs::write(&path, original).unwrap();
+    let guard = runtime_path_mutation_guard(&fs::canonicalize(&path).unwrap()).unwrap();
+    let mut observed = None;
+    let reload = check_keybindings_reload(Some(&path), &mut observed).unwrap();
+    assert!(reload
+        .keybindings
+        .unwrap()
+        .matches(KeyAction::AgentFocusPrev, key(KeyCode::F(8))));
+    assert_eq!(
+        observed, None,
+        "busy completion must be retried even without an edit"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    drop(guard);
+    assert!(check_keybindings_reload(Some(&path), &mut observed).is_some());
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_complete_config(&saved);
+    assert!(check_keybindings_reload(Some(&path), &mut observed).is_none());
+}
+
+#[test]
+fn completion_preserves_unknown_group_values_and_rejects_invalid_roots() {
+    let mut value = serde_json::json!({"agent": "keep this", "agent.focus_prev": []});
+    assert!(complete_keybinding_config(&mut value).unwrap());
+    assert_complete_config(&value);
+    assert_eq!(value["agent"], "keep this");
+    assert_eq!(value["agent.focus_prev"], serde_json::json!([]));
+    assert!(!complete_keybinding_config(&mut value).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keybinding.json");
+    for content in ["[]", "null", "{broken"] {
+        fs::write(&path, content).unwrap();
+        assert!(KeyBindings::read_from_path(Some(&path)).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn completion_preserves_symlinks_permissions_and_readonly_bindings() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("actual.json");
+    let path = dir.path().join("keybinding.json");
+    fs::write(&target, r#"{"agent.focus_prev":["f8"]}"#).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+    symlink(&target, &path).unwrap();
+    KeyBindings::read_from_path(Some(&path)).unwrap();
+    assert!(fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert_complete_config(&serde_json::from_slice(&fs::read(&target).unwrap()).unwrap());
+    let original = r#"{"agent.focus_prev":["f9"]}"#;
+    fs::write(&target, original).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
+    let (bindings, _) = KeyBindings::read_from_path(Some(&path)).unwrap();
+    assert!(bindings.matches(KeyAction::AgentFocusPrev, key(KeyCode::F(9))));
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
 }
 
 #[test]
