@@ -286,7 +286,7 @@ cokacmux start web --cwd C:\work\app -- npm run dev
 
 아래는 기본 설정 기준의 단축키 전체입니다. 처음에는 세션 목록과 코딩 도구 화면에서 쓰는 키만 익히면 됩니다. 나중에 익숙해지면 선택창, 제목 편집, 설정 화면의 키를 보면 됩니다.
 
-단축키는 `~/.cokacmux/keybinding.json`에서 바꿀 수 있습니다. 이 파일을 바꾼 뒤 저장하면 실행 중인 `cokacmux`가 다시 읽습니다. `BackTab`은 보통 `Shift+Tab`입니다.
+모든 cokacmux 키보드 단축키는 `~/.cokacmux/keybinding.json`에서 바꾸거나 `[]`/`null`로 해제할 수 있습니다. 패널 포커스 이동, 복사·선택 해제, 작업 취소, 설정창 편집키와 경로 자동완성도 포함합니다. 저장하면 실행 중인 `cokacmux`가 다시 읽고 화면의 키 안내도 갱신합니다. 누락된 항목은 메모리에서 기본값으로 적용하고 기존 파일은 덮어쓰지 않습니다. `BackTab`과 `Shift+Tab`은 같은 키입니다. 전체 액션과 `cokacdir` 입력 우선권 옵션은 [단축키 설정 문서](docs/KEYBINDINGS.md)를 참고하세요.
 
 ### 세션 목록에서 쓰는 키
 

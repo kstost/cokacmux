@@ -763,6 +763,46 @@ fn scroll_agent_with_wheel(
     Ok(())
 }
 
+/// Translate a keyboard line-scroll action for children whose native binding
+/// is a wheel event. Never fall back to arbitrary bytes in the child's prompt.
+pub(super) fn send_child_scroll_wheel(agent: &mut AgentClient, direction: i32) -> io::Result<()> {
+    if direction == 0 {
+        return Ok(());
+    }
+    if agent.pending_snapshot_output
+        || agent.snapshot_parse_in_progress
+        || agent.pending_resize.is_some()
+    {
+        return Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "waiting for the child's screen geometry",
+        ));
+    }
+    let screen = agent.parser.screen();
+    if screen.mouse_protocol_mode() == vt100::MouseProtocolMode::None {
+        return Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "line scrolling requires the child's fullscreen mouse reporting",
+        ));
+    }
+    let (rows, cols) = screen.size();
+    let mouse = MouseEvent {
+        kind: if direction > 0 {
+            MouseEventKind::ScrollUp
+        } else {
+            MouseEventKind::ScrollDown
+        },
+        // Target the conversation inside the focused child, independently of
+        // the terminal's last pointer position. Stay in legacy protocol range.
+        column: (cols / 2).min(100),
+        row: (rows / 2).min(100),
+        modifiers: KeyModifiers::NONE,
+    };
+    let data = encode_mouse_wheel(screen, mouse, Rect::new(0, 0, cols, rows))
+        .ok_or_else(|| io::Error::new(ErrorKind::Unsupported, "invalid child mouse geometry"))?;
+    send_wheel_input(agent, data)
+}
+
 fn send_wheel_input(agent: &mut AgentClient, data: Vec<u8>) -> io::Result<()> {
     agent.send_input_data(data)?;
     if agent.scrollback_offset() > 0 {

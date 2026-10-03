@@ -6,7 +6,7 @@ cokacmux는 config 디렉터리의 `keybinding.json`을 읽어 단축키를 설�
 
 ## 설정 방식
 
-원하는 액션만 JSON에 적으면 됩니다. 파일에 없는 액션은 기본값을 그대로 사용합니다.
+cokacmux가 처리하는 모든 키보드 단축키는 이 파일에서 변경하거나 해제할 수 있습니다. 원하는 액션만 JSON에 적어도 됩니다. 파일에 없는 액션은 메모리에서 기본값으로 적용하며, 기존 파일은 읽기만 합니다. 따라서 재로드가 사용자 편집 내용이나 서식을 덮어쓰지 않습니다. `[]`와 `null`로 해제한 키도 자동으로 복구하지 않습니다.
 
 ```json
 {
@@ -40,17 +40,43 @@ cokacmux는 config 디렉터리의 `keybinding.json`을 읽어 단축키를 설�
 
 현재 기본값에서 `sessions.launch_agent`는 `["e", "enter"]`, `sessions.toggle_focus`는 `["tab"]`, `sessions.filter`는 `["ctrl+f"]`, `sessions.ai_title_settings`는 `["comma"]`이고, `sessions.toggle_preview`와 `sessions.ai_search`는 빈 배열입니다. Agent 화면에서는 `agent.toggle_cokacdir_panel`이 `["ctrl+f"]`, `agent.toggle_terminal_panel`이 `["ctrl+t"]`, `agent.focus_sidebar`/`agent.focus_main`/`agent.focus_auxiliary`가 각각 `["ctrl+1"]`/`["ctrl+2"]`/`["ctrl+3"]`입니다.
 
-구버전에서 자동 생성된 `sessions.launch_agent: ["e"]` + `sessions.toggle_preview: ["enter"]` 조합은 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+구버전 기본값과 같은 값도 사용자 지정값으로 취급하여 그대로 유지합니다. 예를 들어 `agent.focus_auxiliary: []`, `sessions.filter: ["/"]`, `agent.scroll_page_up: ["shift+pageup"]`를 저장해도 재로드 시 다른 키로 덮어쓰지 않습니다. 화면의 키 안내는 변경한 값을 표시하고, 해제된 동작은 `unbound`로 표시합니다.
 
-구버전에서 자동 생성된 `sessions.filter: ["/"]`와 `sessions.ai_search: ["ctrl+s"]` 값도 새 검색 선택창 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+기본 키를 바꾸면 이전 키는 더 이상 해당 동작에 쓰이지 않습니다. 에이전트 화면에서 다른 cokacmux 액션과도 일치하지 않는 키는 포커스된 자식 앱에 전달됩니다. 패널 포커스 이동과 `Ctrl+F`/`Ctrl+T`에도 고정 예약키는 없습니다. 같은 화면의 여러 액션에 같은 키를 지정하면 먼저 처리되는 액션이 실행되므로 서로 다른 키를 지정하세요. 텍스트 선택, 작업 진행 잠금, 대화상자 등의 현재 입력 문맥이 일반 화면보다 우선합니다.
 
-구버전에서 자동 생성된 `sessions.ai_title_settings: ["ctrl+t"]` 또는 `["comma", "ctrl+t"]` 값도 `["comma"]` 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+예를 들어 Shift 좌우를 자식 앱에 넘기고 패널 토글을 바꾸려면 다음과 같이 지정합니다.
 
-구버전에서 자동 생성된 `sessions.toggle_focus: ["tab", "esc"]` 값도 `["tab"]` 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+```json
+{
+  "agent": {
+    "focus_prev": ["ctrl+left", "ctrl+dot"],
+    "focus_next": ["ctrl+right", "ctrl+slash", "ctrl+_"],
+    "toggle_cokacdir_panel": ["alt+f"],
+    "toggle_terminal_panel": ["alt+t"]
+  },
+  "selection": {
+    "copy": ["alt+c"],
+    "clear": ["esc"]
+  }
+}
+```
 
-구버전에서 자동 생성된 이동 계열 기본값의 `h`, `j`, `k`, `l` 별칭도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+### cokacdir 입력 우선권
 
-구버전에서 자동 생성된 `agent.scroll_page_up` / `agent.scroll_page_down` 값도 새 기본값으로 자동 갱신됩니다. 직접 바꾼 값은 유지됩니다.
+기존 동작을 유지하기 위해 아래 옵션은 기본적으로 `true`입니다. 단축키 배열과 달리 이 두 옵션은 JSON 불리언을 사용합니다. 변경 시 재시작 없이 적용됩니다.
+
+```json
+{
+  "cokacdir": {
+    "passthrough_shift": true,
+    "passthrough_kill": true
+  }
+}
+```
+
+- `passthrough_shift`: cokacdir에 포커스가 있으면 Shift가 포함된 일반 agent/global 단축키 처리를 건너뜁니다. `false`로 설정하면 지정한 Shift 조합도 cokacmux가 처리합니다.
+- `passthrough_kill`: cokacdir에서 `agent.kill`을 자식 앱에 넘깁니다. `false`로 설정하면 cokacmux 종료 동작을 사용합니다. Shift 조합으로 지정했다면 `passthrough_shift`도 적용됩니다.
+- `agent.kill_all`, 사이드바에 포커스가 있을 때의 `agent.sidebar_sessions`, 선택 영역 복사·해제, 대화상자·작업 진행 잠금은 별도의 입력 문맥입니다. 해당 키를 해제하려면 각 액션을 `[]`로 지정합니다. 사이드바 자체에는 입력을 받을 자식 PTY가 없습니다.
 
 점 표기(flat)도 사용할 수 있습니다.
 
@@ -128,7 +154,7 @@ shift+alt+up
 ctrl+shift+left
 ```
 
-키 이름은 대소문자를 구분하지 않습니다. 키 이름 안의 `_`, `-`, 공백은 무시되므로 `pageup`, `page-up`, `page_up`은 같은 키입니다.
+특수 키 이름과 modifier는 대소문자를 구분하지 않습니다. 일반 문자는 `g`와 `G`를 구분합니다. 키 이름 안의 `_`, `-`, 공백은 무시되므로 `pageup`, `page-up`, `page_up`은 같은 키입니다.
 
 ### Modifier
 
@@ -156,7 +182,7 @@ ctrl+shift+left
 | `pageup` | `pgup` |
 | `pagedown` | `pgdn` |
 | `tab` | |
-| `backtab` | |
+| `backtab` | `shift+tab`과 동일 |
 | `delete` | `del` |
 | `insert` | `ins` |
 | `esc` | `escape` |
@@ -205,6 +231,16 @@ G
 |---|---|---|
 | `global.quit` | `ctrl+q` | 어디서든 종료 |
 
+### 선택·알림·작업 취소
+
+| 액션 | 기본 키 | 설명 |
+|---|---|---|
+| `selection.copy` | `enter`, `ctrl+shift+c` | 선택 영역 복사 요청 |
+| `selection.clear` | `esc` | 선택 영역 해제; 키를 자식에게 전달하지 않음 |
+| `notice.dismiss` | `enter`, `esc` | 알림 닫기 |
+| `data_task.cancel` | `esc` | 진행 중인 clone 작업 취소 |
+| `ai_search.cancel` | `esc` | 진행 중인 AI 검색 취소 |
+
 ### sessions
 
 세션 목록/미리보기 화면에서 쓰는 액션입니다. `Esc`는 `sessions.toggle_focus` 기본값이 아닙니다. normal 세션 화면에서는 적용된 검색 결과를 먼저 해제하고, 검색 결과가 없으면 종료합니다.
@@ -213,6 +249,8 @@ Codex가 만든 non-root 세션은 기본 `top-level` 범위에서 숨겨집니�
 
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
+| `sessions.escape` | `esc` | 적용된 검색 결과 해제; 없으면 종료 |
+| `sessions.kill_all` | `ctrl+shift+k`, `shift+k` | 전체 종료 확인창 |
 | `sessions.quit` | `q` | 종료 |
 | `sessions.force_quit` | `ctrl+c` | 종료 |
 | `sessions.toggle_agent` | `ctrl+]`, `ctrl+[` | 세션 화면과 agent 화면 전환 |
@@ -262,6 +300,12 @@ Codex가 만든 non-root 세션은 기본 `top-level` 범위에서 숨겨집니�
 | 액션 | 기본 키 | 설명 |
 |---|---|---|
 | `agent.toggle_sessions` | `ctrl+]`, `ctrl+[` | 세션 화면으로 전환 |
+| `agent.kill_all` | `ctrl+shift+k` | 전체 종료 확인창 |
+| `agent.focus_prev` | `ctrl+left`, `ctrl+dot`, `shift+left` | 이전 패널 포커스 |
+| `agent.focus_next` | `ctrl+right`, `ctrl+slash`, `ctrl+_`, `shift+right` | 다음 패널 포커스 |
+| `agent.focused_sidebar_prev` | `up` | 사이드바에 포커스가 있을 때 이전 에이전트 |
+| `agent.focused_sidebar_next` | `down` | 사이드바에 포커스가 있을 때 다음 에이전트 |
+| `agent.sidebar_sessions` | `esc` | 사이드바에서 세션 화면으로 이동 |
 | `agent.kill` | `ctrl+k` | 현재 코딩 agent/일반 터미널 종료. `cokacdir` 화면에서는 자식 앱에 전달 |
 | `agent.new_shell` | `ctrl+n` | 현재 agent cwd를 기본값으로 새 세션 모달 열기 |
 | `agent.toggle_sidebar` | `ctrl+b` | agents 사이드바 표시/숨김 |
@@ -283,7 +327,9 @@ Codex가 만든 non-root 세션은 기본 `top-level` 범위에서 숨겨집니�
 | `agent.switch_prev` | `ctrl+pageup` | 이전 live agent로 전환 |
 | `agent.switch_next` | `ctrl+pagedown` | 다음 live agent로 전환 |
 
-`Ctrl+F`와 `Ctrl+T`는 cokacmux가 항상 먼저 처리하며 어떤 pane에서도 자식 앱에 전달하지 않습니다. 위 두 토글 액션을 다른 키로 바꿔도 `Ctrl+F`와 `Ctrl+T`는 자식 앱으로 가지 않습니다.
+`Ctrl+F`와 `Ctrl+T`는 기본 패널 토글 키입니다. 해당 액션을 재지정하거나 해제하면 다른 액션과 충돌하지 않는 이전 키는 자식 앱에 전달됩니다. Codex 스크롤은 사용자가 지정한 키를 실행 시 설치한 transcript/pager 입력으로 변환하므로 이미 실행 중인 Codex에서도 cokacmux의 키 재지정이 적용됩니다. 자식 앱 자체의 편집·pager 단축키는 해당 앱이 관리합니다.
+
+Claude와 OpenCode에서도 재지정한 스크롤 키를 자식 앱의 스크롤 입력으로 변환합니다. [Claude fullscreen](https://code.claude.com/docs/en/keybindings#scroll-actions)의 줄 이동은 휠 입력 한 번으로 전달하므로 fullscreen 마우스 보고가 필요하며, 실제 이동량은 Claude의 휠 설정을 따릅니다. 마우스 보고가 꺼져 있으면 상태줄에 이유를 표시하고 지정한 키를 프롬프트에 입력하지 않습니다. 페이지·처음·끝 이동은 `PageUp`/`PageDown`/`Ctrl+Home`/`Ctrl+End`를 사용합니다. [OpenCode 기본 키](https://opencode.ai/docs/keybinds/)는 줄 이동에 `Ctrl+Alt+Y`/`Ctrl+Alt+E`, 페이지 이동에 `PageUp`/`PageDown`, 처음·끝 이동에 `Ctrl+G`/`Ctrl+Alt+G`를 사용합니다. 자식 앱에서 이 기본 스크롤 입력을 별도로 변경하면 해당 앱의 설정도 맞춰야 합니다.
 
 ### delete_confirm
 
@@ -297,6 +343,19 @@ Codex가 만든 non-root 세션은 기본 `top-level` 범위에서 숨겨집니�
 | `delete_confirm.prev` | `left`, `up`, `backtab` | 이전 버튼 선택 |
 | `delete_confirm.delete` | `1`, `y`, `Y` | Delete session 버튼 실행 |
 | `delete_confirm.cancel_choice` | `2` | Cancel 버튼 실행 |
+
+### killall_confirm
+
+전체 종료 확인창의 키입니다. 기본 선택은 Cancel이며 확인창을 여는 키만으로는 종료하지 않습니다.
+
+| 액션 | 기본 키 | 설명 |
+|---|---|---|
+| `killall_confirm.cancel` | `esc`, `n`, `N` | 취소 |
+| `killall_confirm.confirm` | `enter` | 선택한 버튼 실행 |
+| `killall_confirm.next` | `right`, `down`, `tab` | 다음 버튼 |
+| `killall_confirm.prev` | `left`, `up`, `backtab` | 이전 버튼 |
+| `killall_confirm.kill` | `1` | 전체 종료 실행 |
+| `killall_confirm.cancel_choice` | `2` | 취소 |
 
 ### create_folder
 
@@ -370,8 +429,17 @@ clone으로 저장된 폴더 데이터가 있을 때 표시되는 복원 확인 
 | `ai_title_settings.codex` | `3` | Codex 선택 |
 | `ai_title_settings.opencode` | `4` | OpenCode 선택 |
 | `ai_title_settings.pi` | `5` | Pi 선택 |
+| `ai_title_settings.section_prev` | `left` | 이전 섹션 |
+| `ai_title_settings.section_next` | `right` | 다음 섹션 |
+| `ai_title_settings.activate` | `space` | 현재 행 선택/값 변경 |
+| `ai_title_settings.move_left` | `left` | 편집 커서 왼쪽 |
+| `ai_title_settings.move_right` | `right` | 편집 커서 오른쪽 |
+| `ai_title_settings.home` | `home` | 편집 커서 처음 |
+| `ai_title_settings.end` | `end` | 편집 커서 끝 |
+| `ai_title_settings.backspace` | `backspace` | 편집 커서 앞 문자 삭제 |
+| `ai_title_settings.delete` | `delete` | 편집 커서 위치 문자 삭제 |
 
-설정 화면의 섹션 이동은 `←` / `→`입니다. `Space`는 현재 행의 값을 바꾸거나 AI provider를 선택합니다. Keybindings와 Data 섹션은 읽기 전용이며, 저장 전 변경사항은 설정 화면 상단에 표시됩니다.
+설정 화면의 섹션 이동 기본 키는 `←` / `→`(`ai_title_settings.section_prev`/`section_next`)입니다. `Space`(`ai_title_settings.activate`)는 현재 행의 값을 바꾸거나 AI provider를 선택합니다. Keybindings와 Data 섹션은 읽기 전용이며, 저장 전 변경사항은 설정 화면 상단에 표시됩니다.
 
 General의 `Scrollback lines` 행에서는 숫자를 누르면 값 편집을 시작합니다. 이 행과 값 편집 중에는 `1`~`5`가 AI provider 선택 대신 입력값으로 처리됩니다.
 
@@ -406,10 +474,13 @@ General의 `Scrollback lines` 행에서는 숫자를 누르면 값 편집을 시
 | `new_session.delete` | `delete` | 폴더 경로에서 커서 위치 글자 삭제 |
 | `new_session.home` | `home` | 폴더 경로 커서 처음으로 |
 | `new_session.end` | `end` | 폴더 경로 커서 끝으로 |
+| `new_session.complete` | `tab` | 폴더 경로 자동완성 열기/적용 |
 
 Folder 항목의 자동완성은 로컬 디렉터리만 제안합니다. 후보는 exact, 대소문자 무시 exact, prefix, substring, subsequence 순서로 정렬되며, 숨김 디렉터리는 `.`를 직접 입력하기 전까지 뒤로 밀립니다.
 
-폴더 경로 입력 항목에서는 일반 문자 키가 경로 입력으로 우선 처리됩니다. 입력 항목을 이동하려면 `up`, `down`, `tab`, `backtab`을 쓰면 됩니다.
+폴더 경로 입력 항목에서도 지정한 액션 키가 먼저 처리되고, 나머지 일반 문자는 경로에 입력됩니다. 기본 이동 키는 `up`, `down`, `tab`, `backtab`이며 경로 자동완성 키는 `new_session.complete`에서 별도로 바꿀 수 있습니다.
+
+자동완성 후보가 없어도 지정한 자동완성 키가 경로에 문자로 입력되지는 않습니다. 같은 키를 항목 이동에도 지정했다면 후보가 없을 때 해당 이동을 수행합니다. 기본 `Tab`도 이 규칙을 따릅니다.
 
 ### clone_options
 
@@ -425,6 +496,7 @@ clone 실행 전에 세션만 복제할지, 저장 가능한 폴더 데이터도
 | `clone_options.target_prev` | `backtab` | 이전 대상 provider 선택 |
 | `clone_options.session_only` | `1` | Session only 버튼 실행 |
 | `clone_options.folder_data` | `2` | Folder data too 버튼 실행 |
+| `clone_options.context_mode` | `m` | 다른 provider로 복제할 때 context mode 전환 |
 | `clone_options.cancel_choice` | `3` | Cancel 버튼 실행 |
 
 ## macOS 참고

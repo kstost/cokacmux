@@ -296,16 +296,22 @@ pub(super) fn finish_frame(app: &mut App, buffer: &mut Buffer, footer: Option<Re
         }
     }
     if let Some(footer) = footer {
-        let status = app
+        let message = app
             .text_selection
             .copy_status
             .as_deref()
-            .unwrap_or("Text selection · view paused · Enter copy · Esc clear");
+            .unwrap_or("Text selection · view paused");
+        let status = format!(
+            "{} · {} copy · {} clear",
+            message,
+            app.keybindings.help(KeyAction::SelectionCopy, "Enter"),
+            app.keybindings.help(KeyAction::SelectionClear, "Esc"),
+        );
         fill_area(buffer, footer, theme_status_style());
         buffer.set_stringn(
             footer.x,
             footer.y,
-            status,
+            &status,
             footer.width as usize,
             theme_status_style(),
         );
@@ -320,22 +326,19 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         clear(app);
         return false;
     }
-    let copy = (key.code == KeyCode::Enter && key.modifiers.is_empty())
-        || (matches!(key.code, KeyCode::Char('c' | 'C'))
-            && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+    let copy = app.keybindings.matches(KeyAction::SelectionCopy, key);
     if copy && selected.moved {
         let text = selected.text();
         if text.is_empty() {
-            app.text_selection.copy_status = Some("Selection is empty · Esc clear".into());
+            app.text_selection.copy_status = Some("Selection is empty".into());
         } else {
             app.text_selection.clipboard_request = Some(clipboard_sequence(text.as_bytes()));
-            app.text_selection.copy_status =
-                Some("Copy requested · view paused · Esc clear".into());
+            app.text_selection.copy_status = Some("Copy requested · view paused".into());
         }
         return true;
     }
     clear(app);
-    key.code == KeyCode::Esc && key.modifiers.is_empty()
+    app.keybindings.matches(KeyAction::SelectionClear, key)
 }
 
 // OSC 52 requests a copy on the user's terminal, including over SSH. Do not
@@ -369,7 +372,7 @@ fn clipboard_sequence(text: &[u8]) -> Vec<u8> {
 pub(super) fn flush_clipboard(app: &mut App, output: &mut impl Write) {
     if let Some(data) = app.text_selection.clipboard_request.take() {
         if let Err(error) = output.write_all(&data).and_then(|_| output.flush()) {
-            app.text_selection.copy_status = Some(format!("Copy failed: {error} · Esc clear"));
+            app.text_selection.copy_status = Some(format!("Copy failed: {error}"));
         }
     }
 }
@@ -502,6 +505,43 @@ mod tests {
                 .last_input_epoch_ms,
             0
         );
+    }
+
+    #[test]
+    fn selection_copy_and_clear_follow_reassigned_keys() {
+        let mut fixture = Fixture::new(true);
+        fixture.app.keybindings.apply_json(&serde_json::json!({
+            "selection": { "copy": ["f8"], "clear": ["f9"] }
+        }));
+        for event in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            fixture.select_hello(KeyModifiers::ALT);
+            assert!(
+                !handle_key(&mut fixture.app, event),
+                "old shortcut should continue to the child"
+            );
+            assert!(fixture.app.text_selection.clipboard_request.is_none());
+        }
+        fixture.select_hello(KeyModifiers::ALT);
+        assert!(handle_key(
+            &mut fixture.app,
+            KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE)
+        ));
+        let mut output = Vec::new();
+        flush_clipboard(&mut fixture.app, &mut output);
+        assert_eq!(output, b"\x1b]52;c;aGVsbG8=\x1b\\");
+        assert!(handle_key(
+            &mut fixture.app,
+            KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE)
+        ));
+        assert!(fixture.app.text_selection.active.is_none());
+        assert!(fixture.requests.try_recv().is_err());
     }
 
     #[test]

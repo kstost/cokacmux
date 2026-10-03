@@ -245,7 +245,7 @@ fn exit_sends_final_snapshot_before_notice_after_output_discard() {
         }
     }
     assert!(conn.needs_resync);
-    conn.send_exit_after_resync("done".into(), || AgentDaemonEvent::Snapshot {
+    conn.send_exit_after_resync("done".into(), false, || AgentDaemonEvent::Snapshot {
         data: b"FINAL-MARKER".to_vec(),
         state: None,
     })

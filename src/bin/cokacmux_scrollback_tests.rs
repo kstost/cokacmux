@@ -347,8 +347,13 @@ fn only_terminals_keep_a_cokacmux_scrollback() {
     let cwd = "/tmp/project".to_string();
     let terminals = [
         shell_session_info_for_cwd(cwd.clone()),
-        cli_command_session_info("web".into(), cwd.clone(), vec!["npm".into(), "run".into()])
-            .unwrap(),
+        cli_command_session_info(
+            "web".into(),
+            cwd.clone(),
+            vec!["npm".into(), "run".into()],
+            false,
+        )
+        .unwrap(),
     ];
     for info in &terminals {
         assert_eq!(agent_scrollback_lines_for(info, &limited), 5_000);

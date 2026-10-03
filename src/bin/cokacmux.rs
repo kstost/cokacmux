@@ -611,39 +611,10 @@ const NEW_SESSION_NEXT_DEFAULTS: &[&str] = &["down", "tab"];
 const NEW_SESSION_PREV_DEFAULTS: &[&str] = &["up", "backtab"];
 const NEW_SESSION_CHOICE_NEXT_DEFAULTS: &[&str] = &["right", "space"];
 const NEW_SESSION_CHOICE_PREV_DEFAULTS: &[&str] = &["left"];
-const PREVIOUS_SESSION_FILTER_DEFAULTS: &[&str] = &["/"];
-const PREVIOUS_SESSION_AI_SEARCH_DEFAULTS: &[&str] = &["ctrl+s"];
-const PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS: &[&str] = &["ctrl+t"];
-const PREVIOUS_SESSION_AI_TITLE_SETTINGS_WITH_COMMA_DEFAULTS: &[&str] = &["comma", "ctrl+t"];
-const PREVIOUS_SESSION_TOGGLE_FOCUS_DEFAULTS: &[&str] = &["tab", "esc"];
-const PREVIOUS_SESSION_KILL_ALL_DEFAULTS: &[&str] = &["ctrl+shift+k"];
-const PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS: &[&str] = &["e"];
-const PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS: &[&str] = &["enter"];
-const PREVIOUS_SESSION_MOVE_NEXT_DEFAULTS: &[&str] = &["down", "j"];
-const PREVIOUS_SESSION_MOVE_PREV_DEFAULTS: &[&str] = &["up", "k"];
-const PREVIOUS_SEARCH_CHOICE_NEXT_DEFAULTS: &[&str] = &["down", "j", "tab"];
-const PREVIOUS_SEARCH_CHOICE_PREV_DEFAULTS: &[&str] = &["up", "k", "backtab"];
-const PREVIOUS_HORIZONTAL_CHOICE_NEXT_DEFAULTS: &[&str] = &["right", "down", "l", "j", "tab"];
-const PREVIOUS_HORIZONTAL_CHOICE_PREV_DEFAULTS: &[&str] = &["left", "up", "h", "k", "backtab"];
-const PREVIOUS_CLONE_OPTIONS_NEXT_DEFAULTS: &[&str] = &["right", "down", "l", "j"];
-const PREVIOUS_CLONE_OPTIONS_PREV_DEFAULTS: &[&str] = &["left", "up", "h", "k"];
-const PREVIOUS_AGENT_LAUNCH_NEXT_DEFAULTS: &[&str] = &["down", "j"];
-const PREVIOUS_AGENT_LAUNCH_PREV_DEFAULTS: &[&str] = &["up", "k"];
-const PREVIOUS_NEW_SESSION_NEXT_DEFAULTS: &[&str] = &["down", "j", "tab"];
-const PREVIOUS_NEW_SESSION_PREV_DEFAULTS: &[&str] = &["up", "k", "backtab"];
-const PREVIOUS_NEW_SESSION_CHOICE_NEXT_DEFAULTS: &[&str] = &["right", "l", "space"];
-const PREVIOUS_NEW_SESSION_CHOICE_PREV_DEFAULTS: &[&str] = &["left", "h"];
 const AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+up", "shift+alt+pageup", "alt+pageup"];
 const AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] =
     &["shift+alt+down", "shift+alt+pagedown", "alt+pagedown"];
 const AGENT_FOCUS_AUXILIARY_DEFAULTS: &[&str] = &["ctrl+3"];
-const PREVIOUS_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+up", "shift+alt+pageup"];
-const PREVIOUS_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+down", "shift+alt+pagedown"];
-const OLDER_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+alt+pageup"];
-const OLDER_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+alt+pagedown"];
-const PREVIOUS_AGENT_FOCUS_AUXILIARY_DEFAULTS: &[&str] = &[];
-const LEGACY_AGENT_SCROLL_PAGE_UP_DEFAULTS: &[&str] = &["shift+pageup", "alt+pageup"];
-const LEGACY_AGENT_SCROLL_PAGE_DOWN_DEFAULTS: &[&str] = &["shift+pagedown", "alt+pagedown"];
 const CODEX_TRANSCRIPT_OPEN_BINDINGS: &[&str] = &[
     "shift-up",
     "shift-down",
@@ -1196,6 +1167,12 @@ fn unit_test_storage_root() -> &'static PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum KeyAction {
     GlobalQuit,
+    SelectionCopy,
+    SelectionClear,
+    NoticeDismiss,
+    DataTaskCancel,
+    AiSearchCancel,
+    SessionEscape,
     SessionQuit,
     SessionForceQuit,
     SessionToggleAgent,
@@ -1235,6 +1212,11 @@ enum KeyAction {
     AgentFocusSidebar,
     AgentFocusMain,
     AgentFocusAuxiliary,
+    AgentFocusPrev,
+    AgentFocusNext,
+    AgentFocusedSidebarPrev,
+    AgentFocusedSidebarNext,
+    AgentSidebarSessions,
     AgentScrollLineUp,
     AgentScrollLineDown,
     AgentScrollPageUp,
@@ -1303,6 +1285,15 @@ enum KeyAction {
     AiTitleSettingsCodex,
     AiTitleSettingsOpenCode,
     AiTitleSettingsPi,
+    SettingsSectionPrev,
+    SettingsSectionNext,
+    SettingsActivate,
+    SettingsMoveLeft,
+    SettingsMoveRight,
+    SettingsHome,
+    SettingsEnd,
+    SettingsBackspace,
+    SettingsDelete,
     AgentLaunchCancel,
     AgentLaunchConfirm,
     AgentLaunchNext,
@@ -1331,10 +1322,25 @@ enum KeyAction {
     NewSessionDelete,
     NewSessionHome,
     NewSessionEnd,
+    NewSessionComplete,
 }
 
 const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     ("global.quit", KeyAction::GlobalQuit, &["ctrl+q"]),
+    (
+        "selection.copy",
+        KeyAction::SelectionCopy,
+        &["enter", "ctrl+shift+c"],
+    ),
+    ("selection.clear", KeyAction::SelectionClear, &["esc"]),
+    (
+        "notice.dismiss",
+        KeyAction::NoticeDismiss,
+        &["enter", "esc"],
+    ),
+    ("data_task.cancel", KeyAction::DataTaskCancel, &["esc"]),
+    ("ai_search.cancel", KeyAction::AiSearchCancel, &["esc"]),
+    ("sessions.escape", KeyAction::SessionEscape, &["esc"]),
     ("sessions.quit", KeyAction::SessionQuit, &["q"]),
     (
         "sessions.force_quit",
@@ -1481,6 +1487,31 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
         &["ctrl+1"],
     ),
     ("agent.focus_main", KeyAction::AgentFocusMain, &["ctrl+2"]),
+    (
+        "agent.focus_prev",
+        KeyAction::AgentFocusPrev,
+        &["ctrl+left", "ctrl+dot", "shift+left"],
+    ),
+    (
+        "agent.focus_next",
+        KeyAction::AgentFocusNext,
+        &["ctrl+right", "ctrl+slash", "ctrl+_", "shift+right"],
+    ),
+    (
+        "agent.focused_sidebar_prev",
+        KeyAction::AgentFocusedSidebarPrev,
+        &["up"],
+    ),
+    (
+        "agent.focused_sidebar_next",
+        KeyAction::AgentFocusedSidebarNext,
+        &["down"],
+    ),
+    (
+        "agent.sidebar_sessions",
+        KeyAction::AgentSidebarSessions,
+        &["esc"],
+    ),
     (
         "agent.focus_auxiliary",
         KeyAction::AgentFocusAuxiliary,
@@ -1793,6 +1824,43 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     ),
     ("ai_title_settings.pi", KeyAction::AiTitleSettingsPi, &["5"]),
     (
+        "ai_title_settings.section_prev",
+        KeyAction::SettingsSectionPrev,
+        &["left"],
+    ),
+    (
+        "ai_title_settings.section_next",
+        KeyAction::SettingsSectionNext,
+        &["right"],
+    ),
+    (
+        "ai_title_settings.activate",
+        KeyAction::SettingsActivate,
+        &["space"],
+    ),
+    (
+        "ai_title_settings.move_left",
+        KeyAction::SettingsMoveLeft,
+        &["left"],
+    ),
+    (
+        "ai_title_settings.move_right",
+        KeyAction::SettingsMoveRight,
+        &["right"],
+    ),
+    ("ai_title_settings.home", KeyAction::SettingsHome, &["home"]),
+    ("ai_title_settings.end", KeyAction::SettingsEnd, &["end"]),
+    (
+        "ai_title_settings.backspace",
+        KeyAction::SettingsBackspace,
+        &["backspace"],
+    ),
+    (
+        "ai_title_settings.delete",
+        KeyAction::SettingsDelete,
+        &["delete"],
+    ),
+    (
         "agent_launch.cancel",
         KeyAction::AgentLaunchCancel,
         &["esc"],
@@ -1866,6 +1934,11 @@ const DEFAULT_KEYBINDINGS: &[(&str, KeyAction, &[&str])] = &[
     ),
     ("new_session.home", KeyAction::NewSessionHome, &["home"]),
     ("new_session.end", KeyAction::NewSessionEnd, &["end"]),
+    (
+        "new_session.complete",
+        KeyAction::NewSessionComplete,
+        &["tab"],
+    ),
 ];
 
 #[derive(Debug, Clone)]
@@ -1902,6 +1975,7 @@ impl KeyBinding {
             }
         }
         let code = parse_key_code(key_part)?;
+        let (code, modifiers) = normalize_binding_key(code, modifiers);
         if is_disallowed_control_alias_binding(code, modifiers) {
             return Err(format!("unsupported ambiguous control alias `{}`", trimmed));
         }
@@ -1914,6 +1988,12 @@ impl KeyBinding {
     }
 
     fn matches(&self, key: KeyEvent) -> bool {
+        let (code, modifiers) = normalize_binding_key(key.code, key.modifiers);
+        let key = KeyEvent {
+            code,
+            modifiers,
+            ..key
+        };
         if self.code == key.code && self.modifiers == key.modifiers {
             return true;
         }
@@ -1959,8 +2039,22 @@ impl KeyBinding {
         if self.modifiers.contains(KeyModifiers::HYPER) {
             parts.push("Hyper".to_string());
         }
-        parts.push(key_code_display(self.code));
+        parts.push(key_code_display(if self.code == KeyCode::BackTab {
+            KeyCode::Tab
+        } else {
+            self.code
+        }));
         parts.join("+")
+    }
+}
+
+// Terminals report Shift+Tab as either Tab+SHIFT or BackTab, sometimes with
+// SHIFT already consumed. Treat all three spellings as the same binding.
+fn normalize_binding_key(code: KeyCode, modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    match code {
+        KeyCode::BackTab => (KeyCode::BackTab, modifiers | KeyModifiers::SHIFT),
+        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => (KeyCode::BackTab, modifiers),
+        _ => (code, modifiers),
     }
 }
 
@@ -1980,27 +2074,23 @@ fn key_binding_control_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<V
     let KeyCode::Char(c) = code else {
         return None;
     };
-    let bytes = key_event_to_bytes(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))?;
+    let mut bytes = key_event_to_bytes(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))?;
     if bytes == [0x1b] || bytes == [0x1d] {
         return None;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        bytes.insert(0, 0x1b);
     }
     Some(bytes)
 }
 
-/// Ctrl+F and Ctrl+T belong to cokacmux (the right-panel toggles by
-/// default). They are never forwarded to a child app, in any pane, even when
-/// a custom keymap moved the toggles to other keys.
-fn is_cokacmux_reserved_agent_key(key: KeyEvent) -> bool {
-    key_event_control_bytes(key).is_some_and(|bytes| bytes == [0x06] || bytes == [0x14])
-}
-
 fn key_event_control_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    if key.modifiers.intersects(
+        KeyModifiers::SHIFT | KeyModifiers::SUPER | KeyModifiers::META | KeyModifiers::HYPER,
+    ) {
+        return None;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
-        if key.modifiers.intersects(
-            KeyModifiers::SHIFT | KeyModifiers::SUPER | KeyModifiers::META | KeyModifiers::HYPER,
-        ) {
-            return None;
-        }
         if let Some(bytes) = key_event_to_bytes(key) {
             if bytes != [0x1b] && bytes != [0x1d] {
                 return Some(bytes);
@@ -2010,7 +2100,11 @@ fn key_event_control_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     if let KeyCode::Char(c) = key.code {
         if c.is_control() && c != '\u{1b}' && c != '\u{1d}' {
             let mut buf = [0; 4];
-            return Some(c.encode_utf8(&mut buf).as_bytes().to_vec());
+            let mut bytes = c.encode_utf8(&mut buf).as_bytes().to_vec();
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                bytes.insert(0, 0x1b);
+            }
+            return Some(bytes);
         }
     }
     None
@@ -2019,6 +2113,8 @@ fn key_event_control_bytes(key: KeyEvent) -> Option<Vec<u8>> {
 #[derive(Debug, Clone)]
 struct KeyBindings {
     bindings: HashMap<KeyAction, Vec<KeyBinding>>,
+    cokacdir_passthrough_shift: bool,
+    cokacdir_passthrough_kill: bool,
 }
 
 impl Default for KeyBindings {
@@ -2033,7 +2129,11 @@ impl Default for KeyBindings {
                     .collect(),
             );
         }
-        Self { bindings }
+        Self {
+            bindings,
+            cokacdir_passthrough_shift: true,
+            cokacdir_passthrough_kill: true,
+        }
     }
 }
 
@@ -2080,12 +2180,10 @@ impl KeyBindings {
             }
         };
         match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(mut value) => {
-                let migrated = migrate_legacy_keybinding_defaults(&mut value);
+            Ok(value) => {
+                // Fill missing actions from Self::default() in memory only.
+                // Writing this snapshot back could erase a concurrent edit.
                 keybindings.apply_json(&value);
-                if migrated {
-                    persist_migrated_keybinding_file(path, &value);
-                }
             }
             Err(e) => return Err(format!("parse {} failed: {}", path.display(), e)),
         }
@@ -2162,10 +2260,27 @@ impl KeyBindings {
                 group_map.insert(action.to_string(), value);
             }
         }
+        root.insert(
+            "cokacdir".into(),
+            serde_json::json!({
+                "passthrough_shift": true,
+                "passthrough_kill": true,
+            }),
+        );
         serde_json::Value::Object(root)
     }
 
     fn apply_json(&mut self, value: &serde_json::Value) {
+        if let Some(enabled) = keybinding_json_value(value, "cokacdir.passthrough_shift")
+            .and_then(serde_json::Value::as_bool)
+        {
+            self.cokacdir_passthrough_shift = enabled;
+        }
+        if let Some(enabled) = keybinding_json_value(value, "cokacdir.passthrough_kill")
+            .and_then(serde_json::Value::as_bool)
+        {
+            self.cokacdir_passthrough_kill = enabled;
+        }
         for (path, action, _) in DEFAULT_KEYBINDINGS {
             let Some(raw_bindings) = keybinding_json_value(value, path) else {
                 continue;
@@ -2201,10 +2316,10 @@ impl KeyBindings {
             .collect()
     }
 
-    fn help(&self, action: KeyAction, fallback: &str) -> String {
+    fn help(&self, action: KeyAction, _fallback: &str) -> String {
         let labels = self.labels(action, 2);
         if labels.is_empty() {
-            fallback.to_string()
+            "unbound".to_string()
         } else {
             labels.join("/")
         }
@@ -2253,367 +2368,6 @@ fn parse_keybinding_json_list(
             })
             .collect(),
         other => Err(format!("expected string, array, or null, got {}", other)),
-    }
-}
-
-fn migrate_legacy_keybinding_defaults(root: &mut serde_json::Value) -> bool {
-    let mut migrated = false;
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "sessions.filter"),
-        &[PREVIOUS_SESSION_FILTER_DEFAULTS],
-        SESSION_FILTER_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["sessions", "filter"]),
-        &[PREVIOUS_SESSION_FILTER_DEFAULTS],
-        SESSION_FILTER_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "sessions.ai_search"),
-        &[PREVIOUS_SESSION_AI_SEARCH_DEFAULTS],
-        SESSION_AI_SEARCH_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["sessions", "ai_search"]),
-        &[PREVIOUS_SESSION_AI_SEARCH_DEFAULTS],
-        SESSION_AI_SEARCH_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "sessions.ai_title_settings"),
-        &[
-            PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS,
-            PREVIOUS_SESSION_AI_TITLE_SETTINGS_WITH_COMMA_DEFAULTS,
-        ],
-        SESSION_AI_TITLE_SETTINGS_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["sessions", "ai_title_settings"]),
-        &[
-            PREVIOUS_SESSION_AI_TITLE_SETTINGS_DEFAULTS,
-            PREVIOUS_SESSION_AI_TITLE_SETTINGS_WITH_COMMA_DEFAULTS,
-        ],
-        SESSION_AI_TITLE_SETTINGS_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "sessions.toggle_focus"),
-        &[PREVIOUS_SESSION_TOGGLE_FOCUS_DEFAULTS],
-        SESSION_TOGGLE_FOCUS_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["sessions", "toggle_focus"]),
-        &[PREVIOUS_SESSION_TOGGLE_FOCUS_DEFAULTS],
-        SESSION_TOGGLE_FOCUS_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "sessions.kill_all",
-        &["sessions", "kill_all"],
-        &[PREVIOUS_SESSION_KILL_ALL_DEFAULTS],
-        SESSION_KILL_ALL_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "sessions.launch_agent"),
-        &[PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS],
-        SESSION_LAUNCH_AGENT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["sessions", "launch_agent"]),
-        &[PREVIOUS_SESSION_LAUNCH_AGENT_DEFAULTS],
-        SESSION_LAUNCH_AGENT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "sessions.toggle_preview"),
-        &[PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS],
-        &[],
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["sessions", "toggle_preview"]),
-        &[PREVIOUS_SESSION_TOGGLE_PREVIEW_DEFAULTS],
-        &[],
-    );
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "sessions.move_next"),
-        &[PREVIOUS_SESSION_MOVE_NEXT_DEFAULTS],
-        SESSION_MOVE_NEXT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["sessions", "move_next"]),
-        &[PREVIOUS_SESSION_MOVE_NEXT_DEFAULTS],
-        SESSION_MOVE_NEXT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "sessions.move_prev"),
-        &[PREVIOUS_SESSION_MOVE_PREV_DEFAULTS],
-        SESSION_MOVE_PREV_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["sessions", "move_prev"]),
-        &[PREVIOUS_SESSION_MOVE_PREV_DEFAULTS],
-        SESSION_MOVE_PREV_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "search.next",
-        &["search", "next"],
-        &[PREVIOUS_SEARCH_CHOICE_NEXT_DEFAULTS],
-        SEARCH_CHOICE_NEXT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "search.prev",
-        &["search", "prev"],
-        &[PREVIOUS_SEARCH_CHOICE_PREV_DEFAULTS],
-        SEARCH_CHOICE_PREV_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "delete_confirm.next",
-        &["delete_confirm", "next"],
-        &[PREVIOUS_HORIZONTAL_CHOICE_NEXT_DEFAULTS],
-        HORIZONTAL_CHOICE_NEXT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "delete_confirm.prev",
-        &["delete_confirm", "prev"],
-        &[PREVIOUS_HORIZONTAL_CHOICE_PREV_DEFAULTS],
-        HORIZONTAL_CHOICE_PREV_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "create_folder.next",
-        &["create_folder", "next"],
-        &[PREVIOUS_HORIZONTAL_CHOICE_NEXT_DEFAULTS],
-        HORIZONTAL_CHOICE_NEXT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "create_folder.prev",
-        &["create_folder", "prev"],
-        &[PREVIOUS_HORIZONTAL_CHOICE_PREV_DEFAULTS],
-        HORIZONTAL_CHOICE_PREV_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "restore_data.next",
-        &["restore_data", "next"],
-        &[PREVIOUS_HORIZONTAL_CHOICE_NEXT_DEFAULTS],
-        HORIZONTAL_CHOICE_NEXT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "restore_data.prev",
-        &["restore_data", "prev"],
-        &[PREVIOUS_HORIZONTAL_CHOICE_PREV_DEFAULTS],
-        HORIZONTAL_CHOICE_PREV_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "clone_options.next",
-        &["clone_options", "next"],
-        &[PREVIOUS_CLONE_OPTIONS_NEXT_DEFAULTS],
-        CLONE_OPTIONS_NEXT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "clone_options.prev",
-        &["clone_options", "prev"],
-        &[PREVIOUS_CLONE_OPTIONS_PREV_DEFAULTS],
-        CLONE_OPTIONS_PREV_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "agent_launch.next",
-        &["agent_launch", "next"],
-        &[PREVIOUS_AGENT_LAUNCH_NEXT_DEFAULTS],
-        AGENT_LAUNCH_NEXT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "agent_launch.prev",
-        &["agent_launch", "prev"],
-        &[PREVIOUS_AGENT_LAUNCH_PREV_DEFAULTS],
-        AGENT_LAUNCH_PREV_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "new_session.next",
-        &["new_session", "next"],
-        &[PREVIOUS_NEW_SESSION_NEXT_DEFAULTS],
-        NEW_SESSION_NEXT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "new_session.prev",
-        &["new_session", "prev"],
-        &[PREVIOUS_NEW_SESSION_PREV_DEFAULTS],
-        NEW_SESSION_PREV_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "new_session.choice_next",
-        &["new_session", "choice_next"],
-        &[PREVIOUS_NEW_SESSION_CHOICE_NEXT_DEFAULTS],
-        NEW_SESSION_CHOICE_NEXT_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_paths(
-        root,
-        "new_session.choice_prev",
-        &["new_session", "choice_prev"],
-        &[PREVIOUS_NEW_SESSION_CHOICE_PREV_DEFAULTS],
-        NEW_SESSION_CHOICE_PREV_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "agent.scroll_page_up"),
-        &[
-            LEGACY_AGENT_SCROLL_PAGE_UP_DEFAULTS,
-            OLDER_AGENT_SCROLL_PAGE_UP_DEFAULTS,
-            PREVIOUS_AGENT_SCROLL_PAGE_UP_DEFAULTS,
-        ],
-        AGENT_SCROLL_PAGE_UP_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["agent", "scroll_page_up"]),
-        &[
-            LEGACY_AGENT_SCROLL_PAGE_UP_DEFAULTS,
-            OLDER_AGENT_SCROLL_PAGE_UP_DEFAULTS,
-            PREVIOUS_AGENT_SCROLL_PAGE_UP_DEFAULTS,
-        ],
-        AGENT_SCROLL_PAGE_UP_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "agent.scroll_page_down"),
-        &[
-            LEGACY_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
-            OLDER_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
-            PREVIOUS_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
-        ],
-        AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["agent", "scroll_page_down"]),
-        &[
-            LEGACY_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
-            OLDER_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
-            PREVIOUS_AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
-        ],
-        AGENT_SCROLL_PAGE_DOWN_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, "agent.focus_auxiliary"),
-        &[PREVIOUS_AGENT_FOCUS_AUXILIARY_DEFAULTS],
-        AGENT_FOCUS_AUXILIARY_DEFAULTS,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, &["agent", "focus_auxiliary"]),
-        &[PREVIOUS_AGENT_FOCUS_AUXILIARY_DEFAULTS],
-        AGENT_FOCUS_AUXILIARY_DEFAULTS,
-    );
-    migrated
-}
-
-fn migrate_generated_keybinding_paths(
-    root: &mut serde_json::Value,
-    flat_path: &str,
-    nested_path: &[&str],
-    previous_defaults: &[&[&str]],
-    current_defaults: &[&str],
-) -> bool {
-    let mut migrated = false;
-    migrated |= migrate_generated_keybinding_value(
-        flat_keybinding_json_value_mut(root, flat_path),
-        previous_defaults,
-        current_defaults,
-    );
-    migrated |= migrate_generated_keybinding_value(
-        nested_keybinding_json_value_mut(root, nested_path),
-        previous_defaults,
-        current_defaults,
-    );
-    migrated
-}
-
-fn flat_keybinding_json_value_mut<'a>(
-    root: &'a mut serde_json::Value,
-    path: &str,
-) -> Option<&'a mut serde_json::Value> {
-    root.as_object_mut()?.get_mut(path)
-}
-
-fn nested_keybinding_json_value_mut<'a>(
-    root: &'a mut serde_json::Value,
-    path: &[&str],
-) -> Option<&'a mut serde_json::Value> {
-    let mut current = root;
-    for part in path {
-        current = current.as_object_mut()?.get_mut(*part)?;
-    }
-    Some(current)
-}
-
-fn migrate_generated_keybinding_value(
-    value: Option<&mut serde_json::Value>,
-    generated_values: &[&[&str]],
-    current: &[&str],
-) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    if !generated_values
-        .iter()
-        .any(|generated| keybinding_json_list_equals(value, generated))
-    {
-        return false;
-    }
-    *value = keybinding_string_array_value(current);
-    true
-}
-
-fn keybinding_json_list_equals(value: &serde_json::Value, expected: &[&str]) -> bool {
-    match value {
-        serde_json::Value::String(binding) => expected.len() == 1 && binding == expected[0],
-        serde_json::Value::Array(bindings) => {
-            bindings.len() == expected.len()
-                && bindings
-                    .iter()
-                    .zip(expected.iter())
-                    .all(|(binding, expected)| binding.as_str() == Some(*expected))
-        }
-        _ => false,
-    }
-}
-
-fn keybinding_string_array_value(bindings: &[&str]) -> serde_json::Value {
-    serde_json::Value::Array(
-        bindings
-            .iter()
-            .map(|binding| serde_json::Value::String((*binding).to_string()))
-            .collect(),
-    )
-}
-
-fn persist_migrated_keybinding_file(path: &Path, value: &serde_json::Value) {
-    let content = match serde_json::to_string_pretty(value) {
-        Ok(content) => content + "\n",
-        Err(e) => {
-            debug_log(
-                "keybindings_migration_serialize_failed",
-                serde_json::json!({
-                    "path": path.display().to_string(),
-                    "error": e.to_string(),
-                }),
-            );
-            return;
-        }
-    };
-    if let Err(e) = fs::write(path, content) {
-        debug_log(
-            "keybindings_migration_write_failed",
-            serde_json::json!({
-                "path": path.display().to_string(),
-                "error": e.to_string(),
-            }),
-        );
     }
 }
 
@@ -10749,18 +10503,6 @@ impl AgentClient {
     }
 
     fn send_key(&mut self, key: KeyEvent) -> io::Result<()> {
-        if is_cokacmux_reserved_agent_key(key) {
-            debug_log(
-                "agent_client_reserved_key_not_forwarded",
-                serde_json::json!({
-                    "provider": self.info.provider.as_str(),
-                    "session_id": &self.info.session_id,
-                    "code": key_code_label(key),
-                    "modifiers": format!("{:?}", key.modifiers),
-                }),
-            );
-            return Ok(());
-        }
         if let Some(data) =
             key_event_to_bytes_with_mode(key, self.parser.screen().application_cursor())
         {
@@ -17770,11 +17512,11 @@ impl App {
                     | "choose what to start."
                     | "agents sidebar focused."
                     | "path edit cancelled."
-                    | "path edit done; Enter saves settings."
             )
             || message.starts_with("settings:")
             || message.starts_with("AI agent:")
             || message.starts_with("editing path;")
+            || message.starts_with("path edit done;")
         {
             return false;
         }
@@ -17881,8 +17623,7 @@ impl App {
             return true;
         }
 
-        let is_plain_esc = key.code == KeyCode::Esc && key.modifiers.is_empty();
-        if is_plain_esc {
+        if keybindings.matches(KeyAction::DataTaskCancel, key) {
             if !task.cancel_requested {
                 if let Some(cancel_token) = task.cancel_token.as_ref() {
                     cancel_token.store(true, Ordering::Relaxed);
@@ -17912,11 +17653,13 @@ impl App {
             }
         } else {
             let notice = if task.cancel_requested {
-                "clone is cancelling; other actions are locked"
+                "clone is cancelling; other actions are locked".to_string()
             } else {
-                "clone in progress; press Esc to cancel"
-            }
-            .to_string();
+                format!(
+                    "clone in progress; press {} to cancel",
+                    keybindings.help(KeyAction::DataTaskCancel, "Esc")
+                )
+            };
             task.notice = Some(notice.clone());
             self.status = notice;
             debug_log(
@@ -23072,8 +22815,11 @@ impl App {
                     "rows": rows,
                 }),
             );
-            self.status =
-                "no active agent to switch to; press e/Enter to start selected agent".into();
+            self.status = format!(
+                "no active agent to switch to; press {} to start selected agent",
+                self.keybindings
+                    .help(KeyAction::SessionLaunchAgent, "e/Enter")
+            );
             return;
         }
         self.refresh_agent_runtime_states_discovering_live_shells();
@@ -23140,8 +22886,11 @@ impl App {
                 );
                 return;
             }
-            self.status =
-                "no active agent to switch to; press e/Enter to start selected agent".into();
+            self.status = format!(
+                "no active agent to switch to; press {} to start selected agent",
+                self.keybindings
+                    .help(KeyAction::SessionLaunchAgent, "e/Enter")
+            );
             return;
         };
         let key = AgentKey::new(&info);
@@ -25207,6 +24956,39 @@ fn delegate_agent_scroll_to_child(
         return status;
     }
     let provider = agent.info.provider;
+    if matches!(
+        action,
+        AgentScrollAction::Lines(0) | AgentScrollAction::Pages(0)
+    ) {
+        return format!("{}: no scroll requested.", provider.as_str());
+    }
+    if provider == Provider::Claude {
+        if let AgentScrollAction::Lines(delta) = action {
+            // Claude binds line scrolling to wheel events, not Shift+arrows
+            // (which extend its selection). Use its negotiated mouse protocol.
+            let result = mouse::send_child_scroll_wheel(agent, delta);
+            let status = match &result {
+                Ok(()) => format!(
+                    "Claude fullscreen: delegated {}.",
+                    child_scroll_action_label(action)
+                ),
+                Err(error) => format!("scroll not sent: {error}"),
+            };
+            debug_log(
+                "agent_child_scroll_delegated",
+                serde_json::json!({
+                    "provider": provider.as_str(),
+                    "session_id": &agent.info.session_id,
+                    "action": format!("{:?}", action),
+                    "strategy": "claude_fullscreen_wheel",
+                    "original_key": debug_key_event_value(key),
+                    "send_ok": result.is_ok(),
+                    "status": &status,
+                }),
+            );
+            return status;
+        }
+    }
     let overlay_before = agent.codex_transcript_overlay_assumed_open;
     let mut delegated_keys = Vec::new();
     let strategy = if provider == Provider::Codex {
@@ -25228,7 +25010,7 @@ fn delegate_agent_scroll_to_child(
     } else if provider == Provider::OpenCode {
         if let Some(scroll_key) = opencode_child_scroll_key(action) {
             delegated_keys.push(scroll_key);
-            "opencode_page_scroll"
+            "opencode_message_scroll"
         } else {
             delegated_keys.push(key);
             "forward_original"
@@ -25264,7 +25046,7 @@ fn delegate_agent_scroll_to_child(
             "Claude fullscreen: delegated {}.",
             child_scroll_action_label(action)
         )
-    } else if provider == Provider::OpenCode && strategy == "opencode_page_scroll" {
+    } else if provider == Provider::OpenCode && strategy == "opencode_message_scroll" {
         format!("OpenCode: delegated {}.", child_scroll_action_label(action))
     } else {
         format!("{} scroll key forwarded to child.", provider.as_str())
@@ -29893,7 +29675,10 @@ fn handle_paste_input_event(app: &mut App, text: String) {
         }),
     );
     if app.ai_search_pending.is_some() {
-        app.status = "AI search in progress; press Esc to cancel.".into();
+        app.status = format!(
+            "AI search in progress; press {} to cancel.",
+            app.keybindings.help(KeyAction::AiSearchCancel, "Esc")
+        );
         debug_log(
             "input_paste_ignored",
             serde_json::json!({
@@ -50306,9 +50091,7 @@ fn handle_new_session_key(
                     "suggestions": cwd_completion.suggestions.len(),
                 }),
             );
-        } else if keybindings.matches(KeyAction::NewSessionNext, key)
-            && !new_session_cwd_text_key(*selected, key)
-        {
+        } else if keybindings.matches(KeyAction::NewSessionNext, key) {
             if *selected == NEW_SESSION_FIELD_CWD {
                 clear_new_session_path_completion(cwd_completion);
             }
@@ -50320,9 +50103,7 @@ fn handle_new_session_key(
                     "kind": kind.as_str(),
                 }),
             );
-        } else if keybindings.matches(KeyAction::NewSessionPrev, key)
-            && !new_session_cwd_text_key(*selected, key)
-        {
+        } else if keybindings.matches(KeyAction::NewSessionPrev, key) {
             if *selected == NEW_SESSION_FIELD_CWD {
                 clear_new_session_path_completion(cwd_completion);
             }
@@ -50457,13 +50238,6 @@ fn handle_new_session_key(
     handled
 }
 
-fn new_session_cwd_text_key(selected: usize, key: KeyEvent) -> bool {
-    selected == NEW_SESSION_FIELD_CWD
-        && matches!(key.code, KeyCode::Char(_))
-        && !key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-}
-
 fn handle_new_session_cwd_completion_key(
     cwd: &mut String,
     cwd_cursor: &mut usize,
@@ -50473,7 +50247,7 @@ fn handle_new_session_cwd_completion_key(
 ) -> bool {
     let visible = new_session_completion_is_visible(completion);
 
-    if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+    if keybindings.matches(KeyAction::NewSessionComplete, key) {
         if visible {
             if let Some(suggestion) = completion
                 .suggestions
@@ -50485,7 +50259,12 @@ fn handle_new_session_cwd_completion_key(
             }
             return true;
         } else {
-            return trigger_new_session_path_completion(cwd, cwd_cursor, completion);
+            let completed = trigger_new_session_path_completion(cwd, cwd_cursor, completion);
+            // Preserve Tab's shared completion/navigation behavior when no
+            // candidates exist, but never insert a completion key as text.
+            return completed
+                || !(keybindings.matches(KeyAction::NewSessionNext, key)
+                    || keybindings.matches(KeyAction::NewSessionPrev, key));
         }
     }
 
@@ -50508,10 +50287,6 @@ fn handle_new_session_cwd_completion_key(
     }
 }
 
-fn plain_escape_key(key: KeyEvent) -> bool {
-    key.code == KeyCode::Esc && key.modifiers.is_empty()
-}
-
 fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_rows: u16) {
     if handle_ai_search_locked_key(app, key) {
         debug_log_agent_key_outcome(app, key, "ai_search_locked");
@@ -50522,8 +50297,8 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         return;
     }
     let keybindings = app.keybindings.clone();
-    let shift_shortcuts_disabled =
-        agent_shift_shortcuts_disabled_for_active_info(app.focused_agent_info(), key);
+    let shift_shortcuts_disabled = keybindings.cokacdir_passthrough_shift
+        && agent_shift_shortcuts_disabled_for_active_info(app.focused_agent_info(), key);
     debug_log(
         "agent_key_received",
         serde_json::json!({
@@ -50582,7 +50357,9 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         debug_log_agent_key_outcome(app, key, "toggle_to_sessions");
         return;
     }
-    if app.agent_focus == AgentFocusPane::Sidebar && plain_escape_key(key) {
+    if app.agent_focus == AgentFocusPane::Sidebar
+        && keybindings.matches(KeyAction::AgentSidebarSessions, key)
+    {
         debug_log_agent_key(key, "sidebar_escape_toggle_to_sessions");
         debug_log(
             "agent_sidebar_escape_toggle_to_sessions",
@@ -50603,7 +50380,8 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         return;
     }
     if !shift_shortcuts_disabled
-        && !agent_kill_shortcut_disabled_for_active_info(app.focused_agent_info())
+        && !(keybindings.cokacdir_passthrough_kill
+            && agent_kill_shortcut_disabled_for_active_info(app.focused_agent_info()))
         && keybindings.matches(KeyAction::AgentKill, key)
     {
         debug_log_agent_key(key, "kill");
@@ -50662,7 +50440,7 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         return;
     }
     if !shift_shortcuts_disabled {
-        if let Some(delta) = agent_focus_cycle_key(key) {
+        if let Some(delta) = agent_focus_cycle_key(&keybindings, key) {
             debug_log_agent_key(key, "focus_cycle");
             app.cycle_agent_focus_pane(delta);
             let _ = app.sync_agent_viewports(total_width, terminal_rows);
@@ -50671,7 +50449,7 @@ fn handle_agent_key(app: &mut App, key: KeyEvent, total_width: u16, terminal_row
         }
     }
     if !shift_shortcuts_disabled && app.agent_focus == AgentFocusPane::Sidebar {
-        if let Some(delta) = focused_agent_sidebar_select_key(key) {
+        if let Some(delta) = focused_agent_sidebar_select_key(&keybindings, key) {
             debug_log_agent_key(key, "select");
             let viewport = agent_viewports_for_terminal(
                 total_width,
@@ -50812,8 +50590,7 @@ fn handle_ai_search_locked_key(app: &mut App, key: KeyEvent) -> bool {
     if app.ai_search_pending.is_none() {
         return false;
     }
-    let is_plain_esc = key.code == KeyCode::Esc && key.modifiers.is_empty();
-    if is_plain_esc {
+    if app.keybindings.matches(KeyAction::AiSearchCancel, key) {
         app.cancel_pending_ai_search("escape");
         debug_log_key_event(key, "ai_search_escape_cancel");
     } else {
@@ -50822,11 +50599,13 @@ fn handle_ai_search_locked_key(app: &mut App, key: KeyEvent) -> bool {
             .as_ref()
             .is_some_and(|pending| pending.cancel_requested);
         app.status = if cancelling {
-            "AI search is cancelling; other actions are locked."
+            "AI search is cancelling; other actions are locked.".into()
         } else {
-            "AI search in progress; press Esc to cancel."
-        }
-        .into();
+            format!(
+                "AI search in progress; press {} to cancel.",
+                app.keybindings.help(KeyAction::AiSearchCancel, "Esc")
+            )
+        };
         debug_log_key_event(key, "ai_search_locked_ignored");
     }
     true
@@ -50834,7 +50613,7 @@ fn handle_ai_search_locked_key(app: &mut App, key: KeyEvent) -> bool {
 
 fn handle_notice_key(app: &mut App, key: KeyEvent) -> bool {
     if let Some(notice) = app.notice_overlay.as_ref() {
-        if notice_dismiss_key(key) {
+        if app.keybindings.matches(KeyAction::NoticeDismiss, key) {
             let dismissed_message = notice.message.clone();
             app.notice_overlay = None;
             if dismissed_message.as_str() == app.status.as_str() {
@@ -50849,7 +50628,7 @@ fn handle_notice_key(app: &mut App, key: KeyEvent) -> bool {
     if !matches!(app.input_mode, InputMode::Notice { .. }) {
         return false;
     }
-    if notice_dismiss_key(key) {
+    if app.keybindings.matches(KeyAction::NoticeDismiss, key) {
         let dismissed_message = match &app.input_mode {
             InputMode::Notice { message, .. } => Some(message.clone()),
             _ => None,
@@ -50947,15 +50726,14 @@ fn agent_shift_shortcuts_disabled_for_active_info(
     info: Option<&SessionInfo>,
     key: KeyEvent,
 ) -> bool {
-    key.modifiers.contains(KeyModifiers::SHIFT) && info.is_some_and(is_cokacdir_session_info)
+    normalize_binding_key(key.code, key.modifiers)
+        .1
+        .contains(KeyModifiers::SHIFT)
+        && info.is_some_and(is_cokacdir_session_info)
 }
 
 fn agent_kill_shortcut_disabled_for_active_info(info: Option<&SessionInfo>) -> bool {
     info.is_some_and(is_cokacdir_session_info)
-}
-
-fn notice_dismiss_key(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Enter | KeyCode::Esc)
 }
 
 #[cfg(test)]
@@ -51043,13 +50821,25 @@ fn codex_transcript_scroll_key(action: AgentScrollAction) -> Option<KeyEvent> {
 
 fn codex_child_scroll_delegated_keys(
     action: AgentScrollAction,
-    original: KeyEvent,
+    _original: KeyEvent,
     overlay_assumed_open: bool,
 ) -> Option<Vec<KeyEvent>> {
-    codex_transcript_scroll_key(action)?;
-    let mut keys = vec![original];
+    // Parent bindings can change while Codex is already running. Translate
+    // the action to the keymap installed at launch instead of sending the
+    // user's new shortcut as arbitrary text to the child.
+    let mut delegated = codex_transcript_scroll_key(action)?;
+    delegated.modifiers = KeyModifiers::SHIFT;
+    if let AgentScrollAction::Pages(delta) = action {
+        delegated.code = if delta > 0 {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+        delegated.modifiers |= KeyModifiers::ALT;
+    }
+    let mut keys = vec![delegated];
     if !overlay_assumed_open {
-        keys.push(original);
+        keys.push(delegated);
     }
     Some(keys)
 }
@@ -51066,15 +50856,27 @@ fn claude_child_scroll_key(action: AgentScrollAction) -> Option<KeyEvent> {
 }
 
 fn opencode_child_scroll_key(action: AgentScrollAction) -> Option<KeyEvent> {
-    let code = match action {
-        AgentScrollAction::Pages(delta) if delta > 0 => KeyCode::PageUp,
-        AgentScrollAction::Pages(delta) if delta < 0 => KeyCode::PageDown,
-        AgentScrollAction::Lines(_)
-        | AgentScrollAction::Pages(_)
-        | AgentScrollAction::Top
-        | AgentScrollAction::Bottom => return None,
+    // OpenCode's message navigation defaults, independent of parent bindings:
+    // https://opencode.ai/docs/keybinds/
+    let (code, modifiers) = match action {
+        AgentScrollAction::Lines(delta) if delta > 0 => (
+            KeyCode::Char('y'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+        AgentScrollAction::Lines(delta) if delta < 0 => (
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+        AgentScrollAction::Pages(delta) if delta > 0 => (KeyCode::PageUp, KeyModifiers::NONE),
+        AgentScrollAction::Pages(delta) if delta < 0 => (KeyCode::PageDown, KeyModifiers::NONE),
+        AgentScrollAction::Top => (KeyCode::Char('g'), KeyModifiers::CONTROL),
+        AgentScrollAction::Bottom => (
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+        AgentScrollAction::Lines(_) | AgentScrollAction::Pages(_) => return None,
     };
-    Some(KeyEvent::new(code, KeyModifiers::NONE))
+    Some(KeyEvent::new(code, modifiers))
 }
 
 fn codex_transcript_overlay_state_after_forwarded_key(agent: &AgentClient, key: KeyEvent) -> bool {
@@ -51159,30 +50961,23 @@ fn agent_sidebar_select_key(bindings: &KeyBindings, key: KeyEvent) -> Option<i32
     }
 }
 
-fn focused_agent_sidebar_select_key(key: KeyEvent) -> Option<i32> {
-    if !key.modifiers.is_empty() {
-        return None;
-    }
-    match key.code {
-        KeyCode::Up => Some(-1),
-        KeyCode::Down => Some(1),
-        _ => None,
+fn focused_agent_sidebar_select_key(bindings: &KeyBindings, key: KeyEvent) -> Option<i32> {
+    if bindings.matches(KeyAction::AgentFocusedSidebarPrev, key) {
+        Some(-1)
+    } else if bindings.matches(KeyAction::AgentFocusedSidebarNext, key) {
+        Some(1)
+    } else {
+        None
     }
 }
 
-fn agent_focus_cycle_key(key: KeyEvent) -> Option<i32> {
-    match key.modifiers {
-        KeyModifiers::CONTROL => match key.code {
-            KeyCode::Left | KeyCode::Char('.') => Some(-1),
-            KeyCode::Right | KeyCode::Char('/') | KeyCode::Char('_') => Some(1),
-            _ => None,
-        },
-        KeyModifiers::SHIFT => match key.code {
-            KeyCode::Left => Some(-1),
-            KeyCode::Right => Some(1),
-            _ => None,
-        },
-        _ => None,
+fn agent_focus_cycle_key(bindings: &KeyBindings, key: KeyEvent) -> Option<i32> {
+    if bindings.matches(KeyAction::AgentFocusPrev, key) {
+        Some(-1)
+    } else if bindings.matches(KeyAction::AgentFocusNext, key) {
+        Some(1)
+    } else {
+        None
     }
 }
 
@@ -52356,7 +52151,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
     let ai_search_overlay_drawn = if modal_drawn {
         false
     } else {
-        draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref())
+        draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref(), &app.keybindings)
     };
     let new_session_overlay_drawn = if modal_drawn || ai_search_overlay_drawn {
         false
@@ -52464,7 +52259,7 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
     if let InputMode::KillAllConfirm { selected } = &app.input_mode {
         draw_killall_confirm_modal(f, area, *selected, &app.keybindings);
     } else if let Some(task) = app.data_task.as_ref() {
-        draw_data_task_modal(f, area, task);
+        draw_data_task_modal(f, area, task, &app.keybindings);
     } else if let InputMode::DeleteConfirm {
         info,
         removed_index: _,
@@ -52693,7 +52488,12 @@ fn notice_ok_button_line(content_width: usize) -> Line<'static> {
     ])
 }
 
-fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPending) {
+fn draw_data_task_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    task: &DataTaskPending,
+    keybindings: &KeyBindings,
+) {
     let elapsed = task.started_at.elapsed();
     let status = task
         .notice
@@ -52751,11 +52551,15 @@ fn draw_data_task_modal(f: &mut ratatui::Frame, area: Rect, task: &DataTaskPendi
 
     lines.push(Line::from(""));
     let help_items = match task.kind {
-        DataTaskKind::Clone if task.cancel_requested => [direct_help_item(
+        DataTaskKind::Clone if task.cancel_requested => [help_item(
+            keybindings,
+            KeyAction::DataTaskCancel,
             "Esc",
             "pressed · cancelling and rolling back when safe",
         )],
-        DataTaskKind::Clone => [direct_help_item(
+        DataTaskKind::Clone => [help_item(
+            keybindings,
+            KeyAction::DataTaskCancel,
             "Esc",
             "cancel · all other actions locked until clone completes",
         )],
@@ -53442,6 +53246,10 @@ mod pty_regression_tests;
 #[cfg(test)]
 #[path = "cokacmux_scrollback_tests.rs"]
 mod scrollback_tests;
+
+#[cfg(test)]
+#[path = "cokacmux_keybinding_tests.rs"]
+mod keybinding_tests;
 
 // vt100 0.16.2 has an unwrap() in Screen::text() that panics when a wide
 // character is drawn at the last column (col+1 out of bounds). catch_unwind
@@ -54582,47 +54390,35 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 debug_log_key_event(key, "settings_path_edit_cancel");
             } else if keybindings.matches(KeyAction::AiTitleSettingsSave, key) {
                 state.finish_editing_selected_text();
-                app.status = format!("{} edit done; Enter saves settings.", edit_label);
+                app.status = format!(
+                    "{} edit done; {} saves settings.",
+                    edit_label,
+                    keybindings.help(KeyAction::AiTitleSettingsSave, "Enter")
+                );
                 debug_log_key_event(key, "settings_path_edit_done");
             } else {
                 {
                     let value = state.draft.text_field_value_mut(edit.field);
-                    match key.code {
-                        KeyCode::Left => {
-                            edit.cursor = prev_char_boundary(value, edit.cursor);
-                            debug_log_key_event(key, "settings_path_left");
-                        }
-                        KeyCode::Right => {
-                            edit.cursor = next_char_boundary(value, edit.cursor);
-                            debug_log_key_event(key, "settings_path_right");
-                        }
-                        KeyCode::Home => {
-                            edit.cursor = 0;
-                            debug_log_key_event(key, "settings_path_home");
-                        }
-                        KeyCode::End => {
-                            edit.cursor = value.len();
-                            debug_log_key_event(key, "settings_path_end");
-                        }
-                        KeyCode::Backspace => {
-                            delete_before_cursor(value, &mut edit.cursor);
-                            debug_log_key_event(key, "settings_path_backspace");
-                        }
-                        KeyCode::Delete => {
-                            delete_at_cursor(value, &mut edit.cursor);
-                            debug_log_key_event(key, "settings_path_delete");
-                        }
-                        KeyCode::Char(c)
-                            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                                && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    if keybindings.matches(KeyAction::SettingsMoveLeft, key) {
+                        edit.cursor = prev_char_boundary(value, edit.cursor);
+                    } else if keybindings.matches(KeyAction::SettingsMoveRight, key) {
+                        edit.cursor = next_char_boundary(value, edit.cursor);
+                    } else if keybindings.matches(KeyAction::SettingsHome, key) {
+                        edit.cursor = 0;
+                    } else if keybindings.matches(KeyAction::SettingsEnd, key) {
+                        edit.cursor = value.len();
+                    } else if keybindings.matches(KeyAction::SettingsBackspace, key) {
+                        delete_before_cursor(value, &mut edit.cursor);
+                    } else if keybindings.matches(KeyAction::SettingsDelete, key) {
+                        delete_at_cursor(value, &mut edit.cursor);
+                    } else if let KeyCode::Char(c) = key.code {
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT)
                         {
                             insert_at_cursor(value, &mut edit.cursor, c);
-                            debug_log_key_event(key, "settings_path_insert");
-                        }
-                        _ => {
-                            debug_log_key_event(key, "settings_path_ignored");
                         }
                     }
+                    debug_log_key_event(key, "settings_text_edit");
                 }
                 state.editing = Some(edit);
             }
@@ -54634,8 +54430,10 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             if state.selected_text_field().is_some() && !state.edit_finished {
                 state.begin_editing_selected_text();
                 app.status = format!(
-                    "editing {}; Enter finishes edit, Esc cancels edit.",
-                    edit_label
+                    "editing {}; {} finishes edit, {} cancels edit.",
+                    edit_label,
+                    keybindings.help(KeyAction::AiTitleSettingsSave, "Enter"),
+                    keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc")
                 );
                 debug_log_key_event(key, "settings_path_edit_begin");
             } else {
@@ -54648,11 +54446,11 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                     }),
                 );
             }
-        } else if key.code == KeyCode::Left {
+        } else if keybindings.matches(KeyAction::SettingsSectionPrev, key) {
             state.move_section(-1);
             app.status = format!("settings: {}", state.section.label());
             debug_log_key_event(key, "settings_section_prev");
-        } else if key.code == KeyCode::Right {
+        } else if keybindings.matches(KeyAction::SettingsSectionNext, key) {
             state.move_section(1);
             app.status = format!("settings: {}", state.section.label());
             debug_log_key_event(key, "settings_section_next");
@@ -54671,7 +54469,11 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             if let KeyCode::Char(c) = key.code {
                 state.insert_char_in_selected_text(c);
             }
-            app.status = "editing scrollback lines; Enter finishes edit, Esc cancels edit.".into();
+            app.status = format!(
+                "editing scrollback lines; {} finishes edit, {} cancels edit.",
+                keybindings.help(KeyAction::AiTitleSettingsSave, "Enter"),
+                keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc")
+            );
             debug_log_key_event(key, "settings_scrollback_edit_begin_insert");
         } else if keybindings.matches(KeyAction::AiTitleSettingsNone, key) {
             state.section = SettingsSection::Ai;
@@ -54703,7 +54505,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             state.draft.ai_provider = Some(Provider::Pi);
             state.edit_finished = false;
             app.status = "AI agent: pi".into();
-        } else if matches!(key.code, KeyCode::Char(' ')) {
+        } else if keybindings.matches(KeyAction::SettingsActivate, key) {
             app.status = state.activate_selected();
             debug_log_key_event(key, "settings_activate");
         } else if let KeyCode::Char(c) = key.code {
@@ -54712,8 +54514,10 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 && state.insert_char_in_selected_text(c)
             {
                 app.status = format!(
-                    "editing {}; Enter finishes edit, Esc cancels edit.",
-                    edit_label
+                    "editing {}; {} finishes edit, {} cancels edit.",
+                    edit_label,
+                    keybindings.help(KeyAction::AiTitleSettingsSave, "Enter"),
+                    keybindings.help(KeyAction::AiTitleSettingsCancel, "Esc")
                 );
                 debug_log_key_event(key, "settings_path_edit_begin_insert");
             } else {
@@ -55176,7 +54980,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
         app.move_selection(delta);
         return;
     }
-    if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+    if keybindings.matches(KeyAction::SessionEscape, key) {
         if app.clear_session_search_results("esc") {
             debug_log_session_key(app, key, "esc_clear_search");
             return;
@@ -55416,7 +55220,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let ai_search_overlay_drawn = if modal_drawn {
         false
     } else {
-        draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref())
+        draw_ai_search_pending_overlay(f, area, app.ai_search_pending.as_ref(), &app.keybindings)
     };
     let new_session_overlay_drawn = if modal_drawn || ai_search_overlay_drawn {
         false
@@ -56009,13 +55813,14 @@ fn draw_ai_search_pending_overlay(
     f: &mut ratatui::Frame,
     area: Rect,
     pending: Option<&AiSearchPending>,
+    keybindings: &KeyBindings,
 ) -> bool {
     let Some(pending) = pending else {
         return false;
     };
     let modal_area = ai_search_pending_overlay_area(area);
     let content_width = modal_area.width.saturating_sub(2).max(1) as usize;
-    let lines = ai_search_pending_overlay_lines(pending, content_width);
+    let lines = ai_search_pending_overlay_lines(pending, content_width, keybindings);
     fill_area(f.buffer_mut(), modal_area, theme_alt_style());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -56044,6 +55849,7 @@ fn ai_search_pending_overlay_area(area: Rect) -> Rect {
 fn ai_search_pending_overlay_lines(
     pending: &AiSearchPending,
     content_width: usize,
+    keybindings: &KeyBindings,
 ) -> Vec<Line<'static>> {
     let elapsed = pending.started_at.elapsed();
     let headline = if pending.cancel_requested {
@@ -56106,7 +55912,12 @@ fn ai_search_pending_overlay_lines(
             summary,
             Style::default().fg(THEME_FG_DIM).bg(THEME_BG_ALT),
         )),
-        modal_help_line(&[direct_help_item("Esc", "cancel · input locked")]),
+        modal_help_line(&[help_item(
+            keybindings,
+            KeyAction::AiSearchCancel,
+            "Esc",
+            "cancel · input locked",
+        )]),
     ]
 }
 
@@ -56714,7 +56525,14 @@ fn settings_help_items(state: &SettingsState, keybindings: &KeyBindings) -> Vec<
                     "path"
                 },
             ),
-            direct_help_item("←/→", "cursor"),
+            help_pair_item(
+                keybindings,
+                KeyAction::SettingsMoveLeft,
+                KeyAction::SettingsMoveRight,
+                "←",
+                "→",
+                "cursor",
+            ),
             help_item(
                 keybindings,
                 KeyAction::AiTitleSettingsSave,
@@ -56730,7 +56548,14 @@ fn settings_help_items(state: &SettingsState, keybindings: &KeyBindings) -> Vec<
         ];
     }
     let mut items = vec![
-        direct_help_item("←/→", "section"),
+        help_pair_item(
+            keybindings,
+            KeyAction::SettingsSectionPrev,
+            KeyAction::SettingsSectionNext,
+            "←",
+            "→",
+            "section",
+        ),
         help_pair_item(
             keybindings,
             KeyAction::AiTitleSettingsPrev,
@@ -56772,7 +56597,12 @@ fn settings_help_items(state: &SettingsState, keybindings: &KeyBindings) -> Vec<
             ));
         }
         SettingsRowKind::Select => {
-            items.push(direct_help_item("Space", "select"));
+            items.push(help_item(
+                keybindings,
+                KeyAction::SettingsActivate,
+                "Space",
+                "select",
+            ));
             items.push(help_item(
                 keybindings,
                 KeyAction::AiTitleSettingsSave,
@@ -56781,7 +56611,12 @@ fn settings_help_items(state: &SettingsState, keybindings: &KeyBindings) -> Vec<
             ));
         }
         SettingsRowKind::Change => {
-            items.push(direct_help_item("Space", "change"));
+            items.push(help_item(
+                keybindings,
+                KeyAction::SettingsActivate,
+                "Space",
+                "change",
+            ));
             items.push(help_item(
                 keybindings,
                 KeyAction::AiTitleSettingsSave,
@@ -57788,10 +57623,22 @@ fn new_session_help_items(
     if selected == NEW_SESSION_FIELD_CWD {
         let mut items = vec![
             help_item(keybindings, KeyAction::NewSessionConfirm, "Enter", "start"),
-            direct_help_item("Tab", "complete"),
+            help_item(
+                keybindings,
+                KeyAction::NewSessionComplete,
+                "Tab",
+                "complete",
+            ),
         ];
         if completion_visible {
-            items.push(direct_help_item("↑/↓", "select"));
+            items.push(help_pair_item(
+                keybindings,
+                KeyAction::NewSessionPrev,
+                KeyAction::NewSessionNext,
+                "↑",
+                "↓",
+                "select",
+            ));
         } else {
             items.push(help_pair_item(
                 keybindings,
@@ -58694,7 +58541,8 @@ fn push_help_span(
 fn quit_help_item(keybindings: &KeyBindings) -> HelpItem {
     HelpItem::new(
         format!(
-            "Esc/{}/{}",
+            "{}/{}/{}",
+            keybindings.help(KeyAction::SessionEscape, "Esc"),
             keybindings.help(KeyAction::SessionQuit, "q"),
             keybindings.help(KeyAction::GlobalQuit, "Ctrl+Q")
         ),
@@ -59006,7 +58854,14 @@ fn agent_help_items(keybindings: &KeyBindings) -> Vec<HelpItem> {
             "Ctrl+3",
             "right",
         ),
-        direct_help_item("Ctrl/Shift+←/→ Ctrl+./", "focus"),
+        help_pair_item(
+            keybindings,
+            KeyAction::AgentFocusPrev,
+            KeyAction::AgentFocusNext,
+            "←",
+            "→",
+            "focus",
+        ),
         help_item(keybindings, KeyAction::AgentNewShell, "Ctrl+N", "new"),
         help_item(
             keybindings,
@@ -63374,573 +63229,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_generated_search_bindings_are_migrated_to_search_chooser() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "sessions": {
-    "filter": ["/"],
-    "ai_search": ["ctrl+s"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert!(keybindings.matches(
-            KeyAction::SessionFilter,
-            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)
-        ));
-        assert!(!keybindings.matches(
-            KeyAction::SessionFilter,
-            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)
-        ));
-        assert!(!keybindings.matches(
-            KeyAction::SessionAiSearch,
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
-        ));
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(value["sessions"]["filter"], serde_json::json!(["ctrl+f"]));
-        assert_eq!(value["sessions"]["ai_search"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn legacy_generated_session_killall_binding_gains_shift_k_alias() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "sessions": {
-    "kill_all": ["ctrl+shift+k"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-        let shift_k = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT);
-
-        assert!(keybindings.matches(KeyAction::SessionKillAll, shift_k));
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            value["sessions"]["kill_all"],
-            serde_json::json!(["ctrl+shift+k", "shift+k"])
-        );
-    }
-
-    #[test]
-    fn legacy_generated_ai_settings_binding_uses_comma_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "sessions": {
-    "ai_title_settings": ["ctrl+t"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert!(keybindings.matches(
-            KeyAction::SessionAiTitleSettings,
-            KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)
-        ));
-        assert!(!keybindings.matches(
-            KeyAction::SessionAiTitleSettings,
-            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
-        ));
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            value["sessions"]["ai_title_settings"],
-            serde_json::json!(["comma"])
-        );
-    }
-
-    #[test]
-    fn previous_generated_ai_settings_binding_drops_ctrl_t() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "sessions": {
-    "ai_title_settings": ["comma", "ctrl+t"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert!(keybindings.matches(
-            KeyAction::SessionAiTitleSettings,
-            KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)
-        ));
-        assert!(!keybindings.matches(
-            KeyAction::SessionAiTitleSettings,
-            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
-        ));
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            value["sessions"]["ai_title_settings"],
-            serde_json::json!(["comma"])
-        );
-    }
-
-    #[test]
-    fn legacy_generated_agent_scroll_page_bindings_are_migrated() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "agent": {
-    "scroll_page_up": ["shift+pageup", "alt+pageup"],
-    "scroll_page_down": ["shift+pagedown", "alt+pagedown"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert_eq!(
-            agent_scrollback_key(
-                &keybindings,
-                KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT | KeyModifiers::ALT)
-            ),
-            Some(AgentScrollAction::Pages(1))
-        );
-        assert_eq!(
-            agent_scrollback_key(
-                &keybindings,
-                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT | KeyModifiers::ALT)
-            ),
-            Some(AgentScrollAction::Pages(-1))
-        );
-        assert_eq!(
-            agent_scrollback_key(
-                &keybindings,
-                KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT | KeyModifiers::ALT)
-            ),
-            Some(AgentScrollAction::Pages(1))
-        );
-        assert_eq!(
-            agent_scrollback_key(
-                &keybindings,
-                KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT | KeyModifiers::ALT)
-            ),
-            Some(AgentScrollAction::Pages(-1))
-        );
-        assert_eq!(
-            agent_scrollback_key(
-                &keybindings,
-                KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)
-            ),
-            None
-        );
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            value["agent"]["scroll_page_up"],
-            serde_json::json!(["shift+alt+up", "shift+alt+pageup", "alt+pageup"])
-        );
-        assert_eq!(
-            value["agent"]["scroll_page_down"],
-            serde_json::json!(["shift+alt+down", "shift+alt+pagedown", "alt+pagedown"])
-        );
-    }
-
-    #[test]
-    fn legacy_generated_session_preview_binding_is_migrated_to_enter_launch() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "sessions": {
-    "launch_agent": ["e"],
-    "toggle_preview": ["enter"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert!(keybindings.matches(
-            KeyAction::SessionLaunchAgent,
-            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)
-        ));
-        assert!(keybindings.matches(
-            KeyAction::SessionLaunchAgent,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
-        ));
-        assert!(!keybindings.matches(
-            KeyAction::SessionTogglePreview,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
-        ));
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            value["sessions"]["launch_agent"],
-            serde_json::json!(["e", "enter"])
-        );
-        assert_eq!(value["sessions"]["toggle_preview"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn legacy_generated_toggle_focus_binding_drops_esc() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "sessions": {
-    "toggle_focus": ["tab", "esc"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert!(keybindings.matches(
-            KeyAction::SessionToggleFocus,
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
-        ));
-        assert!(!keybindings.matches(
-            KeyAction::SessionToggleFocus,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
-        ));
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            value["sessions"]["toggle_focus"],
-            serde_json::json!(["tab"])
-        );
-    }
-
-    #[test]
-    fn legacy_generated_session_move_bindings_drop_j_k() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "sessions": {
-    "move_next": ["down", "j"],
-    "move_prev": ["up", "k"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert!(keybindings.matches(
-            KeyAction::SessionMoveNext,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
-        ));
-        assert!(keybindings.matches(
-            KeyAction::SessionMovePrev,
-            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
-        ));
-        assert!(!keybindings.matches(
-            KeyAction::SessionMoveNext,
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)
-        ));
-        assert!(!keybindings.matches(
-            KeyAction::SessionMovePrev,
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
-        ));
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(value["sessions"]["move_next"], serde_json::json!(["down"]));
-        assert_eq!(value["sessions"]["move_prev"], serde_json::json!(["up"]));
-    }
-
-    #[test]
-    fn legacy_generated_modal_move_bindings_drop_hjkl() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "search": {
-    "next": ["down", "j", "tab"],
-    "prev": ["up", "k", "backtab"]
-  },
-  "delete_confirm": {
-    "next": ["right", "down", "l", "j", "tab"],
-    "prev": ["left", "up", "h", "k", "backtab"]
-  },
-  "create_folder": {
-    "next": ["right", "down", "l", "j", "tab"],
-    "prev": ["left", "up", "h", "k", "backtab"]
-  },
-  "restore_data": {
-    "next": ["right", "down", "l", "j", "tab"],
-    "prev": ["left", "up", "h", "k", "backtab"]
-  },
-  "clone_options": {
-    "next": ["right", "down", "l", "j"],
-    "prev": ["left", "up", "h", "k"]
-  },
-  "agent_launch": {
-    "next": ["down", "j"],
-    "prev": ["up", "k"]
-  },
-  "new_session": {
-    "next": ["down", "j", "tab"],
-    "prev": ["up", "k", "backtab"],
-    "choice_next": ["right", "l", "space"],
-    "choice_prev": ["left", "h"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert!(keybindings.matches(
-            KeyAction::CloneOptionsContextMode,
-            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)
-        ));
-
-        for action in [
-            KeyAction::SearchChoiceNext,
-            KeyAction::SearchChoicePrev,
-            KeyAction::DeleteConfirmNext,
-            KeyAction::DeleteConfirmPrev,
-            KeyAction::CreateFolderNext,
-            KeyAction::CreateFolderPrev,
-            KeyAction::RestoreDataNext,
-            KeyAction::RestoreDataPrev,
-            KeyAction::CloneOptionsNext,
-            KeyAction::CloneOptionsPrev,
-            KeyAction::AgentLaunchNext,
-            KeyAction::AgentLaunchPrev,
-            KeyAction::NewSessionNext,
-            KeyAction::NewSessionPrev,
-            KeyAction::NewSessionChoiceNext,
-            KeyAction::NewSessionChoicePrev,
-        ] {
-            for ch in ['h', 'j', 'k', 'l'] {
-                assert!(
-                    !keybindings
-                        .matches(action, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
-                    "{:?} should not use plain {}",
-                    action,
-                    ch
-                );
-            }
-        }
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        for (section, action, expected) in [
-            ("search", "next", serde_json::json!(["down", "tab"])),
-            ("search", "prev", serde_json::json!(["up", "backtab"])),
-            (
-                "delete_confirm",
-                "next",
-                serde_json::json!(["right", "down", "tab"]),
-            ),
-            (
-                "delete_confirm",
-                "prev",
-                serde_json::json!(["left", "up", "backtab"]),
-            ),
-            (
-                "create_folder",
-                "next",
-                serde_json::json!(["right", "down", "tab"]),
-            ),
-            (
-                "create_folder",
-                "prev",
-                serde_json::json!(["left", "up", "backtab"]),
-            ),
-            (
-                "restore_data",
-                "next",
-                serde_json::json!(["right", "down", "tab"]),
-            ),
-            (
-                "restore_data",
-                "prev",
-                serde_json::json!(["left", "up", "backtab"]),
-            ),
-            (
-                "clone_options",
-                "next",
-                serde_json::json!(["right", "down"]),
-            ),
-            ("clone_options", "prev", serde_json::json!(["left", "up"])),
-            ("agent_launch", "next", serde_json::json!(["down"])),
-            ("agent_launch", "prev", serde_json::json!(["up"])),
-            ("new_session", "next", serde_json::json!(["down", "tab"])),
-            ("new_session", "prev", serde_json::json!(["up", "backtab"])),
-            (
-                "new_session",
-                "choice_next",
-                serde_json::json!(["right", "space"]),
-            ),
-            ("new_session", "choice_prev", serde_json::json!(["left"])),
-        ] {
-            assert_eq!(value[section][action], expected, "{section}.{action}");
-        }
-    }
-
-    #[test]
-    fn previous_generated_agent_scroll_page_bindings_are_migrated() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "agent": {
-    "scroll_page_up": ["shift+alt+pageup"],
-    "scroll_page_down": ["shift+alt+pagedown"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert_eq!(
-            agent_scrollback_key(
-                &keybindings,
-                KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT | KeyModifiers::ALT)
-            ),
-            Some(AgentScrollAction::Pages(1))
-        );
-        assert_eq!(
-            agent_scrollback_key(
-                &keybindings,
-                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT | KeyModifiers::ALT)
-            ),
-            Some(AgentScrollAction::Pages(-1))
-        );
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            value["agent"]["scroll_page_up"],
-            serde_json::json!(["shift+alt+up", "shift+alt+pageup", "alt+pageup"])
-        );
-        assert_eq!(
-            value["agent"]["scroll_page_down"],
-            serde_json::json!(["shift+alt+down", "shift+alt+pagedown", "alt+pagedown"])
-        );
-    }
-
-    #[test]
-    fn current_generated_agent_scroll_page_bindings_add_windows_page_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "agent": {
-    "scroll_page_up": ["shift+alt+up", "shift+alt+pageup"],
-    "scroll_page_down": ["shift+alt+down", "shift+alt+pagedown"]
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert_eq!(
-            agent_scrollback_key(
-                &keybindings,
-                KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT)
-            ),
-            Some(AgentScrollAction::Pages(1))
-        );
-        assert_eq!(
-            agent_scrollback_key(
-                &keybindings,
-                KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT)
-            ),
-            Some(AgentScrollAction::Pages(-1))
-        );
-
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            value["agent"]["scroll_page_up"],
-            serde_json::json!(["shift+alt+up", "shift+alt+pageup", "alt+pageup"])
-        );
-        assert_eq!(
-            value["agent"]["scroll_page_down"],
-            serde_json::json!(["shift+alt+down", "shift+alt+pagedown", "alt+pagedown"])
-        );
-    }
-
-    #[test]
-    fn generated_agent_focus_auxiliary_empty_binding_is_restored_to_ctrl_3() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keybinding.json");
-        fs::write(
-            &path,
-            r#"{
-  "agent": {
-    "focus_auxiliary": []
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let (keybindings, _) = KeyBindings::load_with_mtime(Some(&path));
-
-        assert!(keybindings.matches(
-            KeyAction::AgentFocusAuxiliary,
-            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL)
-        ));
-        let content = fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            value["agent"]["focus_auxiliary"],
-            serde_json::json!(["ctrl+3"])
-        );
-    }
-
-    #[test]
     fn custom_agent_scroll_page_bindings_are_not_migrated() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keybinding.json");
@@ -64512,7 +63800,7 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
 
             terminal
-                .draw(|f| draw_data_task_modal(f, f.area(), &data_task))
+                .draw(|f| draw_data_task_modal(f, f.area(), &data_task, &keybindings))
                 .unwrap();
             terminal
                 .draw(|f| {
@@ -64596,7 +63884,12 @@ mod tests {
             terminal
                 .draw(|f| {
                     let pending = ai_search_pending_for_test(Arc::new(AtomicBool::new(false)));
-                    assert!(draw_ai_search_pending_overlay(f, f.area(), Some(&pending)));
+                    assert!(draw_ai_search_pending_overlay(
+                        f,
+                        f.area(),
+                        Some(&pending),
+                        &keybindings
+                    ));
                 })
                 .unwrap();
             terminal
@@ -76396,7 +75689,7 @@ IF EXIST "%~dp0\node.exe" (
     }
 
     #[test]
-    fn opencode_child_scroll_uses_page_keys() {
+    fn opencode_child_scroll_uses_message_navigation_keys() {
         assert_eq!(
             opencode_child_scroll_key(AgentScrollAction::Pages(1)).map(|key| key.code),
             Some(KeyCode::PageUp)
@@ -76405,9 +75698,33 @@ IF EXIST "%~dp0\node.exe" (
             opencode_child_scroll_key(AgentScrollAction::Pages(-1)).map(|key| key.code),
             Some(KeyCode::PageDown)
         );
-        assert_eq!(opencode_child_scroll_key(AgentScrollAction::Lines(1)), None);
-        assert_eq!(opencode_child_scroll_key(AgentScrollAction::Top), None);
-        assert_eq!(opencode_child_scroll_key(AgentScrollAction::Bottom), None);
+        assert_eq!(
+            opencode_child_scroll_key(AgentScrollAction::Lines(1)),
+            Some(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ))
+        );
+        assert_eq!(
+            opencode_child_scroll_key(AgentScrollAction::Lines(-1)),
+            Some(KeyEvent::new(
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ))
+        );
+        assert_eq!(
+            opencode_child_scroll_key(AgentScrollAction::Top),
+            Some(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        );
+        assert_eq!(
+            opencode_child_scroll_key(AgentScrollAction::Bottom),
+            Some(KeyEvent::new(
+                KeyCode::Char('g'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ))
+        );
+        assert_eq!(opencode_child_scroll_key(AgentScrollAction::Lines(0)), None);
+        assert_eq!(opencode_child_scroll_key(AgentScrollAction::Pages(0)), None);
     }
 
     #[test]
@@ -78729,7 +78046,7 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
-    fn ctrl_f_and_ctrl_t_are_never_forwarded_to_a_child() {
+    fn agent_client_does_not_reserve_keys_after_shortcut_dispatch() {
         let (mut client, requests) =
             buffered_output_test_client_with_requests("reserved-keys", 174);
         for key in [
@@ -78739,18 +78056,14 @@ IF EXIST "%~dp0\node.exe" (
         ] {
             client.send_key(key).unwrap();
         }
-        assert!(
-            requests.try_recv().is_err(),
-            "reserved keys must not reach the child"
-        );
-
-        client
-            .send_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
-            .unwrap();
-        assert!(
-            requests.try_recv().is_ok(),
-            "other control keys still reach the child"
-        );
+        let inputs: Vec<Vec<u8>> = requests
+            .try_iter()
+            .filter_map(|request| match request.request {
+                AgentDaemonRequest::Input { data, .. } => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inputs, vec![vec![0x06], vec![0x14], vec![0x14]]);
         client.exited = Some("test cleanup".into());
     }
 
