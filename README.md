@@ -315,6 +315,7 @@ cokacmux start web --cwd C:\work\app -- npm run dev
 | `Ctrl+Shift+K`, `Shift+K` | 실행 중인 작업을 모두 끄고 싶을 때 | 전체 종료 확인창을 엽니다. 실수 방지를 위해 바로 종료하지 않습니다. |
 | `Alt+←`, `Ctrl+Shift+←` | 왼쪽 목록을 좁히고 싶을 때 | 목록 영역의 폭을 줄입니다. |
 | `Alt+→`, `Ctrl+Shift+→` | 왼쪽 목록을 넓히고 싶을 때 | 목록 영역의 폭을 늘립니다. |
+| 목록과 미리보기 사이 세로 경계를 왼쪽 버튼으로 드래그 | 마우스로 두 영역의 폭을 조절하고 싶을 때 | 경계를 좌우로 끌면 즉시 폭이 바뀌고, 버튼을 놓으면 저장합니다. |
 | `Alt+↑`, `Ctrl+Shift+↑` | 키보드로 목록 선택을 위로 옮기고 싶을 때 | 포커스를 목록으로 돌리고 위 항목을 고릅니다. |
 | `Alt+↓`, `Ctrl+Shift+↓` | 키보드로 목록 선택을 아래로 옮기고 싶을 때 | 포커스를 목록으로 돌리고 아래 항목을 고릅니다. |
 | `Esc` | 검색 결과를 지우거나 앱을 닫고 싶을 때 | 검색 결과가 있으면 먼저 지웁니다. 지울 검색 결과가 없으면 종료를 요청합니다. |
@@ -356,13 +357,14 @@ cokacmux start web --cwd C:\work\app -- npm run dev
 | `Ctrl+←`, `Ctrl+.` | 포커스를 왼쪽 방향으로 옮기고 싶을 때 | sidebar, main, right pane 사이에서 이전 pane으로 이동합니다. sidebar가 숨겨져 있으면 sidebar는 건너뜁니다. `Shift+←`는 기본 비활성화이며 설정에서 켤 수 있습니다. |
 | `Ctrl+→`, `Ctrl+/`, `Ctrl+_` | 포커스를 오른쪽 방향으로 옮기고 싶을 때 | sidebar, main, right pane 사이에서 다음 pane으로 이동합니다. `Shift+→`는 기본 비활성화이며 설정에서 켤 수 있습니다. |
 | sidebar 포커스에서 `↑`, `↓` | 실행 중인 agent 목록을 고르고 싶을 때 | agents sidebar 안에서 위아래 항목으로 이동합니다. |
-| sidebar 항목을 마우스로 클릭 | 목록에서 다른 작업으로 바로 가고 싶을 때 | 클릭한 agent로 전환하고 sidebar에 포커스를 둡니다. 빈 영역이나 테두리를 클릭하면 포커스만 옮깁니다. |
+| sidebar 항목을 마우스로 클릭 | 목록에서 다른 작업으로 바로 가고 싶을 때 | 클릭한 agent로 전환하고 sidebar에 포커스를 둡니다. 빈 영역이나 바깥 테두리를 클릭하면 포커스만 옮깁니다. |
 | `Alt+↑`, `Ctrl+Shift+↑` | 다른 실행 작업으로 빠르게 바꾸고 싶을 때 | 이전 agent로 전환합니다. |
 | `Alt+↓`, `Ctrl+Shift+↓` | 다른 실행 작업으로 빠르게 바꾸고 싶을 때 | 다음 agent로 전환합니다. |
 | `Ctrl+PageUp` | 여러 agent 사이를 순서대로 오갈 때 | 이전 실행 화면으로 전환합니다. |
 | `Ctrl+PageDown` | 여러 agent 사이를 순서대로 오갈 때 | 다음 실행 화면으로 전환합니다. |
 | `Alt+←`, `Ctrl+Shift+←` | 현재 포커스된 사이드 pane을 줄이고 싶을 때 | sidebar나 right pane의 폭을 줄입니다. |
 | `Alt+→`, `Ctrl+Shift+→` | 현재 포커스된 사이드 pane을 넓히고 싶을 때 | sidebar나 right pane의 폭을 늘립니다. |
+| sidebar의 오른쪽 경계 또는 right pane의 왼쪽 경계를 왼쪽 버튼으로 드래그 | 마우스로 창 폭을 조절하고 싶을 때 | 현재 키보드 포커스와 관계없이 잡은 경계만 움직입니다. 버튼을 놓으면 폭을 저장합니다. |
 | `Shift+↑`, `Shift+↓` | agent 출력 내용을 한 줄씩 되짚어 보고 싶을 때 | 현재 포커스된 agent 화면을 한 줄씩 스크롤합니다. |
 | `Shift+Alt+↑`, `Shift+Alt+PageUp`, `Alt+PageUp` | 긴 출력에서 한 화면 위로 가고 싶을 때 | 현재 포커스된 agent 화면을 크게 위로 스크롤합니다. |
 | `Shift+Alt+↓`, `Shift+Alt+PageDown`, `Alt+PageDown` | 긴 출력에서 한 화면 아래로 가고 싶을 때 | 현재 포커스된 agent 화면을 크게 아래로 스크롤합니다. |

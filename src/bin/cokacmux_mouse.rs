@@ -49,6 +49,7 @@ pub(super) struct AgentSidebarScroll {
 
 impl App {
     pub(super) fn begin_mouse_wheel_frame(&mut self) {
+        resize::begin_frame(self);
         selection::begin_frame(self);
         self.previous_mouse_wheel_regions = std::mem::take(&mut self.mouse_wheel_regions);
     }
@@ -163,6 +164,9 @@ fn sidebar_click(app: &App, mouse: MouseEvent, queued_at: u64) -> Option<(Option
 }
 
 pub(super) fn handle_mouse_input_event(app: &mut App, mouse: MouseEvent, queued_at_epoch_ms: u64) {
+    if resize::handle_mouse(app, mouse, queued_at_epoch_ms) {
+        return;
+    }
     if selection::handle_mouse(app, mouse, queued_at_epoch_ms) {
         return;
     }
@@ -535,6 +539,7 @@ fn send_button_input(agent: &mut AgentClient, data: Vec<u8>) -> io::Result<()> {
 }
 
 pub(super) fn finish_mouse_frame(app: &mut App) {
+    resize::finish_frame(app);
     let cancel = app.mouse_button_capture.as_ref().is_some_and(|capture|
         input_blocked(app) || !app.is_agent_view() || !app.mouse_wheel_regions.iter().any(|region|
             region.area == capture.area && matches!(region.target, MouseWheelTarget::Agent { reader_id } if reader_id == capture.reader_id)));

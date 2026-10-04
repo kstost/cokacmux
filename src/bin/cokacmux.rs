@@ -98,6 +98,10 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 mod mouse;
 #[path = "cokacmux_selection.rs"]
 mod selection;
+#[path = "cokacmux_resize.rs"]
+mod resize;
+#[path = "cokacmux_settings_writer.rs"]
+mod settings_writer;
 const PREVIEW_CACHE_LIMIT: usize = 16;
 const AI_TITLE_TIMEOUT_SECS: u64 = 180;
 const AI_TITLE_MAX_CHARS: usize = 120;
@@ -792,7 +796,7 @@ impl Settings {
             fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(path, format!("{}\n", content))?;
+        cokacmux::jsonl::write_text_atomic(path, &format!("{}\n", content))?;
         Ok(())
     }
 }
@@ -5998,6 +6002,9 @@ fn main_event_debug_value(event: &MainEvent) -> serde_json::Value {
             }
             value
         }
+        MainEvent::SettingsSaved { seq, result } => serde_json::json!({
+            "kind": "settings_saved", "seq": seq, "error": result.as_ref().err(),
+        }),
         MainEvent::KeybindingsReloaded(reload) => serde_json::json!({
             "kind": "keybindings_reloaded",
             "has_keybindings": reload.keybindings.is_some(),
@@ -12236,6 +12243,10 @@ enum MainEvent {
     NewSessionPrepareResult(Box<NewSessionPrepareResult>),
     /// The keybindings watcher thread saw the file change.
     KeybindingsReloaded(Box<KeybindingsReload>),
+    SettingsSaved {
+        seq: u64,
+        result: std::result::Result<(), String>,
+    },
 }
 
 /// How the attach worker should obtain the agent connection.
@@ -12855,6 +12866,8 @@ enum PendingRuntimeAction {
 
 struct App {
     settings: Settings,
+    settings_writer: Option<settings_writer::SettingsWriter>,
+    pane_resize: resize::PaneResize,
     keybindings: KeyBindings,
     keybindings_path: Option<PathBuf>,
     keybindings_mtime: Option<SystemTime>,
@@ -13062,6 +13075,8 @@ impl App {
         let persisted_agent_aux = load_persisted_agent_auxiliaries();
         let mut app = Self {
             settings,
+            settings_writer: None,
+            pane_resize: resize::PaneResize::default(),
             keybindings,
             keybindings_path,
             keybindings_mtime,
@@ -13313,7 +13328,7 @@ impl App {
             .normalize_placeholders();
         normalize_program_placeholder(&mut self.settings.cokacmux.cokacdir_program);
 
-        match self.settings.save() {
+        match self.save_settings() {
             Ok(()) => {
                 self.session_view = self.settings.cokacmux.session_view;
                 if self.session_view != previous_session_view {
@@ -13329,12 +13344,15 @@ impl App {
                     self.focus = FocusPane::Sessions;
                 }
                 self.status = if previous_settings.cokacmux.scrollback_lines != scrollback_lines {
-                    "settings saved; scrollback lines apply to newly started terminals.".into()
+                    format!(
+                        "settings {}; scrollback lines apply to newly started terminals.",
+                        self.settings_save_word()
+                    )
                 } else {
-                    "settings saved.".into()
+                    format!("settings {}.", self.settings_save_word())
                 };
                 debug_log(
-                    "settings_saved",
+                    "settings_save_queued",
                     serde_json::json!({
                         "provider": ai_title_provider_label(self.settings.cokacmux.ai.provider),
                         "session_view": self.session_view.label(),
@@ -13600,7 +13618,7 @@ impl App {
         } else {
             "agents sidebar: hidden".into()
         };
-        if let Err(e) = self.settings.save() {
+        if let Err(e) = self.save_settings() {
             debug_log(
                 "settings_save_failed",
                 serde_json::json!({
@@ -13697,7 +13715,7 @@ impl App {
             return;
         }
         self.settings.cokacmux.agent_sidebar_visible = true;
-        if let Err(e) = self.settings.save() {
+        if let Err(e) = self.save_settings() {
             debug_log(
                 "settings_save_failed",
                 serde_json::json!({
@@ -13745,7 +13763,7 @@ impl App {
     fn focus_agent_sidebar(&mut self) {
         if !self.settings.cokacmux.agent_sidebar_visible {
             self.settings.cokacmux.agent_sidebar_visible = true;
-            if let Err(e) = self.settings.save() {
+            if let Err(e) = self.save_settings() {
                 debug_log(
                     "settings_save_failed",
                     serde_json::json!({
@@ -16073,15 +16091,17 @@ impl App {
         }
 
         self.settings.cokacmux.sessions_pane_width = Some(next);
-        match self.settings.save() {
+        match self.save_settings() {
             Ok(()) => {
                 let preview = total_width.saturating_sub(next);
                 self.status = format!(
-                    "layout saved: sessions {} cols, preview {} cols",
-                    next, preview
+                    "layout {}: sessions {} cols, preview {} cols",
+                    self.settings_save_word(),
+                    next,
+                    preview
                 );
                 debug_log(
-                    "sessions_pane_resize_saved",
+                    "sessions_pane_resize_save_queued",
                     serde_json::json!({
                         "sessions": next,
                         "preview": preview,
@@ -16131,15 +16151,23 @@ impl App {
         if was_hidden && next > 0 {
             self.settings.cokacmux.agent_sidebar_visible = true;
         }
-        match self.settings.save() {
+        match self.save_settings() {
             Ok(()) => {
                 self.status = if was_hidden && self.settings.cokacmux.agent_sidebar_visible {
-                    format!("layout saved: agent sidebar shown at {} cols", next)
+                    format!(
+                        "layout {}: agent sidebar shown at {} cols",
+                        self.settings_save_word(),
+                        next
+                    )
                 } else {
-                    format!("layout saved: agent sidebar {} cols", next)
+                    format!(
+                        "layout {}: agent sidebar {} cols",
+                        self.settings_save_word(),
+                        next
+                    )
                 };
                 debug_log(
-                    "agent_sidebar_resize_saved",
+                    "agent_sidebar_resize_save_queued",
                     serde_json::json!({
                         "next": next,
                         "visible": self.settings.cokacmux.agent_sidebar_visible,
@@ -16216,11 +16244,16 @@ impl App {
         self.agent_aux_width = Some(next);
         self.settings.cokacmux.agent_aux_width = Some(next);
         let main = content_width.saturating_sub(next);
-        match self.settings.save() {
+        match self.save_settings() {
             Ok(()) => {
-                self.status = format!("layout saved: agent {} cols, right {} cols", main, next);
+                self.status = format!(
+                    "layout {}: agent {} cols, right {} cols",
+                    self.settings_save_word(),
+                    main,
+                    next
+                );
                 debug_log(
-                    "agent_auxiliary_resize_saved",
+                    "agent_auxiliary_resize_save_queued",
                     serde_json::json!({
                         "next": next,
                         "main": main,
@@ -20860,8 +20893,12 @@ impl App {
         self.preview_scroll = 0;
         self.focus = FocusPane::Sessions;
         self.settings.cokacmux.session_view = self.session_view;
-        self.status = match self.settings.save() {
-            Ok(()) => format!("session view saved: {}", self.session_view.label()),
+        self.status = match self.save_settings() {
+            Ok(()) => format!(
+                "session view {}: {}",
+                self.settings_save_word(),
+                self.session_view.label()
+            ),
             Err(e) => format!(
                 "session view changed: {} (save failed: {})",
                 self.session_view.label(),
@@ -28980,9 +29017,21 @@ fn cokacmux_main() -> Result<()> {
 
     let mut terminal = setup_terminal()?;
     let mut terminal_restore_guard = TerminalRestoreGuard::new();
-    let result = run(&mut terminal);
+    let mut app = App::new();
+    let result = run(&mut terminal, &mut app);
     let restore_result = restore_terminal(&mut terminal);
     terminal_restore_guard.disarm();
+    resize::cancel(&mut app);
+    let settings_result = if let Some(writer) = app.settings_writer.take() {
+        if writer.saving {
+            eprintln!("Saving settings before exit...");
+        }
+        writer
+            .finish()
+            .map_err(|error| anyhow::anyhow!("settings save failed: {error}"))
+    } else {
+        Ok(())
+    };
     debug_log(
         "main_tui_exit",
         serde_json::json!({
@@ -28995,7 +29044,7 @@ fn cokacmux_main() -> Result<()> {
     match (result, restore_result) {
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => settings_result,
     }
 }
 
@@ -29532,6 +29581,7 @@ fn main_event_kind(event: &MainEvent) -> &'static str {
         MainEvent::KillAllResult(_) => "killall_result",
         MainEvent::NewSessionPrepareResult(_) => "new_session_prepare_result",
         MainEvent::KeybindingsReloaded(_) => "keybindings_reloaded",
+        MainEvent::SettingsSaved { .. } => "settings_saved",
     }
 }
 
@@ -29757,6 +29807,7 @@ fn spawn_ui_stall_watchdog() -> io::Result<JoinHandle<()>> {
 }
 
 fn handle_actionable_input_event(app: &mut App, key: KeyEvent) {
+    resize::cancel(app);
     let started = Instant::now();
     if selection::handle_key(app, key) {
         return;
@@ -30098,6 +30149,7 @@ fn handle_main_event(
             event: Event::Paste(text),
             ..
         } => {
+            resize::cancel(app);
             handle_paste_input_event(app, text);
         }
         MainEvent::Input {
@@ -30114,6 +30166,7 @@ fn handle_main_event(
             event: Event::FocusLost,
             ..
         } => {
+            resize::cancel(app);
             selection::clear(app);
             mouse::cancel_mouse_capture(app);
         }
@@ -30122,6 +30175,7 @@ fn handle_main_event(
             ..
         } => {
             // Coordinates from the previous layout are no longer actionable.
+            resize::cancel(app);
             selection::clear(app);
             mouse::cancel_mouse_capture(app);
             app.mouse_wheel_regions.clear();
@@ -30223,6 +30277,7 @@ fn handle_main_event(
         MainEvent::NewSessionPrepareResult(result) => {
             app.on_new_session_prepare_result(result);
         }
+        MainEvent::SettingsSaved { seq, result } => app.settings_saved(seq, result),
         MainEvent::KeybindingsReloaded(reload) => {
             app.on_keybindings_reloaded(*reload);
         }
@@ -30344,8 +30399,7 @@ fn draw_app_frame(terminal: &mut Tui, app: &mut App, reason: &'static str) -> Re
     Ok(())
 }
 
-fn run(terminal: &mut Tui) -> Result<()> {
-    let mut app = App::new();
+fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
     let (main_tx, main_rx) = mpsc::channel::<MainEvent>();
     app.main_tx = Some(main_tx.clone());
     app.runtime_tx = Some(spawn_agent_runtime_worker(main_tx.clone())?);
@@ -30360,7 +30414,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
     debug_log(
         "tui_runtime_initialized",
         serde_json::json!({
-            "snapshot": app_runtime_snapshot_debug_value(&app, false),
+            "snapshot": app_runtime_snapshot_debug_value(app, false),
         }),
     );
 
@@ -30491,7 +30545,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
     app.poll_preview_results();
     app.poll_agent_sessions();
     app.poll_agent_runtime_states();
-    draw_app_frame(terminal, &mut app, "initial")?;
+    draw_app_frame(terminal, app, "initial")?;
     record_main_loop_heartbeat();
     let mut previous_is_agent_view = app.is_agent_view();
 
@@ -30512,7 +30566,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
             }
         };
         record_main_loop_heartbeat();
-        handle_main_event(&mut app, event, &mut previous_is_agent_view, "main_event");
+        handle_main_event(app, event, &mut previous_is_agent_view, "main_event");
         record_main_loop_heartbeat();
         // Drain a bounded burst so tight redraw loops cannot keep UI input
         // stuck behind agent output forever. Unprocessed events stay queued
@@ -30530,7 +30584,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
                     Ok(event) => {
                         drained_events = drained_events.saturating_add(1);
                         handle_main_event(
-                            &mut app,
+                            app,
                             event,
                             &mut previous_is_agent_view,
                             "queued_event",
@@ -30556,7 +30610,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
                     "budget_ms": MAIN_EVENT_DRAIN_BUDGET_MS,
                     "hit_count_limit": drained_events >= MAIN_EVENT_DRAIN_LIMIT,
                     "hit_time_budget": drain_elapsed >= Duration::from_millis(MAIN_EVENT_DRAIN_BUDGET_MS),
-                    "snapshot": app_runtime_snapshot_debug_value(&app, false),
+                    "snapshot": app_runtime_snapshot_debug_value(app, false),
                 }),
             );
         }
@@ -30581,18 +30635,19 @@ fn run(terminal: &mut Tui) -> Result<()> {
             );
         }
         debug_ui_slow_operation(
-            &app,
+            app,
             "pre_draw",
             "main_loop",
             pre_draw_elapsed_ms,
             None,
             None,
         );
-        draw_app_frame(terminal, &mut app, "main_loop")?;
+        draw_app_frame(terminal, app, "main_loop")?;
         record_main_loop_heartbeat();
     }
-    mouse::cancel_mouse_capture(&mut app);
-    mouse::finish_mouse_frame(&mut app);
+    resize::cancel(app);
+    mouse::cancel_mouse_capture(app);
+    mouse::finish_mouse_frame(app);
     let registry_saved = flush_persisted_agent_auxiliary_registry_writer(Duration::from_secs(1));
     if !registry_saved {
         debug_log(
@@ -52238,6 +52293,7 @@ fn ui_agent(f: &mut ratatui::Frame, app: &mut App) {
         return;
     }
 
+    resize::record_agents(app, area, layout);
     let main_outcome = if let Some(agent) = app.active_agent.as_mut() {
         let main_focused = app.agent_focus == AgentFocusPane::Main;
         render_main_agent_title_bar(f, layout.main, &agent.info, main_focused);
@@ -55392,6 +55448,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             Constraint::Length(preview_width),
         ])
         .split(outer[0]);
+    resize::record_sessions(app, area, main[0], main[1]);
     debug_log(
         "ui_sessions_layout",
         serde_json::json!({
@@ -63045,6 +63102,8 @@ mod tests {
         };
         App {
             settings,
+            settings_writer: None,
+            pane_resize: resize::PaneResize::default(),
             keybindings: KeyBindings::default(),
             keybindings_path: None,
             keybindings_mtime: None,
