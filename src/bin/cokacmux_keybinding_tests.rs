@@ -36,6 +36,7 @@ fn every_default_key_has_a_boolean_and_can_be_disabled() {
     let defaults = KeyBindings::default();
     let mut loaded = KeyBindings::default();
     loaded.apply_json(&config);
+    let mut disabled = Vec::new();
     for (path, action, keys) in DEFAULT_KEYBINDINGS {
         let entries = keybinding_json_value_mut(&mut config, path)
             .unwrap()
@@ -49,16 +50,82 @@ fn every_default_key_has_a_boolean_and_can_be_disabled() {
         );
         for (entry, key) in entries.iter_mut().zip(keys.iter()) {
             assert_eq!(entry["key"], *key, "{path}");
-            assert_eq!(entry["enabled"], true, "{path}");
+            assert!(entry["enabled"].is_boolean(), "{path}");
+            if entry["enabled"] == false {
+                disabled.push((*path, *key));
+            }
             entry["enabled"] = false.into();
         }
     }
+    assert_eq!(
+        disabled,
+        vec![
+            ("agent.focus_prev", "shift+left"),
+            ("agent.focus_next", "shift+right"),
+        ]
+    );
     loaded.apply_json(&config);
     for (_, action, _) in DEFAULT_KEYBINDINGS {
         assert!(loaded.bindings[action].is_empty(), "{action:?}");
         assert_eq!(loaded.help(*action, "default"), "unbound");
     }
     assert!(!complete_keybinding_config(&mut config).unwrap());
+}
+
+#[test]
+fn shift_arrow_defaults_and_existing_preferences_survive_config_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keybinding.json");
+    for content in [
+        None,
+        Some("{}"),
+        Some(
+            r#"{
+        "agent.focus_prev": [{"key":"shift+left","enabled":true}],
+        "agent.focus_next": ["shift+right"]
+    }"#,
+        ),
+    ] {
+        if let Some(content) = content {
+            fs::write(&path, content).unwrap();
+        }
+        let (bindings, _) = KeyBindings::read_from_path(Some(&path)).unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let custom = content.is_some_and(|content| content.contains("shift+left"));
+        for (action, name, code, key) in [
+            (
+                KeyAction::AgentFocusPrev,
+                "agent.focus_prev",
+                KeyCode::Left,
+                "shift+left",
+            ),
+            (
+                KeyAction::AgentFocusNext,
+                "agent.focus_next",
+                KeyCode::Right,
+                "shift+right",
+            ),
+        ] {
+            let entry = keybinding_json_value(&config, name)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["key"] == key)
+                .unwrap();
+            assert_eq!(entry["enabled"], custom);
+            assert_eq!(
+                bindings.matches(action, KeyEvent::new(code, KeyModifiers::SHIFT)),
+                custom
+            );
+            if !custom {
+                assert!(!KeyBindings::default()
+                    .matches(action, KeyEvent::new(code, KeyModifiers::SHIFT)));
+                assert!(bindings.matches(action, KeyEvent::new(code, KeyModifiers::CONTROL)));
+            }
+        }
+        assert_complete_config(&config);
+    }
 }
 
 #[test]
@@ -131,6 +198,70 @@ fn legacy_and_boolean_entries_roundtrip_without_losing_user_data() {
     KeyBindings::read_from_path(Some(&path)).unwrap();
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(KeyBindings::file_mtime(Some(&path)).unwrap(), observed);
+}
+
+#[test]
+fn startup_keeps_valid_actions_when_another_action_is_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keybinding.json");
+    for invalid in [
+        serde_json::json!(["not-a-valid-key"]),
+        serde_json::json!([{ "key": "f9", "enabled": "false" }]),
+        serde_json::json!([{ "enabled": false }]),
+        serde_json::json!(12),
+    ] {
+        let mut value = serde_json::json!({
+            "sessions.quit": ["f8"],
+            "global.quit": null,
+            "agent": {
+                "kill_all": [],
+                "focus_prev": [
+                    { "key": "ctrl+left", "enabled": true },
+                    { "key": "shift+left", "enabled": false }
+                ],
+                "scroll_line_up": invalid
+            },
+            "cokacdir.passthrough_shift": false,
+            "notes": "preserve this file until it is fixed"
+        });
+        let original = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+        let before = KeyBindings::file_mtime(Some(&path)).unwrap();
+        let (bindings, observed) = KeyBindings::load_with_mtime(Some(&path));
+        assert!(bindings.matches(KeyAction::SessionQuit, key(KeyCode::F(8))));
+        assert!(!bindings.matches(KeyAction::SessionQuit, key(KeyCode::Char('q'))));
+        assert!(bindings.bindings[&KeyAction::GlobalQuit].is_empty());
+        assert!(bindings.bindings[&KeyAction::AgentKillAll].is_empty());
+        assert!(bindings.matches(
+            KeyAction::AgentFocusPrev,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)
+        ));
+        assert!(!bindings.matches(
+            KeyAction::AgentFocusPrev,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT)
+        ));
+        assert!(!bindings.cokacdir_passthrough_shift);
+        assert_eq!(
+            bindings.labels(KeyAction::AgentScrollLineUp, usize::MAX),
+            KeyBindings::default().labels(KeyAction::AgentScrollLineUp, usize::MAX)
+        );
+        assert_eq!(observed, before);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(KeyBindings::file_mtime(Some(&path)).unwrap(), before);
+
+        // Correcting the bad action must resume normal completion and reload.
+        value["agent"]["scroll_line_up"] = enabled_keys_json(&["f9"]);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut observed = None;
+        let reload = check_keybindings_reload(Some(&path), &mut observed).unwrap();
+        let bindings = reload.keybindings.unwrap();
+        assert!(bindings.matches(KeyAction::SessionQuit, key(KeyCode::F(8))));
+        assert!(bindings.matches(KeyAction::AgentScrollLineUp, key(KeyCode::F(9))));
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_complete_config(&saved);
+        assert_eq!(saved["notes"], value["notes"]);
+        assert!(check_keybindings_reload(Some(&path), &mut observed).is_none());
+    }
 }
 
 #[test]
@@ -914,6 +1045,9 @@ fn cokacdir_shift_passthrough_can_be_kept_or_overridden() {
     app.set_active_agent(client);
     app.agent_focus = AgentFocusPane::Main;
     app.settings.cokacmux.agent_sidebar_visible = true;
+    app.keybindings.apply_json(&serde_json::json!({
+        "agent.focus_prev": [{ "key": "shift+left", "enabled": true }]
+    }));
     let event = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
     handle_agent_key(&mut app, event, 120, 30);
     assert_eq!(app.agent_focus, AgentFocusPane::Main);

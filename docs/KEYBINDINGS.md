@@ -4,6 +4,8 @@ cokacmux는 config 디렉터리의 `keybinding.json`을 읽어 단축키를 설�
 
 앱을 재시작하지 않아도 됩니다. 백그라운드 감시 스레드가 약 2초마다 파일의 수정 시각만 확인하고, 파일이 바뀐 경우에만 다시 읽어 파싱합니다. 실행 중 파일이 삭제되어도 다음 감시 스레드 확인 때 기본 파일을 다시 만듭니다. 파싱에 실패하면 기존 단축키를 유지하고 status/debug log에 실패 이유를 남깁니다.
 
+앱 시작 시 JSON 객체 안의 일부 단축키 액션만 잘못되었다면 정상 액션은 적용하고, 잘못된 액션만 기본값을 사용하며 오류를 debug log에 남깁니다. 다른 액션의 사용자 지정 키나 `enabled: false`, `[]`, `null` 설정은 유지합니다. 오류가 있는 파일은 자동 변환하거나 보완 저장하지 않으며, 오류를 고쳐 저장하면 다음 재로드부터 정상적으로 보완합니다. JSON 문법 자체가 잘못되었거나 최상위 값이 객체가 아니면 시작 시 기본 단축키를 사용합니다.
+
 ## 설정 방식
 
 cokacmux가 처리하는 모든 키보드 단축키는 이 파일에서 변경하거나 해제할 수 있습니다. 각 액션의 배열에 `key`와 `enabled`를 지정합니다. `enabled: true`는 사용, `enabled: false`는 미사용입니다. 키 조합마다 개별 설정하므로 같은 액션의 다른 키는 그대로 사용할 수 있습니다. `false`인 키도 파일에 남아 있어 나중에 `true`로 바꾸면 다시 사용할 수 있습니다.
@@ -24,7 +26,7 @@ cokacmux가 처리하는 모든 키보드 단축키는 이 파일에서 변경�
 
 `enabled`를 생략하면 `true`로 처리하며 저장 시 명시적으로 추가합니다. 값은 JSON 불리언이어야 합니다. `"false"`, `0`, `null` 등은 오류입니다. 꺼진 항목도 `key` 문자열은 필요하지만, 키 이름의 유효성은 켤 때 검사합니다.
 
-앱 시작 시와 실행 중 재로드 시, 기존 파일에도 빠진 액션과 cokacdir 옵션을 기본값으로 자동 추가합니다. 기본 단축키는 모두 `enabled: true`로 생성하며, 기본 키가 없는 액션은 `[]`입니다. 구버전 문자열과 문자열 배열은 키와 순서를 유지한 채 `key`/`enabled` 형식으로 자동 변환합니다. 사용자 지정 키, `false` 값, 알 수 없는 항목, `[]`와 `null`로 해제한 액션은 유지합니다. 보완하거나 변환할 때 JSON 서식은 정리되며, 이미 완전한 파일은 다시 쓰지 않습니다.
+앱 시작 시와 실행 중 재로드 시, 기존 파일에도 빠진 액션과 cokacdir 옵션을 기본값으로 자동 추가합니다. `agent.focus_prev`의 `shift+left`와 `agent.focus_next`의 `shift+right`는 기본적으로 `enabled: false`로 생성합니다. 나머지 기본 단축키는 `enabled: true`이며, 기본 키가 없는 액션은 `[]`입니다. 구버전 문자열과 문자열 배열은 키와 순서를 유지한 채 `key`/`enabled` 형식으로 자동 변환합니다. 이미 지정한 Shift 좌우 키도 사용자가 정한 사용 여부를 유지합니다. 사용자 지정 키, `false` 값, 알 수 없는 항목, `[]`와 `null`로 해제한 액션은 유지합니다. 보완하거나 변환할 때 JSON 서식은 정리되며, 이미 완전한 파일은 다시 쓰지 않습니다.
 
 보완 저장은 같은 디렉터리의 임시 파일을 작성한 뒤 교체합니다. 여러 cokacmux 사이의 저장을 잠금으로 조정하고, 저장 직전 원문이 달라졌으면 다음 감시 주기에 다시 읽습니다. JSON 문법이나 단축키 설정이 잘못되었거나 최상위 값이 객체가 아니면 파일을 변경하지 않습니다. 읽기 전용 파일은 그대로 두고 메모리에서 설정을 적용합니다. 특정 동작을 해제하려면 액션 항목을 삭제하는 대신 모든 키를 `enabled: false`로 바꾸거나 `[]` 또는 `null`을 지정하세요.
 
@@ -313,8 +315,8 @@ Codex가 만든 non-root 세션은 기본 `top-level` 범위에서 숨겨집니�
 |---|---|---|
 | `agent.toggle_sessions` | `ctrl+]`, `ctrl+[` | 세션 화면으로 전환 |
 | `agent.kill_all` | `ctrl+shift+k` | 전체 종료 확인창 |
-| `agent.focus_prev` | `ctrl+left`, `ctrl+dot`, `shift+left` | 이전 패널 포커스 |
-| `agent.focus_next` | `ctrl+right`, `ctrl+slash`, `ctrl+_`, `shift+right` | 다음 패널 포커스 |
+| `agent.focus_prev` | `ctrl+left`, `ctrl+dot` | 이전 패널 포커스. `shift+left`는 기본 `enabled: false` |
+| `agent.focus_next` | `ctrl+right`, `ctrl+slash`, `ctrl+_` | 다음 패널 포커스. `shift+right`는 기본 `enabled: false` |
 | `agent.focused_sidebar_prev` | `up` | 사이드바에 포커스가 있을 때 이전 에이전트 |
 | `agent.focused_sidebar_next` | `down` | 사이드바에 포커스가 있을 때 다음 에이전트 |
 | `agent.sidebar_sessions` | `esc` | 사이드바에서 세션 화면으로 이동 |

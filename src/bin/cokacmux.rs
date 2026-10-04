@@ -262,7 +262,7 @@ INTERACTIVE KEYS - agent screen:
   Ctrl+B                Toggle the agent sidebar
   Ctrl+F / Ctrl+T       Toggle the cokacdir / terminal right panel
   Ctrl+1/2/3            Focus sidebar / agent / right panel
-  Ctrl+Left/Right       Move focus between panes (also Shift+Left/Right)
+  Ctrl+Left/Right       Move focus between panes (Shift+Left/Right disabled by default)
   Shift+Up/Down         Scroll one line
   Shift+Alt+Up/Down     Scroll one page (also Alt+PgUp/PgDn)
   Shift+Home/End        Scroll to top/bottom (also Alt+Home/End)
@@ -2125,6 +2125,7 @@ impl Default for KeyBindings {
                 *action,
                 defaults
                     .iter()
+                    .filter(|binding| Self::default_binding_enabled(binding))
                     .filter_map(|binding| KeyBinding::parse(binding).ok())
                     .collect(),
             );
@@ -2138,6 +2139,10 @@ impl Default for KeyBindings {
 }
 
 impl KeyBindings {
+    fn default_binding_enabled(binding: &str) -> bool {
+        !matches!(binding, "shift+left" | "shift+right")
+    }
+
     fn load_with_mtime(path: Option<&Path>) -> (Self, Option<SystemTime>) {
         match Self::read_from_path(path) {
             Ok(keybindings) => keybindings,
@@ -2157,12 +2162,14 @@ impl KeyBindings {
         path: Option<&Path>,
     ) -> std::result::Result<(Self, Option<SystemTime>), String> {
         let modified = Self::ensure_file_or_mtime(path)?;
-        Self::read_for_observed_mtime(path, modified)
+        // Startup has no previous valid snapshot: preserve every valid action.
+        Self::read_for_observed_mtime(path, modified, true)
     }
 
     fn read_for_observed_mtime(
         path: Option<&Path>,
         modified: Option<SystemTime>,
+        allow_partial_config: bool,
     ) -> std::result::Result<(Self, Option<SystemTime>), String> {
         let mut keybindings = Self::default();
         let Some(path) = path else {
@@ -2180,7 +2187,19 @@ impl KeyBindings {
         };
         let mut value: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| format!("parse {} failed: {}", path.display(), e))?;
-        let completed = complete_keybinding_config(&mut value)?;
+        let completed = match complete_keybinding_config(&mut value) {
+            Ok(completed) => completed,
+            Err(error) if allow_partial_config && value.is_object() => {
+                // apply_json isolates errors per action. Do not persist this
+                // partially normalized document until the user fixes it.
+                debug_log(
+                    "keybindings_completion_skipped",
+                    serde_json::json!({ "path": path.display().to_string(), "error": error }),
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        };
         keybindings.apply_json(&value);
         let modified = if completed {
             match persist_completed_keybindings(path, &content, &value) {
@@ -2256,7 +2275,12 @@ impl KeyBindings {
             let value = serde_json::Value::Array(
                 defaults
                     .iter()
-                    .map(|binding| serde_json::json!({ "key": binding, "enabled": true }))
+                    .map(|binding| {
+                        serde_json::json!({
+                            "key": binding,
+                            "enabled": Self::default_binding_enabled(binding),
+                        })
+                    })
                     .collect(),
             );
             let Some((group, action)) = path.split_once('.') else {
@@ -29657,7 +29681,8 @@ fn check_keybindings_reload(
         return None;
     }
     *known_mtime = current_mtime;
-    let reload = match KeyBindings::read_for_observed_mtime(path, current_mtime) {
+    // A failed reload must retain the currently active valid snapshot.
+    let reload = match KeyBindings::read_for_observed_mtime(path, current_mtime, false) {
         Ok((keybindings, observed_mtime)) => {
             *known_mtime = observed_mtime;
             debug_log(
