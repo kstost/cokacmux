@@ -1,21 +1,21 @@
 import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
-  BadgeCheck,
-  ClipboardList,
-  Copy,
-  FolderSearch,
-  Github,
-  History,
-  Keyboard,
-  Layers3,
-  Play,
-  Search,
-  ShieldAlert,
-  SplitSquareHorizontal,
-  TerminalSquare,
-  Wand2
-} from 'lucide-react';
+  CheckBadgeIcon,
+  ClipboardListIcon,
+  CopyIcon,
+  FolderSearchIcon,
+  HistoryIcon,
+  KeyboardIcon,
+  LayersIcon,
+  PlayIcon,
+  SearchIcon,
+  ShieldAlertIcon,
+  SourceCodeIcon,
+  SplitPanesIcon,
+  TerminalIcon,
+  WandIcon
+} from './icons.jsx';
 import { copyText } from './copy-command.js';
 import './styles.css';
 
@@ -31,7 +31,7 @@ const quickKeys = [
 
 const valueMoments = [
   {
-    icon: ClipboardList,
+    icon: ClipboardListIcon,
     title: '작업 세션 자체를 자산으로 남길 때',
     before:
       '멋진 코드는 남지만 그 코드를 얻기 위해 거친 대화와 판단 과정은 흩어집니다.',
@@ -39,7 +39,7 @@ const valueMoments = [
       '세션 안의 대화 내용을 노하우로 보존하고, 다음 작업의 스킬셋처럼 다시 씁니다.'
   },
   {
-    icon: Layers3,
+    icon: LayersIcon,
     title: '여러 프로젝트의 세션을 한 화면에서 관리할 때',
     before:
       '프로젝트마다 터미널 창과 코딩 도구가 흩어져서 어느 작업이 살아 있는지 확인하기 어렵습니다.',
@@ -47,7 +47,7 @@ const valueMoments = [
       '프로젝트별 세션과 실행 중인 작업을 한 화면에서 보고, 필요한 프로젝트로 바로 돌아갑니다.'
   },
   {
-    icon: SplitSquareHorizontal,
+    icon: SplitPanesIcon,
     title: '여러 프로젝트를 동시에 작업할 때',
     before:
       '한 프로젝트에서 테스트가 도는 동안 다른 프로젝트를 만지려면 창을 옮겨 다니며 상태를 놓치기 쉽습니다.',
@@ -55,7 +55,7 @@ const valueMoments = [
       '한 작업은 계속 돌려 두고, 다른 agent나 terminal을 열어 병렬로 확인하고 수정합니다.'
   },
   {
-    icon: Copy,
+    icon: CopyIcon,
     title: '세션을 복제해 다른 방향을 실험할 때',
     before:
       '원래 세션에 바로 이어서 실험하면 안정적인 수정과 큰 구조 변경이 한 흐름에 섞입니다.',
@@ -63,7 +63,7 @@ const valueMoments = [
       '원본 세션을 보존하고, 기록만 복사하거나 작업 폴더까지 복사해 새 방향을 따로 시험합니다.'
   },
   {
-    icon: ShieldAlert,
+    icon: ShieldAlertIcon,
     title: '프로세스를 안전하게 백그라운드에 둘 때',
     before:
       '목록으로 돌아가거나 다른 일을 보려고 하다가 실행 중인 agent나 터미널을 꺼버릴까 봐 조심합니다.',
@@ -71,7 +71,7 @@ const valueMoments = [
       '작업 프로세스는 살아 있게 두고 화면만 전환합니다. 종료할 때도 현재 작업과 전체 작업을 구분해 끕니다.'
   },
   {
-    icon: Search,
+    icon: SearchIcon,
     title: '예전 세션 맥락을 다시 찾아야 할 때',
     before:
       '어느 도구에서, 어느 폴더에서, 어떤 제목의 세션이었는지 기억을 더듬습니다.',
@@ -158,19 +158,19 @@ const startRoutes = [
 
 const primerItems = [
   {
-    icon: Layers3,
+    icon: LayersIcon,
     title: 'cokacmux는 무엇인가요?',
     text:
       'Claude Code, Codex, Pi, OpenCode, GJC와 터미널 작업에서 생긴 세션을 여러 프로젝트에 걸쳐 관리하는 터미널 앱입니다. 코딩에이전트를 위해 섬세하게 설계된 Multiplexer라고 이해하면 쉽습니다.'
   },
   {
-    icon: FolderSearch,
+    icon: FolderSearchIcon,
     title: '언제 필요해지나요?',
     text:
       '여러 프로젝트를 동시에 수정하거나, 한 프로젝트에서 테스트를 돌려 둔 채 다른 프로젝트를 확인하거나, 예전 세션을 다시 찾아 이어가고 싶을 때 씁니다.'
   },
   {
-    icon: TerminalSquare,
+    icon: TerminalIcon,
     title: '처음에는 무엇을 보나요?',
     text:
       '왼쪽에는 프로젝트별 세션과 실행 중인 작업이 보이고, 오른쪽에는 선택한 세션의 내용이 보입니다. 먼저 어떤 맥락과 프로세스가 살아 있는지 훑어보면 됩니다.'
@@ -186,7 +186,7 @@ const firstRunSteps = [
 
 const screenParts = [
   {
-    icon: TerminalSquare,
+    icon: TerminalIcon,
     name: '터미널 안에서 열리는 화면',
     meaning:
       'cokacmux는 웹 브라우저가 아니라 터미널에서 움직입니다. 글자와 키보드만으로 조작하는 작업 관리 화면이라고 생각하면 됩니다.',
@@ -194,7 +194,7 @@ const screenParts = [
       '처음에는 마우스를 찾지 말고 키보드의 위아래 화살표, Tab, Enter, Esc만 기억하면 됩니다.'
   },
   {
-    icon: ClipboardList,
+    icon: ClipboardListIcon,
     name: '왼쪽 세션 목록',
     meaning:
       'Claude Code, Codex 같은 코딩 도구들이 만든 작업 세션을 줄 단위로 보여줍니다. 한 줄이 하나의 되돌아갈 수 있는 맥락입니다.',
@@ -202,7 +202,7 @@ const screenParts = [
       '위아래 화살표로 줄을 옮기며 제목, 시간, 작업 폴더를 훑습니다. 지금 밝게 표시된 줄이 선택된 세션입니다.'
   },
   {
-    icon: FolderSearch,
+    icon: FolderSearchIcon,
     name: '목록의 칸들',
     meaning:
       '상태는 실행 중인지, 도구는 어느 AI 코딩 도구의 세션인지, 제목은 사람이 알아보기 쉬운 이름, 폴더는 그 세션이 작업하던 위치입니다.',
@@ -210,7 +210,7 @@ const screenParts = [
       '제목만 보지 말고 폴더와 시간을 같이 봅니다. 비슷한 제목이 많을 때는 폴더가 가장 좋은 단서가 됩니다.'
   },
   {
-    icon: History,
+    icon: HistoryIcon,
     name: '오른쪽 미리보기',
     meaning:
       '선택한 세션의 내용을 읽기 전용으로 보여주는 공간입니다. 여기서 읽는다고 세션이 다시 시작되지는 않습니다.',
@@ -218,7 +218,7 @@ const screenParts = [
       'Tab을 눌러 오른쪽으로 이동한 뒤 위아래로 읽습니다. 필요한 기록이 맞는지 확인한 다음에만 다시 엽니다.'
   },
   {
-    icon: Keyboard,
+    icon: KeyboardIcon,
     name: '하단 단축키 안내',
     meaning:
       '현재 화면에서 바로 쓸 수 있는 키를 짧게 보여주는 안내줄입니다. 화면이 바뀌면 안내되는 키도 바뀝니다.',
@@ -226,7 +226,7 @@ const screenParts = [
       '모든 단축키를 외우려 하지 말고, 아래 안내줄에서 지금 필요한 키만 확인합니다. 막히면 Esc로 한 단계 빠져나옵니다.'
   },
   {
-    icon: Play,
+    icon: PlayIcon,
     name: '다시 열기와 실행 화면',
     meaning:
       '세션을 다시 열면 원래 코딩 도구가 실제로 실행됩니다. 이때부터는 AI에게 새 질문을 하거나 이어서 작업할 수 있습니다.',
@@ -303,7 +303,7 @@ const chapters = [
     id: 'start',
     eyebrow: '실습 1',
     title: '지난 세션을 찾아 미리보기로 확인한다',
-    icon: History,
+    icon: HistoryIcon,
     scene:
       'cokacmux가 무엇을 보여주는지 알았다면, 이제 저장된 세션 목록에서 필요한 작업 맥락을 찾는 흐름을 익힙니다.',
     steps: [
@@ -334,7 +334,7 @@ const chapters = [
     id: 'search',
     eyebrow: '실습 2',
     title: '기억나는 단어가 있을 때 빠르게 검색한다',
-    icon: Search,
+    icon: SearchIcon,
     scene:
       '“auth”, “snapshot”, “resume” 같은 단어만 기억나고 정확한 세션 제목은 모르는 상황입니다.',
     steps: [
@@ -365,7 +365,7 @@ const chapters = [
     id: 'resume',
     eyebrow: '실습 3',
     title: '세션을 다시 열어 이어서 작업한다',
-    icon: Play,
+    icon: PlayIcon,
     scene:
       '어제 멈춘 리팩터링 작업을 오늘 이어서 하고 싶습니다. 기존 세션의 맥락을 유지하는 것이 중요합니다.',
     steps: [
@@ -396,7 +396,7 @@ const chapters = [
     id: 'parallel',
     eyebrow: '실습 4',
     title: '한 작업은 켜 두고, 다른 작업을 나란히 연다',
-    icon: SplitSquareHorizontal,
+    icon: SplitPanesIcon,
     scene:
       '메인 agent가 테스트를 돌리는 동안, 오른쪽에는 명령창을 열어 로그를 보고 싶습니다.',
     steps: [
@@ -427,7 +427,7 @@ const chapters = [
     id: 'switch',
     eyebrow: '실습 5',
     title: '켜 둔 작업 사이를 빠르게 오간다',
-    icon: Layers3,
+    icon: LayersIcon,
     scene:
       '프론트엔드 수정 agent, 백엔드 테스트 terminal, 문서 정리 agent를 모두 켜 둔 상태입니다.',
     steps: [
@@ -458,7 +458,7 @@ const chapters = [
     id: 'clone',
     eyebrow: '실습 6',
     title: '같은 세션을 복사해 다른 방향을 실험한다',
-    icon: Copy,
+    icon: CopyIcon,
     scene:
       '한 세션에서는 안정적인 수정만 하고, 다른 세션에서는 더 큰 구조 변경을 실험하고 싶습니다.',
     steps: [
@@ -489,7 +489,7 @@ const chapters = [
     id: 'organize',
     eyebrow: '실습 7',
     title: '제목을 정리하고 오래된 기록을 치운다',
-    icon: ClipboardList,
+    icon: ClipboardListIcon,
     scene:
       '프로젝트가 끝난 뒤 나중에 찾기 쉽도록 세션 제목을 정리하고 불필요한 기록을 삭제합니다.',
     steps: [
@@ -520,7 +520,7 @@ const chapters = [
     id: 'cleanup',
     eyebrow: '실습 8',
     title: '하루가 끝나면 실행 중인 작업을 안전하게 종료한다',
-    icon: ShieldAlert,
+    icon: ShieldAlertIcon,
     scene:
       '여러 agent와 terminal을 켜 둔 채 퇴근하기 전에, 어떤 것은 끄고 어떤 것은 남길지 정해야 합니다.',
     steps: [
@@ -574,34 +574,34 @@ function App() {
           <ul className="heroFacts" aria-label="cokacmux 핵심 요약">
             {heroFacts.map((fact) => (
               <li key={fact}>
-                <BadgeCheck size={18} />
+                <CheckBadgeIcon size={18} />
                 <span>{fact}</span>
               </li>
             ))}
           </ul>
           <div className="heroActions" aria-label="빠른 이동">
             <a href="#why">
-              <Search size={18} />
+              <SearchIcon size={18} />
               왜 쓰는지 보기
             </a>
             <a href="#example">
-              <History size={18} />
+              <HistoryIcon size={18} />
               실제 예시
             </a>
             <a href="#what-is">
-              <Play size={18} />
+              <PlayIcon size={18} />
               먼저 이해하기
             </a>
             <a href="#screen-tour">
-              <Layers3 size={18} />
+              <LayersIcon size={18} />
               첫 화면 해설
             </a>
             <a href="#first-steps">
-              <Keyboard size={18} />
+              <KeyboardIcon size={18} />
               10단계 따라하기
             </a>
             <a href="https://github.com/kstost/cokacmux/" target="_blank" rel="noreferrer">
-              <Github size={18} />
+              <SourceCodeIcon size={18} />
               GitHub
             </a>
           </div>
@@ -647,7 +647,7 @@ function App() {
         <div className="promiseStrip" aria-label="cokacmux가 줄여주는 일">
           {threePromises.map((promise) => (
             <div className="promiseItem" key={promise}>
-              <BadgeCheck size={19} />
+              <CheckBadgeIcon size={19} />
               <span>{promise}</span>
             </div>
           ))}
@@ -901,7 +901,7 @@ function App() {
         <ol>
           {checklist.map((item) => (
             <li key={item}>
-              <BadgeCheck size={20} />
+              <CheckBadgeIcon size={20} />
               <span>{item}</span>
             </li>
           ))}
@@ -926,7 +926,7 @@ function CopyCommandButton({ command }) {
 
   return (
     <button type="button" className="copyCommand" onClick={copyCommand}>
-      <Copy size={17} />
+      <CopyIcon size={17} />
       {copied ? '복사됨' : '복사'}
     </button>
   );
@@ -964,7 +964,7 @@ function TutorialChapter({ chapter, index }) {
       </div>
 
       <footer className="outcome">
-        <Wand2 size={18} />
+        <WandIcon size={18} />
         <span>{chapter.outcome}</span>
       </footer>
     </article>

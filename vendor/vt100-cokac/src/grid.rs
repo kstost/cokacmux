@@ -111,6 +111,35 @@ impl Grid {
     }
 
     pub fn set_size(&mut self, size: Size) {
+        // cokacmux: when the height shrinks past the cursor, move the rows
+        // above the new window into scrollback (as xterm and tmux do) instead
+        // of truncating the bottom rows, which would silently drop the most
+        // recent output together with the cursor line. Grids without
+        // scrollback (the alternate screen, or a parser created with no
+        // scrollback) keep the upstream behavior.
+        if size.rows > 0
+            && size.rows < self.size.rows
+            && !self.rows.is_empty()
+            && self.scrollback_len > 0
+            && !self.scroll_region_active()
+        {
+            let excess = self.size.rows - size.rows;
+            let push = (self.pos.row + 1).saturating_sub(size.rows).min(excess);
+            for _ in 0..push {
+                let removed = self.rows.remove(0);
+                self.scrollback.push_back(removed);
+                while self.scrollback.len() > self.scrollback_len {
+                    self.scrollback.pop_front();
+                }
+                if self.scrollback_offset > 0 {
+                    self.scrollback_offset =
+                        self.scrollback.len().min(self.scrollback_offset + 1);
+                }
+            }
+            self.pos.row -= push;
+            self.saved_pos.row = self.saved_pos.row.saturating_sub(push);
+        }
+
         if size.cols != self.size.cols {
             for row in &mut self.rows {
                 row.wrap(false);

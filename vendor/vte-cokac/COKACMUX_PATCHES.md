@@ -17,3 +17,9 @@ This is a private, versioned checkpoint format, not an alternate terminal
 escape-sequence protocol. When updating vte, review the checkpoint validator
 and bump vt100's checkpoint version if its representation or semantics change.
 Do not deserialize a decoder and advance it without validation.
+
+Removed from the upstream package (2026-10-06):
+
+- `tests/demo.vte`, an upstream test fixture that nothing in this repository
+  referenced (`autotests = false`). Removed so the repository does not carry
+  externally made sample material bundled with the dependency.

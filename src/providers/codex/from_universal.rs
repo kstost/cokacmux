@@ -103,12 +103,16 @@ pub fn parse_lines(content: &str, ctx: &CodexReadCtx) -> Result<UniversalSession
         match outer_type.as_str() {
             "session_meta" => {
                 session_meta_lines = session_meta_lines.saturating_add(1);
+                // Only the first session_meta describes this rollout. Later
+                // ones (a parent's meta copied into a subagent rollout) are
+                // kept as timeline messages but must not overwrite identity.
+                let is_first_session_meta = session_meta_lines == 1;
                 if let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) {
                     if session.cwd.is_empty() {
                         session.cwd = cwd.to_string();
                     }
                 }
-                if let Some(g) = payload.get("git") {
+                if let Some(g) = payload.get("git").filter(|_| is_first_session_meta) {
                     session.git = Some(GitInfo {
                         branch: g.get("branch").and_then(|v| v.as_str()).map(String::from),
                         commit: g
@@ -121,7 +125,11 @@ pub fn parse_lines(content: &str, ctx: &CodexReadCtx) -> Result<UniversalSession
                             .map(String::from),
                     });
                 }
-                if let Some(v) = payload.get("cli_version").and_then(|v| v.as_str()) {
+                if let Some(v) = payload
+                    .get("cli_version")
+                    .and_then(|v| v.as_str())
+                    .filter(|_| is_first_session_meta)
+                {
                     session.origin.cli_version = Some(v.to_string());
                 }
                 if let Some(provider) = payload
@@ -136,7 +144,9 @@ pub fn parse_lines(content: &str, ctx: &CodexReadCtx) -> Result<UniversalSession
                         session.session_id = id.to_string();
                     }
                 }
-                session.session_meta = Some(payload.clone());
+                if is_first_session_meta {
+                    session.session_meta = Some(payload.clone());
+                }
                 // Also emit as a meta system message so the timeline is complete.
                 session.messages.push(make_meta_msg(
                     &val,

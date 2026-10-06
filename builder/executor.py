@@ -296,10 +296,9 @@ class BuildExecutor:
             if not cargo_cleaned:
                 self.logger.warning(f"cargo clean failed: {result.stderr}")
 
-            # Remove dist directory
-            if self.dist_dir.exists():
-                shutil.rmtree(self.dist_dir)
-                self.logger.info(f"Removed {self.dist_dir}")
+            # The dist directory holds the previous complete distribution.
+            # It is replaced only after every requested target builds
+            # (copy_to_dist), so a failed build never leaves it empty.
 
             if cargo_cleaned:
                 self.logger.success("Clean complete")

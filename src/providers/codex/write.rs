@@ -64,6 +64,9 @@ fn to_jsonl_path_with_mode(
 
 fn patch_install_identity(jsonl: &str, session: &UniversalSession) -> Result<String> {
     let mut out = String::new();
+    // Only the first session_meta is the rollout's identity. Later ones (a
+    // parent's meta copied into a subagent rollout) describe another thread.
+    let mut patched_session_meta = false;
     for line in jsonl.lines() {
         if line.trim().is_empty() {
             out.push('\n');
@@ -77,7 +80,8 @@ fn patch_install_identity(jsonl: &str, session: &UniversalSession) -> Result<Str
             .to_string();
         if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
             match line_type.as_str() {
-                "session_meta" => {
+                "session_meta" if !patched_session_meta => {
+                    patched_session_meta = true;
                     payload.insert("id".into(), Value::String(session.session_id.clone()));
                     if payload.contains_key("session_id") {
                         payload.insert(
@@ -124,20 +128,20 @@ pub fn to_jsonl_string(session: &UniversalSession, opts: &CodexWriteOpts) -> Res
 
     // 1) If a session_meta is present in the source and the session originated
     //    from codex, replay it. Otherwise synthesize a minimal one.
-    let mut wrote_session_meta = false;
+    let mut replayed_session_meta_index = None;
     if opts.replay_raw {
-        for m in &session.messages {
+        for (index, m) in session.messages.iter().enumerate() {
             if m.provenance.source_event_type == "codex:session_meta" {
                 let s = serde_json::to_string(&m.provenance.raw)?;
                 out.push_str(&s);
                 out.push('\n');
-                wrote_session_meta = true;
+                replayed_session_meta_index = Some(index);
                 replayed_raw_messages = replayed_raw_messages.saturating_add(1);
                 break;
             }
         }
     }
-    if !wrote_session_meta {
+    if replayed_session_meta_index.is_none() {
         out.push_str(&serde_json::to_string(&synth_session_meta(session))?);
         out.push('\n');
     }
@@ -158,9 +162,13 @@ pub fn to_jsonl_string(session: &UniversalSession, opts: &CodexWriteOpts) -> Res
     }
 
     // 2) Replay or synthesize each message.
-    for m in &session.messages {
-        // Skip session_meta — already emitted above.
-        if m.provenance.source_event_type == "codex:session_meta" {
+    for (index, m) in session.messages.iter().enumerate() {
+        // The first session_meta was already emitted above. Later ones (a
+        // parent's meta copied into a subagent rollout) are replayed in place
+        // so a same-provider round trip keeps every native line.
+        if m.provenance.source_event_type == "codex:session_meta"
+            && (!opts.replay_raw || replayed_session_meta_index == Some(index))
+        {
             continue;
         }
 

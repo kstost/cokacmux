@@ -733,6 +733,13 @@ struct Settings {
     cokacmux: CokacmuxSettings,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
+    /// Set when settings.json existed but could neither be read nor copied
+    /// aside when these settings were loaded. They are then defaults, and
+    /// saving them would destroy the user's file, so saves fail instead.
+    /// Kept per instance: a later load elsewhere (attach, daemon) that hits a
+    /// transient read error must not block saving the app's own settings.
+    #[serde(skip)]
+    save_blocked: bool,
     #[cfg(test)]
     #[serde(skip)]
     skip_save: bool,
@@ -743,6 +750,7 @@ impl Default for Settings {
         Self {
             cokacmux: CokacmuxSettings::default(),
             extra: serde_json::Map::new(),
+            save_blocked: false,
             #[cfg(test)]
             skip_save: false,
         }
@@ -751,6 +759,7 @@ impl Default for Settings {
 
 impl Settings {
     fn load() -> Self {
+        let mut save_blocked = false;
         if let Some(path) = settings_path() {
             match fs::read_to_string(&path) {
                 Ok(content) => {
@@ -760,16 +769,33 @@ impl Settings {
                             return settings.normalized();
                         }
                     }
+                    // The next save replaces the file with defaults, so keep
+                    // the user's unparsable settings before falling back.
+                    if !preserve_invalid_settings_file(&path, &content) {
+                        save_blocked = true;
+                    }
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => {
                     let settings = Self::default();
                     let _ = settings.save_to_path(&path);
                     return settings;
                 }
-                Err(_) => {}
+                Err(error) => {
+                    debug_log(
+                        "settings_load_read_failed",
+                        serde_json::json!({
+                            "path": path.display().to_string(),
+                            "error": error.to_string(),
+                        }),
+                    );
+                    save_blocked = true;
+                }
             }
         }
-        Self::default()
+        Self {
+            save_blocked,
+            ..Self::default()
+        }
     }
 
     fn normalized(mut self) -> Self {
@@ -788,6 +814,12 @@ impl Settings {
         let Some(path) = settings_path() else {
             anyhow::bail!("cannot resolve home directory");
         };
+        if self.save_blocked {
+            anyhow::bail!(
+                "{} could not be read at startup; not overwriting it",
+                path.display()
+            );
+        }
         self.save_to_path(&path)
     }
 
@@ -799,6 +831,31 @@ impl Settings {
         cokacmux::jsonl::write_text_atomic(path, &format!("{}\n", content))?;
         Ok(())
     }
+}
+
+/// Copies an unparsable settings.json next to it, named by content hash so
+/// repeated starts reuse one copy. Returns false when no copy exists.
+fn preserve_invalid_settings_file(path: &Path, content: &str) -> bool {
+    let digest = Sha256::digest(content.as_bytes());
+    let backup = path.with_file_name(format!(
+        "settings.json.invalid-{}",
+        bytes_to_lower_hex(&digest[..6])
+    ));
+    let result = if backup.exists() {
+        Ok(())
+    } else {
+        cokacmux::jsonl::write_text_atomic(&backup, content)
+    };
+    debug_log(
+        "settings_load_invalid_preserved",
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "backup": backup.display().to_string(),
+            "ok": result.is_ok(),
+            "error": result.as_ref().err().map(|error| error.to_string()),
+        }),
+    );
+    result.is_ok()
 }
 
 fn migrate_legacy_ai_settings_json(value: &mut serde_json::Value) {
@@ -2739,6 +2796,7 @@ fn move_provider_in_options(provider: Provider, delta: i32, options: &[Provider]
     options[next]
 }
 
+#[cfg(test)]
 fn available_agent_provider_options(agent_programs: &AgentProgramSettings) -> Vec<Provider> {
     PROVIDER_OPTIONS
         .iter()
@@ -2762,8 +2820,151 @@ fn normalize_agent_provider_selection(
     }
 }
 
+#[cfg(test)]
 fn agent_provider_available(provider: Provider, agent_programs: &AgentProgramSettings) -> bool {
     resolve_agent_program_for_provider(provider, agent_programs).is_some()
+}
+
+/// How long a program lookup is served before it is refreshed in the
+/// background. Lookups run `which` and, failing that, a login shell, so the
+/// UI thread never runs them itself; it only reads this cache.
+const PROGRAM_RESOLUTION_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Opening the new-session modal re-checks the agent programs, so an agent
+/// installed while cokacmux runs shows up without waiting for the TTL. A
+/// lookup this recent is reused so quick reopens do not respawn the lookups.
+const PROGRAM_RESOLUTION_REOPEN_MIN_AGE: Duration = Duration::from_secs(2);
+const COKACDIR_DEFAULT_PROGRAM_CACHE_KEY: &str = "cokacdir:default";
+
+#[derive(Default)]
+struct ProgramResolutionCacheEntry {
+    resolved: Option<Option<PathBuf>>,
+    resolved_at: Option<Instant>,
+    refreshing: bool,
+}
+
+fn program_resolution_cache() -> &'static Mutex<HashMap<String, ProgramResolutionCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, ProgramResolutionCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn agent_program_cache_key(provider: Provider, program: &str) -> String {
+    format!("agent:{}:{}", provider.as_str(), program)
+}
+
+/// Returns the last known lookup for `key` without blocking. A missing entry,
+/// or one older than `max_age`, starts one background refresh. `None` means
+/// no lookup has answered yet.
+fn cached_program_resolution(
+    key: &str,
+    max_age: Duration,
+    resolve: impl FnOnce() -> Option<PathBuf> + Send + 'static,
+) -> Option<Option<PathBuf>> {
+    let mut cache = program_resolution_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = cache.entry(key.to_string()).or_default();
+    let should_refresh = entry
+        .resolved_at
+        .is_none_or(|resolved_at| resolved_at.elapsed() >= max_age);
+    if should_refresh && !entry.refreshing {
+        entry.refreshing = true;
+        let worker_key = key.to_string();
+        let spawned = thread::Builder::new()
+            .name("cokacmux-program-resolve".into())
+            .spawn(move || {
+                let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(resolve));
+                let mut cache = program_resolution_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let entry = cache.entry(worker_key).or_default();
+                entry.refreshing = false;
+                entry.resolved_at = Some(Instant::now());
+                match resolved {
+                    Ok(resolved) => entry.resolved = Some(resolved),
+                    // A panicking lookup keeps the old answer. Without one it
+                    // counts as not found, like a failed `which`, so the UI
+                    // is not left showing "checking" until the next refresh.
+                    Err(_) => {
+                        entry.resolved.get_or_insert(None);
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            entry.refreshing = false;
+            // Retry after `max_age` instead of on every frame.
+            entry.resolved_at = Some(Instant::now());
+            debug_log(
+                "program_resolution_spawn_failed",
+                serde_json::json!({
+                    "key": key,
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    }
+    entry.resolved.clone()
+}
+
+/// Records a lookup that a worker already ran, so the UI sees it at once.
+fn store_program_resolution(key: &str, resolved: Option<PathBuf>) {
+    let mut cache = program_resolution_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = cache.entry(key.to_string()).or_default();
+    entry.resolved = Some(resolved);
+    entry.resolved_at = Some(Instant::now());
+}
+
+/// UI-thread variant of `agent_provider_available`: `Some(found)` from the
+/// program lookup cache, or `None` while the background lookup runs.
+fn agent_provider_status_for_ui(
+    provider: Provider,
+    agent_programs: &AgentProgramSettings,
+    max_age: Duration,
+) -> Option<bool> {
+    let program = agent_programs.program_for(provider);
+    let key = agent_program_cache_key(provider, &program);
+    cached_program_resolution(&key, max_age, move || {
+        resolve_agent_program_candidate(provider, &program)
+    })
+    .map(|resolved| resolved.is_some())
+}
+
+#[derive(Debug, Default)]
+struct AgentProviderAvailability {
+    /// Coding agents whose program was found.
+    available: Vec<Provider>,
+    /// Coding agents whose program lookup has not answered yet.
+    checking: Vec<Provider>,
+}
+
+fn agent_provider_availability_for_ui(
+    agent_programs: &AgentProgramSettings,
+    max_age: Duration,
+) -> AgentProviderAvailability {
+    let mut availability = AgentProviderAvailability::default();
+    for provider in PROVIDER_OPTIONS {
+        match agent_provider_status_for_ui(provider, agent_programs, max_age) {
+            Some(true) => availability.available.push(provider),
+            Some(false) => {}
+            None => availability.checking.push(provider),
+        }
+    }
+    availability
+}
+
+/// Like `normalize_agent_provider_selection`, but keeps a provider whose
+/// lookup has not answered yet, so the preferred agent is not replaced before
+/// its answer arrives.
+fn settle_agent_provider_selection(
+    provider: Provider,
+    options: &[Provider],
+    checking: &[Provider],
+) -> Provider {
+    if checking.contains(&provider) {
+        return provider;
+    }
+    normalize_agent_provider_selection(provider, options).unwrap_or(provider)
 }
 
 fn move_launch_mode(launch_mode: AgentLaunchMode, delta: i32) -> AgentLaunchMode {
@@ -3235,7 +3436,10 @@ impl SettingsState {
                 return status.clone();
             }
         }
-        let status = settings_text_status(&self.draft, field);
+        let Some(status) = settings_text_status(&self.draft, field) else {
+            // The 500ms housekeeping tick redraws once the lookup lands.
+            return SettingsTextStatus::warning("checking…");
+        };
         self.text_status_cache
             .borrow_mut()
             .insert(field, (value, status.clone()));
@@ -4956,6 +5160,7 @@ fn agent_exit_request_debug_value(request: &AgentExitRequest) -> serde_json::Val
         "kind": request.kind.label(),
         "phase": request.phase.label(),
         "elapsed_ms": request.started_at.elapsed().as_millis(),
+        "shell_foreground": request.shell_foreground.as_ref().map(ShellForegroundProbe::label),
     })
 }
 
@@ -9307,6 +9512,76 @@ struct AgentExitRequest {
     kind: AgentExitRequestKind,
     phase: AgentExitRequestPhase,
     started_at: Instant,
+    /// For a typed `exit`: whether the session shell itself held the
+    /// terminal. None when no check ran, which keeps the overlay as before.
+    shell_foreground: Option<ShellForegroundProbe>,
+}
+
+const SHELL_FOREGROUND_PENDING: u8 = 0;
+const SHELL_FOREGROUND_SHELL: u8 = 1;
+const SHELL_FOREGROUND_OTHER_PROGRAM: u8 = 2;
+const SHELL_FOREGROUND_UNKNOWN: u8 = 3;
+/// How long the exit overlay waits for the foreground check before showing.
+const SHELL_FOREGROUND_PROBE_GRACE_MS: u64 = 1_000;
+
+/// Background check of whether the session shell held the terminal (was its
+/// foreground process group). When another program does (docker exec, ssh,
+/// a nested shell), a typed `exit` ends that program and the session lives on.
+#[derive(Debug, Clone)]
+struct ShellForegroundProbe {
+    state: Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl ShellForegroundProbe {
+    fn start(shell_pid: u32) -> Self {
+        let state = Arc::new(std::sync::atomic::AtomicU8::new(SHELL_FOREGROUND_PENDING));
+        let worker_state = Arc::clone(&state);
+        let spawned = thread::Builder::new()
+            .name("cokacmux-shell-foreground".into())
+            .spawn(move || {
+                let answer = std::panic::catch_unwind(|| shell_holds_terminal_foreground(shell_pid))
+                    .ok()
+                    .flatten();
+                worker_state.store(
+                    match answer {
+                        Some(true) => SHELL_FOREGROUND_SHELL,
+                        Some(false) => SHELL_FOREGROUND_OTHER_PROGRAM,
+                        None => SHELL_FOREGROUND_UNKNOWN,
+                    },
+                    Ordering::Release,
+                );
+                debug_log(
+                    "shell_foreground_probe_done",
+                    serde_json::json!({
+                        "shell_pid": shell_pid,
+                        "shell_foreground": answer,
+                    }),
+                );
+            });
+        if spawned.is_err() {
+            state.store(SHELL_FOREGROUND_UNKNOWN, Ordering::Release);
+        }
+        Self { state }
+    }
+
+    fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+
+    /// True only on definitive evidence that another program held the
+    /// terminal; an unknown answer keeps the exit overlay.
+    fn other_program_held_terminal(&self) -> bool {
+        self.state() == SHELL_FOREGROUND_OTHER_PROGRAM
+    }
+
+    fn label(&self) -> &'static str {
+        match self.state() {
+            SHELL_FOREGROUND_PENDING => "pending",
+            SHELL_FOREGROUND_SHELL => "shell",
+            SHELL_FOREGROUND_OTHER_PROGRAM => "other_program",
+            _ => "unknown",
+        }
+    }
 }
 
 struct AgentClient {
@@ -9348,7 +9623,12 @@ struct AgentClient {
     pending_input_key: Option<String>,
     pending_input_count: u64,
     exit_input_line: String,
+    /// Foreground check started when the typed line became an exit command,
+    /// so it reflects who held the terminal before Enter was sent.
+    exit_line_probe: Option<ShellForegroundProbe>,
     exit_request: Option<AgentExitRequest>,
+    /// The daemon's PTY child (the session shell for terminal sessions).
+    child_pid: Option<u32>,
     pending_snapshot_output: bool,
     snapshot_parse_in_progress: bool,
     startup_spinner_started_at: Option<Instant>,
@@ -10007,6 +10287,8 @@ impl AgentClient {
                 pending_input_key: None,
                 pending_input_count: 0,
                 exit_input_line: String::new(),
+                exit_line_probe: None,
+                child_pid: None,
                 exit_request: None,
                 pending_snapshot_output: false,
                 snapshot_parse_in_progress: false,
@@ -10066,6 +10348,7 @@ impl AgentClient {
                 self.command_line = command;
                 self.daemon_pid = daemon_pid;
                 self.daemon_pid_start_ticks = daemon_pid_start_ticks;
+                self.child_pid = child_pid;
                 self.bracketed_paste_mode = bracketed_paste_mode;
                 self.input_acknowledgements = input_acknowledgements;
                 self.input_replay_epoch = input_replay_epoch;
@@ -10080,6 +10363,9 @@ impl AgentClient {
                 let state_before = verbose_debug.then(|| {
                     debug_agent_client_state_value(self, visible_rows, visible_rows.min(120))
                 });
+                // These read /proc on the UI thread; json! evaluates its
+                // arguments before debug_log checks the flag.
+                let process_debug = DEBUG_ENABLED.load(Ordering::Relaxed);
                 debug_log(
                     "agent_client_event_attached",
                     serde_json::json!({
@@ -10088,10 +10374,16 @@ impl AgentClient {
                         "command": &self.command_line,
                         "daemon_pid": daemon_pid,
                         "daemon_pid_start_ticks": daemon_pid_start_ticks,
-                        "daemon_exe": debug_process_exe(daemon_pid),
-                        "daemon_cmdline": debug_process_cmdline(daemon_pid),
+                        "daemon_exe": process_debug
+                            .then(|| debug_process_exe(daemon_pid))
+                            .flatten(),
+                        "daemon_cmdline": process_debug
+                            .then(|| debug_process_cmdline(daemon_pid))
+                            .flatten(),
                         "child_pid": child_pid,
-                        "child_cmdline": child_pid.and_then(debug_process_cmdline),
+                        "child_cmdline": process_debug
+                            .then(|| child_pid.and_then(debug_process_cmdline))
+                            .flatten(),
                         "snapshot_event": snapshot_event,
                         "pending_snapshot_output_before": self.pending_snapshot_output,
                         "last_screen_change_epoch_ms": last_screen_change_epoch_ms,
@@ -10824,6 +11116,16 @@ impl AgentClient {
 
     fn mark_exit_detected(&mut self) {
         if let Some(request) = self.exit_request.as_mut() {
+            // An `exit` that another foreground program received was never
+            // this shell's exit; time the real one from now.
+            if request
+                .shell_foreground
+                .as_ref()
+                .is_some_and(ShellForegroundProbe::other_program_held_terminal)
+            {
+                request.started_at = Instant::now();
+                request.shell_foreground = None;
+            }
             request.phase = AgentExitRequestPhase::Detected;
         } else if is_plain_pty_tool_session_info(&self.info) {
             let kind = if is_cokacdir_session_info(&self.info) {
@@ -10835,6 +11137,7 @@ impl AgentClient {
                 kind,
                 phase: AgentExitRequestPhase::Detected,
                 started_at: Instant::now(),
+                shell_foreground: None,
             });
         }
     }
@@ -10844,6 +11147,7 @@ impl AgentClient {
             kind,
             phase: AgentExitRequestPhase::Requested,
             started_at: Instant::now(),
+            shell_foreground: None,
         });
         debug_log(
             "agent_exit_request_detected",
@@ -10868,32 +11172,65 @@ impl AgentClient {
         }
 
         match key.code {
-            KeyCode::Char(ch)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
+            KeyCode::Char(ch) if key_inserts_text(key) => {
                 self.exit_input_line.push(ch);
                 if self.exit_input_line.len() > AGENT_EXIT_INPUT_LINE_LIMIT {
                     self.exit_input_line.clear();
                 }
+                self.refresh_exit_line_probe();
             }
             KeyCode::Backspace => {
                 self.exit_input_line.pop();
+                self.refresh_exit_line_probe();
             }
             KeyCode::Enter => {
                 let exit_command = shell_line_is_exit_command(&self.exit_input_line);
                 self.exit_input_line.clear();
+                let probe = self.exit_line_probe.take();
                 if exit_command {
-                    self.set_exit_request(AgentExitRequestKind::TerminalExit);
+                    self.set_terminal_exit_request(probe);
                 }
             }
             KeyCode::Esc => {
                 self.exit_input_line.clear();
+                self.exit_line_probe = None;
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.exit_input_line.clear();
+                self.exit_line_probe = None;
             }
             _ => {}
+        }
+    }
+
+    /// Starts one foreground check when the typed line becomes an exit
+    /// command, so its answer reflects who held the terminal before Enter,
+    /// and drops it once the line stops being one.
+    fn refresh_exit_line_probe(&mut self) {
+        if !shell_line_is_exit_command(&self.exit_input_line) {
+            self.exit_line_probe = None;
+        } else if self.exit_line_probe.is_none() {
+            self.exit_line_probe = self.start_shell_foreground_probe();
+        }
+    }
+
+    /// Only platforms that can read a process's terminal foreground group
+    /// check; elsewhere a typed `exit` shows the overlay as before.
+    fn start_shell_foreground_probe(&self) -> Option<ShellForegroundProbe> {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return None;
+        }
+        self.child_pid.map(ShellForegroundProbe::start)
+    }
+
+    /// A typed `exit` reaches whichever program holds the terminal. Without
+    /// an earlier check (a pasted line), one starts now; it may then see the
+    /// shell back in front, which shows the overlay as before.
+    fn set_terminal_exit_request(&mut self, probe: Option<ShellForegroundProbe>) {
+        let probe = probe.or_else(|| self.start_shell_foreground_probe());
+        self.set_exit_request(AgentExitRequestKind::TerminalExit);
+        if let Some(request) = self.exit_request.as_mut() {
+            request.shell_foreground = probe;
         }
     }
 
@@ -10919,9 +11256,12 @@ impl AgentClient {
             if has_newline {
                 let exit_command = shell_line_is_exit_command(&self.exit_input_line);
                 self.exit_input_line.clear();
+                let probe = self.exit_line_probe.take();
                 if exit_command {
-                    self.set_exit_request(AgentExitRequestKind::TerminalExit);
+                    self.set_terminal_exit_request(probe);
                 }
+            } else {
+                self.refresh_exit_line_probe();
             }
         }
     }
@@ -12747,6 +13087,8 @@ where
     Some(VerifiedMissingLiveShell { info, state, meta })
 }
 
+// Keep new-session draft fields explicit across the worker boundary.
+#[allow(clippy::too_many_arguments)]
 fn run_new_session_prepare(
     seq: u64,
     kind: NewSessionKind,
@@ -12755,6 +13097,7 @@ fn run_new_session_prepare(
     launch_mode: AgentLaunchMode,
     cols: u16,
     rows: u16,
+    agent_programs: &AgentProgramSettings,
 ) -> NewSessionPrepareResult {
     let started = Instant::now();
     debug_log(
@@ -12769,7 +13112,10 @@ fn run_new_session_prepare(
             "rows": rows,
         }),
     );
-    let outcome = normalize_launch_cwd(&raw_cwd);
+    // Check the agent before normalize_launch_cwd, which may create the
+    // folder: a missing agent must not leave a new empty folder behind.
+    let outcome = new_session_agent_program_check(kind, provider, agent_programs)
+        .and_then(|()| normalize_launch_cwd(&raw_cwd));
     let result = NewSessionPrepareResult {
         seq,
         kind,
@@ -12787,6 +13133,28 @@ fn run_new_session_prepare(
         new_session_prepare_result_debug_value(&result),
     );
     result
+}
+
+/// Runs on the prepare worker. The UI only knows the cached lookup, which may
+/// be stale or still running, so the launch looks the program up itself and
+/// shares the fresh answer with the UI.
+fn new_session_agent_program_check(
+    kind: NewSessionKind,
+    provider: Provider,
+    agent_programs: &AgentProgramSettings,
+) -> std::result::Result<(), String> {
+    if kind != NewSessionKind::CodingAgent {
+        return Ok(());
+    }
+    let program = agent_programs.program_for(provider);
+    let resolved = resolve_agent_program_candidate(provider, &program);
+    let found = resolved.is_some();
+    store_program_resolution(&agent_program_cache_key(provider, &program), resolved);
+    if found {
+        Ok(())
+    } else {
+        Err(format!("{} agent is not installed.", provider.as_str()))
+    }
 }
 
 struct AgentRuntimeRefreshRequest {
@@ -12996,6 +13364,9 @@ struct App {
     killall_pending: Option<KillAllPending>,
     new_session_launch_seq: u64,
     new_session_launch: Option<NewSessionLaunchPending>,
+    /// Coding agents whose program lookup had not answered when the
+    /// new-session modal last read the lookup cache.
+    new_session_provider_checking: Vec<Provider>,
     /// First-seen order of agents-sidebar entries. Keeps the sidebar from
     /// shuffling as sessions reorder by activity or discovery rescans the
     /// runtime dir; new agents append, departed agents free their slot.
@@ -13168,6 +13539,7 @@ impl App {
             killall_pending: None,
             new_session_launch_seq: 0,
             new_session_launch: None,
+            new_session_provider_checking: Vec::new(),
             agent_sidebar_order: Vec::new(),
             last_ui_stall_log_at: None,
             ui_stall_log_count: 0,
@@ -18934,10 +19306,14 @@ impl App {
         self.attach_terminal_input_target = None;
         self.queued_attach = None;
         self.discard_deferred_agent_input(reason);
+        // A cancelled attach never delivers a current result, so nothing else
+        // would clear a new-session launch overlay waiting on it.
         if let Some(key) = cancelled_in_flight.as_ref() {
+            self.finish_new_session_launch_for_key(key, reason);
             self.abandon_agent_kill_replacement_for(key, reason);
         }
         if let Some(key) = cancelled_queued.as_ref() {
+            self.finish_new_session_launch_for_key(key, reason);
             self.abandon_agent_kill_replacement_for(key, reason);
         }
     }
@@ -18972,11 +19348,43 @@ impl App {
                     "snapshot": app_runtime_snapshot_debug_value(self, false),
                 }),
             );
+            self.release_replaced_queued_attach(&job);
             self.mark_new_session_launch_attach_queued(&job.ctx.key);
             self.queued_attach = Some(job);
             return;
         }
         self.start_attach_job(job);
+    }
+
+    /// A queued attach replaced by a newer request never runs. Clear the
+    /// state that was waiting on it so no overlay or "Connecting…" pane is
+    /// left without an attach that could finish it.
+    fn release_replaced_queued_attach(&mut self, next: &AttachJob) {
+        let Some(previous) = self.queued_attach.as_ref() else {
+            return;
+        };
+        let previous_key = previous.ctx.key.clone();
+        if previous_key == next.ctx.key {
+            return;
+        }
+        let replacement_waits_on_previous = previous.ctx.target.is_main_agent()
+            && self
+                .agent_kill_replacement
+                .as_ref()
+                .is_some_and(|replacement| AgentKey::new(&replacement.target) == previous_key);
+        self.finish_new_session_launch_for_key(&previous_key, "attach_queue_replaced");
+        if replacement_waits_on_previous {
+            if next.ctx.target.is_main_agent() {
+                if let Some(replacement) = self.agent_kill_replacement.as_mut() {
+                    replacement.target = next.info.clone();
+                }
+            } else {
+                self.abandon_agent_kill_replacement_for(
+                    &previous_key,
+                    "replacement_queue_replaced_by_auxiliary_attach",
+                );
+            }
+        }
     }
 
     fn mark_new_session_launch_attach_key(&mut self, seq: u64, key: AgentKey) {
@@ -21541,7 +21949,33 @@ impl App {
                     "rows": rows,
                 }),
             );
+            // Keep the agent workspace mounted while the fresh client
+            // attaches. Without an active client the view would fall back to
+            // the sessions list and keys meant for the agent (Esc, q, Enter)
+            // would run as list commands. The replacement clears when the
+            // attach finishes and is abandoned (sessions view) if it fails.
+            let mount_replacement = self.agent_kill_replacement.is_none();
+            if mount_replacement {
+                self.agent_kill_replacement = Some(AgentKillReplacement {
+                    target: info.clone(),
+                });
+            }
             self.attach_existing_live_agent(info, cols, rows, "connection_recovery");
+            if mount_replacement
+                && !self
+                    .attach_in_flight
+                    .as_ref()
+                    .is_some_and(|attach| attach.key == key)
+                && !self
+                    .queued_attach
+                    .as_ref()
+                    .is_some_and(|job| job.ctx.key == key)
+            {
+                self.abandon_agent_kill_replacement_for(
+                    &key,
+                    "connection_recovery_attach_not_started",
+                );
+            }
             return;
         }
 
@@ -22074,10 +22508,19 @@ impl App {
         );
         let cwd_cursor = cwd.len();
         self.status = "choose what to start.".into();
-        let provider_options =
-            available_agent_provider_options(&self.settings.cokacmux.agent_programs);
-        let provider =
-            normalize_agent_provider_selection(provider, &provider_options).unwrap_or(provider);
+        // Never looks a program up here: the cached answers show at once and
+        // a background re-check lands through `sync_new_session_provider_options`.
+        let availability = agent_provider_availability_for_ui(
+            &self.settings.cokacmux.agent_programs,
+            PROGRAM_RESOLUTION_REOPEN_MIN_AGE,
+        );
+        let provider = settle_agent_provider_selection(
+            provider,
+            &availability.available,
+            &availability.checking,
+        );
+        let provider_options = availability.available;
+        self.new_session_provider_checking = availability.checking;
         self.input_mode = InputMode::NewSession {
             selected: NEW_SESSION_FIELD_KIND,
             kind: NewSessionKind::Terminal,
@@ -22088,6 +22531,48 @@ impl App {
             provider_options,
             launch_mode: AgentLaunchMode::Normal,
         };
+    }
+
+    /// Applies program lookups that answered while the new-session modal is
+    /// open. Reads the lookup cache only, so it runs on every housekeeping
+    /// tick without blocking.
+    fn sync_new_session_provider_options(&mut self) {
+        let InputMode::NewSession {
+            provider,
+            provider_options,
+            ..
+        } = &mut self.input_mode
+        else {
+            self.new_session_provider_checking.clear();
+            return;
+        };
+        let availability = agent_provider_availability_for_ui(
+            &self.settings.cokacmux.agent_programs,
+            PROGRAM_RESOLUTION_CACHE_TTL,
+        );
+        let next_provider = settle_agent_provider_selection(
+            *provider,
+            &availability.available,
+            &availability.checking,
+        );
+        if *provider == next_provider
+            && *provider_options == availability.available
+            && self.new_session_provider_checking == availability.checking
+        {
+            return;
+        }
+        debug_log(
+            "new_session_provider_options_synced",
+            serde_json::json!({
+                "provider": provider.as_str(),
+                "next_provider": next_provider.as_str(),
+                "available": availability.available.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+                "checking": availability.checking.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            }),
+        );
+        *provider = next_provider;
+        *provider_options = availability.available;
+        self.new_session_provider_checking = availability.checking;
     }
 
     fn start_new_session_from_modal(
@@ -22102,8 +22587,15 @@ impl App {
         if self.reject_while_data_task_running("starting a new session") {
             return false;
         }
+        // Refuse only an agent the last lookup did not find. One whose lookup
+        // is still running goes ahead: the prepare worker checks the program
+        // again off the UI thread before anything is created.
         if kind == NewSessionKind::CodingAgent
-            && !agent_provider_available(provider, &self.settings.cokacmux.agent_programs)
+            && agent_provider_status_for_ui(
+                provider,
+                &self.settings.cokacmux.agent_programs,
+                PROGRAM_RESOLUTION_CACHE_TTL,
+            ) == Some(false)
         {
             self.status = format!("{} agent is not installed.", provider.as_str());
             debug_log(
@@ -22155,8 +22647,18 @@ impl App {
                 "rows": rows,
             }),
         );
+        let agent_programs = self.settings.cokacmux.agent_programs.clone();
         let Some(tx) = self.main_tx.clone() else {
-            let result = run_new_session_prepare(seq, kind, cwd, provider, launch_mode, cols, rows);
+            let result = run_new_session_prepare(
+                seq,
+                kind,
+                cwd,
+                provider,
+                launch_mode,
+                cols,
+                rows,
+                &agent_programs,
+            );
             self.on_new_session_prepare_result(Box::new(result));
             return true;
         };
@@ -22164,7 +22666,16 @@ impl App {
             .name("cokacmux-new-session".into())
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_new_session_prepare(seq, kind, cwd, provider, launch_mode, cols, rows)
+                    run_new_session_prepare(
+                        seq,
+                        kind,
+                        cwd,
+                        provider,
+                        launch_mode,
+                        cols,
+                        rows,
+                        &agent_programs,
+                    )
                 }));
                 let event = match outcome {
                     Ok(result) => MainEvent::NewSessionPrepareResult(Box::new(result)),
@@ -22223,11 +22734,17 @@ impl App {
                 self.new_session_launch = None;
                 self.status = message.clone();
                 if matches!(self.input_mode, InputMode::Normal) {
-                    let provider_options =
-                        available_agent_provider_options(&self.settings.cokacmux.agent_programs);
-                    let provider =
-                        normalize_agent_provider_selection(result.provider, &provider_options)
-                            .unwrap_or(result.provider);
+                    let availability = agent_provider_availability_for_ui(
+                        &self.settings.cokacmux.agent_programs,
+                        PROGRAM_RESOLUTION_CACHE_TTL,
+                    );
+                    let provider = settle_agent_provider_selection(
+                        result.provider,
+                        &availability.available,
+                        &availability.checking,
+                    );
+                    let provider_options = availability.available;
+                    self.new_session_provider_checking = availability.checking;
                     let cwd_cursor = result.raw_cwd.len();
                     self.input_mode = InputMode::NewSession {
                         selected: NEW_SESSION_FIELD_CWD,
@@ -30285,6 +30802,7 @@ fn handle_main_event(
             app.poll_preview_results();
             app.poll_agent_sessions();
             app.poll_agent_runtime_states();
+            app.sync_new_session_provider_options();
         }
         MainEvent::AnimationTick { .. } => {}
         MainEvent::PreviewReady { .. } => {
@@ -39142,6 +39660,12 @@ fn windows_process_tree_pids_complete(root_pid: u32) -> Option<Vec<u32>> {
         children.entry(parent_pid).or_default().push(pid);
     }
 
+    // Windows keeps a process's parent PID after the parent exits, so a
+    // reused PID can appear to own older, unrelated processes. Drop such an
+    // edge only on definitive evidence: the child was created clearly before
+    // this parent. The margin tolerates small system clock corrections.
+    const WINDOWS_PARENT_REUSE_MARGIN_100NS: u64 = 10_000_000;
+    let mut creation_times: HashMap<u32, Option<u64>> = HashMap::new();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut queue = VecDeque::from([root_pid]);
@@ -39151,7 +39675,33 @@ fn windows_process_tree_pids_complete(root_pid: u32) -> Option<Vec<u32>> {
         }
         out.push(pid);
         if let Some(child_pids) = children.get(&pid) {
-            queue.extend(child_pids.iter().copied());
+            let parent_created = *creation_times
+                .entry(pid)
+                .or_insert_with(|| windows_process_creation_filetime(pid));
+            for &child_pid in child_pids {
+                let child_created = *creation_times
+                    .entry(child_pid)
+                    .or_insert_with(|| windows_process_creation_filetime(child_pid));
+                if let (Some(parent_created), Some(child_created)) = (parent_created, child_created)
+                {
+                    if child_created.saturating_add(WINDOWS_PARENT_REUSE_MARGIN_100NS)
+                        < parent_created
+                    {
+                        trace_log(
+                            "windows_process_tree_reused_parent_pid_skipped",
+                            serde_json::json!({
+                                "root_pid": root_pid,
+                                "parent_pid": pid,
+                                "child_pid": child_pid,
+                                "parent_created": parent_created,
+                                "child_created": child_created,
+                            }),
+                        );
+                        continue;
+                    }
+                }
+                queue.push_back(child_pid);
+            }
         }
     }
     Some(out)
@@ -45690,6 +46240,37 @@ fn linux_process_stat_group_and_state(stat: &str) -> Option<(i32, char)> {
     Some((pgid, state))
 }
 
+/// Whether `pid` is in its terminal's foreground process group. Some(false)
+/// while it runs another foreground program; None when that cannot be read.
+/// Reads process state, so it runs on a worker, never the UI thread.
+#[cfg(target_os = "linux")]
+fn shell_holds_terminal_foreground(pid: u32) -> Option<bool> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    linux_process_stat_holds_terminal_foreground(&stat)
+}
+
+#[cfg(target_os = "macos")]
+fn shell_holds_terminal_foreground(pid: u32) -> Option<bool> {
+    let info = macos_process_bsdinfo(pid, "shell_holds_terminal_foreground")?;
+    // Without a controlling terminal there is no foreground group to compare.
+    (info.e_tpgid != 0).then_some(info.e_tpgid == info.pbi_pgid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn shell_holds_terminal_foreground(_pid: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_process_stat_holds_terminal_foreground(stat: &str) -> Option<bool> {
+    // After the command name: state ppid pgrp session tty_nr tpgid ...
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let mut parts = after_comm.split_whitespace();
+    let pgrp: i32 = parts.nth(2)?.parse().ok()?;
+    let tpgid: i32 = parts.nth(2)?.parse().ok()?;
+    (tpgid > 0).then_some(tpgid == pgrp)
+}
+
 #[cfg(target_os = "macos")]
 fn unix_process_group_has_live_member(pgid: i32) -> bool {
     macos_process_group_member_pids_complete(pgid)
@@ -48518,13 +49099,17 @@ fn validate_cli_terminal_command_with_base(
         } else {
             configured
         };
-        let resolved = resolved.canonicalize().map_err(|error| {
-            anyhow::anyhow!(
-                "command program is not runnable or not found: {} ({})",
-                command[0],
-                error
-            )
-        })?;
+        // Make the path absolute without resolving symlinks: programs such as
+        // venv/bin/python or busybox applets depend on the name they run as.
+        let resolved = std::path::absolute(&resolved)
+            .and_then(|path| fs::metadata(&path).map(|_| path))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "command program is not runnable or not found: {} ({})",
+                    command[0],
+                    error
+                )
+            })?;
         let resolved_text = resolved.to_string_lossy().into_owned();
         validate_cli_terminal_program(&resolved_text)?;
         command[0] = resolved_text;
@@ -49232,6 +49817,10 @@ fn default_shell_program() -> String {
 }
 
 fn cokacdir_launch_spec(info: &SessionInfo, settings: &CokacmuxSettings) -> AgentLaunchSpec {
+    cokacdir_launch_spec_with_program(info, cokacdir_program_for_spec(settings))
+}
+
+fn cokacdir_launch_spec_with_program(info: &SessionInfo, program: String) -> AgentLaunchSpec {
     let cwd = if info.cwd.is_empty() {
         None
     } else {
@@ -49243,11 +49832,28 @@ fn cokacdir_launch_spec(info: &SessionInfo, settings: &CokacmuxSettings) -> Agen
         vec![info.cwd.clone()]
     };
     AgentLaunchSpec {
-        program: cokacdir_program_for_spec(settings),
+        program,
         args,
         env: Vec::new(),
         cwd,
     }
+}
+
+/// Draw-path variant of `cokacdir_program_for_spec`: never runs a program
+/// lookup on the calling thread. Until the background lookup lands the
+/// preview shows the bare program name.
+fn cokacdir_program_for_preview(settings: &CokacmuxSettings) -> String {
+    if let Some(program) = configured_cokacdir_program(settings) {
+        return program;
+    }
+    cached_program_resolution(
+        COKACDIR_DEFAULT_PROGRAM_CACHE_KEY,
+        PROGRAM_RESOLUTION_CACHE_TTL,
+        resolve_cokacdir_default_program,
+    )
+    .flatten()
+    .map(|path| path.display().to_string())
+    .unwrap_or_else(|| COKACDIR_PROGRAM_NAME.to_string())
 }
 
 fn cokacdir_program_for_spec(settings: &CokacmuxSettings) -> String {
@@ -49285,13 +49891,6 @@ fn ensure_cokacdir_program(settings: &CokacmuxSettings) -> Result<PathBuf> {
         }
     }
     download_cokacdir_program()
-}
-
-fn resolve_cokacdir_program(settings: &CokacmuxSettings) -> Option<PathBuf> {
-    if let Some(program) = configured_cokacdir_program(settings) {
-        return resolve_cokacdir_program_candidate(&program);
-    }
-    resolve_cokacdir_default_program()
 }
 
 fn resolve_cokacdir_default_program() -> Option<PathBuf> {
@@ -50279,6 +50878,7 @@ fn handle_new_session_key(
     keybindings: &KeyBindings,
 ) -> bool {
     let mut start_action: Option<(NewSessionKind, String, Provider, AgentLaunchMode)> = None;
+    let provider_checking = app.new_session_provider_checking.clone();
     let handled = if let InputMode::NewSession {
         selected,
         kind,
@@ -50292,11 +50892,8 @@ fn handle_new_session_key(
     {
         *selected = clamp_new_session_field(*selected, *kind);
         if *kind == NewSessionKind::CodingAgent {
-            if let Some(normalized) =
-                normalize_agent_provider_selection(*provider, provider_options)
-            {
-                *provider = normalized;
-            }
+            *provider =
+                settle_agent_provider_selection(*provider, provider_options, &provider_checking);
         }
         if *selected == NEW_SESSION_FIELD_CWD
             && new_session_completion_is_visible(cwd_completion)
@@ -50400,9 +50997,7 @@ fn handle_new_session_key(
                 clear_new_session_path_completion(cwd_completion);
                 debug_log_key_event(key, "new_session_cwd_right");
             } else if let KeyCode::Char(c) = key.code {
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT)
-                {
+                if key_inserts_text(key) {
                     insert_at_cursor(cwd, cwd_cursor, c);
                     update_new_session_path_completion(cwd, *cwd_cursor, cwd_completion, true);
                     debug_log_key_event(key, "new_session_cwd_insert");
@@ -50419,11 +51014,11 @@ fn handle_new_session_key(
                     *kind = move_new_session_kind(*kind, 1);
                     *selected = clamp_new_session_field(*selected, *kind);
                     if *kind == NewSessionKind::CodingAgent {
-                        if let Some(normalized) =
-                            normalize_agent_provider_selection(*provider, provider_options)
-                        {
-                            *provider = normalized;
-                        }
+                        *provider = settle_agent_provider_selection(
+                            *provider,
+                            provider_options,
+                            &provider_checking,
+                        );
                     }
                 }
                 NEW_SESSION_FIELD_PROVIDER => {
@@ -50452,11 +51047,11 @@ fn handle_new_session_key(
                     *kind = move_new_session_kind(*kind, -1);
                     *selected = clamp_new_session_field(*selected, *kind);
                     if *kind == NewSessionKind::CodingAgent {
-                        if let Some(normalized) =
-                            normalize_agent_provider_selection(*provider, provider_options)
-                        {
-                            *provider = normalized;
-                        }
+                        *provider = settle_agent_provider_selection(
+                            *provider,
+                            provider_options,
+                            &provider_checking,
+                        );
                     }
                 }
                 NEW_SESSION_FIELD_PROVIDER => {
@@ -51485,12 +52080,35 @@ fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     key_event_to_bytes_with_mode(key, false)
 }
 
+/// Windows reports AltGr as Ctrl+Alt. When that chord yields a printable
+/// character other than an ASCII letter or digit (`[`, `@`, `{`, `€`, `ą` on
+/// many European layouts), it is typed text rather than a Ctrl+Alt shortcut.
+fn is_windows_altgr_text_char(key: KeyEvent) -> bool {
+    cfg!(windows)
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(
+            key.code,
+            KeyCode::Char(c) if !c.is_control() && !c.is_ascii_alphanumeric() && c != ' '
+        )
+}
+
+/// True when a character key should be inserted into a text field.
+fn key_inserts_text(key: KeyEvent) -> bool {
+    (!key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT))
+        || is_windows_altgr_text_char(key)
+}
+
 fn key_event_to_bytes_with_mode(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let mut bytes = Vec::new();
 
     match key.code {
+        KeyCode::Char(c) if is_windows_altgr_text_char(key) => {
+            let mut buf = [0; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
         KeyCode::Char(c) if ctrl => {
             if alt {
                 bytes.push(0x1b);
@@ -52616,6 +53234,7 @@ fn draw_input_modal(f: &mut ratatui::Frame, area: Rect, app: &App) -> bool {
             cwd_completion,
             *provider,
             provider_options,
+            &app.new_session_provider_checking,
             *launch_mode,
             &app.settings.cokacmux,
             &app.keybindings,
@@ -53113,6 +53732,22 @@ fn draw_runtime_refresh_pending_overlay(f: &mut ratatui::Frame, area: Rect, app:
 
 fn agent_exit_request_visible(agent: &AgentClient) -> Option<AgentExitRequest> {
     let request = agent.exit_request.as_ref()?;
+    if agent.exited.is_none() && request.phase == AgentExitRequestPhase::Requested {
+        if let Some(probe) = request.shell_foreground.as_ref() {
+            // The `exit` went to another foreground program (docker exec,
+            // ssh, a nested shell); this session is not exiting.
+            if probe.other_program_held_terminal() {
+                return None;
+            }
+            // Wait briefly for the answer rather than flash the overlay.
+            if probe.state() == SHELL_FOREGROUND_PENDING
+                && request.started_at.elapsed()
+                    < Duration::from_millis(SHELL_FOREGROUND_PROBE_GRACE_MS)
+            {
+                return None;
+            }
+        }
+    }
     if agent.exited.is_some()
         || request.phase == AgentExitRequestPhase::Detected
         || request.started_at.elapsed()
@@ -53151,6 +53786,7 @@ fn agent_exit_overlay_context(app: &App) -> Option<(String, AgentExitRequest, Op
                 kind: AgentExitRequestKind::ForcedKill,
                 phase: AgentExitRequestPhase::Requested,
                 started_at: pending.started_at,
+                shell_foreground: None,
             },
             None,
         ))
@@ -53564,7 +54200,8 @@ fn install_vt100_panic_filter() {
 
 fn safe_parser_process(parser: &mut vt100::Parser, bytes: &[u8]) -> bool {
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    let (cols, rows) = parser.screen().size();
+    // vt100::Screen::size() returns (rows, cols).
+    let (rows, cols) = parser.screen().size();
     match catch_unwind(AssertUnwindSafe(|| parser.process(bytes))) {
         Ok(()) => true,
         Err(_) => {
@@ -54672,9 +55309,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                     } else if keybindings.matches(KeyAction::SettingsDelete, key) {
                         delete_at_cursor(value, &mut edit.cursor);
                     } else if let KeyCode::Char(c) = key.code {
-                        if !key.modifiers.contains(KeyModifiers::CONTROL)
-                            && !key.modifiers.contains(KeyModifiers::ALT)
-                        {
+                        if key_inserts_text(key) {
                             insert_at_cursor(value, &mut edit.cursor, c);
                         }
                     }
@@ -54769,8 +55404,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
             app.status = state.activate_selected();
             debug_log_key_event(key, "settings_activate");
         } else if let KeyCode::Char(c) = key.code {
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
+            if key_inserts_text(key)
                 && state.insert_char_in_selected_text(c)
             {
                 app.status = format!(
@@ -54951,9 +55585,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 );
             }
         } else if let KeyCode::Char(c) = key.code {
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-            {
+            if key_inserts_text(key) {
                 insert_at_cursor(draft, cursor, c);
                 debug_log_title_edit_cursor(source, draft, *cursor, "insert");
             } else {
@@ -55075,9 +55707,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 }),
             );
         } else if let KeyCode::Char(c) = key.code {
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-            {
+            if key_inserts_text(key) {
                 insert_at_cursor(draft, cursor, c);
                 debug_log(
                     "ai_search_insert",
@@ -55198,9 +55828,7 @@ fn handle_key(app: &mut App, key: KeyEvent, total_width: u16, agent_cols: u16, a
                 }),
             );
         } else if let KeyCode::Char(c) = key.code {
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-            {
+            if key_inserts_text(key) {
                 insert_at_cursor(draft, cursor, c);
                 debug_log(
                     "filter_insert",
@@ -56743,34 +57371,63 @@ impl SettingsTextStatus {
     }
 }
 
-fn settings_text_status(draft: &SettingsDraft, field: SettingsTextField) -> SettingsTextStatus {
+/// Drawn on the UI thread. Program fields answer from the program lookup
+/// cache (`which`, then a login shell, can stall for seconds) and start one
+/// background lookup when the value was never looked up. `None` means that
+/// lookup is still running, so the status must not be cached yet.
+fn settings_text_status(
+    draft: &SettingsDraft,
+    field: SettingsTextField,
+) -> Option<SettingsTextStatus> {
     match field {
-        SettingsTextField::ScrollbackLines => {
+        SettingsTextField::ScrollbackLines => Some(
             match parse_agent_scrollback_lines(&draft.scrollback_lines) {
                 Ok(None) => SettingsTextStatus::ok("unlimited"),
                 Ok(Some(0)) => SettingsTextStatus::ok("off"),
                 Ok(Some(_)) => SettingsTextStatus::ok("lines"),
                 Err(_) => SettingsTextStatus::error("enter 0 or more / unlimited"),
-            }
-        }
+            },
+        ),
         SettingsTextField::AgentProgram(provider) => {
-            match resolve_agent_program_for_provider(provider, &draft.agent_programs) {
+            let program = draft.agent_programs.program_for(provider);
+            let worker_program = program.clone();
+            let resolved = cached_program_resolution(
+                &agent_program_cache_key(provider, &program),
+                PROGRAM_RESOLUTION_CACHE_TTL,
+                move || resolve_agent_program_candidate(provider, &worker_program),
+            )?;
+            Some(match resolved {
                 Some(path) => SettingsTextStatus::ok(format!("ok: {}", display_cwd_path(&path))),
                 None => SettingsTextStatus::error("not found"),
-            }
+            })
         }
         SettingsTextField::CokacdirProgram => {
             let settings = CokacmuxSettings {
                 cokacdir_program: Some(draft.cokacdir_program.clone()),
                 ..Default::default()
             };
-            match resolve_cokacdir_program(&settings) {
+            let resolved = match configured_cokacdir_program(&settings) {
+                Some(program) => {
+                    let worker_program = program.clone();
+                    cached_program_resolution(
+                        &format!("cokacdir:configured:{}", program),
+                        PROGRAM_RESOLUTION_CACHE_TTL,
+                        move || resolve_cokacdir_program_candidate(&worker_program),
+                    )?
+                }
+                None => cached_program_resolution(
+                    COKACDIR_DEFAULT_PROGRAM_CACHE_KEY,
+                    PROGRAM_RESOLUTION_CACHE_TTL,
+                    resolve_cokacdir_default_program,
+                )?,
+            };
+            Some(match resolved {
                 Some(path) => SettingsTextStatus::ok(format!("ok: {}", display_cwd_path(&path))),
                 None if draft.cokacdir_program.trim().is_empty() => {
                     SettingsTextStatus::warning("auto-download")
                 }
                 None => SettingsTextStatus::error("not found"),
-            }
+            })
         }
     }
 }
@@ -57190,6 +57847,7 @@ fn draw_new_session_modal(
     cwd_completion: &NewSessionPathCompletion,
     provider: Provider,
     provider_options: &[Provider],
+    provider_checking: &[Provider],
     launch_mode: AgentLaunchMode,
     settings: &CokacmuxSettings,
     keybindings: &KeyBindings,
@@ -57198,8 +57856,15 @@ fn draw_new_session_modal(
     let completion_visible =
         selected == NEW_SESSION_FIELD_CWD && new_session_completion_is_visible(cwd_completion);
     let help_items = new_session_help_items(selected, completion_visible, keybindings);
-    let preview_command =
-        new_session_preview_command(kind, cwd, provider, provider_options, launch_mode, settings);
+    let preview_command = new_session_preview_command(
+        kind,
+        cwd,
+        provider,
+        provider_options,
+        provider_checking,
+        launch_mode,
+        settings,
+    );
     let desired_width = NEW_SESSION_MODAL_STABLE_CONTENT_WIDTH;
     let base_content_rows: usize = if kind == NewSessionKind::CodingAgent {
         8
@@ -57253,7 +57918,11 @@ fn draw_new_session_modal(
         value_width,
     ));
     if kind == NewSessionKind::CodingAgent {
-        let provider_label = if provider_options.is_empty() {
+        let provider_label = if provider_checking.contains(&provider) {
+            format!("{} (checking…)", provider.as_str())
+        } else if provider_options.is_empty() && !provider_checking.is_empty() {
+            "checking…".to_string()
+        } else if provider_options.is_empty() {
             "none installed".to_string()
         } else {
             provider.as_str().to_string()
@@ -57534,6 +58203,7 @@ fn new_session_preview_command(
     cwd: &str,
     provider: Provider,
     provider_options: &[Provider],
+    provider_checking: &[Provider],
     launch_mode: AgentLaunchMode,
     settings: &CokacmuxSettings,
 ) -> String {
@@ -57560,10 +58230,18 @@ fn new_session_preview_command(
                 title: None,
                 relation: None,
             };
-            cokacdir_launch_spec(&info, settings).command_line()
+            // Drawn every frame: never resolve the program here.
+            cokacdir_launch_spec_with_program(&info, cokacdir_program_for_preview(settings))
+                .command_line()
         }
         NewSessionKind::CodingAgent => {
+            if provider_checking.contains(&provider) {
+                return format!("checking whether {} agent is installed…", provider.as_str());
+            }
             if provider_options.is_empty() {
+                if !provider_checking.is_empty() {
+                    return "checking installed coding agents…".to_string();
+                }
                 return "no installed coding agents".to_string();
             }
             if !provider_options.contains(&provider) {
@@ -61278,7 +61956,22 @@ mod tests {
 
         let command = validate_cli_terminal_command_at(&["./tool".into()], dir.path()).unwrap();
 
-        assert_eq!(PathBuf::from(&command[0]), program.canonicalize().unwrap());
+        assert_eq!(PathBuf::from(&command[0]), program);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_program_symlink_keeps_the_name_it_runs_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("python3.12");
+        fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let linked = dir.path().join("python");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+
+        let command = validate_cli_terminal_command_at(&["./python".into()], dir.path()).unwrap();
+
+        assert_eq!(PathBuf::from(&command[0]), linked);
     }
 
     #[test]
@@ -61444,6 +62137,8 @@ mod tests {
             pending_input_key: None,
             pending_input_count: 0,
             exit_input_line: String::new(),
+            exit_line_probe: None,
+            child_pid: None,
             exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
@@ -63195,6 +63890,7 @@ mod tests {
             killall_pending: None,
             new_session_launch_seq: 0,
             new_session_launch: None,
+            new_session_provider_checking: Vec::new(),
             agent_sidebar_order: Vec::new(),
             last_ui_stall_log_at: None,
             ui_stall_log_count: 0,
@@ -64238,6 +64934,7 @@ mod tests {
                         &NewSessionPathCompletion::default(),
                         Provider::Codex,
                         &[Provider::Codex],
+                        &[],
                         AgentLaunchMode::SkipPermissions,
                         &CokacmuxSettings::default(),
                         &keybindings,
@@ -64359,6 +65056,7 @@ mod tests {
                     &completion,
                     Provider::Codex,
                     &provider_options,
+                    &[],
                     AgentLaunchMode::Normal,
                     &CokacmuxSettings::default(),
                     keybindings,
@@ -65610,6 +66308,23 @@ mod tests {
         state.section = SettingsSection::Agents;
         state.selected = SETTINGS_AGENTS_CODEX;
         state.draft.agent_programs.codex = Some("/definitely/missing/codex".to_string());
+
+        // The first draw only starts the background program lookup.
+        let _ = rendered_settings_modal(100, 24, &state);
+        let key = agent_program_cache_key(
+            Provider::Codex,
+            &state.draft.agent_programs.program_for(Provider::Codex),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while program_resolution_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .is_none_or(|entry| entry.resolved.is_none())
+        {
+            assert!(Instant::now() < deadline, "program lookup did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
 
         let rendered = rendered_settings_modal(100, 24, &state);
         assert!(rendered.contains("not found"));
@@ -68435,6 +69150,26 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn linux_process_stat_foreground_parser_compares_tpgid_with_pgrp() {
+        // pid (comm) state ppid pgrp session tty_nr tpgid
+        assert_eq!(
+            linux_process_stat_holds_terminal_foreground("123 (bash) S 1 123 123 34816 123 0"),
+            Some(true)
+        );
+        assert_eq!(
+            linux_process_stat_holds_terminal_foreground(
+                "123 (odd) name) S 1 123 123 34816 456 0"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            linux_process_stat_holds_terminal_foreground("123 (bash) S 1 123 123 0 -1 0"),
+            None
+        );
+        assert_eq!(linux_process_stat_holds_terminal_foreground("bad stat"), None);
+    }
+
+    #[test]
     fn ps_process_group_parser_excludes_zombies() {
         let raw = " 100 777 Ss\n 101 778 Z\n 102 778 S+\n";
 
@@ -69247,6 +69982,9 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
                 assert!(!cwd_completion.visible);
                 let expected_provider = if provider_options.is_empty()
                     || provider_options.contains(&Provider::OpenCode)
+                    || app
+                        .new_session_provider_checking
+                        .contains(&Provider::OpenCode)
                 {
                     Provider::OpenCode
                 } else {
@@ -69257,6 +69995,104 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             }
             other => panic!("expected new session mode, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn new_session_selection_keeps_agent_whose_lookup_is_running() {
+        assert_eq!(
+            settle_agent_provider_selection(
+                Provider::Codex,
+                &[Provider::Claude],
+                &[Provider::Codex]
+            ),
+            Provider::Codex
+        );
+        assert_eq!(
+            settle_agent_provider_selection(Provider::Codex, &[Provider::Claude], &[]),
+            Provider::Claude
+        );
+        assert_eq!(
+            settle_agent_provider_selection(Provider::Codex, &[], &[]),
+            Provider::Codex
+        );
+    }
+
+    #[test]
+    fn new_session_modal_shows_agent_lookup_in_progress() {
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_new_session_modal(
+                    f,
+                    f.area(),
+                    NEW_SESSION_FIELD_PROVIDER,
+                    NewSessionKind::CodingAgent,
+                    "/repo",
+                    "/repo".len(),
+                    &NewSessionPathCompletion::default(),
+                    Provider::Codex,
+                    &[],
+                    &[Provider::Codex],
+                    AgentLaunchMode::Normal,
+                    &CokacmuxSettings::default(),
+                    &KeyBindings::default(),
+                );
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("codex (checking…)"), "{rendered}");
+        assert!(!rendered.contains("none installed"), "{rendered}");
+    }
+
+    #[test]
+    fn new_session_enter_refuses_agent_the_last_lookup_did_not_find() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.agent_programs.codex =
+            Some(dir.path().join("missing-codex").display().to_string());
+        let program = app
+            .settings
+            .cokacmux
+            .agent_programs
+            .program_for(Provider::Codex);
+        store_program_resolution(&agent_program_cache_key(Provider::Codex, &program), None);
+
+        assert!(!app.start_new_session_from_modal(
+            NewSessionKind::CodingAgent,
+            dir.path().display().to_string(),
+            Provider::Codex,
+            AgentLaunchMode::Normal,
+            100,
+            28,
+        ));
+        assert_eq!(app.status, "codex agent is not installed.");
+        assert!(app.new_session_launch.is_none());
+    }
+
+    #[test]
+    fn new_session_prepare_checks_unanswered_agent_before_creating_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_folder = dir.path().join("new-project");
+        let mut app = app_for_key_tests();
+        app.settings.cokacmux.agent_programs.codex =
+            Some(dir.path().join("missing-codex").display().to_string());
+
+        // No lookup has answered for this program, so Enter is not refused on
+        // the UI thread. Without main_tx the prepare step runs inline.
+        assert!(app.start_new_session_from_modal(
+            NewSessionKind::CodingAgent,
+            new_folder.display().to_string(),
+            Provider::Codex,
+            AgentLaunchMode::Normal,
+            100,
+            28,
+        ));
+        assert_eq!(app.status, "codex agent is not installed.");
+        assert!(app.new_session_launch.is_none());
+        assert!(!new_folder.exists());
+        assert!(matches!(app.input_mode, InputMode::NewSession { .. }));
     }
 
     #[test]
@@ -76527,6 +77363,57 @@ IF EXIST "%~dp0\node.exe" (
 
     #[cfg(unix)]
     #[test]
+    fn terminal_exit_overlay_follows_shell_foreground_check() {
+        fn set_probe(app: &mut App, state: u8) {
+            let request = app
+                .active_agent
+                .as_mut()
+                .and_then(|agent| agent.exit_request.as_mut())
+                .expect("exit command should set an exit request");
+            request.shell_foreground = Some(ShellForegroundProbe {
+                state: Arc::new(std::sync::atomic::AtomicU8::new(state)),
+            });
+        }
+
+        let mut app = app_for_key_tests();
+        app.show_sessions_view = false;
+        let (mut client, _request_rx) =
+            buffered_output_test_client_with_requests("terminal-exit-foreground", 272);
+        client.info = shell_session_info_for_cwd("/repo".into());
+        app.set_active_agent(client);
+        for ch in "exit".chars() {
+            handle_agent_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                80,
+                24,
+            );
+        }
+        handle_agent_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            80,
+            24,
+        );
+
+        // The line reached docker exec, ssh or a nested shell instead.
+        set_probe(&mut app, SHELL_FOREGROUND_OTHER_PROGRAM);
+        assert!(agent_exit_overlay_context(&app).is_none());
+        assert!(!app.display_status().contains("Exit requested"));
+
+        // Still checking: hold the overlay briefly instead of flashing it.
+        set_probe(&mut app, SHELL_FOREGROUND_PENDING);
+        assert!(agent_exit_overlay_context(&app).is_none());
+
+        // The session shell held the terminal, or the check could not tell.
+        for state in [SHELL_FOREGROUND_SHELL, SHELL_FOREGROUND_UNKNOWN] {
+            set_probe(&mut app, state);
+            assert!(agent_exit_overlay_context(&app).is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn terminal_pasted_exit_without_newline_tracks_until_enter() {
         let (mut client, _request_rx) =
             buffered_output_test_client_with_requests("terminal-pasted-exit", 274);
@@ -77658,6 +78545,8 @@ IF EXIST "%~dp0\node.exe" (
             pending_input_key: None,
             pending_input_count: 0,
             exit_input_line: String::new(),
+            exit_line_probe: None,
+            child_pid: None,
             exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
@@ -77734,6 +78623,8 @@ IF EXIST "%~dp0\node.exe" (
             pending_input_key: None,
             pending_input_count: 0,
             exit_input_line: String::new(),
+            exit_line_probe: None,
+            child_pid: None,
             exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
@@ -81287,6 +82178,8 @@ IF EXIST "%~dp0\node.exe" (
             pending_input_key: None,
             pending_input_count: 0,
             exit_input_line: String::new(),
+            exit_line_probe: None,
+            child_pid: None,
             exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
@@ -81566,6 +82459,8 @@ IF EXIST "%~dp0\node.exe" (
             pending_input_key: None,
             pending_input_count: 0,
             exit_input_line: String::new(),
+            exit_line_probe: None,
+            child_pid: None,
             exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,
@@ -81652,6 +82547,8 @@ IF EXIST "%~dp0\node.exe" (
             pending_input_key: None,
             pending_input_count: 0,
             exit_input_line: String::new(),
+            exit_line_probe: None,
+            child_pid: None,
             exit_request: None,
             pending_snapshot_output: false,
             snapshot_parse_in_progress: false,

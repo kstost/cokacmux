@@ -158,7 +158,22 @@ fn list_claude() -> Result<Vec<SessionInfo>> {
         if !proj.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        for f in std::fs::read_dir(proj.path())?.flatten() {
+        // One unreadable or vanished project directory must not hide every
+        // other Claude session.
+        let entries = match std::fs::read_dir(proj.path()) {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::debug::log(
+                    "discovery_claude_project_unreadable",
+                    serde_json::json!({
+                        "path": proj.path().display().to_string(),
+                        "error": error.to_string(),
+                    }),
+                );
+                continue;
+            }
+        };
+        for f in entries.flatten() {
             let p = f.path();
             if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
