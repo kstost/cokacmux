@@ -92,89 +92,51 @@ pub fn from_db_connection(conn: &Connection, session_id: &str) -> Result<Univers
             "session_id": session_id,
         }),
     );
-    // session row
-    let mut stmt = conn.prepare(
-        "SELECT id, project_id, directory, title, agent, model, cost,
-                tokens_input, tokens_output, tokens_reasoning,
-                tokens_cache_read, tokens_cache_write,
-                time_created, time_updated,
-                parent_id, slug, version, share_url,
-                summary_additions, summary_deletions, summary_files, summary_diffs,
-                revert, permission, time_compacting, time_archived, workspace_id, path
-         FROM session WHERE id = ?1",
-    )?;
-    let session_row = stmt
-        .query_row(rusqlite::params![session_id], |row| {
-            Ok(SessionRow {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                directory: row.get(2)?,
-                title: row.get(3)?,
-                agent: row.get(4)?,
-                model: row.get(5)?,
-                cost: row.get(6)?,
-                tokens_input: row.get(7)?,
-                tokens_output: row.get(8)?,
-                tokens_reasoning: row.get(9)?,
-                tokens_cache_read: row.get(10)?,
-                tokens_cache_write: row.get(11)?,
-                time_created: row.get(12)?,
-                time_updated: row.get(13)?,
-                parent_id: row.get(14)?,
-                slug: row.get(15)?,
-                version: row.get(16)?,
-                share_url: row.get(17)?,
-                summary_additions: row.get(18)?,
-                summary_deletions: row.get(19)?,
-                summary_files: row.get(20)?,
-                summary_diffs: row.get(21)?,
-                revert: row.get(22)?,
-                permission: row.get(23)?,
-                time_compacting: row.get(24)?,
-                time_archived: row.get(25)?,
-                workspace_id: row.get(26)?,
-                path: row.get(27)?,
-            })
-        })
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                ConvertError::Parse(format!("no session row for id {}", session_id))
-            }
-            other => ConvertError::Sqlite(other),
-        })?;
+    let session_row = read_session_row(conn, session_id)?;
 
-    // messages
-    let mut stmt = conn.prepare(
-        "SELECT id, session_id, time_created, time_updated, data
-         FROM message WHERE session_id = ?1 ORDER BY time_created ASC, id ASC",
-    )?;
-    let message_rows: Vec<MessageRow> = stmt
-        .query_map(rusqlite::params![session_id], |row| {
-            Ok(MessageRow {
-                id: row.get(0)?,
-                time_created: row.get(2)?,
-                time_updated: row.get(3)?,
-                data: row.get(4)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // messages and parts: absent from OpenCode 2, whose transcript lives in
+    // `session_message` only.
+    let message_rows: Vec<MessageRow> = if db::table_exists(conn, "message")? {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, time_created, time_updated, data
+             FROM message WHERE session_id = ?1 ORDER BY time_created ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                Ok(MessageRow {
+                    id: row.get(0)?,
+                    time_created: row.get(2)?,
+                    time_updated: row.get(3)?,
+                    data: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    } else {
+        Vec::new()
+    };
 
     // parts (we'll group by message_id)
-    let mut stmt = conn.prepare(
-        "SELECT id, message_id, session_id, time_created, time_updated, data
-         FROM part WHERE session_id = ?1 ORDER BY time_created ASC, id ASC",
-    )?;
-    let part_rows: Vec<PartRow> = stmt
-        .query_map(rusqlite::params![session_id], |row| {
-            Ok(PartRow {
-                id: row.get(0)?,
-                message_id: row.get(1)?,
-                time_created: row.get(3)?,
-                time_updated: row.get(4)?,
-                data: row.get(5)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let part_rows: Vec<PartRow> = if db::table_exists(conn, "part")? {
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, session_id, time_created, time_updated, data
+             FROM part WHERE session_id = ?1 ORDER BY time_created ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                Ok(PartRow {
+                    id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    time_created: row.get(3)?,
+                    time_updated: row.get(4)?,
+                    data: row.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    } else {
+        Vec::new()
+    };
 
     let session_message_rows = if db::table_exists(conn, "session_message")? {
         let has_seq = db::table_has_column(conn, "session_message", "seq")?;
@@ -241,6 +203,64 @@ pub fn from_db_connection(conn: &Connection, session_id: &str) -> Result<Univers
         ),
     }
     result
+}
+
+/// The session row from whichever session table holds it (`session`, or
+/// OpenCode 2's `session_v2`, whose title may be NULL).
+fn read_session_row(conn: &Connection, session_id: &str) -> Result<SessionRow> {
+    for table in db::session_tables(conn)? {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, project_id, directory, COALESCE(title, ''), agent, model, cost,
+                    tokens_input, tokens_output, tokens_reasoning,
+                    tokens_cache_read, tokens_cache_write,
+                    time_created, time_updated,
+                    parent_id, COALESCE(slug, ''), COALESCE(version, ''), share_url,
+                    summary_additions, summary_deletions, summary_files, summary_diffs,
+                    revert, permission, time_compacting, time_archived, workspace_id, path
+             FROM {table} WHERE id = ?1"
+        ))?;
+        let row = stmt.query_row(rusqlite::params![session_id], |row| {
+            Ok(SessionRow {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                directory: row.get(2)?,
+                title: row.get(3)?,
+                agent: row.get(4)?,
+                model: row.get(5)?,
+                cost: row.get(6)?,
+                tokens_input: row.get(7)?,
+                tokens_output: row.get(8)?,
+                tokens_reasoning: row.get(9)?,
+                tokens_cache_read: row.get(10)?,
+                tokens_cache_write: row.get(11)?,
+                time_created: row.get(12)?,
+                time_updated: row.get(13)?,
+                parent_id: row.get(14)?,
+                slug: row.get(15)?,
+                version: row.get(16)?,
+                share_url: row.get(17)?,
+                summary_additions: row.get(18)?,
+                summary_deletions: row.get(19)?,
+                summary_files: row.get(20)?,
+                summary_diffs: row.get(21)?,
+                revert: row.get(22)?,
+                permission: row.get(23)?,
+                time_compacting: row.get(24)?,
+                time_archived: row.get(25)?,
+                workspace_id: row.get(26)?,
+                path: row.get(27)?,
+            })
+        });
+        match row {
+            Ok(row) => return Ok(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(error) => return Err(ConvertError::Sqlite(error)),
+        }
+    }
+    Err(ConvertError::Parse(format!(
+        "no session row for id {}",
+        session_id
+    )))
 }
 
 pub struct SessionRow {

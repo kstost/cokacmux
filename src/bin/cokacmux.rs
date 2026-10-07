@@ -2826,20 +2826,69 @@ fn agent_provider_available(provider: Provider, agent_programs: &AgentProgramSet
 }
 
 /// How long a program lookup is served before it is refreshed in the
-/// background. Lookups run `which` and, failing that, a login shell, so the
-/// UI thread never runs them itself; it only reads this cache.
+/// background. Lookups search PATH and, failing that, ask a login shell for
+/// its PATH, so the UI thread never runs them itself; it only reads this
+/// cache.
 const PROGRAM_RESOLUTION_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Opening the new-session modal re-checks the agent programs, so an agent
 /// installed while cokacmux runs shows up without waiting for the TTL. A
 /// lookup this recent is reused so quick reopens do not respawn the lookups.
 const PROGRAM_RESOLUTION_REOPEN_MIN_AGE: Duration = Duration::from_secs(2);
+/// A lookup that could not finish is retried this soon instead of after the
+/// TTL, without respawning a login shell on every frame.
+const PROGRAM_RESOLUTION_UNKNOWN_RETRY: Duration = Duration::from_secs(5);
 const COKACDIR_DEFAULT_PROGRAM_CACHE_KEY: &str = "cokacdir:default";
+
+/// Outcome of looking a program up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProgramLookup {
+    Found(PathBuf),
+    NotFound,
+    /// The lookup could not finish (the login shell timed out or never
+    /// reported its PATH). This is not evidence that the program is absent.
+    Unknown,
+}
+
+impl ProgramLookup {
+    fn from_found(path: Option<PathBuf>) -> Self {
+        path.map_or(Self::NotFound, Self::Found)
+    }
+
+    fn found(self) -> Option<PathBuf> {
+        match self {
+            Self::Found(path) => Some(path),
+            Self::NotFound | Self::Unknown => None,
+        }
+    }
+}
 
 #[derive(Default)]
 struct ProgramResolutionCacheEntry {
+    /// The last definite answer: `Some(None)` is "not found".
     resolved: Option<Option<PathBuf>>,
     resolved_at: Option<Instant>,
+    /// The latest lookup could not finish, so it is retried sooner.
+    unknown: bool,
     refreshing: bool,
+}
+
+impl ProgramResolutionCacheEntry {
+    fn record(&mut self, lookup: ProgramLookup) {
+        self.resolved_at = Some(Instant::now());
+        match lookup {
+            ProgramLookup::Found(path) => {
+                self.resolved = Some(Some(path));
+                self.unknown = false;
+            }
+            ProgramLookup::NotFound => {
+                self.resolved = Some(None);
+                self.unknown = false;
+            }
+            // Keep the last definite answer. Without one the UI keeps showing
+            // "checking" until a retry answers, never "not installed".
+            ProgramLookup::Unknown => self.unknown = true,
+        }
+    }
 }
 
 fn program_resolution_cache() -> &'static Mutex<HashMap<String, ProgramResolutionCacheEntry>> {
@@ -2851,21 +2900,26 @@ fn agent_program_cache_key(provider: Provider, program: &str) -> String {
     format!("agent:{}:{}", provider.as_str(), program)
 }
 
-/// Returns the last known lookup for `key` without blocking. A missing entry,
-/// or one older than `max_age`, starts one background refresh. `None` means
-/// no lookup has answered yet.
+/// Returns the last definite lookup for `key` without blocking. A missing
+/// entry, or one older than `max_age`, starts one background refresh. `None`
+/// means no lookup has answered definitely yet.
 fn cached_program_resolution(
     key: &str,
     max_age: Duration,
-    resolve: impl FnOnce() -> Option<PathBuf> + Send + 'static,
+    resolve: impl FnOnce() -> ProgramLookup + Send + 'static,
 ) -> Option<Option<PathBuf>> {
     let mut cache = program_resolution_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let entry = cache.entry(key.to_string()).or_default();
+    let refresh_age = if entry.unknown {
+        max_age.min(PROGRAM_RESOLUTION_UNKNOWN_RETRY)
+    } else {
+        max_age
+    };
     let should_refresh = entry
         .resolved_at
-        .is_none_or(|resolved_at| resolved_at.elapsed() >= max_age);
+        .is_none_or(|resolved_at| resolved_at.elapsed() >= refresh_age);
     if should_refresh && !entry.refreshing {
         entry.refreshing = true;
         let worker_key = key.to_string();
@@ -2878,13 +2932,14 @@ fn cached_program_resolution(
                     .unwrap_or_else(|e| e.into_inner());
                 let entry = cache.entry(worker_key).or_default();
                 entry.refreshing = false;
-                entry.resolved_at = Some(Instant::now());
                 match resolved {
-                    Ok(resolved) => entry.resolved = Some(resolved),
+                    Ok(lookup) => entry.record(lookup),
                     // A panicking lookup keeps the old answer. Without one it
-                    // counts as not found, like a failed `which`, so the UI
-                    // is not left showing "checking" until the next refresh.
+                    // counts as not found, so the UI is not left showing
+                    // "checking" until the next refresh.
                     Err(_) => {
+                        entry.resolved_at = Some(Instant::now());
+                        entry.unknown = false;
                         entry.resolved.get_or_insert(None);
                     }
                 }
@@ -2906,17 +2961,15 @@ fn cached_program_resolution(
 }
 
 /// Records a lookup that a worker already ran, so the UI sees it at once.
-fn store_program_resolution(key: &str, resolved: Option<PathBuf>) {
+fn store_program_resolution(key: &str, lookup: ProgramLookup) {
     let mut cache = program_resolution_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let entry = cache.entry(key.to_string()).or_default();
-    entry.resolved = Some(resolved);
-    entry.resolved_at = Some(Instant::now());
+    cache.entry(key.to_string()).or_default().record(lookup);
 }
 
 /// UI-thread variant of `agent_provider_available`: `Some(found)` from the
-/// program lookup cache, or `None` while the background lookup runs.
+/// program lookup cache, or `None` until a lookup answers definitely.
 fn agent_provider_status_for_ui(
     provider: Provider,
     agent_programs: &AgentProgramSettings,
@@ -2925,7 +2978,7 @@ fn agent_provider_status_for_ui(
     let program = agent_programs.program_for(provider);
     let key = agent_program_cache_key(provider, &program);
     cached_program_resolution(&key, max_age, move || {
-        resolve_agent_program_candidate(provider, &program)
+        lookup_agent_program_candidate(provider, &program)
     })
     .map(|resolved| resolved.is_some())
 }
@@ -4167,6 +4220,7 @@ enum BackgroundWorkerKind {
     NewSessionPrepare,
     Clone,
     Restore,
+    Delete,
 }
 
 impl BackgroundWorkerKind {
@@ -4181,6 +4235,7 @@ impl BackgroundWorkerKind {
             Self::NewSessionPrepare => "new session",
             Self::Clone => "clone",
             Self::Restore => "restore",
+            Self::Delete => "delete",
         }
     }
 }
@@ -4204,6 +4259,7 @@ fn background_worker_panicked(kind: BackgroundWorkerKind, seq: u64) -> MainEvent
 enum DataTaskKind {
     Clone,
     Restore,
+    Delete,
 }
 
 impl DataTaskKind {
@@ -4211,6 +4267,7 @@ impl DataTaskKind {
         match self {
             DataTaskKind::Clone => "clone",
             DataTaskKind::Restore => "restore",
+            DataTaskKind::Delete => "delete",
         }
     }
 
@@ -4218,6 +4275,7 @@ impl DataTaskKind {
         match self {
             DataTaskKind::Clone => "Clone in progress",
             DataTaskKind::Restore => "Restore in progress",
+            DataTaskKind::Delete => "Delete in progress",
         }
     }
 }
@@ -4300,6 +4358,16 @@ enum CloneWorkerOutcome {
         target: Provider,
         error: String,
     },
+}
+
+#[derive(Debug)]
+struct DeleteWorkerResult {
+    seq: u64,
+    info: SessionInfo,
+    removed_index: Option<usize>,
+    /// The removal report and whether the session's folder-data snapshot was
+    /// removed too.
+    outcome: std::result::Result<(session::remove::RemoveReport, bool), String>,
 }
 
 #[derive(Debug)]
@@ -6166,6 +6234,12 @@ fn main_event_debug_value(event: &MainEvent) -> serde_json::Value {
                 "target": target,
             })
         }
+        MainEvent::DeleteResult(result) => serde_json::json!({
+            "kind": "delete_result",
+            "seq": result.seq,
+            "info": session_info_debug_value(&result.info),
+            "outcome_ok": result.outcome.is_ok(),
+        }),
         MainEvent::RestoreResult(result) => serde_json::json!({
             "kind": "restore_result",
             "seq": result.seq,
@@ -12570,6 +12644,7 @@ enum MainEvent {
     CloneResult(CloneWorkerResult),
     /// Saved folder-data restore completed in the background.
     RestoreResult(RestoreWorkerResult),
+    DeleteResult(DeleteWorkerResult),
     /// AI title generation completed in the background.
     AiTitleResult(AiTitleWorkerResult),
     /// An attach job (pre-checks + daemon connect/spawn) finished off the
@@ -13147,13 +13222,15 @@ fn new_session_agent_program_check(
         return Ok(());
     }
     let program = agent_programs.program_for(provider);
-    let resolved = resolve_agent_program_candidate(provider, &program);
-    let found = resolved.is_some();
-    store_program_resolution(&agent_program_cache_key(provider, &program), resolved);
-    if found {
-        Ok(())
-    } else {
-        Err(format!("{} agent is not installed.", provider.as_str()))
+    let lookup = lookup_agent_program_candidate(provider, &program);
+    store_program_resolution(&agent_program_cache_key(provider, &program), lookup.clone());
+    match lookup {
+        ProgramLookup::Found(_) => Ok(()),
+        ProgramLookup::NotFound => Err(format!("{} agent is not installed.", provider.as_str())),
+        ProgramLookup::Unknown => Err(format!(
+            "could not check whether {} agent is installed (the login shell did not report its PATH in time); try again.",
+            provider.as_str()
+        )),
     }
 }
 
@@ -16974,6 +17051,15 @@ impl App {
             BackgroundWorkerKind::Restore => {
                 if self.data_task.as_ref().is_some_and(|task| {
                     task.seq == failure.seq && task.kind == DataTaskKind::Restore
+                }) {
+                    self.data_task = None;
+                } else {
+                    handled = false;
+                }
+            }
+            BackgroundWorkerKind::Delete => {
+                if self.data_task.as_ref().is_some_and(|task| {
+                    task.seq == failure.seq && task.kind == DataTaskKind::Delete
                 }) {
                     self.data_task = None;
                 } else {
@@ -24909,10 +24995,8 @@ impl App {
         while let Some(deferred) = self.deferred_agent_input.pop_front() {
             let bytes = deferred.accounted_bytes();
             self.deferred_agent_input_bytes = self.deferred_agent_input_bytes.saturating_sub(bytes);
-            match deferred.kind {
-                DeferredAgentInputKind::Key(key) => self.send_key_to_focused_agent(key),
-                DeferredAgentInputKind::Paste(text) => self.send_paste_to_focused_agent(&text),
-            }
+            let DeferredAgentInput { target, kind } = deferred;
+            self.send_deferred_agent_input(&target.attach_target, kind);
             replayed_events = replayed_events.saturating_add(1);
             replayed_bytes = replayed_bytes.saturating_add(bytes);
         }
@@ -24927,6 +25011,49 @@ impl App {
                     "remaining_bytes": self.deferred_agent_input_bytes,
                 }),
             );
+        }
+    }
+
+    /// Delivers replayed input to the pane it was deferred for. Focus after
+    /// the attach is restored per agent and may land on another pane (for
+    /// example the new agent's right panel), so routing by the current focus
+    /// would hand keystrokes typed for one agent to another.
+    /// `deferred_agent_input_target_is_ready` already verified the target.
+    fn send_deferred_agent_input(
+        &mut self,
+        attach_target: &AttachTarget,
+        kind: DeferredAgentInputKind,
+    ) {
+        match attach_target {
+            AttachTarget::MainAgent => match kind {
+                DeferredAgentInputKind::Key(key) => self.send_key_to_active_agent(key),
+                DeferredAgentInputKind::Paste(text) => self.send_paste_to_active_agent(&text),
+            },
+            AttachTarget::Auxiliary { .. } => {
+                let Some(aux) = self.agent_aux.as_mut() else {
+                    self.status = "right panel is not open.".into();
+                    debug_log(
+                        "agent_deferred_input_skipped",
+                        serde_json::json!({
+                            "target": "auxiliary",
+                            "reason": "auxiliary_missing",
+                        }),
+                    );
+                    return;
+                };
+                match kind {
+                    DeferredAgentInputKind::Key(key) => {
+                        if let Err(error) = send_key_to_agent_client(&mut aux.agent, key) {
+                            self.status = format!("right panel input not sent: {}", error);
+                        }
+                    }
+                    DeferredAgentInputKind::Paste(text) => {
+                        if let Err(error) = send_paste_to_agent_client(&mut aux.agent, &text) {
+                            self.status = format!("right panel paste not sent: {}", error);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -25893,6 +26020,8 @@ impl App {
         }
     }
 
+    /// Deletes on a worker: removal touches files and databases and, for
+    /// OpenCode 2, runs the OpenCode CLI, none of which may block the UI.
     fn delete_session(&mut self, info: SessionInfo, removed_index: Option<usize>) {
         if self.reject_while_data_task_running("deleting a session") {
             return;
@@ -25905,23 +26034,86 @@ impl App {
                 "cwd": &info.cwd,
             }),
         );
-        match session::remove::remove(&info) {
-            Ok(rep) => {
-                let data_snapshot_removed = match session::data::remove_snapshot_for_session(&info)
-                {
-                    Ok(removed) => removed,
-                    Err(e) => {
-                        debug_log(
-                            "delete_data_snapshot_failed",
-                            serde_json::json!({
-                                "provider": info.provider.as_str(),
-                                "session_id": &info.session_id,
-                                "error": e.to_string(),
-                            }),
-                        );
-                        false
-                    }
+        let seq = self.next_data_task_seq();
+        let label = format!(
+            "deleting {} {}",
+            info.provider.as_str(),
+            truncate_width(&info.session_id, 14)
+        );
+        self.data_task = Some(DataTaskPending::new(
+            seq,
+            DataTaskKind::Delete,
+            label.clone(),
+        ));
+        self.status = label;
+        let agent_programs = self.settings.cokacmux.agent_programs.clone();
+        let Some(tx) = self.main_tx.clone() else {
+            let result = run_delete_worker(seq, info, removed_index, &agent_programs);
+            self.on_delete_worker_result(result);
+            return;
+        };
+        match thread::Builder::new()
+            .name("cokacmux-data-delete".to_string())
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_delete_worker(seq, info, removed_index, &agent_programs)
+                }));
+                let event = match outcome {
+                    Ok(result) => MainEvent::DeleteResult(result),
+                    Err(_) => background_worker_panicked(BackgroundWorkerKind::Delete, seq),
                 };
+                let _ = tx.send(event);
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                self.data_task = None;
+                self.status = format!(
+                    "delete worker failed: {}",
+                    truncate_width(&e.to_string(), 80)
+                );
+                debug_log(
+                    "delete_worker_spawn_failed",
+                    serde_json::json!({
+                        "seq": seq,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn on_delete_worker_result(&mut self, result: DeleteWorkerResult) {
+        let Some(task) = self.data_task.as_ref() else {
+            debug_log(
+                "delete_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "reason": "none_pending",
+                }),
+            );
+            return;
+        };
+        if task.seq != result.seq || task.kind != DataTaskKind::Delete {
+            debug_log(
+                "delete_result_ignored",
+                serde_json::json!({
+                    "seq": result.seq,
+                    "pending_seq": task.seq,
+                    "pending_kind": task.kind.label(),
+                    "reason": "stale",
+                }),
+            );
+            return;
+        }
+        self.data_task = None;
+        let DeleteWorkerResult {
+            info,
+            removed_index,
+            outcome,
+            ..
+        } = result;
+        match outcome {
+            Ok((rep, data_snapshot_removed)) => {
                 let status = format!(
                     "deleted {} (rows={}, file={:?})",
                     info.session_id, rep.deleted_rows, rep.deleted_file
@@ -25974,7 +26166,7 @@ impl App {
                     serde_json::json!({
                         "provider": info.provider.as_str(),
                         "session_id": &info.session_id,
-                        "error": e.to_string(),
+                        "error": e,
                     }),
                 );
             }
@@ -26085,6 +26277,7 @@ impl App {
             DataTaskPending::new(seq, DataTaskKind::Clone, label.clone())
                 .with_cancel_token(cancel_token.clone()),
         );
+        let agent_programs = self.settings.cokacmux.agent_programs.clone();
         self.status = label;
         let Some(tx) = self.main_tx.clone() else {
             let result = run_clone_worker(
@@ -26093,6 +26286,7 @@ impl App {
                 target,
                 copy_folder_data,
                 context_mode,
+                agent_programs,
                 cancel_token,
                 None,
             );
@@ -26110,6 +26304,7 @@ impl App {
                         target,
                         copy_folder_data,
                         context_mode,
+                        agent_programs,
                         cancel_token,
                         Some(worker_tx.clone()),
                     )
@@ -26304,12 +26499,78 @@ impl App {
     }
 }
 
+fn run_delete_worker(
+    seq: u64,
+    info: SessionInfo,
+    removed_index: Option<usize>,
+    agent_programs: &AgentProgramSettings,
+) -> DeleteWorkerResult {
+    let remove_opts = session::remove::RemoveOpts {
+        opencode_command: (info.provider == Provider::OpenCode)
+            .then(|| agent_provider_command(Provider::OpenCode, agent_programs))
+            .flatten(),
+    };
+    let outcome = session::remove::remove_with_opts(&info, &remove_opts)
+        .map_err(|error| error.to_string())
+        .map(|report| {
+            let data_snapshot_removed = match session::data::remove_snapshot_for_session(&info)
+            {
+                Ok(removed) => removed,
+                Err(e) => {
+                    debug_log(
+                        "delete_data_snapshot_failed",
+                        serde_json::json!({
+                            "provider": info.provider.as_str(),
+                            "session_id": &info.session_id,
+                            "error": e.to_string(),
+                        }),
+                    );
+                    false
+                }
+            };
+            (report, data_snapshot_removed)
+        });
+    DeleteWorkerResult {
+        seq,
+        info,
+        removed_index,
+        outcome,
+    }
+}
+
+/// A provider CLI that a clone runs on that provider's own storage (Codex
+/// indexing a copied thread, OpenCode 2 importing a session), found the way
+/// an agent launch finds it. Runs on the clone worker: the lookup may start a
+/// shell.
+fn agent_provider_command(
+    provider: Provider,
+    agent_programs: &AgentProgramSettings,
+) -> Option<session::clone::ProviderCommand> {
+    let program = agent_programs.program_for(provider);
+    #[cfg(unix)]
+    {
+        let (lookup, path_env) = lookup_unix_agent_program_with_login_path(&program);
+        if let Some(program) = lookup.found() {
+            return Some(session::clone::ProviderCommand { program, path_env });
+        }
+    }
+    resolve_agent_program_candidate(provider, &program).map(|program| {
+        session::clone::ProviderCommand {
+            program,
+            path_env: None,
+        }
+    })
+}
+
+// Keep the clone request fields explicit across the worker boundary.
+#[allow(clippy::too_many_arguments)]
 fn run_clone_worker(
     seq: u64,
     source: SessionInfo,
     target: Provider,
     copy_folder_data: bool,
     context_mode: session::clone::CloneContextMode,
+    agent_programs: AgentProgramSettings,
     cancel_token: Arc<AtomicBool>,
     progress_tx: Option<Sender<MainEvent>>,
 ) -> CloneWorkerResult {
@@ -26428,6 +26689,12 @@ fn run_clone_worker(
         data_stats.clone(),
         progress.last_total(),
     );
+    let opencode_command = (target == Provider::OpenCode)
+        .then(|| agent_provider_command(Provider::OpenCode, &agent_programs))
+        .flatten();
+    let remove_opts = session::remove::RemoveOpts {
+        opencode_command: opencode_command.clone(),
+    };
     let outcome = match session::clone::clone_to_live(
         &source,
         &session::clone::CloneOpts {
@@ -26439,6 +26706,10 @@ fn run_clone_worker(
                 .as_ref()
                 .map(|(_, target_cwd)| target_cwd.display().to_string()),
             context_mode,
+            codex_command: (source.provider == Provider::Codex && target == Provider::Codex)
+                .then(|| agent_provider_command(Provider::Codex, &agent_programs))
+                .flatten(),
+            opencode_command,
             ..Default::default()
         },
     ) {
@@ -26446,7 +26717,7 @@ fn run_clone_worker(
             if clone_cancelled(&cancel_token) {
                 return CloneWorkerResult {
                     seq,
-                    outcome: cancel_clone_after_report(source, report, cloned_working_dir),
+                    outcome: cancel_clone_after_report(source, report, cloned_working_dir, &remove_opts),
                 };
             }
             let data_snapshot_error = None;
@@ -26489,7 +26760,7 @@ fn run_clone_worker(
             if clone_cancelled(&cancel_token) {
                 return CloneWorkerResult {
                     seq,
-                    outcome: cancel_clone_after_report(source, report, cloned_working_dir),
+                    outcome: cancel_clone_after_report(source, report, cloned_working_dir, &remove_opts),
                 };
             }
             let clone_tree_error = session::clone_tree::record_clone_report(&report)
@@ -26498,7 +26769,7 @@ fn run_clone_worker(
             if clone_cancelled(&cancel_token) {
                 return CloneWorkerResult {
                     seq,
-                    outcome: cancel_clone_after_report(source, report, cloned_working_dir),
+                    outcome: cancel_clone_after_report(source, report, cloned_working_dir, &remove_opts),
                 };
             }
             progress.send_now(
@@ -26634,6 +26905,7 @@ fn cancel_clone_after_report(
     source: SessionInfo,
     report: session::clone::CloneReport,
     cloned_working_dir: Option<PathBuf>,
+    remove_opts: &session::remove::RemoveOpts,
 ) -> CloneWorkerOutcome {
     let cloned_info = session_info_from_clone_report(&source, &report);
     let clone_tree_cleanup_error = session::clone_tree::remove_clone_child(
@@ -26652,7 +26924,7 @@ fn cancel_clone_after_report(
             .err()
             .map(|error| error.to_string())
     });
-    match session::remove::remove(&cloned_info) {
+    match session::remove::remove_with_opts(&cloned_info, remove_opts) {
         Ok(remove_report) => CloneWorkerOutcome::Cancelled {
             source,
             target: report.target_provider,
@@ -30092,6 +30364,7 @@ fn main_event_kind(event: &MainEvent) -> &'static str {
         MainEvent::DataTaskProgress(_) => "data_task_progress",
         MainEvent::CloneResult(_) => "clone_result",
         MainEvent::RestoreResult(_) => "restore_result",
+        MainEvent::DeleteResult(_) => "delete_result",
         MainEvent::AiTitleResult(_) => "ai_title_result",
         MainEvent::AttachResult(_) => "attach_result",
         MainEvent::AgentKillResult(_) => "agent_kill_result",
@@ -30777,6 +31050,9 @@ fn handle_main_event(
         }
         MainEvent::RestoreResult(result) => {
             app.on_restore_worker_result(result);
+        }
+        MainEvent::DeleteResult(result) => {
+            app.on_delete_worker_result(result);
         }
         MainEvent::AiTitleResult(result) => {
             app.on_ai_title_worker_result(result);
@@ -38178,7 +38454,43 @@ fn claude_new_agent_backing_session_in_root(
 /// row qualifies only when it is the unique session for this cwd created
 /// after that instant. Ambiguity (two new agents racing in one cwd) links
 /// nothing rather than risking a wrong alias.
+/// The OpenCode session id a new agent runs under, when the installed
+/// OpenCode creates sessions under a given id (OpenCode 2). Reads the
+/// OpenCode database; only called for a real new-agent id, on the launch
+/// worker or in the daemon, never while drawing.
+fn opencode_new_agent_pinned_session_id(agent_session_id: &str) -> Option<String> {
+    let session_uuid = new_agent_session_uuid(agent_session_id)?;
+    opencode_pinned_session_id_for(
+        &session_uuid,
+        cokacmux::providers::discovery::opencode_store_is_event_sourced(),
+    )
+}
+
+/// `store_event_sourced` says whether the OpenCode database is OpenCode 2's.
+/// Older OpenCode versions are launched without a pinned id.
+fn opencode_pinned_session_id_for(
+    session_uuid: &uuid::Uuid,
+    store_event_sourced: Option<bool>,
+) -> Option<String> {
+    (store_event_sourced == Some(true))
+        .then(|| cokacmux::ids::opencode_session_id_for_uuid(session_uuid))
+}
+
 fn opencode_new_agent_backing_session(meta: &AgentMetaSnapshot) -> Option<NewAgentBackingSession> {
+    // OpenCode 2 agents run under the id cokacmux assigned, so their session
+    // is found by that id alone; a session of another OpenCode client that
+    // started in the same folder can never be taken for it.
+    if let Some(pinned) = opencode_new_agent_pinned_session_id(meta.session_id.as_deref()?) {
+        let (session_id, backing_path) =
+            cokacmux::providers::discovery::opencode_session_by_id(&pinned)?;
+        return Some(NewAgentBackingSession {
+            key: AgentKey {
+                provider: Provider::OpenCode,
+                session_id,
+            },
+            backing_path,
+        });
+    }
     let session_uuid = new_agent_session_uuid(meta.session_id.as_deref()?)?;
     let timestamp = session_uuid.get_timestamp()?;
     let (secs, nanos) = timestamp.to_unix();
@@ -48401,11 +48713,19 @@ fn shell_display_word(value: &str) -> String {
 
 #[cfg(not(windows))]
 fn agent_command_builder(spec: &AgentLaunchSpec) -> CommandBuilder {
-    let program = resolve_unix_agent_program(&spec.program)
+    let (lookup, login_path) = lookup_unix_agent_program_with_login_path(&spec.program);
+    let program = lookup
+        .found()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| spec.program.clone());
     let mut command = CommandBuilder::new(program);
     command.args(&spec.args);
+    // A program found only on the login shell's PATH runs with that PATH, so
+    // what it starts by name (`#!/usr/bin/env node` in an nvm install)
+    // resolves the way the lookup that found it did.
+    if let Some(login_path) = login_path {
+        command.env("PATH", login_path);
+    }
     for (key, value) in &spec.env {
         command.env(key, value);
     }
@@ -49849,7 +50169,7 @@ fn cokacdir_program_for_preview(settings: &CokacmuxSettings) -> String {
     cached_program_resolution(
         COKACDIR_DEFAULT_PROGRAM_CACHE_KEY,
         PROGRAM_RESOLUTION_CACHE_TTL,
-        resolve_cokacdir_default_program,
+        lookup_cokacdir_default_program,
     )
     .flatten()
     .map(|path| path.display().to_string())
@@ -49878,9 +50198,24 @@ fn ensure_cokacdir_program(settings: &CokacmuxSettings) -> Result<PathBuf> {
         return Ok(path);
     }
     if let Some(path) = cokacdir_installed_existing_path() {
-        match validate_cokacdir_program(&path) {
-            Ok(()) => return Ok(path),
-            Err(error) => debug_log(
+        match check_cokacdir_program(&path) {
+            CokacdirProgramCheck::Valid => return Ok(path),
+            // A check that could not finish (a stalled disk, a loaded system)
+            // says nothing about the binary. Replacing it would turn the stall
+            // into a network download and a binary swap, so run the copy
+            // that was validated when it was installed.
+            CokacdirProgramCheck::Inconclusive(error) => {
+                debug_log(
+                    "cokacdir_installed_validation_inconclusive",
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "error": error.to_string(),
+                        "action": "use_installed",
+                    }),
+                );
+                return Ok(path);
+            }
+            CokacdirProgramCheck::Invalid(error) => debug_log(
                 "cokacdir_installed_validation_failed",
                 serde_json::json!({
                     "path": path.display().to_string(),
@@ -49896,6 +50231,23 @@ fn ensure_cokacdir_program(settings: &CokacmuxSettings) -> Result<PathBuf> {
 fn resolve_cokacdir_default_program() -> Option<PathBuf> {
     resolve_cokacdir_program_candidate(COKACDIR_PROGRAM_NAME)
         .or_else(cokacdir_installed_existing_path)
+}
+
+fn lookup_cokacdir_default_program() -> ProgramLookup {
+    match lookup_cokacdir_program_candidate(COKACDIR_PROGRAM_NAME) {
+        ProgramLookup::Found(path) => ProgramLookup::Found(path),
+        lookup => cokacdir_installed_existing_path().map_or(lookup, ProgramLookup::Found),
+    }
+}
+
+#[cfg(unix)]
+fn lookup_cokacdir_program_candidate(program: &str) -> ProgramLookup {
+    lookup_unix_agent_program(program)
+}
+
+#[cfg(not(unix))]
+fn lookup_cokacdir_program_candidate(program: &str) -> ProgramLookup {
+    ProgramLookup::from_found(resolve_cokacdir_program_candidate(program))
 }
 
 fn configured_cokacdir_program(settings: &CokacmuxSettings) -> Option<String> {
@@ -50005,39 +50357,97 @@ fn download_cokacdir_program() -> Result<PathBuf> {
     Ok(target)
 }
 
+/// Result of running a cokacdir binary's `--version`.
+enum CokacdirProgramCheck {
+    Valid,
+    /// Definitive evidence that the file is not a working cokacdir.
+    Invalid(anyhow::Error),
+    /// The check could not finish: it timed out, or the process could not be
+    /// started for a reason that says nothing about the file itself.
+    Inconclusive(anyhow::Error),
+}
+
+/// A download is published only after a check that finished and passed.
 fn validate_cokacdir_program(path: &Path) -> Result<()> {
-    let is_regular_file = fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false);
+    match check_cokacdir_program(path) {
+        CokacdirProgramCheck::Valid => Ok(()),
+        CokacdirProgramCheck::Invalid(error) | CokacdirProgramCheck::Inconclusive(error) => {
+            Err(error)
+        }
+    }
+}
+
+/// Whether starting a program failed because the file is not an executable
+/// for this system (a truncated or HTML-error download, another platform's
+/// binary), as opposed to a transient condition.
+fn spawn_error_proves_bad_executable(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ENOEXEC)
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_BAD_EXE_FORMAT: i32 = 193;
+        error.raw_os_error() == Some(ERROR_BAD_EXE_FORMAT)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn check_cokacdir_program(path: &Path) -> CokacdirProgramCheck {
+    let is_regular_file = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type().is_file(),
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => {
+            return CokacdirProgramCheck::Inconclusive(anyhow::anyhow!(
+                "cannot read cokacdir at {}: {}",
+                path.display(),
+                error
+            ))
+        }
+    };
     if !is_regular_file || !program_path_is_runnable(path) {
-        anyhow::bail!(
+        return CokacdirProgramCheck::Invalid(anyhow::anyhow!(
             "cokacdir is not a runnable regular file: {}",
             path.display()
-        );
+        ));
     }
 
     let mut command = Command::new(path);
     command.arg("--version");
-    let output =
-        command_output_with_timeout(command, Duration::from_millis(COKACDIR_VERSION_TIMEOUT_MS))
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "run downloaded cokacdir at {} failed: {}",
-                    path.display(),
-                    error
-                )
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "downloaded cokacdir at {} timed out during --version",
-                    path.display()
-                )
-            })?;
+    let output = match command_output_with_timeout(
+        command,
+        Duration::from_millis(COKACDIR_VERSION_TIMEOUT_MS),
+    ) {
+        Ok(Some(output)) => output,
+        Ok(None) => {
+            return CokacdirProgramCheck::Inconclusive(anyhow::anyhow!(
+                "downloaded cokacdir at {} timed out during --version",
+                path.display()
+            ))
+        }
+        Err(error) => {
+            let bad_executable = spawn_error_proves_bad_executable(&error);
+            let error = anyhow::anyhow!(
+                "run downloaded cokacdir at {} failed: {}",
+                path.display(),
+                error
+            );
+            return if bad_executable {
+                CokacdirProgramCheck::Invalid(error)
+            } else {
+                CokacdirProgramCheck::Inconclusive(error)
+            };
+        }
+    };
     if !output.status.success() {
-        anyhow::bail!(
+        return CokacdirProgramCheck::Invalid(anyhow::anyhow!(
             "downloaded cokacdir failed --version: {}",
             command_output_error("cokacdir", &output)
-        );
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -50050,12 +50460,12 @@ fn validate_cokacdir_program(path: &Path) -> Result<()> {
         format!("{}\n{}", stdout.trim(), stderr.trim())
     };
     if !binary_version_output_identifies(&version_output, COKACDIR_PROGRAM_NAME) {
-        anyhow::bail!(
+        return CokacdirProgramCheck::Invalid(anyhow::anyhow!(
             "downloaded cokacdir returned an unexpected version: {}",
             truncate_width(&version_output, 160)
-        );
+        ));
     }
-    Ok(())
+    CokacdirProgramCheck::Valid
 }
 
 fn binary_version_output_identifies(output: &str, name: &str) -> bool {
@@ -50423,13 +50833,24 @@ fn resolve_agent_program_for_provider(
 
 #[cfg(unix)]
 fn resolve_agent_program_candidate(provider: Provider, program: &str) -> Option<PathBuf> {
-    resolve_unix_agent_program(program).or_else(|| {
-        if provider == Provider::OpenCode && program.trim() == default_agent_program(provider) {
-            resolve_unix_opencode_default_install()
-        } else {
-            None
-        }
-    })
+    lookup_agent_program_candidate(provider, program).found()
+}
+
+#[cfg(unix)]
+fn lookup_agent_program_candidate(provider: Provider, program: &str) -> ProgramLookup {
+    let lookup = lookup_unix_agent_program(program);
+    if matches!(lookup, ProgramLookup::Found(_))
+        || provider != Provider::OpenCode
+        || program.trim() != default_agent_program(provider)
+    {
+        return lookup;
+    }
+    resolve_unix_opencode_default_install().map_or(lookup, ProgramLookup::Found)
+}
+
+#[cfg(not(unix))]
+fn lookup_agent_program_candidate(provider: Provider, program: &str) -> ProgramLookup {
+    ProgramLookup::from_found(resolve_agent_program_candidate(provider, program))
 }
 
 #[cfg(windows)]
@@ -50450,18 +50871,177 @@ fn resolve_agent_program_candidate(_provider: Provider, program: &str) -> Option
 
 #[cfg(unix)]
 fn resolve_unix_agent_program(program: &str) -> Option<PathBuf> {
+    lookup_unix_agent_program(program).found()
+}
+
+#[cfg(unix)]
+fn lookup_unix_agent_program(program: &str) -> ProgramLookup {
+    lookup_unix_agent_program_with_login_path(program).0
+}
+
+/// Looks `program` up the way a terminal would run it. A name with a path
+/// component is checked as given. A bare name is searched on this process's
+/// PATH, then on the PATH of the user's login shell, which also carries what
+/// the shell's startup files add when cokacmux itself started with a shorter
+/// PATH (from a desktop launcher or a service manager). The second value is
+/// that login PATH when the program was found only there.
+#[cfg(unix)]
+fn lookup_unix_agent_program_with_login_path(program: &str) -> (ProgramLookup, Option<OsString>) {
     let trimmed = program.trim();
     if trimmed.is_empty() {
-        return None;
+        return (ProgramLookup::NotFound, None);
     }
     let expanded = expand_configured_program_path(trimmed);
     let path = Path::new(&expanded);
     if path.components().count() > 1 || path.is_absolute() {
-        return unix_runnable_file(path).then(|| path.to_path_buf());
+        let found = unix_runnable_file(path).then(|| path.to_path_buf());
+        return (ProgramLookup::from_found(found), None);
     }
 
-    resolve_unix_program_with_which(&expanded)
-        .or_else(|| resolve_unix_program_with_login_shell(&expanded))
+    if let Some(found) = std::env::var_os("PATH")
+        .and_then(|search_path| find_unix_program_on_search_path(&expanded, &search_path))
+    {
+        return (ProgramLookup::Found(found), None);
+    }
+    let Some(login_path) = unix_login_shell_search_path() else {
+        return (ProgramLookup::Unknown, None);
+    };
+    match find_unix_program_on_search_path(&expanded, &login_path) {
+        Some(found) => (ProgramLookup::Found(found), Some(login_path)),
+        None => (ProgramLookup::NotFound, None),
+    }
+}
+
+/// Searches the absolute directories of a PATH value in order, as `execvp`
+/// does. Empty and relative entries are skipped: they would resolve against
+/// cokacmux's own working directory, not the folder the program runs in.
+#[cfg(unix)]
+fn find_unix_program_on_search_path(
+    program: &str,
+    search_path: &std::ffi::OsStr,
+) -> Option<PathBuf> {
+    std::env::split_paths(search_path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(|candidate| unix_runnable_file(candidate))
+}
+
+/// Brackets the login shell's PATH in its output, so text printed by the
+/// shell's startup files is never taken for PATH.
+#[cfg(unix)]
+const LOGIN_SHELL_PATH_MARKER: &str = "__COKACMUX_LOGIN_SHELL_PATH__";
+
+#[cfg(unix)]
+#[derive(Default)]
+struct LoginShellSearchPathCache {
+    finished_at: Option<Instant>,
+    search_path: Option<OsString>,
+}
+
+/// The PATH of the user's login shell, or `None` when no shell reported one
+/// in time. Concurrent lookups share one query: a caller that waited for a
+/// running query takes its answer, and a reported PATH is reused for the
+/// program lookup TTL. Runs a shell, so it must never run on the UI thread.
+#[cfg(unix)]
+fn unix_login_shell_search_path() -> Option<OsString> {
+    static CACHE: OnceLock<Mutex<LoginShellSearchPathCache>> = OnceLock::new();
+    let requested_at = Instant::now();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(LoginShellSearchPathCache::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(finished_at) = cache.finished_at {
+        let answered_this_request = finished_at >= requested_at;
+        let reported_recently =
+            cache.search_path.is_some() && finished_at.elapsed() < PROGRAM_RESOLUTION_CACHE_TTL;
+        if answered_this_request || reported_recently {
+            return cache.search_path.clone();
+        }
+    }
+    let search_path = query_unix_login_shell_search_path();
+    cache.finished_at = Some(Instant::now());
+    cache.search_path = search_path.clone();
+    search_path
+}
+
+/// Asks the user's shell, started as an interactive login shell the way a
+/// terminal starts it, for its PATH, so entries added by either the profile
+/// or the rc files count. `/bin/sh` answers when `$SHELL` cannot run the
+/// POSIX-style command (nushell, tcsh) or cannot start.
+#[cfg(unix)]
+fn query_unix_login_shell_search_path() -> Option<OsString> {
+    let script = format!(
+        "printf '%s%s%s' '{marker}' \"$PATH\" '{marker}'",
+        marker = LOGIN_SHELL_PATH_MARKER
+    );
+    let mut shells = Vec::new();
+    if let Some(shell) = std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .filter(|shell| shell.is_absolute())
+    {
+        shells.push(shell);
+    }
+    let posix_shell = PathBuf::from("/bin/sh");
+    if !shells.contains(&posix_shell) {
+        shells.push(posix_shell);
+    }
+    for shell in shells {
+        let mut command = Command::new(&shell);
+        command.args(["-i", "-l", "-c", &script]);
+        let output = match command_output_with_timeout(
+            command,
+            Duration::from_millis(PROGRAM_RESOLVE_COMMAND_TIMEOUT_MS),
+        ) {
+            Ok(Some(output)) => output,
+            // A slow environment would slow a second shell the same way;
+            // report the PATH as unknown instead of doubling the wait.
+            Ok(None) => {
+                debug_log(
+                    "login_shell_path_timed_out",
+                    serde_json::json!({
+                        "shell": shell.display().to_string(),
+                        "timeout_ms": PROGRAM_RESOLVE_COMMAND_TIMEOUT_MS,
+                    }),
+                );
+                return None;
+            }
+            Err(error) => {
+                debug_log(
+                    "login_shell_path_spawn_failed",
+                    serde_json::json!({
+                        "shell": shell.display().to_string(),
+                        "error": error.to_string(),
+                    }),
+                );
+                continue;
+            }
+        };
+        if let Some(search_path) = login_shell_search_path_from_output(&output.stdout) {
+            return Some(search_path);
+        }
+        debug_log(
+            "login_shell_path_unreported",
+            serde_json::json!({
+                "shell": shell.display().to_string(),
+                "status": output.status.to_string(),
+            }),
+        );
+    }
+    None
+}
+
+#[cfg(unix)]
+fn login_shell_search_path_from_output(stdout: &[u8]) -> Option<OsString> {
+    let marker = LOGIN_SHELL_PATH_MARKER.as_bytes();
+    let find = |haystack: &[u8]| {
+        haystack
+            .windows(marker.len())
+            .position(|window| window == marker)
+    };
+    let start = find(stdout)? + marker.len();
+    let rest = &stdout[start..];
+    let value = &rest[..find(rest)?];
+    (!value.is_empty()).then(|| std::ffi::OsStr::from_bytes(value).to_os_string())
 }
 
 #[cfg(unix)]
@@ -50481,50 +51061,13 @@ fn opencode_unix_default_install_candidates(home: &Path) -> [PathBuf; 2] {
 }
 
 #[cfg(unix)]
-fn resolve_unix_program_with_which(program: &str) -> Option<PathBuf> {
-    let mut command = Command::new("which");
-    command.arg(program);
-    let output = command_output_with_timeout(
-        command,
-        Duration::from_millis(PROGRAM_RESOLVE_COMMAND_TIMEOUT_MS),
-    )
-    .ok()??;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!path.is_empty())
-        .then_some(PathBuf::from(path))
-        .filter(|path| unix_runnable_file(path))
-}
-
-#[cfg(unix)]
-fn resolve_unix_program_with_login_shell(program: &str) -> Option<PathBuf> {
-    let command = format!("which {}", shell_single_quote(program));
-    let mut shell = Command::new("bash");
-    shell.args(["-lc", &command]);
-    let output = command_output_with_timeout(
-        shell,
-        Duration::from_millis(PROGRAM_RESOLVE_COMMAND_TIMEOUT_MS),
-    )
-    .ok()??;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!path.is_empty())
-        .then_some(PathBuf::from(path))
-        .filter(|path| unix_runnable_file(path))
-}
-
-#[cfg(unix)]
 fn unix_runnable_file(path: &Path) -> bool {
     path.metadata()
         .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
         .unwrap_or(false)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -50720,6 +51263,13 @@ fn new_agent_launch_spec_with_programs(
             }
             if let Some(path) = &cwd {
                 args.push(path.display().to_string());
+            }
+            // Like claude's --session-id: OpenCode 2 creates the session under
+            // the id given with --session, so the agent's session is known by
+            // id instead of being guessed from its folder and start time.
+            if let Some(session_id) = opencode_new_agent_pinned_session_id(&info.session_id) {
+                args.push("--session".to_string());
+                args.push(session_id);
             }
             AgentLaunchSpec {
                 program: agent_programs.program_for(Provider::OpenCode),
@@ -53445,6 +53995,10 @@ fn draw_data_task_modal(
         DataTaskKind::Restore => [direct_help_item(
             "Wait",
             "restore must finish before other actions",
+        )],
+        DataTaskKind::Delete => [direct_help_item(
+            "Wait",
+            "delete must finish before other actions",
         )],
     };
     lines.push(modal_help_line(&help_items));
@@ -57394,7 +57948,7 @@ fn settings_text_status(
             let resolved = cached_program_resolution(
                 &agent_program_cache_key(provider, &program),
                 PROGRAM_RESOLUTION_CACHE_TTL,
-                move || resolve_agent_program_candidate(provider, &worker_program),
+                move || lookup_agent_program_candidate(provider, &worker_program),
             )?;
             Some(match resolved {
                 Some(path) => SettingsTextStatus::ok(format!("ok: {}", display_cwd_path(&path))),
@@ -57412,13 +57966,13 @@ fn settings_text_status(
                     cached_program_resolution(
                         &format!("cokacdir:configured:{}", program),
                         PROGRAM_RESOLUTION_CACHE_TTL,
-                        move || resolve_cokacdir_program_candidate(&worker_program),
+                        move || lookup_cokacdir_program_candidate(&worker_program),
                     )?
                 }
                 None => cached_program_resolution(
                     COKACDIR_DEFAULT_PROGRAM_CACHE_KEY,
                     PROGRAM_RESOLUTION_CACHE_TTL,
-                    resolve_cokacdir_default_program,
+                    lookup_cokacdir_default_program,
                 )?,
             };
             Some(match resolved {
@@ -70057,7 +70611,10 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
             .cokacmux
             .agent_programs
             .program_for(Provider::Codex);
-        store_program_resolution(&agent_program_cache_key(Provider::Codex, &program), None);
+        store_program_resolution(
+            &agent_program_cache_key(Provider::Codex, &program),
+            ProgramLookup::NotFound,
+        );
 
         assert!(!app.start_new_session_from_modal(
             NewSessionKind::CodingAgent,
@@ -72561,6 +73118,87 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
 
         assert!(error.contains("configured cokacdir_program"));
         assert!(error.contains("/definitely/missing/cokacdir"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cokacdir_check_rejects_a_file_that_is_not_an_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join(cokacdir_local_filename());
+        fs::write(&program, "<html>404 Not Found</html>\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(check_cokacdir_program(&program), CokacdirProgramCheck::Invalid(_)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cokacdir_check_accepts_a_program_that_identifies_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join(cokacdir_local_filename());
+        fs::write(&program, "#!/bin/sh\necho 'cokacdir 1.2.3'\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(check_cokacdir_program(&program), CokacdirProgramCheck::Valid));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn program_search_path_follows_order_and_skips_relative_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_runnable = dir.path().join("first");
+        let runnable = dir.path().join("second");
+        fs::create_dir_all(&not_runnable).unwrap();
+        fs::create_dir_all(&runnable).unwrap();
+        fs::write(not_runnable.join("agent"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(not_runnable.join("agent"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(runnable.join("agent"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(runnable.join("agent"), fs::Permissions::from_mode(0o755)).unwrap();
+        let search_path = std::env::join_paths([
+            PathBuf::from("relative/bin"),
+            not_runnable.clone(),
+            runnable.clone(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            find_unix_program_on_search_path("agent", &search_path),
+            Some(runnable.join("agent"))
+        );
+        assert_eq!(find_unix_program_on_search_path("missing", &search_path), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn login_shell_path_is_read_only_between_markers() {
+        let output = format!(
+            "Welcome!\n{marker}/opt/homebrew/bin:/usr/bin{marker}\nbye\n",
+            marker = LOGIN_SHELL_PATH_MARKER
+        );
+        assert_eq!(
+            login_shell_search_path_from_output(output.as_bytes()),
+            Some(OsString::from("/opt/homebrew/bin:/usr/bin"))
+        );
+        let unterminated = format!("{}/usr/bin", LOGIN_SHELL_PATH_MARKER);
+        assert_eq!(login_shell_search_path_from_output(unterminated.as_bytes()), None);
+        assert_eq!(login_shell_search_path_from_output(b"/usr/bin"), None);
+    }
+
+    #[test]
+    fn unfinished_program_lookup_keeps_the_last_definite_answer() {
+        let mut entry = ProgramResolutionCacheEntry::default();
+        entry.record(ProgramLookup::Unknown);
+        assert_eq!(entry.resolved, None);
+        assert!(entry.unknown);
+
+        entry.record(ProgramLookup::Found(PathBuf::from("/usr/bin/codex")));
+        entry.record(ProgramLookup::Unknown);
+        assert_eq!(entry.resolved, Some(Some(PathBuf::from("/usr/bin/codex"))));
+        assert!(entry.unknown);
+
+        entry.record(ProgramLookup::NotFound);
+        assert_eq!(entry.resolved, Some(None));
+        assert!(!entry.unknown);
     }
 
     #[test]
@@ -76074,6 +76712,57 @@ printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"title\":\"Large s
     }
 
     #[test]
+    fn opencode_new_agent_pins_its_session_id_only_on_opencode_2() {
+        let uuid = uuid::Uuid::now_v7();
+
+        assert_eq!(
+            opencode_pinned_session_id_for(&uuid, Some(true)),
+            Some(cokacmux::ids::opencode_session_id_for_uuid(&uuid))
+        );
+        assert_eq!(opencode_pinned_session_id_for(&uuid, Some(false)), None);
+        assert_eq!(opencode_pinned_session_id_for(&uuid, None), None);
+    }
+
+    #[test]
+    fn delete_runs_on_a_worker_and_applies_its_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delete-me.jsonl");
+        fs::write(&path, "{}\n").unwrap();
+        let info = SessionInfo {
+            provider: Provider::Claude,
+            session_id: "delete-me".into(),
+            cwd: "/repo".into(),
+            source: path.clone(),
+            updated_at_epoch_s: 0,
+            title: None,
+            relation: None,
+        };
+        let mut app = app_for_key_tests();
+        let (tx, rx) = mpsc::channel::<MainEvent>();
+        app.main_tx = Some(tx);
+
+        app.delete_session(info, Some(0));
+
+        // The key handler returns at once; the delete stays a data task until
+        // the worker reports back.
+        assert!(app
+            .data_task
+            .as_ref()
+            .is_some_and(|task| task.kind == DataTaskKind::Delete));
+        let result = loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                MainEvent::DeleteResult(result) => break result,
+                _ => continue,
+            }
+        };
+        app.on_delete_worker_result(result);
+
+        assert!(app.data_task.is_none());
+        assert!(!path.exists());
+        assert!(app.status.starts_with("deleted delete-me"), "{}", app.status);
+    }
+
+    #[test]
     fn new_agent_session_uuid_requires_prefixed_uuid() {
         let uuid = uuid::Uuid::now_v7();
         assert_eq!(new_agent_session_uuid(&format!("new-{uuid}")), Some(uuid));
@@ -77129,6 +77818,68 @@ IF EXIST "%~dp0\node.exe" (
             request.request,
             AgentDaemonRequest::Input { data, .. } if data.as_slice() == b"r"
         ));
+        assert!(app.deferred_agent_input.is_empty());
+    }
+
+    #[test]
+    fn deferred_main_input_ignores_focus_restored_to_right_panel() {
+        let mut app = app_for_key_tests();
+        let (old_client, old_requests) =
+            buffered_output_test_client_with_requests("old-agent", 807);
+        app.active_agent = Some(old_client);
+        app.show_sessions_view = false;
+        app.agent_focus = AgentFocusPane::Main;
+        let target = AgentKey {
+            provider: Provider::Claude,
+            session_id: "new-agent".into(),
+        };
+        app.attach_in_flight = Some(AttachInFlight {
+            seq: 1,
+            key: target.clone(),
+            target: AttachTarget::MainAgent,
+            started_at: Instant::now(),
+        });
+        app.send_key_to_focused_agent(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.send_paste_to_focused_agent("typed for main");
+
+        // The attach finishes and focus is restored to the new agent's right
+        // panel, as it was when that agent was last shown.
+        let (target_client, target_requests) =
+            buffered_output_test_client_with_requests("new-agent", 808);
+        let parent = AgentKey::new(&target_client.info);
+        app.active_agent = Some(target_client);
+        let (auxiliary_client, auxiliary_requests) =
+            buffered_output_test_client_with_requests("restored-auxiliary", 809);
+        app.agent_aux = Some(AgentAuxPane {
+            kind: AgentAuxKind::Terminal,
+            parent,
+            agent: auxiliary_client,
+        });
+        app.agent_focus = AgentFocusPane::Auxiliary;
+        app.attach_in_flight = None;
+        app.flush_deferred_agent_input();
+
+        let replayed = target_requests
+            .try_iter()
+            .map(|request| match request.request {
+                AgentDaemonRequest::Input { data, .. } => data,
+                other => panic!("expected deferred input request, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(replayed.starts_with(b"x"), "{replayed:?}");
+        assert!(replayed.ends_with(b"typed for main"), "{replayed:?}");
+        assert!(matches!(
+            auxiliary_requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        // The replaced old client may send its own teardown requests, but no
+        // input.
+        let old_inputs = old_requests
+            .try_iter()
+            .filter(|request| matches!(request.request, AgentDaemonRequest::Input { .. }))
+            .count();
+        assert_eq!(old_inputs, 0);
         assert!(app.deferred_agent_input.is_empty());
     }
 

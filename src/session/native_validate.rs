@@ -709,8 +709,57 @@ pub(crate) fn validate_opencode_connection(
         db_path.is_file(),
         db_path.display().to_string(),
     );
-    validate_opencode_db_connection(&mut report, conn, session_id);
+    match crate::providers::opencode::db::is_event_sourced(conn) {
+        Ok(true) => validate_opencode_event_sourced_connection(&mut report, conn, session_id),
+        Ok(false) => validate_opencode_db_connection(&mut report, conn, session_id),
+        Err(error) => report.check("schema_readable", false, error.to_string()),
+    }
     report
+}
+
+/// OpenCode 2 derives `session_v2` and `session_message` from its events, so
+/// a session is valid when OpenCode stored a row for it and its transcript
+/// reads back with at least one turn.
+#[cfg(feature = "opencode")]
+fn validate_opencode_event_sourced_connection(
+    report: &mut NativeValidationReport,
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) {
+    let directory = conn
+        .query_row(
+            "SELECT directory FROM session_v2 WHERE id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    report.check(
+        "session_row_present",
+        directory.is_some(),
+        "session_v2".to_string(),
+    );
+    report.check(
+        "session_directory_non_empty",
+        directory
+            .as_deref()
+            .is_some_and(|directory| !directory.is_empty()),
+        format!("directory={directory:?}"),
+    );
+    match crate::providers::opencode::from_db_connection(conn, session_id) {
+        Ok(session) => {
+            let turns = session
+                .messages
+                .iter()
+                .filter(|message| !message.flags.is_meta)
+                .count();
+            report.check(
+                "transcript_turns_present",
+                turns > 0,
+                format!("turns={turns}"),
+            );
+        }
+        Err(error) => report.check("transcript_readable", false, error.to_string()),
+    }
 }
 
 #[cfg(feature = "opencode")]

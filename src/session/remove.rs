@@ -11,10 +11,22 @@ pub struct RemoveReport {
     pub deleted_rows: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RemoveOpts {
+    /// The OpenCode CLI. OpenCode 2 sessions live in an event store that only
+    /// OpenCode may write, so deleting one goes through the CLI.
+    pub opencode_command: Option<crate::providers::ProviderCommand>,
+}
+
 /// Delete the session described by `info`. For Claude this is a file
 /// unlink. For Codex it's a file unlink + DELETE FROM state_5.sqlite::threads.
-/// For OpenCode it's DELETE FROM session/message/part rows on opencode.db.
+/// For OpenCode it's DELETE FROM session/message/part rows on opencode.db, or
+/// `opencode session delete` for OpenCode 2.
 pub fn remove(info: &SessionInfo) -> Result<RemoveReport> {
+    remove_with_opts(info, &RemoveOpts::default())
+}
+
+pub fn remove_with_opts(info: &SessionInfo, opts: &RemoveOpts) -> Result<RemoveReport> {
     crate::debug::log(
         "delete_library_start",
         serde_json::json!({
@@ -26,7 +38,7 @@ pub fn remove(info: &SessionInfo) -> Result<RemoveReport> {
     let result = match info.provider {
         Provider::Claude => remove_claude(info),
         Provider::Codex => remove_codex(info),
-        Provider::OpenCode => remove_opencode(info),
+        Provider::OpenCode => remove_opencode(info, opts),
         Provider::Pi => remove_pi(info),
         Provider::Gjc => remove_gjc(info),
     };
@@ -172,13 +184,30 @@ fn remove_codex(info: &SessionInfo) -> Result<RemoveReport> {
 }
 
 #[cfg(feature = "opencode")]
-fn remove_opencode(info: &SessionInfo) -> Result<RemoveReport> {
+fn remove_opencode(info: &SessionInfo, opts: &RemoveOpts) -> Result<RemoveReport> {
     // info.source is the opencode.db path.
     if !info.source.is_file() {
         return Err(ConvertError::Other(format!(
             "opencode database not found: {}",
             info.source.display()
         )));
+    }
+    let event_sourced = {
+        let conn = crate::providers::opencode::db::open_readonly(&info.source)?;
+        crate::providers::opencode::db::is_event_sourced(&conn)?
+    };
+    if event_sourced {
+        let command = opts.opencode_command.as_ref().ok_or_else(|| {
+            ConvertError::Other(
+                "OpenCode 2 keeps sessions in an event store that only OpenCode may write; deleting needs the opencode CLI".into(),
+            )
+        })?;
+        crate::providers::opencode::cli::delete_session(command, &info.source, &info.session_id)?;
+        return Ok(RemoveReport {
+            provider: Provider::OpenCode,
+            deleted_file: None,
+            deleted_rows: 0,
+        });
     }
     let mut conn = rusqlite::Connection::open_with_flags(
         &info.source,
@@ -230,7 +259,7 @@ fn remove_opencode(info: &SessionInfo) -> Result<RemoveReport> {
 }
 
 #[cfg(not(feature = "opencode"))]
-fn remove_opencode(_info: &SessionInfo) -> Result<RemoveReport> {
+fn remove_opencode(_info: &SessionInfo, _opts: &RemoveOpts) -> Result<RemoveReport> {
     Err(ConvertError::Unsupported(
         "opencode remove requires the `opencode` feature".into(),
     ))

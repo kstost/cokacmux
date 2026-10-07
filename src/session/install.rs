@@ -37,6 +37,9 @@ pub struct InstallSessionOpts {
     pub gjc_agent_dir: Option<PathBuf>,
     /// Override GJC's `--session-dir` session directory.
     pub gjc_session_dir: Option<PathBuf>,
+    /// The OpenCode CLI. OpenCode 2 keeps sessions in an event store that
+    /// only OpenCode may write, so installing into it needs the CLI.
+    pub opencode_command: Option<providers::ProviderCommand>,
 }
 
 impl Default for InstallSessionOpts {
@@ -52,6 +55,7 @@ impl Default for InstallSessionOpts {
             pi_session_dir: None,
             gjc_agent_dir: None,
             gjc_session_dir: None,
+            opencode_command: None,
         }
     }
 }
@@ -341,6 +345,73 @@ fn ensure_install_paths_available(paths: &[PathBuf], overwrite: bool) -> Result<
     Ok(())
 }
 
+#[cfg(feature = "opencode")]
+fn opencode_db_is_event_sourced(db_path: &Path) -> Result<bool> {
+    let conn = providers::opencode::db::open_readonly(db_path)?;
+    providers::opencode::db::is_event_sourced(&conn)
+}
+
+/// OpenCode 2: the session goes in through `opencode session import`, and is
+/// read back to confirm what OpenCode stored. It is never written as rows:
+/// OpenCode derives those from its own events.
+#[cfg(feature = "opencode")]
+fn install_opencode_event_sourced(
+    session: &UniversalSession,
+    opts: &InstallSessionOpts,
+    db_path: &Path,
+) -> Result<InstallSessionReport> {
+    let command = opts.opencode_command.as_ref().ok_or_else(|| {
+        ConvertError::Other(
+            "OpenCode 2 keeps sessions in an event store that only OpenCode may write; installing needs the opencode CLI, and it was not found".into(),
+        )
+    })?;
+    if opts.overwrite {
+        return Err(ConvertError::Unsupported(
+            "replacing an existing OpenCode 2 session is not supported".into(),
+        ));
+    }
+    let document = providers::opencode::cli::import_document_from_session(session)?;
+    providers::opencode::cli::import_session(command, db_path, &document, &session.cwd)?;
+    let validation = {
+        let conn = providers::opencode::db::open_readonly(db_path)?;
+        native_validate::validate_opencode_connection(db_path, &session.session_id, &conn)
+    };
+    if !validation.ok {
+        let error = ConvertError::Other(format!(
+            "{} session {} failed native install validation: {}",
+            Provider::OpenCode.as_str(),
+            session.session_id,
+            validation.failure_summary(),
+        ));
+        return Err(
+            match providers::opencode::cli::delete_session(command, db_path, &session.session_id) {
+                Ok(()) => error,
+                Err(cleanup) => ConvertError::Other(format!(
+                    "{error}; removing the imported session failed: {cleanup}"
+                )),
+            },
+        );
+    }
+    crate::debug::log(
+        "session_install_ok",
+        serde_json::json!({
+            "provider": Provider::OpenCode.as_str(),
+            "session_id": &session.session_id,
+            "path": "opencode_cli_import",
+            "native_validation_checks": validation.checks.len(),
+        }),
+    );
+    Ok(InstallSessionReport {
+        provider: Provider::OpenCode,
+        session_id: session.session_id.clone(),
+        artifact: ArtifactPath::OpenCodeDb {
+            db_path: db_path.to_path_buf(),
+            session_id: session.session_id.clone(),
+        },
+        validation,
+    })
+}
+
 fn path_entry_exists(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -360,6 +431,9 @@ fn install_opencode_transactional(
     };
     let db_path = providers::opencode::install::planned_db_path(&provider_opts)?;
     let db_existed = path_entry_exists(&db_path)?;
+    if db_existed && opencode_db_is_event_sourced(&db_path)? {
+        return install_opencode_event_sourced(session, opts, &db_path);
+    }
     let result = (|| -> Result<InstallSessionReport> {
         if let Some(parent) = db_path
             .parent()
@@ -766,6 +840,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(todo, "old todo");
+    }
+
+    #[cfg(feature = "opencode")]
+    #[test]
+    fn opencode_2_install_without_cli_fails_without_writing_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("opencode").join("opencode.db");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        drop(providers::opencode::cli::tests::create_event_sourced_db(
+            &db_path,
+        ));
+        let session = UniversalSession::new(
+            "ses_0123456789abABCDEFGHIJKLMN",
+            Provider::OpenCode,
+            "/repo",
+        );
+
+        let error = install_universal_session(
+            Provider::OpenCode,
+            &session,
+            &InstallSessionOpts {
+                opencode_db_path: Some(db_path.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("opencode CLI"), "{error}");
+        // OpenCode 2 derives its rows from events: no legacy table may be
+        // created, and no row written, behind OpenCode's back.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for table in ["session", "message", "part"] {
+            assert!(
+                !providers::opencode::db::table_exists(&conn, table).unwrap(),
+                "{table}"
+            );
+        }
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_v2", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[cfg(feature = "opencode")]

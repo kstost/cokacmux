@@ -62,6 +62,31 @@ pub fn opencode_session_id() -> String {
     format!("ses_{}", opencode_identifier(true))
 }
 
+/// The OpenCode session id cokacmux assigns to a new agent identified by
+/// `uuid` (a UUID v7). Always the same for the same uuid, so the agent's
+/// session can be found again by id; laid out like OpenCode's own session
+/// ids (descending time prefix, 14 base62 characters).
+pub fn opencode_session_id_for_uuid(uuid: &uuid::Uuid) -> String {
+    const CHARS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let unix_ms = uuid
+        .get_timestamp()
+        .map(|timestamp| {
+            let (secs, nanos) = timestamp.to_unix();
+            secs.saturating_mul(1000)
+                .saturating_add(u64::from(nanos / 1_000_000))
+        })
+        .unwrap_or(0);
+    let mask = 0xffff_ffff_ffffu64;
+    let prefix = !(unix_ms.wrapping_mul(0x1000)) & mask;
+    let digest = Sha256::digest(uuid.as_bytes());
+    let suffix: String = digest
+        .iter()
+        .take(14)
+        .map(|byte| CHARS[*byte as usize % CHARS.len()] as char)
+        .collect();
+    format!("ses_{prefix:012x}{suffix}")
+}
+
 pub fn opencode_message_id() -> String {
     format!("msg_{}", opencode_identifier(false))
 }
@@ -114,6 +139,20 @@ mod tests {
         let a = new_uuid_v7();
         let b = new_uuid_v7();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn opencode_session_id_for_uuid_is_stable_and_shaped_like_native_ids() {
+        let a = uuid::Uuid::now_v7();
+        let b = uuid::Uuid::now_v7();
+        let id = opencode_session_id_for_uuid(&a);
+
+        assert_eq!(id, opencode_session_id_for_uuid(&a));
+        assert_ne!(id, opencode_session_id_for_uuid(&b));
+        assert_eq!(id.len(), opencode_session_id().len());
+        assert!(id.starts_with("ses_"));
+        assert!(id[4..16].chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(id[16..].chars().all(|ch| ch.is_ascii_alphanumeric()));
     }
 
     #[test]

@@ -49,6 +49,26 @@ pub fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(exists > 0)
 }
 
+/// The tables that hold session rows, in lookup order. OpenCode 2 keeps
+/// sessions in `session_v2`, with the transcript in `session_message`;
+/// earlier versions use `session` with `message` and `part`.
+pub fn session_tables(conn: &Connection) -> Result<Vec<&'static str>> {
+    let mut tables = Vec::new();
+    for table in ["session", "session_v2"] {
+        if table_exists(conn, table)? {
+            tables.push(table);
+        }
+    }
+    Ok(tables)
+}
+
+/// Whether the database is OpenCode 2's event-sourced store. OpenCode derives
+/// its session rows from events, so other programs must not write those rows
+/// directly: they go through the OpenCode CLI instead.
+pub fn is_event_sourced(conn: &Connection) -> Result<bool> {
+    Ok(table_exists(conn, "session_v2")? && !table_exists(conn, "session")?)
+}
+
 fn quote_sql_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }

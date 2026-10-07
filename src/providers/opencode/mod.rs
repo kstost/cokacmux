@@ -1,5 +1,6 @@
 //! OpenCode adapter — SQLite (`opencode.db`).
 
+pub mod cli;
 pub mod clone;
 pub mod db;
 pub mod from_universal;

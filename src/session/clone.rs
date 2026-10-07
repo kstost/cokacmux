@@ -6,6 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -37,6 +38,13 @@ pub struct CloneOpts {
     pub context_mode: CloneContextMode,
     /// Override `~/.cokacmux/context` for file-reference context clones.
     pub context_dir: Option<PathBuf>,
+    /// The Codex CLI, for a same-provider Codex clone of a session that keeps
+    /// paginated history: Codex must index the copy itself. Without it such a
+    /// clone fails instead of leaving a thread Codex shows as empty.
+    pub codex_command: Option<ProviderCommand>,
+    /// The OpenCode CLI. OpenCode 2 keeps sessions in an event store that only
+    /// OpenCode may write, so clones into it go through the CLI.
+    pub opencode_command: Option<ProviderCommand>,
 }
 
 impl Default for CloneOpts {
@@ -48,9 +56,13 @@ impl Default for CloneOpts {
             new_id: None,
             context_mode: CloneContextMode::Inline,
             context_dir: None,
+            codex_command: None,
+            opencode_command: None,
         }
     }
 }
+
+pub use crate::providers::ProviderCommand;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloneContextMode {
@@ -155,6 +167,7 @@ fn clone_cross_provider_context_wrapper(
         opts,
         &InstallSessionOpts {
             overwrite: opts.overwrite,
+            opencode_command: opts.opencode_command.clone(),
             ..Default::default()
         },
     )
@@ -428,7 +441,8 @@ fn clone_codex_same_provider_at_home(
     )?
     .rollout_path;
     let mut lines = read_jsonl_lines(&src.source)?;
-    patch_codex_jsonl_lines(&mut lines, &src.session_id, &new_id, &src.cwd, &new_cwd);
+    let history_needs_index =
+        patch_codex_jsonl_lines(&mut lines, &src.session_id, &new_id, &src.cwd, &new_cwd);
     let rollback = ClonePathRollback::capture(std::slice::from_ref(&target), opts.overwrite)?;
     let bytes_written = match write_jsonl_lines_atomic(&target, opts.overwrite, &lines) {
         Ok(bytes_written) => bytes_written,
@@ -465,6 +479,18 @@ fn clone_codex_same_provider_at_home(
             ));
         }
     };
+    if history_needs_index {
+        if let Err(error) =
+            index_codex_clone_history(codex_home, &new_id, opts.codex_command.as_ref())
+        {
+            let state_error = state_rollback.rollback().err();
+            let file_error = rollback.rollback().err();
+            return Err(error_with_rollback_failures(
+                error,
+                state_error.into_iter().chain(file_error),
+            ));
+        }
+    }
     state_rollback.commit();
     rollback.commit();
     crate::debug::log(
@@ -478,6 +504,7 @@ fn clone_codex_same_provider_at_home(
             "path": "codex_native_rollout_copy",
             "bytes_written": bytes_written,
             "native_validation_checks": validation.checks.len(),
+            "codex_history_indexed": history_needs_index,
         }),
     );
     Ok(CloneReport {
@@ -498,6 +525,13 @@ fn clone_codex_same_provider_at_home(
 fn clone_opencode_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport> {
     if let Some(new_id) = opts.new_id.as_deref() {
         ensure_distinct_native_clone_id(Provider::OpenCode, &src.session_id, new_id)?;
+    }
+    let event_sourced = {
+        let conn = providers::opencode::db::open_readonly(&src.source)?;
+        providers::opencode::db::is_event_sourced(&conn)?
+    };
+    if event_sourced {
+        return clone_opencode_event_sourced(src, opts);
     }
     let (report, validation) = providers::opencode::clone::clone_session_rows_with_validation(
         &src.source,
@@ -543,6 +577,91 @@ fn clone_opencode_same_provider(src: &SessionInfo, opts: &CloneOpts) -> Result<C
             "messages_copied": report.messages_copied,
             "parts_copied": report.parts_copied,
             "session_messages_copied": report.session_messages_copied,
+        }),
+    );
+    Ok(CloneReport {
+        source_provider: Provider::OpenCode,
+        source_session_id: src.session_id.clone(),
+        new_session_id: new_id,
+        target_provider: Provider::OpenCode,
+        new_cwd,
+        artifact,
+    })
+}
+
+/// Same-provider OpenCode 2 clone: OpenCode exports the session, the copy
+/// gets new session and message ids, and OpenCode imports it. OpenCode
+/// derives its rows from events, so they are never copied directly.
+#[cfg(feature = "opencode")]
+fn clone_opencode_event_sourced(src: &SessionInfo, opts: &CloneOpts) -> Result<CloneReport> {
+    let command = opts.opencode_command.as_ref().ok_or_else(|| {
+        ConvertError::Other(
+            "OpenCode 2 keeps sessions in an event store that only OpenCode may write; cloning needs the opencode CLI, and it was not found".into(),
+        )
+    })?;
+    if opts.overwrite {
+        return Err(ConvertError::Unsupported(
+            "replacing an existing OpenCode 2 session is not supported".into(),
+        ));
+    }
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| mint_id_for(Provider::OpenCode));
+    ensure_distinct_native_clone_id(Provider::OpenCode, &src.session_id, &new_id)?;
+    let new_cwd = opts.cwd.clone().unwrap_or_else(|| src.cwd.clone());
+    if new_cwd.is_empty() {
+        return Err(ConvertError::MissingField("session.cwd"));
+    }
+    let export = providers::opencode::cli::export_session(command, &src.source, &src.session_id)?;
+    let document = providers::opencode::cli::retarget_export(&export, &new_id)?;
+    providers::opencode::cli::import_session(command, &src.source, &document, &new_cwd)?;
+    let artifact = ArtifactPath::OpenCodeDb {
+        db_path: src.source.clone(),
+        session_id: new_id.clone(),
+    };
+    let validation = {
+        let conn = providers::opencode::db::open_readonly(&src.source)?;
+        super::native_validate::validate_opencode_connection(&src.source, &new_id, &conn)
+    };
+    let source_turns = export
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let copied_turns = document
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if !validation.ok || source_turns != copied_turns {
+        let error = ConvertError::Other(format!(
+            "{} clone artifact failed native validation: {}",
+            Provider::OpenCode.as_str(),
+            if validation.ok {
+                format!("messages copied {copied_turns} of {source_turns}")
+            } else {
+                validation.failure_summary()
+            }
+        ));
+        return Err(
+            match providers::opencode::cli::delete_session(command, &src.source, &new_id) {
+                Ok(()) => error,
+                Err(cleanup) => ConvertError::Other(format!(
+                    "{error}; removing the imported copy failed: {cleanup}"
+                )),
+            },
+        );
+    }
+    crate::debug::log(
+        "clone_to_live_ok",
+        serde_json::json!({
+            "source_provider": src.provider.as_str(),
+            "source_session_id": &src.session_id,
+            "target_provider": Provider::OpenCode.as_str(),
+            "new_session_id": &new_id,
+            "artifact": format!("{:?}", &artifact),
+            "native_validation_checks": validation.checks.len(),
+            "path": "opencode_cli_export_import",
+            "messages_copied": copied_turns,
         }),
     );
     Ok(CloneReport {
@@ -1373,23 +1492,135 @@ fn is_claude_api_content_type(kind: &str) -> bool {
     )
 }
 
+const CODEX_LEGACY_HISTORY_MODE: &str = "legacy";
+const CODEX_PAGINATED_HISTORY_MODE: &str = "paginated";
+
+/// Rewrites the rollout's identity for the clone. Returns whether the source
+/// declared paginated history. Codex reads such a thread from its history
+/// index (`thread_history_*.sqlite`), keyed by thread id, which has no rows for
+/// the new id. The copy therefore declares legacy history, and Codex indexes
+/// it from the copied rollout (`index_codex_clone_history`).
 fn patch_codex_jsonl_lines(
     lines: &mut [JsonLine],
     old_sid: &str,
     new_sid: &str,
     old_cwd: &str,
     new_cwd: &str,
-) {
+) -> bool {
+    let mut declared_paginated = false;
     for line in lines {
         let JsonLine::Json(Value::Object(map)) = line else {
             continue;
         };
+        let is_session_meta = map.get("type").and_then(Value::as_str) == Some("session_meta");
         let Some(Value::Object(payload)) = map.get_mut("payload") else {
             continue;
         };
+        let is_identity =
+            is_session_meta && payload.get("id").and_then(Value::as_str) == Some(old_sid);
         rewrite_string_if_equal(payload, "id", old_sid, new_sid);
         rewrite_string_if_equal(payload, "cwd", old_cwd, new_cwd);
+        if is_identity {
+            if let Some(Value::String(mode)) = payload.get_mut("history_mode") {
+                if mode == CODEX_PAGINATED_HISTORY_MODE {
+                    *mode = CODEX_LEGACY_HISTORY_MODE.to_string();
+                    declared_paginated = true;
+                }
+            }
+        }
     }
+    declared_paginated
+}
+
+/// How long Codex may take to index a cloned rollout. A large session on a
+/// slow disk needs time; the clone runs on a worker thread.
+const CODEX_CLONE_INDEX_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Asks Codex to build its paginated history index for a cloned thread: the
+/// migration Codex itself applies to legacy sessions. The index is Codex's
+/// own derived storage, so Codex builds it from the copied rollout instead of
+/// cokacmux reproducing its format.
+fn index_codex_clone_history(
+    codex_home: &Path,
+    thread_id: &str,
+    command: Option<&ProviderCommand>,
+) -> Result<()> {
+    let Some(command) = command else {
+        return Err(ConvertError::Other(
+            "this Codex session keeps paginated history; cloning it needs the codex CLI to index the copy, and it was not found".into(),
+        ));
+    };
+    crate::debug::log(
+        "codex_clone_history_index_start",
+        serde_json::json!({
+            "codex_home": codex_home.display().to_string(),
+            "thread_id": thread_id,
+            "program": command.program.display().to_string(),
+        }),
+    );
+    let mut process = command.command();
+    process
+        .args([
+            "migrate-rollouts",
+            "--thread",
+            thread_id,
+            "--apply",
+            "--json",
+        ])
+        .env("CODEX_HOME", codex_home);
+    let output = providers::run_command_bounded(process, CODEX_CLONE_INDEX_TIMEOUT)
+        .map_err(|error| {
+            ConvertError::Other(format!(
+                "could not run codex to index the cloned session: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ConvertError::Other(format!(
+                "codex did not finish indexing the cloned session within {}s",
+                CODEX_CLONE_INDEX_TIMEOUT.as_secs()
+            ))
+        })?;
+    let status = codex_migration_status(&output.stdout, thread_id);
+    if output.status.success() && status.as_deref() == Some("migrated") {
+        crate::debug::log(
+            "codex_clone_history_index_ok",
+            serde_json::json!({ "thread_id": thread_id }),
+        );
+        return Ok(());
+    }
+    let stderr_tail = providers::output_tail(&output.stderr, 300);
+    crate::debug::log(
+        "codex_clone_history_index_failed",
+        serde_json::json!({
+            "thread_id": thread_id,
+            "exit": output.status.to_string(),
+            "status": status,
+            "stderr_tail": &stderr_tail,
+        }),
+    );
+    Err(ConvertError::Other(format!(
+        "codex did not index the cloned session ({}, migration status {}){}",
+        output.status,
+        status.as_deref().unwrap_or("missing"),
+        if stderr_tail.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr_tail}")
+        }
+    )))
+}
+
+/// The `migrate-rollouts --json` outcome status reported for `thread_id`.
+fn codex_migration_status(stdout: &[u8], thread_id: &str) -> Option<String> {
+    let report: Value = serde_json::from_slice(stdout).ok()?;
+    report
+        .get("outcomes")?
+        .as_array()?
+        .iter()
+        .find(|outcome| outcome.get("thread_id").and_then(Value::as_str) == Some(thread_id))?
+        .get("status")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn rewrite_string_if_equal(
@@ -1763,6 +1994,9 @@ fn copy_codex_state_thread_row(
             "id" => *value = SqlValue::Text(new_session_id.to_string()),
             "rollout_path" => *value = SqlValue::Text(rollout_path.display().to_string()),
             "cwd" => *value = SqlValue::Text(cwd.to_string()),
+            // The copied rollout declares legacy history (see
+            // `patch_codex_jsonl_lines`); the index row must agree with it.
+            "history_mode" => *value = SqlValue::Text(CODEX_LEGACY_HISTORY_MODE.to_string()),
             _ => {}
         }
     }
@@ -2675,6 +2909,170 @@ mod tests {
         assert_eq!(row.1, "/new/cwd");
         assert_eq!(row.2, "old title");
         assert_eq!(row.3, "native-value");
+    }
+
+    /// A Codex home holding one rollout that declares paginated history, as
+    /// current Codex writes it, plus its `threads` row.
+    #[cfg(all(feature = "opencode", unix))]
+    fn paginated_codex_source(codex_home: &Path) -> SessionInfo {
+        let source_dir = codex_home.join("sessions/2026/10/07");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source_path = source_dir
+            .join("rollout-2026-10-07T00-00-00-11111111-1111-7111-8111-111111111111.jsonl");
+        fs::write(
+            &source_path,
+            [
+                json!({
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "11111111-1111-7111-8111-111111111111",
+                        "cwd": "/old/cwd",
+                        "history_mode": "paginated"
+                    }
+                })
+                .to_string(),
+                json!({"ordinal": 1, "type": "event_msg", "payload": {"type": "task_started"}})
+                    .to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                history_mode TEXT NOT NULL DEFAULT 'legacy'
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, history_mode)
+             VALUES ('11111111-1111-7111-8111-111111111111', ?1, '/old/cwd', 'paginated')",
+            rusqlite::params![source_path.display().to_string()],
+        )
+        .unwrap();
+        session_info(
+            Provider::Codex,
+            "11111111-1111-7111-8111-111111111111",
+            "/old/cwd",
+            source_path,
+        )
+    }
+
+    /// A stand-in `codex` that records its arguments and reports `status`
+    /// for the thread it was asked to migrate.
+    #[cfg(all(feature = "opencode", unix))]
+    fn fake_codex(dir: &Path, status: &str) -> ProviderCommand {
+        use std::os::unix::fs::PermissionsExt;
+        let program = dir.join("codex");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CODEX_HOME/args.txt\"\nprintf '{{\"outcomes\":[{{\"thread_id\":\"%s\",\"status\":\"{status}\",\"message\":null}}]}}' \"$3\"\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        ProviderCommand {
+            program,
+            path_env: None,
+        }
+    }
+
+    #[cfg(all(feature = "opencode", unix))]
+    fn codex_thread_history_mode(codex_home: &Path, id: &str) -> Option<String> {
+        rusqlite::Connection::open(codex_home.join("state_5.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT history_mode FROM threads WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    #[cfg(all(feature = "opencode", unix))]
+    #[test]
+    fn codex_clone_of_paginated_history_is_indexed_by_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join(".codex");
+        let src = paginated_codex_source(&codex_home);
+        let new_id = "22222222-2222-7222-8222-222222222222";
+
+        let report = clone_codex_same_provider_at_home(
+            &src,
+            &CloneOpts {
+                new_id: Some(new_id.into()),
+                codex_command: Some(fake_codex(dir.path(), "migrated")),
+                ..Default::default()
+            },
+            &codex_home,
+        )
+        .unwrap();
+
+        let ArtifactPath::File(path) = report.artifact else {
+            panic!("expected file artifact");
+        };
+        let values = parse_jsonl(&path);
+        // Codex keeps paginated history in an index keyed by thread id; the
+        // copy declares legacy history so Codex indexes it from the rollout.
+        assert_eq!(values[0]["payload"]["history_mode"], "legacy");
+        assert_eq!(values[0]["payload"]["id"], new_id);
+        assert_eq!(values[1]["ordinal"], 1);
+        assert_eq!(
+            codex_thread_history_mode(&codex_home, new_id).as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(
+            fs::read_to_string(codex_home.join("args.txt")).unwrap(),
+            format!("migrate-rollouts\n--thread\n{new_id}\n--apply\n--json\n")
+        );
+        // The source keeps its own declaration and row.
+        assert_eq!(
+            parse_jsonl(&src.source)[0]["payload"]["history_mode"],
+            "paginated"
+        );
+        assert_eq!(
+            codex_thread_history_mode(&codex_home, &src.session_id).as_deref(),
+            Some("paginated")
+        );
+    }
+
+    #[cfg(all(feature = "opencode", unix))]
+    #[test]
+    fn codex_clone_of_paginated_history_rolls_back_without_codex_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join(".codex");
+        let src = paginated_codex_source(&codex_home);
+        let new_id = "22222222-2222-7222-8222-222222222222";
+
+        for codex_command in [None, Some(fake_codex(dir.path(), "skipped"))] {
+            let error = clone_codex_same_provider_at_home(
+                &src,
+                &CloneOpts {
+                    new_id: Some(new_id.into()),
+                    codex_command,
+                    ..Default::default()
+                },
+                &codex_home,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("index"), "{error}");
+            assert_eq!(codex_thread_history_mode(&codex_home, new_id), None);
+            let leftovers = fs::read_dir(src.source.parent().unwrap())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().contains(new_id))
+                .count();
+            assert_eq!(leftovers, 0, "the cloned rollout must be rolled back");
+        }
     }
 
     #[cfg(feature = "opencode")]

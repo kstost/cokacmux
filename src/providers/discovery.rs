@@ -894,28 +894,39 @@ fn list_opencode() -> Result<Vec<SessionInfo>> {
         return Ok(Vec::new());
     }
     let conn = crate::providers::opencode::db::open_readonly(&db)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, directory, title, time_updated FROM session ORDER BY time_updated DESC",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(SessionInfo {
-            provider: Provider::OpenCode,
-            session_id: row.get::<_, String>(0)?,
-            cwd: row.get::<_, String>(1)?,
-            source: db.clone(),
-            updated_at_epoch_s: (row.get::<_, i64>(3)? / 1000).max(0) as u64,
-            title: {
-                let t: String = row.get(2)?;
-                if t.is_empty() {
-                    None
-                } else {
-                    Some(t)
-                }
-            },
-            relation: None,
-        })
-    })?;
-    let out: Vec<SessionInfo> = rows.filter_map(|r| r.ok()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<SessionInfo> = Vec::new();
+    // OpenCode 2 lists sessions from `session_v2`; earlier versions from
+    // `session`. A row present in both is listed once.
+    for table in crate::providers::opencode::db::session_tables(&conn)? {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, directory, COALESCE(title, ''), time_updated FROM {table}"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SessionInfo {
+                provider: Provider::OpenCode,
+                session_id: row.get::<_, String>(0)?,
+                cwd: row.get::<_, String>(1)?,
+                source: db.clone(),
+                updated_at_epoch_s: (row.get::<_, i64>(3)? / 1000).max(0) as u64,
+                title: {
+                    let t: String = row.get(2)?;
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t)
+                    }
+                },
+                relation: None,
+            })
+        })?;
+        for info in rows.filter_map(|r| r.ok()) {
+            if seen.insert(info.session_id.clone()) {
+                out.push(info);
+            }
+        }
+    }
+    out.sort_by_key(|info| std::cmp::Reverse(info.updated_at_epoch_s));
     crate::debug::log(
         "discovery_opencode_scan_ok",
         serde_json::json!({
@@ -970,6 +981,56 @@ pub fn unique_opencode_session_created_after(
     }
 }
 
+/// Whether the default OpenCode database is OpenCode 2's event store: the
+/// version whose `--session <id>` creates the session under that id. `None`
+/// when there is no readable database. Reads the database, so never call it
+/// on the UI thread.
+#[cfg(feature = "opencode")]
+pub fn opencode_store_is_event_sourced() -> Option<bool> {
+    let db = default_opencode_db_candidates()
+        .into_iter()
+        .find(|p| p.is_file())?;
+    let conn = crate::providers::opencode::db::open_readonly(&db).ok()?;
+    crate::providers::opencode::db::is_event_sourced(&conn).ok()
+}
+
+#[cfg(not(feature = "opencode"))]
+pub fn opencode_store_is_event_sourced() -> Option<bool> {
+    None
+}
+
+/// The OpenCode session stored under exactly `session_id`, with its database.
+#[cfg(feature = "opencode")]
+pub fn opencode_session_by_id(session_id: &str) -> Option<(String, std::path::PathBuf)> {
+    let db = default_opencode_db_candidates()
+        .into_iter()
+        .find(|p| p.is_file())?;
+    opencode_session_exists_in_db(&db, session_id).then(|| (session_id.to_string(), db))
+}
+
+#[cfg(feature = "opencode")]
+fn opencode_session_exists_in_db(db: &Path, session_id: &str) -> bool {
+    let Ok(conn) = crate::providers::opencode::db::open_readonly(db) else {
+        return false;
+    };
+    let Ok(tables) = crate::providers::opencode::db::session_tables(&conn) else {
+        return false;
+    };
+    tables.into_iter().any(|table| {
+        conn.query_row(
+            &format!("SELECT 1 FROM {table} WHERE id = ?1"),
+            rusqlite::params![session_id],
+            |_| Ok(()),
+        )
+        .is_ok()
+    })
+}
+
+#[cfg(not(feature = "opencode"))]
+pub fn opencode_session_by_id(_session_id: &str) -> Option<(String, std::path::PathBuf)> {
+    None
+}
+
 #[cfg(not(feature = "opencode"))]
 pub fn unique_opencode_session_created_after(
     _cwd: &str,
@@ -985,16 +1046,24 @@ fn unique_opencode_session_created_after_in_db(
     created_after_epoch_ms: i64,
 ) -> Result<Option<String>> {
     let conn = crate::providers::opencode::db::open_readonly(db)?;
-    let mut stmt = conn.prepare(
-        "SELECT id FROM session \
-         WHERE directory = ?1 AND time_created >= ?2 AND parent_id IS NULL",
-    )?;
-    let ids: Vec<String> = stmt
-        .query_map(rusqlite::params![cwd, created_after_epoch_ms], |row| {
-            row.get::<_, String>(0)
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let mut ids: Vec<String> = Vec::new();
+    for table in crate::providers::opencode::db::session_tables(&conn)? {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM {table} \
+             WHERE directory = ?1 AND time_created >= ?2 AND parent_id IS NULL"
+        ))?;
+        let table_ids = stmt
+            .query_map(rusqlite::params![cwd, created_after_epoch_ms], |row| {
+                row.get::<_, String>(0)
+            })?
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>();
+        for id in table_ids {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
     match ids.as_slice() {
         [id] => Ok(Some(id.clone())),
         [] => Ok(None),
@@ -1042,6 +1111,29 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[cfg(feature = "opencode")]
+    #[test]
+    fn opencode_session_lookup_by_id_reads_opencode_2_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode.db");
+        let conn = crate::providers::opencode::cli::tests::create_event_sourced_db(&db);
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, slug, directory, version,
+                                     time_created, time_updated)
+             VALUES ('ses_pinned', 'proj', 'calm-sea', '/repo', '2.0.24', 1, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(opencode_session_exists_in_db(&db, "ses_pinned"));
+        assert!(!opencode_session_exists_in_db(&db, "ses_other"));
+        assert!(!opencode_session_exists_in_db(
+            &dir.path().join("missing.db"),
+            "ses_pinned"
+        ));
+    }
 
     #[test]
     fn extracts_claude_cwd_and_ai_title_for_discovery() {

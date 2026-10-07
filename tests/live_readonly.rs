@@ -173,26 +173,36 @@ fn recent_opencode_samples(limit: usize) -> Vec<LiveSample> {
     if !db_path.is_file() {
         return Vec::new();
     }
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let mut stmt = conn
-        .prepare("SELECT id FROM session ORDER BY time_updated DESC LIMIT ?1")
-        .unwrap();
-    stmt.query_map(rusqlite::params![limit as i64], |row| {
-        row.get::<_, String>(0)
-    })
-    .unwrap()
-    .map(|row| {
-        let session_id = row.unwrap();
-        LiveSample {
+    // Read-only: this gate must never write to the live database. OpenCode 2
+    // keeps sessions in `session_v2`, earlier versions in `session`.
+    let conn = providers::opencode::db::open_readonly(&db_path).unwrap();
+    let mut ids = Vec::new();
+    for table in providers::opencode::db::session_tables(&conn).unwrap() {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id, time_updated FROM {table} ORDER BY time_updated DESC LIMIT ?1"
+            ))
+            .unwrap();
+        ids.extend(
+            stmt.query_map(rusqlite::params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap()),
+        );
+    }
+    ids.sort_by_key(|(_, updated)| std::cmp::Reverse(*updated));
+    ids.truncate(limit);
+    ids.into_iter()
+        .map(|(session_id, _)| LiveSample {
             provider: Provider::OpenCode,
             label: format!("{}#{}", db_path.display(), session_id),
             source: SessionSource::OpenCodeDb {
                 db_path: db_path.clone(),
                 session_id,
             },
-        }
-    })
-    .collect()
+        })
+        .collect()
 }
 
 fn recent_pi_samples(limit: usize) -> Vec<LiveSample> {
